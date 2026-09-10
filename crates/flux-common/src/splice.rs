@@ -1,0 +1,159 @@
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::io;
+use tokio::io::Interest;
+use tokio::net::TcpStream;
+
+#[cfg(target_os = "linux")]
+struct Pipe {
+    reader: libc::c_int,
+    writer: libc::c_int,
+}
+
+#[cfg(target_os = "linux")]
+impl Pipe {
+    fn new() -> io::Result<Self> {
+        let mut fds = [0; 2];
+        let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            reader: fds[0],
+            writer: fds[1],
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.reader);
+            libc::close(self.writer);
+        }
+    }
+}
+
+/// Linux zero-copy unidirectional splice between two TCP streams via an in-kernel pipe.
+#[cfg(target_os = "linux")]
+async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> io::Result<u64> {
+    let pipe = Pipe::new()?;
+    let mut transferred: u64 = 0;
+    const SPLICE_CHUNK: usize = 65536;
+
+    loop {
+        // 1. Splice socket -> pipe
+        let mut n_read = 0;
+        read_stream
+            .async_io(Interest::READABLE, || {
+                let res = unsafe {
+                    libc::splice(
+                        read_stream.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        pipe.writer,
+                        std::ptr::null_mut(),
+                        SPLICE_CHUNK,
+                        libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
+                    )
+                };
+                if res < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() == io::ErrorKind::WouldBlock {
+                        return Err(err);
+                    }
+                    return Err(err);
+                }
+                n_read = res as usize;
+                Ok(())
+            })
+            .await?;
+
+        if n_read == 0 {
+            // EOF from reader
+            break;
+        }
+
+        // 2. Splice pipe -> socket
+        let mut pipe_rem = n_read;
+        while pipe_rem > 0 {
+            let mut n_written = 0;
+            write_stream
+                .async_io(Interest::WRITABLE, || {
+                    let res = unsafe {
+                        libc::splice(
+                            pipe.reader,
+                            std::ptr::null_mut(),
+                            write_stream.as_raw_fd(),
+                            std::ptr::null_mut(),
+                            pipe_rem,
+                            libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
+                        )
+                    };
+                    if res < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.kind() == io::ErrorKind::WouldBlock {
+                            return Err(err);
+                        }
+                        return Err(err);
+                    }
+                    n_written = res as usize;
+                    Ok(())
+                })
+                .await?;
+
+            pipe_rem -= n_written;
+            transferred += n_written as u64;
+        }
+    }
+
+    Ok(transferred)
+}
+
+/// Linux zero-copy bidirectional splice.
+/// Falls back to standard copy_bidirectional if splice is unsupported or fails.
+pub async fn copy_bidirectional_zero_copy(
+    a: &mut TcpStream,
+    b: &mut TcpStream,
+) -> io::Result<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        let t1 = splice_direction(a, b);
+        let t2 = splice_direction(b, a);
+        tokio::try_join!(t1, t2)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::copy::copy_bidirectional(a, b).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_zero_copy_splice() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 12];
+            socket.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"SPLICE_HELLO");
+            socket.write_all(b"SPLICE_REPLY").await.unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"SPLICE_HELLO").await.unwrap();
+        let mut buf = vec![0u8; 12];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"SPLICE_REPLY");
+
+        srv.await.unwrap();
+    }
+}

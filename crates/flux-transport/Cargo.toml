@@ -1,0 +1,21 @@
+[package]
+name = "flux-transport"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flux-types = { workspace = true }
+flux-common = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+rcgen = { workspace = true }

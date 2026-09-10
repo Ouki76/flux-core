@@ -1,0 +1,20 @@
+[package]
+name = "flux-outbound"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flux-types = { workspace = true }
+flux-common = { workspace = true }
+flux-dns = { workspace = true }
+flux-protocol = { workspace = true }
+flux-transport = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+rand = { workspace = true }

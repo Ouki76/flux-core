@@ -1,0 +1,27 @@
+[package]
+name = "flux-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+flux-types = { workspace = true }
+flux-common = { workspace = true }
+flux-router = { workspace = true }
+flux-dns = { workspace = true }
+flux-transport = { workspace = true }
+flux-protocol = { workspace = true }
+flux-inbound = { workspace = true }
+flux-outbound = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+rcgen = { workspace = true }
+ipnet = { workspace = true }
