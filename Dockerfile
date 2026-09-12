@@ -15,7 +15,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/flux-core /usr/local/bin/flux-core
-COPY config.example.json /etc/flux-core/config.json
 
 RUN mkdir -p /etc/flux-core
 
