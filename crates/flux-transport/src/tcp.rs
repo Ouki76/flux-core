@@ -15,6 +15,11 @@ impl TcpTransport {
         };
 
         let _ = stream.set_nodelay(true);
+        let sock_ref = socket2::SockRef::from(&stream);
+        let _ = sock_ref.set_send_buffer_size(256 * 1024);
+        let _ = sock_ref.set_recv_buffer_size(256 * 1024);
+        let _ = sock_ref.set_keepalive(true);
+
         Ok(stream)
     }
 }

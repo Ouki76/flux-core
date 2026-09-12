@@ -15,6 +15,7 @@ use flux_inbound::{HttpInbound, MixedInbound, SocksInbound, VlessInbound};
 use flux_outbound::{
     BlockOutbound, DirectOutbound, SelectorOutbound, SocksOutbound, UrlTestOutbound, VlessOutbound,
 };
+use crate::api::{ApiServer, TrafficMeter};
 use crate::config::{Config, InboundConfig, OutboundConfig};
 use crate::dispatcher::DefaultDispatcher;
 
@@ -49,31 +50,35 @@ pub struct Instance {
     pub inbounds: Vec<Arc<dyn Inbound>>,
     pub registry: Arc<OutboundRegistry>,
     pub dispatcher: Arc<dyn Dispatcher>,
+    pub meter: Arc<TrafficMeter>,
+    pub api_server: Option<Arc<ApiServer>>,
 }
 
 impl Instance {
     pub fn new(config: Config) -> FluxResult<Self> {
         // 1. DNS & Fake-IP
-        let fake_ip_pool = if let Some(dns_cfg) = &config.dns {
-            if let Some(fip) = &dns_cfg.fakeip {
+        let (fake_ip_pool, dns_servers) = if let Some(dns_cfg) = &config.dns {
+            let pool = if let Some(fip) = &dns_cfg.fakeip {
                 if fip.enabled.unwrap_or(false) {
                     let range = fip.inet4_range.as_deref().unwrap_or("198.18.0.0/15");
-                    let pool = FakeIpPool::new(range, 10000).map_err(|e| {
+                    let p = FakeIpPool::new(range, 10000).map_err(|e| {
                         FluxError::Config(format!("invalid fake-ip range {}: {}", range, e))
                     })?;
-                    Some(Arc::new(pool))
+                    Some(Arc::new(p))
                 } else {
                     None
                 }
             } else {
                 None
-            }
+            };
+            (pool, dns_cfg.servers.clone())
         } else {
-            None
+            (None, vec![])
         };
 
-        let resolver = Arc::new(DnsResolver::new(fake_ip_pool));
+        let resolver = Arc::new(DnsResolver::new(fake_ip_pool).with_servers(dns_servers));
         let registry = Arc::new(OutboundRegistry::new());
+        let meter = TrafficMeter::new();
 
         // 2. Outbounds - Pass 1: Leaf outbounds
         let mut group_configs = Vec::new();
@@ -266,8 +271,8 @@ impl Instance {
 
         let router = Arc::new(Router::new(rules, default_outbound).with_rule_sets(rule_set_registry));
 
-        // 4. Dispatcher
-        let dispatcher = Arc::new(DefaultDispatcher::new(router, registry.clone()));
+        // 4. Dispatcher with live traffic meter
+        let dispatcher = Arc::new(DefaultDispatcher::new(router, registry.clone()).with_meter(meter.clone()));
 
         // 5. Inbounds
         let mut inbounds: Vec<Arc<dyn Inbound>> = Vec::new();
@@ -310,10 +315,14 @@ impl Instance {
 
                     let tls_acceptor = if let Some(t) = tls {
                         if t.enabled {
-                            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-                            let cert_der = CertificateDer::from(cert.cert);
-                            let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-                            Some(TlsTransport::create_server_acceptor(vec![cert_der], key_der, vec![])?)
+                            let (certs, key) = if let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path) {
+                                TlsTransport::load_certs_and_key(cp, kp)?
+                            } else {
+                                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                                    .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
+                                (vec![CertificateDer::from(cert.cert)], PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()))
+                            };
+                            Some(TlsTransport::create_server_acceptor(certs, key, vec![])?)
                         } else {
                             None
                         }
@@ -343,15 +352,21 @@ impl Instance {
                     let ifname = interface_name.unwrap_or_else(|| "tun0".into());
                     inbounds.push(Arc::new(flux_inbound::TunInbound::new(tag, ifname, mtu)));
                 }
-                InboundConfig::Trojan { tag, listen, listen_port, password, tls: _ } => {
+                InboundConfig::Trojan { tag, listen, listen_port, password, tls } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
                         FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                     })?;
-                    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-                    let cert_der = CertificateDer::from(cert.cert);
-                    let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-                    let tls_acceptor = TlsTransport::create_server_acceptor(vec![cert_der], key_der, vec![])?;
+                    let (certs, key) = if let Some(t) = &tls
+                        && let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path)
+                    {
+                        TlsTransport::load_certs_and_key(cp, kp)?
+                    } else {
+                        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                            .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
+                        (vec![CertificateDer::from(cert.cert)], PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()))
+                    };
+                    let tls_acceptor = TlsTransport::create_server_acceptor(certs, key, vec![])?;
                     inbounds.push(Arc::new(flux_inbound::TrojanInbound::new(tag, addr, password, tls_acceptor)));
                 }
                 InboundConfig::Shadowsocks { tag, listen, listen_port, password, method: _ } => {
@@ -364,14 +379,32 @@ impl Instance {
             }
         }
 
+        // 6. Optional Clash REST API server
+        let api_server = if let Some(exp) = config.experimental
+            && let Some(clash_api) = exp.clash_api
+            && let Some(ctrl) = clash_api.external_controller
+        {
+            let api_addr: SocketAddr = ctrl.parse().map_err(|e| {
+                FluxError::Config(format!("invalid external_controller address {}: {}", ctrl, e))
+            })?;
+            Some(Arc::new(ApiServer::new(api_addr, registry.clone(), meter.clone())))
+        } else {
+            None
+        };
+
         Ok(Self {
             inbounds,
             registry,
             dispatcher,
+            meter,
+            api_server,
         })
     }
 
     pub async fn start(&self) -> FluxResult<()> {
+        if let Some(api) = &self.api_server {
+            api.start().await?;
+        }
         for inbound in &self.inbounds {
             inbound.start(self.dispatcher.clone()).await?;
         }
@@ -379,6 +412,9 @@ impl Instance {
     }
 
     pub async fn stop(&self) -> FluxResult<()> {
+        if let Some(api) = &self.api_server {
+            api.stop().await?;
+        }
         for inbound in &self.inbounds {
             inbound.stop().await?;
         }
@@ -401,7 +437,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     let clean = s.trim();
-    if clean.len() % 2 != 0 {
+    if !clean.len().is_multiple_of(2) {
         return None;
     }
     (0..clean.len())

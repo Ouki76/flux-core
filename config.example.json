@@ -1,0 +1,164 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      "1.1.1.1",
+      "8.8.8.8"
+    ],
+    "fakeip": {
+      "enabled": true,
+      "inet4_range": "198.18.0.0/15"
+    }
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "0.0.0.0",
+      "listen_port": 1080
+    },
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "0.0.0.0",
+      "listen_port": 10808
+    },
+    {
+      "type": "http",
+      "tag": "http-in",
+      "listen": "0.0.0.0",
+      "listen_port": 10809
+    },
+    {
+      "type": "vless",
+      "tag": "vless-reality-in",
+      "listen": "0.0.0.0",
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
+        }
+      ],
+      "reality": {
+        "enabled": true,
+        "server_names": [
+          "gateway.icloud.com",
+          "www.microsoft.com"
+        ],
+        "private_key": "a8059fd5f5e62aebd04db4d8394c3147c3a94058eac4b4f0505839052c56be55",
+        "short_ids": [
+          "0123456789abcdef"
+        ]
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality-out",
+      "server": "example-vless-node.com",
+      "server_port": 443,
+      "uuid": "a1b2c3d4-e5f6-7890-1234-56789abcdef0",
+      "flow": "xtls-rprx-vision",
+      "reality": {
+        "enabled": true,
+        "public_key": "71264d178bd4b5ae55ba602e28dcc178af2ed8e36f6e425a0d29093d2efa702a",
+        "short_id": "0123456789abcdef"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-out",
+      "server": "example-trojan-node.com",
+      "server_port": 443,
+      "password": "trojan_secret_password",
+      "tls": {
+        "enabled": true,
+        "server_name": "example-trojan-node.com",
+        "insecure": false
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "ss-out",
+      "server": "example-ss-node.com",
+      "server_port": 8388,
+      "method": "chacha20-ietf-poly1305",
+      "password": "ss_secret_password"
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    },
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": [
+        "vless-reality-out",
+        "trojan-out",
+        "ss-out",
+        "direct"
+      ],
+      "default": "vless-reality-out"
+    },
+    {
+      "type": "urltest",
+      "tag": "auto-fastest",
+      "outbounds": [
+        "vless-reality-out",
+        "trojan-out",
+        "ss-out"
+      ],
+      "url": "http://cp.cloudflare.com/generate_204",
+      "interval": "300s",
+      "tolerance": 50
+    }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "tag": "geosite-ads",
+        "domain_suffix": [
+          "doubleclick.net",
+          "adservice.google.com"
+        ]
+      }
+    ],
+    "rules": [
+      {
+        "rule_set": [
+          "geosite-ads"
+        ],
+        "outbound": "block"
+      },
+      {
+        "ip_cidr": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "127.0.0.0/8"
+        ],
+        "outbound": "direct"
+      },
+      {
+        "port": [
+          443,
+          80
+        ],
+        "outbound": "proxy"
+      }
+    ],
+    "final": "direct"
+  },
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090"
+    }
+  }
+}

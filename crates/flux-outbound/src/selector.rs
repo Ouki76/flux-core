@@ -1,5 +1,6 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, OutboundLookup, PacketEndpoint, SessionMeta,
 };
@@ -31,20 +32,8 @@ impl SelectorOutbound {
         }
     }
 
-    pub fn select(&self, tag: &str) -> FluxResult<()> {
-        if !self.outbounds.iter().any(|t| t == tag) {
-            return Err(FluxError::OutboundNotFound(format!(
-                "outbound '{}' is not in selector '{}' list",
-                tag, self.tag
-            )));
-        }
-        let mut guard = self.selected.write().unwrap();
-        *guard = tag.to_string();
-        Ok(())
-    }
-
     pub fn current(&self) -> String {
-        self.selected.read().unwrap().clone()
+        self.selected.read().clone()
     }
 
     fn get_active(&self) -> FluxResult<Arc<dyn Outbound>> {
@@ -72,5 +61,33 @@ impl Outbound for SelectorOutbound {
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
         let active = self.get_active()?;
         active.dial_packet(meta).await
+    }
+
+    fn is_group(&self) -> bool {
+        true
+    }
+
+    fn group_type(&self) -> Option<&'static str> {
+        Some("Selector")
+    }
+
+    fn select(&self, tag: &str) -> FluxResult<()> {
+        if !self.outbounds.iter().any(|t| t == tag) {
+            return Err(FluxError::OutboundNotFound(format!(
+                "outbound '{}' is not in selector '{}' list",
+                tag, self.tag
+            )));
+        }
+        let mut guard = self.selected.write();
+        *guard = tag.to_string();
+        Ok(())
+    }
+
+    fn current_selected(&self) -> Option<String> {
+        Some(self.current())
+    }
+
+    fn candidate_outbounds(&self) -> Vec<String> {
+        self.outbounds.clone()
     }
 }

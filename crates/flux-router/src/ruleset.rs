@@ -1,9 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use flux_types::SessionMeta;
-use crate::rule::DomainMatch;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuleSet {
@@ -20,7 +19,11 @@ pub struct RuleSet {
     #[serde(skip)]
     pub parsed_cidrs: Vec<IpNet>,
     #[serde(skip)]
-    pub parsed_domains: Vec<DomainMatch>,
+    pub exact_set: HashSet<String>,
+    #[serde(skip)]
+    pub suffix_set: HashSet<String>,
+    #[serde(skip)]
+    pub keyword_list: Vec<String>,
 }
 
 impl RuleSet {
@@ -31,16 +34,22 @@ impl RuleSet {
             .filter_map(|s| s.parse::<IpNet>().ok())
             .collect();
 
-        self.parsed_domains.clear();
+        self.exact_set.clear();
         for d in &self.domain {
-            self.parsed_domains.push(DomainMatch::Exact(d.clone()));
+            self.exact_set.insert(d.trim().to_ascii_lowercase());
         }
+
+        self.suffix_set.clear();
         for s in &self.domain_suffix {
-            self.parsed_domains.push(DomainMatch::Suffix(s.clone()));
+            let clean = s.trim().trim_start_matches('.').to_ascii_lowercase();
+            self.suffix_set.insert(clean);
         }
-        for k in &self.domain_keyword {
-            self.parsed_domains.push(DomainMatch::Keyword(k.clone()));
-        }
+
+        self.keyword_list = self
+            .domain_keyword
+            .iter()
+            .map(|k| k.trim().to_ascii_lowercase())
+            .collect();
     }
 
     pub fn matches(&self, meta: &SessionMeta) -> bool {
@@ -50,7 +59,34 @@ impl RuleSet {
                 self.parsed_cidrs.iter().any(|c| c.contains(&ip))
             }
             flux_types::TargetAddress::Domain(domain, _) => {
-                self.parsed_domains.iter().any(|dm| dm.matches(domain))
+                let domain_lower = domain.trim().to_ascii_lowercase();
+
+                // 1. O(1) Exact domain lookup
+                if self.exact_set.contains(&domain_lower) {
+                    return true;
+                }
+
+                // 2. O(L) Suffix domain lookup by climbing domain hierarchy
+                if self.suffix_set.contains(&domain_lower) {
+                    return true;
+                }
+
+                let mut current = domain_lower.as_str();
+                while let Some(dot_idx) = current.find('.') {
+                    current = &current[dot_idx + 1..];
+                    if self.suffix_set.contains(current) {
+                        return true;
+                    }
+                }
+
+                // 3. Keyword scan
+                if !self.keyword_list.is_empty()
+                    && self.keyword_list.iter().any(|k| domain_lower.contains(k))
+                {
+                    return true;
+                }
+
+                false
             }
         }
     }

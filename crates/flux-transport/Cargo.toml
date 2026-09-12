@@ -19,3 +19,5 @@ bytes = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 rcgen = { workspace = true }
+pem = "3"
+socket2 = { workspace = true }

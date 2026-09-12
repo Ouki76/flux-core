@@ -2,7 +2,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use crate::error::FluxResult;
+use crate::error::{FluxError, FluxResult};
 use crate::session::{SessionMeta, UdpPacket};
 
 /// A bidirectional stream of bytes.
@@ -32,6 +32,34 @@ pub trait Outbound: Send + Sync {
     fn tag(&self) -> &str;
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream>;
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>>;
+
+    /// Whether this outbound is a group (Selector, UrlTest, etc.)
+    fn is_group(&self) -> bool {
+        false
+    }
+
+    /// Group type string for Clash API compatibility ("Selector", "URLTest", etc.)
+    fn group_type(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Dynamically change the selected outbound if this is a selector group.
+    fn select(&self, _tag: &str) -> FluxResult<()> {
+        Err(FluxError::Protocol {
+            protocol: "outbound-group",
+            message: "this outbound is not a selectable group".into(),
+        })
+    }
+
+    /// Returns the currently active outbound tag for groups.
+    fn current_selected(&self) -> Option<String> {
+        None
+    }
+
+    /// Returns the list of candidate outbound tags for groups.
+    fn candidate_outbounds(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 /// Lookup registry for outbound groups (selector, urltest) to find candidate outbounds.
@@ -43,6 +71,8 @@ pub trait OutboundLookup: Send + Sync {
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
     async fn dispatch_stream(&self, meta: SessionMeta, inbound_stream: BoxedStream);
+    async fn dial_outbound(&self, meta: &SessionMeta) -> FluxResult<BoxedStream>;
+    async fn bridge_streams(&self, meta: SessionMeta, inbound_stream: BoxedStream, outbound_stream: BoxedStream);
     async fn dispatch_packet(
         &self,
         meta: SessionMeta,

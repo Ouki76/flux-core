@@ -4,11 +4,11 @@ use flux_types::{FluxError, FluxResult, TargetAddress};
 pub struct HttpHandshake;
 
 impl HttpHandshake {
-    /// Server-side: parse HTTP CONNECT request from incoming stream.
-    /// Returns target address.
+    /// Server-side: parse HTTP CONNECT or standard forward GET/POST request from incoming stream.
+    /// Returns target address and optional reconstructed prefix bytes for origin-form requests.
     pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
-    ) -> FluxResult<TargetAddress> {
+    ) -> FluxResult<(TargetAddress, Option<Vec<u8>>)> {
         let mut buf = Vec::with_capacity(1024);
         let mut byte = [0u8; 1];
 
@@ -37,6 +37,7 @@ impl HttpHandshake {
         let mut parts = request_line.split_whitespace();
         let method = parts.next().unwrap_or("");
         let uri = parts.next().unwrap_or("");
+        let version = parts.next().unwrap_or("HTTP/1.1");
 
         if method.eq_ignore_ascii_case("CONNECT") {
             let target: TargetAddress = uri.parse().map_err(|_| FluxError::Protocol {
@@ -48,18 +49,29 @@ impl HttpHandshake {
             stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
             stream.flush().await?;
 
-            Ok(target)
+            Ok((target, None))
         } else {
-            // Forward proxy GET/POST http://example.com:80/path
+            // Forward proxy GET/POST/HEAD http://example.com:80/path
             if uri.starts_with("http://") || uri.starts_with("https://") {
                 let without_scheme = uri.split_once("://").map(|(_, rest)| rest).unwrap_or(uri);
-                let host_and_path = without_scheme.split_once('/').map(|(h, _)| h).unwrap_or(without_scheme);
-                let target: TargetAddress = if host_and_path.contains(':') {
-                    host_and_path.parse()?
-                } else {
-                    format!("{}:80", host_and_path).parse()?
+                let (host_and_port, path) = match without_scheme.split_once('/') {
+                    Some((hp, p)) => (hp, format!("/{}", p)),
+                    None => (without_scheme, "/".to_string()),
                 };
-                Ok(target)
+                let target: TargetAddress = if host_and_port.contains(':') {
+                    host_and_port.parse()?
+                } else {
+                    format!("{}:80", host_and_port).parse()?
+                };
+
+                // Reconstruct HTTP request line in origin-form: METHOD /path HTTP/1.1
+                let new_request_line = format!("{} {} {}\r\n", method, path, version);
+                let remaining_headers = header_str.split_once("\r\n").map(|(_, rest)| rest).unwrap_or("");
+                let mut reconstructed = Vec::new();
+                reconstructed.extend_from_slice(new_request_line.as_bytes());
+                reconstructed.extend_from_slice(remaining_headers.as_bytes());
+
+                Ok((target, Some(reconstructed)))
             } else {
                 Err(FluxError::Protocol {
                     protocol: "http",
@@ -114,7 +126,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(1024);
 
         let srv = tokio::spawn(async move {
-            let target = HttpHandshake::server_handshake(&mut server).await.unwrap();
+            let (target, _) = HttpHandshake::server_handshake(&mut server).await.unwrap();
             assert_eq!(target.host(), "example.com");
             assert_eq!(target.port(), 443);
         });

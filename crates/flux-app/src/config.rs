@@ -12,6 +12,17 @@ pub struct Config {
     #[serde(default)]
     pub outbounds: Vec<OutboundConfig>,
     pub route: Option<RouteConfig>,
+    pub experimental: Option<ExperimentalConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ExperimentalConfig {
+    pub clash_api: Option<ClashApiConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ClashApiConfig {
+    pub external_controller: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -19,8 +30,10 @@ pub struct LogConfig {
     pub level: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DnsConfig {
+    #[serde(default)]
+    pub servers: Vec<String>,
     pub fakeip: Option<FakeIpConfig>,
 }
 

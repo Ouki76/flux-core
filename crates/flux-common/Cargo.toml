@@ -11,3 +11,4 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 libc = { version = "0.2" }
+parking_lot = "0.12"

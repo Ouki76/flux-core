@@ -121,6 +121,37 @@ impl TlsTransport {
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
+    pub fn load_certs_and_key(
+        cert_path: &str,
+        key_path: &str,
+    ) -> FluxResult<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+        let cert_content = std::fs::read(cert_path).map_err(FluxError::Io)?;
+        let key_content = std::fs::read(key_path).map_err(FluxError::Io)?;
+
+        let pems = pem::parse_many(&cert_content)
+            .map_err(|e| FluxError::Crypto(format!("failed to parse cert pem: {}", e)))?;
+        let certs: Vec<CertificateDer<'static>> = pems
+            .into_iter()
+            .map(|p| CertificateDer::from(p.into_contents()))
+            .collect();
+
+        if certs.is_empty() {
+            return Err(FluxError::Crypto("no certificates found in pem file".into()));
+        }
+
+        let key_pem = pem::parse(&key_content)
+            .map_err(|e| FluxError::Crypto(format!("failed to parse key pem: {}", e)))?;
+
+        let key = match key_pem.tag() {
+            "RSA PRIVATE KEY" => PrivateKeyDer::Pkcs1(key_pem.into_contents().into()),
+            "PRIVATE KEY" => PrivateKeyDer::Pkcs8(key_pem.into_contents().into()),
+            "EC PRIVATE KEY" => PrivateKeyDer::Sec1(key_pem.into_contents().into()),
+            _ => PrivateKeyDer::Pkcs8(key_pem.into_contents().into()),
+        };
+
+        Ok((certs, key))
+    }
+
     pub async fn connect<S>(
         stream: S,
         cfg: &TlsClientConfig,

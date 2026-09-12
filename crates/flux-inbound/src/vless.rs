@@ -68,7 +68,7 @@ impl Inbound for VlessInbound {
                         break;
                     }
                 };
-                let _ = socket.set_nodelay(true);
+                crate::optimize_tcp_socket(&socket);
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
@@ -105,24 +105,81 @@ impl Inbound for VlessInbound {
                         }
                     };
 
-                    if req.command != VLESS_CMD_TCP {
-                        warn!("[{}] VLESS unsupported command: {}", inbound_tag, req.command);
-                        return;
-                    }
-
                     if let Err(e) = VlessProtocol::write_response_header(&mut stream).await {
                         warn!("[{}] VLESS write response header failed: {}", inbound_tag, e);
                         return;
                     }
 
-                    let meta = SessionMeta::new(
-                        client_addr,
-                        req.address,
-                        inbound_tag,
-                        NetworkType::Tcp,
-                    );
+                    if req.command == VLESS_CMD_TCP {
+                        let meta = SessionMeta::new(
+                            client_addr,
+                            req.address,
+                            inbound_tag,
+                            NetworkType::Tcp,
+                        );
 
-                    disp.dispatch_stream(meta, stream).await;
+                        disp.dispatch_stream(meta, stream).await;
+                    } else if req.command == flux_protocol::vless::VLESS_CMD_UDP {
+                        let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel::<flux_types::UdpPacket>(128);
+                        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<flux_types::UdpPacket>(128);
+
+                        let meta = SessionMeta::new(
+                            client_addr,
+                            req.address.clone(),
+                            inbound_tag.clone(),
+                            NetworkType::Udp,
+                        );
+
+                        let disp_clone = disp.clone();
+                        tokio::spawn(async move {
+                            disp_clone.dispatch_packet(meta, pkt_rx, out_tx).await;
+                        });
+
+                        let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+                        let req_addr = req.address.clone();
+                        let read_task = tokio::spawn(async move {
+                            loop {
+                                let mut len_buf = [0u8; 2];
+                                if tokio::io::AsyncReadExt::read_exact(&mut read_half, &mut len_buf).await.is_err() {
+                                    break;
+                                }
+                                let payload_len = u16::from_be_bytes(len_buf) as usize;
+                                let mut payload = vec![0u8; payload_len];
+                                if tokio::io::AsyncReadExt::read_exact(&mut read_half, &mut payload).await.is_err() {
+                                    break;
+                                }
+
+                                let packet = flux_types::UdpPacket::new(
+                                    bytes::Bytes::from(payload),
+                                    req_addr.clone(),
+                                    req_addr.clone(),
+                                );
+                                if pkt_tx.send(packet).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        let write_task = tokio::spawn(async move {
+                            while let Some(packet) = out_rx.recv().await {
+                                let encoded = flux_protocol::udp::encode_vless_udp(&packet.payload);
+                                if tokio::io::AsyncWriteExt::write_all(&mut write_half, &encoded).await.is_err() {
+                                    break;
+                                }
+                                if tokio::io::AsyncWriteExt::flush(&mut write_half).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+
+                        tokio::select! {
+                            _ = read_task => {},
+                            _ = write_task => {},
+                        }
+                    } else {
+                        warn!("[{}] VLESS unsupported command: {}", inbound_tag, req.command);
+                    }
                 });
             }
         });

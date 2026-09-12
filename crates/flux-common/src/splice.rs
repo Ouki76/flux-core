@@ -1,6 +1,7 @@
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::io;
+#[cfg(target_os = "linux")]
 use tokio::io::Interest;
 use tokio::net::TcpStream;
 
@@ -70,7 +71,10 @@ async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> 
             .await?;
 
         if n_read == 0 {
-            // EOF from reader
+            // EOF from reader: signal half-close on writer
+            unsafe {
+                libc::shutdown(write_stream.as_raw_fd(), libc::SHUT_WR);
+            }
             break;
         }
 
@@ -111,7 +115,7 @@ async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> 
 }
 
 /// Linux zero-copy bidirectional splice.
-/// Falls back to standard copy_bidirectional if splice is unsupported or fails.
+/// Falls back to standard copy_bidirectional if splice is unsupported or on non-Linux OS.
 pub async fn copy_bidirectional_zero_copy(
     a: &mut TcpStream,
     b: &mut TcpStream,
@@ -137,23 +141,35 @@ mod tests {
 
     #[tokio::test]
     async fn test_zero_copy_splice() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let srv = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
+        // Setup echo target server
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = echo_listener.accept().await.unwrap();
             let mut buf = vec![0u8; 12];
             socket.read_exact(&mut buf).await.unwrap();
             assert_eq!(&buf, b"SPLICE_HELLO");
             socket.write_all(b"SPLICE_REPLY").await.unwrap();
         });
 
-        let mut client = TcpStream::connect(addr).await.unwrap();
+        // Setup proxy listener
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        // Run proxy relay with copy_bidirectional_zero_copy
+        tokio::spawn(async move {
+            let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
+            let mut target_stream = TcpStream::connect(echo_addr).await.unwrap();
+            let _ = copy_bidirectional_zero_copy(&mut client_stream, &mut target_stream).await;
+        });
+
+        // Client connects to proxy
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         client.write_all(b"SPLICE_HELLO").await.unwrap();
+        let _ = client.shutdown().await;
+
         let mut buf = vec![0u8; 12];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"SPLICE_REPLY");
-
-        srv.await.unwrap();
     }
 }

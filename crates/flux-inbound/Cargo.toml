@@ -20,3 +20,4 @@ serde = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
 libc = { version = "0.2" }
+socket2 = { workspace = true }

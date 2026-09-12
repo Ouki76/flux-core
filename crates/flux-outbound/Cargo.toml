@@ -18,3 +18,4 @@ serde = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
+parking_lot = "0.12"

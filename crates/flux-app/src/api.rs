@@ -87,18 +87,63 @@ impl ApiServer {
                 let met = meter.clone();
 
                 tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = match socket.read(&mut buf).await {
-                        Ok(n) if n > 0 => n,
-                        _ => return,
+                    let mut buf = Vec::with_capacity(4096);
+                    let mut chunk = [0u8; 1024];
+
+                    // 1. Read headers until \r\n\r\n
+                    let mut header_end = None;
+                    while buf.len() < 16384 {
+                        let n = match socket.read(&mut chunk).await {
+                            Ok(n) if n > 0 => n,
+                            _ => return,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            break;
+                        }
+                    }
+
+                    let Some(h_end) = header_end else {
+                        return;
                     };
 
-                    let req_str = String::from_utf8_lossy(&buf[..n]);
-                    let mut lines = req_str.lines();
+                    let header_str = String::from_utf8_lossy(&buf[..h_end]).into_owned();
+                    let mut lines = header_str.lines();
                     let first_line = lines.next().unwrap_or("");
                     let mut parts = first_line.split_whitespace();
-                    let method = parts.next().unwrap_or("GET");
-                    let uri = parts.next().unwrap_or("/");
+                    let method = parts.next().unwrap_or("GET").to_string();
+                    let uri = parts.next().unwrap_or("/").to_string();
+
+                    // Parse Content-Length
+                    let mut content_length = 0usize;
+                    for line in lines {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+
+                    // 2. Read remaining body if not yet fully in buffer
+                    while buf.len() < h_end + content_length {
+                        let needed = (h_end + content_length).saturating_sub(buf.len());
+                        let to_read = needed.min(chunk.len());
+                        let n = match socket.read(&mut chunk[..to_read]).await {
+                            Ok(n) if n > 0 => n,
+                            _ => break,
+                        };
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+
+                    let body_slice = if buf.len() >= h_end + content_length {
+                        &buf[h_end..h_end + content_length]
+                    } else if buf.len() >= h_end {
+                        &buf[h_end..]
+                    } else {
+                        &[]
+                    };
+                    let body_str = String::from_utf8_lossy(body_slice);
 
                     let (status, body) = if method == "OPTIONS" {
                         ("200 OK", String::new())
@@ -113,33 +158,49 @@ impl ApiServer {
                         ("200 OK", data.to_string())
                     } else if uri == "/proxies" && method == "GET" {
                         let mut proxies = serde_json::Map::new();
-                        // Iterate through known outbounds
+                        // Iterate through known outbounds with group introspection
                         for entry in reg.map.iter() {
                             let tag = entry.key();
-                            proxies.insert(
-                                tag.clone(),
-                                json!({
-                                    "name": tag,
-                                    "type": "Outbound",
-                                    "history": []
-                                }),
-                            );
+                            let outbound = entry.value();
+                            if outbound.is_group() {
+                                proxies.insert(
+                                    tag.clone(),
+                                    json!({
+                                        "name": tag,
+                                        "type": outbound.group_type().unwrap_or("Selector"),
+                                        "now": outbound.current_selected().unwrap_or_default(),
+                                        "all": outbound.candidate_outbounds(),
+                                        "history": []
+                                    }),
+                                );
+                            } else {
+                                proxies.insert(
+                                    tag.clone(),
+                                    json!({
+                                        "name": tag,
+                                        "type": "Outbound",
+                                        "history": []
+                                    }),
+                                );
+                            }
                         }
                         let resp = json!({ "proxies": proxies });
                         ("200 OK", resp.to_string())
                     } else if uri.starts_with("/proxies/") && method == "PUT" {
                         let selector_tag = uri.strip_prefix("/proxies/").unwrap_or("");
-                        let body_str = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
-                        let target_name = serde_json::from_str::<serde_json::Value>(body_str)
+                        let target_name = serde_json::from_str::<serde_json::Value>(&body_str)
                             .ok()
                             .and_then(|v| v.get("name").and_then(|n| n.as_str().map(String::from)))
                             .unwrap_or_default();
 
-                        if let Some(_out) = reg.get_outbound(selector_tag) {
-                            // If it's a selector, switch target
-                            let _ = target_name;
+                        if let Some(out) = reg.get_outbound(selector_tag) {
+                            match out.select(&target_name) {
+                                Ok(()) => ("204 No Content", String::new()),
+                                Err(e) => ("400 Bad Request", json!({"error": e.to_string()}).to_string()),
+                            }
+                        } else {
+                            ("404 Not Found", json!({"error": format!("selector '{}' not found", selector_tag)}).to_string())
                         }
-                        ("204 No Content", String::new())
                     } else if uri == "/connections" {
                         let data = json!({
                             "connections": [],
@@ -159,6 +220,8 @@ impl ApiServer {
                     );
 
                     let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                    let _ = socket.shutdown().await;
                 });
             }
         });

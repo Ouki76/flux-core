@@ -1,8 +1,13 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
 use ipnet::Ipv4Net;
 use lru::LruCache;
+use parking_lot::Mutex;
+
+const DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(10000) {
+    Some(v) => v,
+    None => unreachable!(),
+};
 
 #[derive(Debug)]
 pub struct FakeIpPool {
@@ -15,7 +20,7 @@ pub struct FakeIpPool {
 impl FakeIpPool {
     pub fn new(cidr: &str, capacity: usize) -> Result<Self, ipnet::AddrParseError> {
         let network: Ipv4Net = cidr.parse()?;
-        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(10000).unwrap());
+        let cap = NonZeroUsize::new(capacity).unwrap_or(DEFAULT_CAPACITY);
         
         // Start from first usable IP in network
         let start_ip = u32::from(network.network()) + 1;
@@ -29,14 +34,22 @@ impl FakeIpPool {
     }
 
     pub fn default_pool() -> Self {
-        Self::new("198.18.0.0/15", 10000).expect("valid default fake-ip cidr")
+        Self::new("198.18.0.0/15", 10000).unwrap_or_else(|_| {
+            let net = Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15).expect("valid cidr");
+            Self {
+                network: net,
+                current: Mutex::new(u32::from(net.network()) + 1),
+                domain_to_ip: Mutex::new(LruCache::new(DEFAULT_CAPACITY)),
+                ip_to_domain: Mutex::new(LruCache::new(DEFAULT_CAPACITY)),
+            }
+        })
     }
 
     pub fn allocate(&self, domain: &str) -> Ipv4Addr {
         let domain_lower = domain.to_ascii_lowercase();
         
-        let mut d2i = self.domain_to_ip.lock().unwrap();
-        let mut i2d = self.ip_to_domain.lock().unwrap();
+        let mut d2i = self.domain_to_ip.lock();
+        let mut i2d = self.ip_to_domain.lock();
 
         if let Some(&ip) = d2i.get(&domain_lower) {
             i2d.get(&ip); // promote in LRU
@@ -44,7 +57,7 @@ impl FakeIpPool {
         }
 
         // Allocate next IP
-        let mut curr = self.current.lock().unwrap();
+        let mut curr = self.current.lock();
         let start = u32::from(self.network.network()) + 1;
         let end = u32::from(self.network.broadcast()) - 1;
 
@@ -69,7 +82,7 @@ impl FakeIpPool {
     pub fn lookup_domain(&self, ip: &IpAddr) -> Option<String> {
         match ip {
             IpAddr::V4(ipv4) => {
-                let mut i2d = self.ip_to_domain.lock().unwrap();
+                let mut i2d = self.ip_to_domain.lock();
                 i2d.get(ipv4).cloned()
             }
             IpAddr::V6(_) => None,

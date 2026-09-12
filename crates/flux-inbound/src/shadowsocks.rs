@@ -63,7 +63,7 @@ impl Inbound for ShadowsocksInbound {
                         break;
                     }
                 };
-                let _ = socket.set_nodelay(true);
+                crate::optimize_tcp_socket(&socket);
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();

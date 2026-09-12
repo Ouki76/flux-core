@@ -82,10 +82,8 @@ impl Rule {
         }
 
         // Network match
-        if !self.networks.is_empty() {
-            if !self.networks.contains(&meta.network) {
-                return false;
-            }
+        if !self.networks.is_empty() && !self.networks.contains(&meta.network) {
+            return false;
         }
 
         // Port match

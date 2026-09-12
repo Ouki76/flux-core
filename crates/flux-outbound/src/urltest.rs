@@ -1,7 +1,8 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use dashmap::DashMap;
+use parking_lot::RwLock;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 use tracing::{debug, info};
@@ -81,7 +82,7 @@ impl UrlTestOutbound {
     async fn probe_candidate(&self, tag: &str) -> Option<Duration> {
         let outbound = self.lookup.get(tag)?;
         let meta = SessionMeta::new(
-            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().ok()?,
             self.target_addr.clone(),
             format!("{}-healthcheck", self.tag),
             NetworkType::Tcp,
@@ -130,14 +131,14 @@ impl UrlTestOutbound {
         }
 
         if let Some(new_best) = best_tag {
-            let mut guard = self.current_best.write().unwrap();
-            if let Some(current) = guard.as_ref() {
-                if let Some(cur_rtt_entry) = self.latencies.get(current) {
-                    let cur_rtt = *cur_rtt_entry.value();
-                    // Apply tolerance: only switch if new_best is significantly better
-                    if cur_rtt <= min_rtt + self.tolerance {
-                        return;
-                    }
+            let mut guard = self.current_best.write();
+            if let Some(current) = guard.as_ref()
+                && let Some(cur_rtt_entry) = self.latencies.get(current)
+            {
+                let cur_rtt = *cur_rtt_entry.value();
+                // Apply tolerance: only switch if new_best is significantly better
+                if cur_rtt <= min_rtt + self.tolerance {
+                    return;
                 }
             }
             info!(
@@ -149,7 +150,7 @@ impl UrlTestOutbound {
     }
 
     pub fn current_best_tag(&self) -> Option<String> {
-        self.current_best.read().unwrap().clone()
+        self.current_best.read().clone()
     }
 
     pub fn url(&self) -> &str {
@@ -171,6 +172,9 @@ impl UrlTestOutbound {
 }
 
 fn parse_test_url(url: &str) -> (TargetAddress, String, String) {
+    let is_https = url.starts_with("https://");
+    let default_port = if is_https { 443 } else { 80 };
+
     let without_scheme = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
@@ -182,9 +186,9 @@ fn parse_test_url(url: &str) -> (TargetAddress, String, String) {
     };
 
     let (host, port) = if let Some((h, p)) = host_port.split_once(':') {
-        (h.to_string(), p.parse::<u16>().unwrap_or(80))
+        (h.to_string(), p.parse::<u16>().unwrap_or(default_port))
     } else {
-        (host_port.to_string(), 80)
+        (host_port.to_string(), default_port)
     };
 
     let target = TargetAddress::domain(host.clone(), port);
@@ -205,5 +209,21 @@ impl Outbound for UrlTestOutbound {
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
         let active = self.get_active()?;
         active.dial_packet(meta).await
+    }
+
+    fn is_group(&self) -> bool {
+        true
+    }
+
+    fn group_type(&self) -> Option<&'static str> {
+        Some("URLTest")
+    }
+
+    fn current_selected(&self) -> Option<String> {
+        self.current_best_tag()
+    }
+
+    fn candidate_outbounds(&self) -> Vec<String> {
+        self.outbounds.clone()
     }
 }

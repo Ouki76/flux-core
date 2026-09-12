@@ -50,7 +50,7 @@ impl Inbound for MixedInbound {
                         break;
                     }
                 };
-                let _ = socket.set_nodelay(true);
+                crate::optimize_tcp_socket(&socket);
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
@@ -58,8 +58,14 @@ impl Inbound for MixedInbound {
                 tokio::spawn(async move {
                     // Peek the first byte to detect protocol
                     let mut peek_buf = [0u8; 1];
-                    if let Err(e) = socket.peek(&mut peek_buf).await {
-                        warn!("[{}] client {} peek failed: {}", inbound_tag, client_addr, e);
+                    let n = match socket.peek(&mut peek_buf).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            warn!("[{}] client {} peek failed: {}", inbound_tag, client_addr, e);
+                            return;
+                        }
+                    };
+                    if n == 0 {
                         return;
                     }
 
@@ -78,25 +84,39 @@ impl Inbound for MixedInbound {
                         };
 
                         if req.command == Socks5Command::Connect {
+                            let meta = SessionMeta::new(
+                                client_addr,
+                                req.address,
+                                inbound_tag.clone(),
+                                NetworkType::Tcp,
+                            );
+
+                            let outbound_stream = match disp.dial_outbound(&meta).await {
+                                Ok(s) => s,
+                                Err(FluxError::Blocked(msg)) => {
+                                    warn!("[{}] connection to {} blocked: {}", inbound_tag, meta.destination, msg);
+                                    let _ = Socks5Handshake::send_reply(&mut socket, 0x02, None).await;
+                                    return;
+                                }
+                                Err(e) => {
+                                    warn!("[{}] connection to {} failed: {}", inbound_tag, meta.destination, e);
+                                    let _ = Socks5Handshake::send_reply(&mut socket, 0x05, None).await;
+                                    return;
+                                }
+                            };
+
                             if let Err(e) = Socks5Handshake::send_reply(&mut socket, REP_SUCCESS, None).await {
                                 warn!("[{}] SOCKS5 send reply failed: {}", inbound_tag, e);
                                 return;
                             }
 
-                            let meta = SessionMeta::new(
-                                client_addr,
-                                req.address,
-                                inbound_tag,
-                                NetworkType::Tcp,
-                            );
-
-                            disp.dispatch_stream(meta, Box::new(socket)).await;
+                            disp.bridge_streams(meta, Box::new(socket), outbound_stream).await;
                         } else {
                             warn!("[{}] non-CONNECT not supported in mixed TCP mode", inbound_tag);
                         }
                     } else {
                         // HTTP proxy
-                        let target = match HttpHandshake::server_handshake(&mut socket).await {
+                        let (target, prefix_opt) = match HttpHandshake::server_handshake(&mut socket).await {
                             Ok(t) => t,
                             Err(e) => {
                                 warn!("[{}] HTTP handshake failed: {}", inbound_tag, e);
@@ -111,7 +131,13 @@ impl Inbound for MixedInbound {
                             NetworkType::Tcp,
                         );
 
-                        disp.dispatch_stream(meta, Box::new(socket)).await;
+                        let stream: flux_types::BoxedStream = if let Some(prefix) = prefix_opt {
+                            Box::new(flux_common::copy::PrefixedStream::new(socket, prefix))
+                        } else {
+                            Box::new(socket)
+                        };
+
+                        disp.dispatch_stream(meta, stream).await;
                     }
                 });
             }

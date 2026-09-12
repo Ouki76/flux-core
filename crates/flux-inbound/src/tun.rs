@@ -5,10 +5,10 @@ use bytes::Bytes;
 use async_trait::async_trait;
 use tracing::info;
 use flux_types::{
-    Dispatcher, FluxResult, Inbound, NetworkType,
+    Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedPacket {
     pub src: SocketAddr,
     pub dst: SocketAddr,
@@ -151,6 +151,43 @@ fn calc_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+#[cfg(target_os = "linux")]
+fn open_tun_device(name: &str) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    let dev_path = std::ffi::CString::new("/dev/net/tun")?;
+    let fd = unsafe { libc::open(dev_path.as_ptr(), libc::O_RDWR | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    #[repr(C)]
+    struct ifreq {
+        ifr_name: [libc::c_char; libc::IFNAMSIZ],
+        ifr_flags: libc::c_short,
+    }
+
+    const IFF_TUN: libc::c_short = 0x0001;
+    const IFF_NO_PI: libc::c_short = 0x1000;
+    const TUNSETIFF: libc::c_ulong = 0x400454ca;
+
+    let mut ifr: ifreq = unsafe { std::mem::zeroed() };
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(libc::IFNAMSIZ - 1);
+    for (i, &b) in bytes[..len].iter().enumerate() {
+        ifr.ifr_name[i] = b as libc::c_char;
+    }
+
+    let ret = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
+    if ret < 0 {
+        unsafe { libc::close(fd) };
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
 pub struct TunInbound {
     tag: String,
     interface_name: String,
@@ -175,12 +212,112 @@ impl Inbound for TunInbound {
         &self.tag
     }
 
-    async fn start(&self, _dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()> {
+    async fn start(&self, dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()> {
         self.running.store(true, Ordering::SeqCst);
-        info!(
-            "[{}] TUN inbound configured for interface '{}' (MTU: {})",
-            self.tag, self.interface_name, self.mtu
-        );
+        let tag = self.tag.clone();
+        let mtu = self.mtu;
+        let ifname = self.interface_name.clone();
+        let running = self.running.clone();
+
+        #[cfg(target_os = "linux")]
+        {
+            match open_tun_device(&ifname) {
+                Ok(owned_fd) => {
+                    info!("[{}] TUN interface '{}' opened successfully (MTU: {})", tag, ifname, mtu);
+                    let async_fd = match tokio::io::unix::AsyncFd::new(owned_fd) {
+                        Ok(afd) => Arc::new(afd),
+                        Err(e) => {
+                            tracing::error!("[{}] failed to register TUN AsyncFd: {}", tag, e);
+                            return Ok(());
+                        }
+                    };
+
+                    let tag_clone: Arc<str> = Arc::from(tag.as_str());
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; mtu + 64];
+                        while running.load(Ordering::Relaxed) {
+                            let mut guard = match async_fd.readable().await {
+                                Ok(g) => g,
+                                Err(_) => break,
+                            };
+
+                            let n = match guard.try_io(|inner| {
+                                use std::os::fd::AsRawFd;
+                                let res = unsafe { libc::read(inner.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+                                if res < 0 {
+                                    Err(std::io::Error::last_os_error())
+                                } else {
+                                    Ok(res as usize)
+                                }
+                            }) {
+                                Ok(Ok(n)) => n,
+                                Ok(Err(_)) => continue,
+                                Err(_would_block) => continue,
+                            };
+
+                            if let Some(parsed) = parse_ip_packet(&buf[..n])
+                                && parsed.network == NetworkType::Udp
+                            {
+                                let meta = SessionMeta::new(
+                                    parsed.src,
+                                    TargetAddress::Ip(parsed.dst),
+                                    tag_clone.clone(),
+                                    NetworkType::Udp,
+                                );
+
+                                    let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+                                    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+                                    let disp = dispatcher.clone();
+                                    tokio::spawn(async move {
+                                        disp.dispatch_packet(meta, pkt_rx, out_tx).await;
+                                    });
+
+                                    let _ = pkt_tx.send(UdpPacket::new(
+                                        parsed.payload,
+                                        TargetAddress::Ip(parsed.src),
+                                        TargetAddress::Ip(parsed.dst),
+                                    )).await;
+
+                                    let afd_clone = async_fd.clone();
+                                    let orig_src = parsed.dst;
+                                    let orig_dst = parsed.src;
+                                    tokio::spawn(async move {
+                                        while let Some(reply) = out_rx.recv().await {
+                                            if let Some(ip_pkt) = build_ipv4_udp_packet(orig_src, orig_dst, &reply.payload) {
+                                                let _ = afd_clone.writable().await.map(|mut g| {
+                                                    g.try_io(|inner| {
+                                                        use std::os::fd::AsRawFd;
+                                                        let res = unsafe {
+                                                            libc::write(inner.as_raw_fd(), ip_pkt.as_ptr() as *const libc::c_void, ip_pkt.len())
+                                                        };
+                                                        if res < 0 {
+                                                            Err(std::io::Error::last_os_error())
+                                                        } else {
+                                                            Ok(res as usize)
+                                                        }
+                                                    })
+                                                });
+                                            }
+                                        }
+                                    });
+                                }
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[{}] TUN device '{}' could not be opened (CAP_NET_ADMIN / root required: {}). TUN mode will remain passive.",
+                        tag, ifname, e
+                    );
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            tracing::info!("[{}] TUN interface configured on non-Linux OS: {}", tag, ifname);
+        }
+
         Ok(())
     }
 

@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use clap::{Parser, Subcommand};
-use tracing::{error, info, Level};
+use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 use flux_app::{Config, Instance};
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(name = "flux-core")]
@@ -33,8 +36,10 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_env_filter(filter)
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 

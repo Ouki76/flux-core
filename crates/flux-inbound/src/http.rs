@@ -49,13 +49,13 @@ impl Inbound for HttpInbound {
                         break;
                     }
                 };
-                let _ = socket.set_nodelay(true);
+                crate::optimize_tcp_socket(&socket);
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
 
                 tokio::spawn(async move {
-                    let target = match HttpHandshake::server_handshake(&mut socket).await {
+                    let (target, prefix_opt) = match HttpHandshake::server_handshake(&mut socket).await {
                         Ok(t) => t,
                         Err(e) => {
                             warn!("[{}] client {} HTTP handshake failed: {}", inbound_tag, client_addr, e);
@@ -70,7 +70,13 @@ impl Inbound for HttpInbound {
                         NetworkType::Tcp,
                     );
 
-                    disp.dispatch_stream(meta, Box::new(socket)).await;
+                    let stream: flux_types::BoxedStream = if let Some(prefix) = prefix_opt {
+                        Box::new(flux_common::copy::PrefixedStream::new(socket, prefix))
+                    } else {
+                        Box::new(socket)
+                    };
+
+                    disp.dispatch_stream(meta, stream).await;
                 });
             }
         });

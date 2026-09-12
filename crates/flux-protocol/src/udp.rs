@@ -112,6 +112,42 @@ pub fn decode_socks5_udp(src_addr: TargetAddress, mut data: Bytes) -> FluxResult
     Ok(UdpPacket::new(data, src_addr, destination))
 }
 
+/// Encodes a Trojan UDP packet: [ATYP + Addr + Port] + [Length (2 bytes BE)] + [\r\n] + [Payload].
+pub fn encode_trojan_udp(packet: &UdpPacket) -> Bytes {
+    let mut buf = BytesMut::with_capacity(32 + packet.payload.len());
+    match &packet.destination {
+        TargetAddress::Ip(SocketAddr::V4(v4)) => {
+            buf.put_u8(ATYP_IPV4);
+            buf.put_slice(&v4.ip().octets());
+            buf.put_u16(v4.port());
+        }
+        TargetAddress::Ip(SocketAddr::V6(v6)) => {
+            buf.put_u8(ATYP_IPV6);
+            buf.put_slice(&v6.ip().octets());
+            buf.put_u16(v6.port());
+        }
+        TargetAddress::Domain(domain, port) => {
+            buf.put_u8(ATYP_DOMAIN);
+            let bytes = domain.as_bytes();
+            buf.put_u8(bytes.len() as u8);
+            buf.put_slice(bytes);
+            buf.put_u16(*port);
+        }
+    }
+    buf.put_u16(packet.payload.len() as u16);
+    buf.put_slice(b"\r\n");
+    buf.put_slice(&packet.payload);
+    buf.freeze()
+}
+
+/// Encodes a VLESS UDP packet: [Length (2 bytes BE)] + [Payload].
+pub fn encode_vless_udp(payload: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(2 + payload.len());
+    buf.put_u16(payload.len() as u16);
+    buf.put_slice(payload);
+    buf.freeze()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +165,16 @@ mod tests {
 
         assert_eq!(decoded.payload, Bytes::from_static(b"ping"));
         assert_eq!(decoded.destination, TargetAddress::domain("dns.google", 53));
+    }
+
+    #[test]
+    fn test_trojan_udp_encoding() {
+        let packet = UdpPacket::new(
+            Bytes::from_static(b"trojan-payload"),
+            "127.0.0.1:12345".parse().unwrap(),
+            TargetAddress::domain("dns.google", 53),
+        );
+        let encoded = encode_trojan_udp(&packet);
+        assert!(encoded.len() > 14);
     }
 }

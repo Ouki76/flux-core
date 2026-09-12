@@ -39,6 +39,7 @@ impl Inbound for SocksInbound {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
+        let listen_ip = self.listen_addr.ip();
 
         info!("[{}] SOCKS5 inbound listening on {}", tag, self.listen_addr);
 
@@ -53,7 +54,7 @@ impl Inbound for SocksInbound {
                         break;
                     }
                 };
-                let _ = socket.set_nodelay(true);
+                crate::optimize_tcp_socket(&socket);
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
@@ -76,12 +77,6 @@ impl Inbound for SocksInbound {
 
                     match req.command {
                         Socks5Command::Connect => {
-                            // Send success reply
-                            if let Err(e) = Socks5Handshake::send_reply(&mut socket, REP_SUCCESS, None).await {
-                                warn!("[{}] failed to send reply: {}", inbound_tag, e);
-                                return;
-                            }
-
                             let meta = SessionMeta::new(
                                 client_addr,
                                 req.address,
@@ -89,14 +84,33 @@ impl Inbound for SocksInbound {
                                 NetworkType::Tcp,
                             );
 
-                            disp.dispatch_stream(meta, Box::new(socket)).await;
+                            let outbound_stream = match disp.dial_outbound(&meta).await {
+                                Ok(s) => s,
+                                Err(FluxError::Blocked(msg)) => {
+                                    warn!("[{}] connection to {} blocked: {}", inbound_tag, meta.destination, msg);
+                                    let _ = Socks5Handshake::send_reply(&mut socket, 0x02, None).await; // 0x02 = connection not allowed by ruleset
+                                    return;
+                                }
+                                Err(e) => {
+                                    warn!("[{}] connection to {} failed: {}", inbound_tag, meta.destination, e);
+                                    let _ = Socks5Handshake::send_reply(&mut socket, 0x05, None).await; // 0x05 = connection refused
+                                    return;
+                                }
+                            };
+
+                            if let Err(e) = Socks5Handshake::send_reply(&mut socket, REP_SUCCESS, None).await {
+                                warn!("[{}] failed to send reply: {}", inbound_tag, e);
+                                return;
+                            }
+
+                            disp.bridge_streams(meta, Box::new(socket), outbound_stream).await;
                         }
                         Socks5Command::UdpAssociate => {
-                            // Bind local UDP socket for relaying
-                            let udp_socket = match UdpSocket::bind("127.0.0.1:0").await {
+                            // Bind local UDP socket for relaying on the matching inbound interface
+                            let udp_socket = match UdpSocket::bind(SocketAddr::new(listen_ip, 0)).await {
                                 Ok(s) => Arc::new(s),
                                 Err(e) => {
-                                    error!("[{}] failed to bind UDP relay socket: {}", inbound_tag, e);
+                                    error!("[{}] failed to bind UDP relay socket on {}: {}", inbound_tag, listen_ip, e);
                                     let _ = Socks5Handshake::send_reply(&mut socket, 0x01, None).await;
                                     return;
                                 }
@@ -110,10 +124,16 @@ impl Inbound for SocksInbound {
                                 }
                             };
 
+                            let reply_addr = if listen_ip.is_unspecified() {
+                                socket.local_addr().map(|a| SocketAddr::new(a.ip(), local_udp_addr.port())).unwrap_or(local_udp_addr)
+                            } else {
+                                local_udp_addr
+                            };
+
                             if let Err(e) = Socks5Handshake::send_reply(
                                 &mut socket,
                                 REP_SUCCESS,
-                                Some(local_udp_addr),
+                                Some(reply_addr),
                             )
                             .await
                             {
@@ -153,10 +173,10 @@ impl Inbound for SocksInbound {
                                     *client_peer_clone.lock().await = Some(src);
 
                                     let payload = bytes::Bytes::copy_from_slice(&buf[..len]);
-                                    if let Ok(pkt) = decode_socks5_udp(TargetAddress::Ip(src), payload) {
-                                        if pkt_tx.send(pkt).await.is_err() {
-                                            break;
-                                        }
+                                    if let Ok(pkt) = decode_socks5_udp(TargetAddress::Ip(src), payload)
+                                        && pkt_tx.send(pkt).await.is_err()
+                                    {
+                                        break;
                                     }
                                 }
                             });
