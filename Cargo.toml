@@ -61,6 +61,7 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+strip = true
 [package]
 name = "flux-core"
 version = "0.1.0"

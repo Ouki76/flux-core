@@ -117,8 +117,8 @@ async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> 
 /// Linux zero-copy bidirectional splice.
 /// Falls back to standard copy_bidirectional if splice is unsupported or on non-Linux OS.
 pub async fn copy_bidirectional_zero_copy(
-    a: &mut TcpStream,
-    b: &mut TcpStream,
+    a: &TcpStream,
+    b: &TcpStream,
 ) -> io::Result<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
@@ -129,7 +129,9 @@ pub async fn copy_bidirectional_zero_copy(
 
     #[cfg(not(target_os = "linux"))]
     {
-        crate::copy::copy_bidirectional(a, b).await
+        let mut ca = a.try_clone().await?;
+        let mut cb = b.try_clone().await?;
+        crate::copy::copy_bidirectional(&mut ca, &mut cb).await
     }
 }
 
@@ -158,9 +160,9 @@ mod tests {
 
         // Run proxy relay with copy_bidirectional_zero_copy
         tokio::spawn(async move {
-            let (mut client_stream, _) = proxy_listener.accept().await.unwrap();
-            let mut target_stream = TcpStream::connect(echo_addr).await.unwrap();
-            let _ = copy_bidirectional_zero_copy(&mut client_stream, &mut target_stream).await;
+            let (client_stream, _) = proxy_listener.accept().await.unwrap();
+            let target_stream = TcpStream::connect(echo_addr).await.unwrap();
+            let _ = copy_bidirectional_zero_copy(&client_stream, &target_stream).await;
         });
 
         // Client connects to proxy

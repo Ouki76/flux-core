@@ -32,8 +32,26 @@ enum Commands {
     Version,
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let worker_threads = std::env::var("FLUX_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get().clamp(2, 4))
+                .unwrap_or(2)
+        });
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_stack_size(1024 * 1024)
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()

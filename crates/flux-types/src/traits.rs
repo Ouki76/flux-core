@@ -5,9 +5,16 @@ use tokio::sync::mpsc;
 use crate::error::{FluxError, FluxResult};
 use crate::session::{SessionMeta, UdpPacket};
 
-/// A bidirectional stream of bytes.
-pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {}
-impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin> AsyncStream for T {}
+/// A bidirectional stream of bytes with downcasting capabilities.
+pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {
+    fn as_any(&self) -> &dyn std::any::Any;
+}
+
+impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static> AsyncStream for T {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 pub type BoxedStream = Box<dyn AsyncStream>;
 

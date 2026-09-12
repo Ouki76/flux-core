@@ -23,7 +23,7 @@ impl BufferPool {
 
     pub fn default_pool() -> &'static Self {
         static INSTANCE: OnceLock<BufferPool> = OnceLock::new();
-        INSTANCE.get_or_init(|| BufferPool::new(DEFAULT_BUFFER_SIZE, 512))
+        INSTANCE.get_or_init(|| BufferPool::new(DEFAULT_BUFFER_SIZE, 64))
     }
 
     /// Acquire a buffer from the pool or allocate a new one.

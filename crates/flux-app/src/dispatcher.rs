@@ -57,6 +57,26 @@ impl Dispatcher for DefaultDispatcher {
     async fn bridge_streams(&self, _meta: SessionMeta, inbound_stream: BoxedStream, outbound_stream: BoxedStream) {
         let meter = self.meter.clone();
         tokio::spawn(async move {
+            #[cfg(target_os = "linux")]
+            if let (Some(tcp_in), Some(tcp_out)) = (
+                inbound_stream.as_any().downcast_ref::<tokio::net::TcpStream>(),
+                outbound_stream.as_any().downcast_ref::<tokio::net::TcpStream>(),
+            ) {
+                match flux_common::copy_bidirectional_zero_copy(tcp_in, tcp_out).await {
+                    Ok((up, down)) => {
+                        if let Some(m) = meter {
+                            m.record_traffic(up, down);
+                        }
+                        debug!("zero-copy splice stream closed: upload={} B, download={} B", up, down);
+                        return;
+                    }
+                    Err(e) => {
+                        debug!("zero-copy splice stream ended: {}", e);
+                        return;
+                    }
+                }
+            }
+
             match copy_bidirectional(inbound_stream, outbound_stream).await {
                 Ok((up, down)) => {
                     if let Some(m) = meter {

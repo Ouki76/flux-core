@@ -10,7 +10,7 @@ use flux_types::{FluxError, FluxResult, TargetAddress};
 use crate::fakeip::FakeIpPool;
 use crate::wire::{DnsMessage, QTYPE_A};
 
-const DNS_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(4096) {
+const DNS_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
     Some(v) => v,
     None => unreachable!(),
 };
