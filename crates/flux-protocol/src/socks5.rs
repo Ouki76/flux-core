@@ -4,6 +4,7 @@ use flux_types::{FluxError, FluxResult, TargetAddress};
 
 pub const SOCKS5_VERSION: u8 = 0x05;
 pub const METHOD_NO_AUTH: u8 = 0x00;
+pub const METHOD_PASSWORD: u8 = 0x02;
 pub const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 
 pub const CMD_CONNECT: u8 = 0x01;
@@ -16,6 +17,8 @@ pub const ATYP_IPV6: u8 = 0x04;
 
 pub const REP_SUCCESS: u8 = 0x00;
 pub const REP_GENERAL_FAILURE: u8 = 0x01;
+pub const REP_CONNECTION_NOT_ALLOWED: u8 = 0x02;
+pub const REP_CONNECTION_REFUSED: u8 = 0x05;
 pub const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 pub const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
@@ -32,14 +35,22 @@ pub struct Socks5Request {
     pub address: TargetAddress,
 }
 
-/// SOCKS5 protocol handler
+/// SOCKS5 protocol handler supporting RFC 1928 and RFC 1929 authentication.
 pub struct Socks5Handshake;
 
 impl Socks5Handshake {
-    /// Server-side: read client handshake and negotiate authentication.
+    /// Server-side: read client handshake and negotiate authentication (No Auth).
     pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
     ) -> FluxResult<()> {
+        Self::server_handshake_with_auth(stream, None).await.map(|_| ())
+    }
+
+    /// Server-side: negotiate auth with optional RFC 1929 username/password list.
+    pub async fn server_handshake_with_auth<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
+        users: Option<&[(String, String)]>,
+    ) -> FluxResult<Option<String>> {
         let mut ver_nmethods = [0u8; 2];
         stream.read_exact(&mut ver_nmethods).await.map_err(|e| {
             FluxError::Protocol {
@@ -64,19 +75,62 @@ impl Socks5Handshake {
             }
         })?;
 
-        if methods.contains(&METHOD_NO_AUTH) {
-            stream.write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH]).await.map_err(|e| {
-                FluxError::Protocol {
+        if let Some(user_list) = users && !user_list.is_empty() {
+            // Server requires username/password
+            if !methods.contains(&METHOD_PASSWORD) {
+                stream.write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE]).await?;
+                stream.flush().await?;
+                return Err(FluxError::AuthFailed("client does not support password auth".into()));
+            }
+
+            stream.write_all(&[SOCKS5_VERSION, METHOD_PASSWORD]).await?;
+            stream.flush().await?;
+
+            // Read RFC 1929 Auth negotiation
+            let mut sub_ver = [0u8; 1];
+            stream.read_exact(&mut sub_ver).await?;
+            if sub_ver[0] != 0x01 {
+                return Err(FluxError::Protocol {
                     protocol: "socks5",
-                    message: format!("failed to write method selection: {}", e),
-                }
-            })?;
-            stream.flush().await?;
-            Ok(())
+                    message: format!("unsupported auth subnegotiation version: {}", sub_ver[0]),
+                });
+            }
+
+            let mut ulen = [0u8; 1];
+            stream.read_exact(&mut ulen).await?;
+            let mut u_buf = vec![0u8; ulen[0] as usize];
+            stream.read_exact(&mut u_buf).await?;
+            let username = String::from_utf8_lossy(&u_buf).to_string();
+
+            let mut plen = [0u8; 1];
+            stream.read_exact(&mut plen).await?;
+            let mut p_buf = vec![0u8; plen[0] as usize];
+            stream.read_exact(&mut p_buf).await?;
+            let password = String::from_utf8_lossy(&p_buf).to_string();
+
+            let matched = user_list.iter().any(|(u, p)| u == &username && p == &password);
+            if matched {
+                // Success: 0x01 0x00
+                stream.write_all(&[0x01, 0x00]).await?;
+                stream.flush().await?;
+                Ok(Some(username))
+            } else {
+                // Fail: 0x01 0x01
+                stream.write_all(&[0x01, 0x01]).await?;
+                stream.flush().await?;
+                Err(FluxError::AuthFailed(format!("invalid credentials for user '{}'", username)))
+            }
         } else {
-            stream.write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE]).await?;
-            stream.flush().await?;
-            Err(FluxError::AuthFailed("no acceptable auth method".into()))
+            // No auth required
+            if methods.contains(&METHOD_NO_AUTH) {
+                stream.write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH]).await?;
+                stream.flush().await?;
+                Ok(None)
+            } else {
+                stream.write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE]).await?;
+                stream.flush().await?;
+                Err(FluxError::AuthFailed("no acceptable auth method".into()))
+            }
         }
     }
 
@@ -235,24 +289,61 @@ impl Socks5Handshake {
         Ok(())
     }
 
-    /// Client-side: initiate SOCKS5 connection to a remote server.
+    /// Client-side: initiate SOCKS5 connection to a remote server with optional credentials.
     pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
         command: u8,
         target: &TargetAddress,
     ) -> FluxResult<Option<SocketAddr>> {
-        // Send client greeting (No Auth)
-        stream.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await?;
-        stream.flush().await?;
+        Self::client_handshake_with_auth(stream, command, target, None).await
+    }
 
-        // Read server response
-        let mut resp = [0u8; 2];
-        stream.read_exact(&mut resp).await?;
-        if resp[0] != SOCKS5_VERSION || resp[1] != METHOD_NO_AUTH {
-            return Err(FluxError::AuthFailed(format!(
-                "socks5 handshake rejected: ver={}, method={}",
-                resp[0], resp[1]
-            )));
+    /// Client-side: initiate SOCKS5 connection with optional username/password auth.
+    pub async fn client_handshake_with_auth<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut S,
+        command: u8,
+        target: &TargetAddress,
+        auth: Option<(&str, &str)>,
+    ) -> FluxResult<Option<SocketAddr>> {
+        if let Some((user, pass)) = auth {
+            // Client supports Password Auth
+            stream.write_all(&[SOCKS5_VERSION, 1, METHOD_PASSWORD]).await?;
+            stream.flush().await?;
+
+            let mut resp = [0u8; 2];
+            stream.read_exact(&mut resp).await?;
+            if resp[0] != SOCKS5_VERSION || resp[1] != METHOD_PASSWORD {
+                return Err(FluxError::AuthFailed("server rejected password auth method".into()));
+            }
+
+            // Send RFC 1929 Auth Request
+            let mut auth_req = Vec::with_capacity(3 + user.len() + pass.len());
+            auth_req.push(0x01); // Version 1
+            auth_req.push(user.len() as u8);
+            auth_req.extend_from_slice(user.as_bytes());
+            auth_req.push(pass.len() as u8);
+            auth_req.extend_from_slice(pass.as_bytes());
+            stream.write_all(&auth_req).await?;
+            stream.flush().await?;
+
+            let mut auth_resp = [0u8; 2];
+            stream.read_exact(&mut auth_resp).await?;
+            if auth_resp[1] != 0x00 {
+                return Err(FluxError::AuthFailed("invalid username or password".into()));
+            }
+        } else {
+            // Client greeting (No Auth)
+            stream.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await?;
+            stream.flush().await?;
+
+            let mut resp = [0u8; 2];
+            stream.read_exact(&mut resp).await?;
+            if resp[0] != SOCKS5_VERSION || resp[1] != METHOD_NO_AUTH {
+                return Err(FluxError::AuthFailed(format!(
+                    "socks5 handshake rejected: ver={}, method={}",
+                    resp[0], resp[1]
+                )));
+            }
         }
 
         // Send request
@@ -331,6 +422,35 @@ mod tests {
         let client_task = tokio::spawn(async move {
             let target = TargetAddress::domain("example.com", 443);
             Socks5Handshake::client_handshake(&mut client, CMD_CONNECT, &target).await.unwrap();
+        });
+
+        srv_task.await.unwrap();
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_socks5_user_pass_auth() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let allowed = vec![("admin".to_string(), "pass123".to_string())];
+
+        let srv_task = tokio::spawn(async move {
+            let user = Socks5Handshake::server_handshake_with_auth(&mut server, Some(&allowed)).await.unwrap();
+            assert_eq!(user, Some("admin".to_string()));
+            let req = Socks5Handshake::read_request(&mut server).await.unwrap();
+            assert_eq!(req.command, Socks5Command::Connect);
+            Socks5Handshake::send_reply(&mut server, REP_SUCCESS, None).await.unwrap();
+        });
+
+        let client_task = tokio::spawn(async move {
+            let target = TargetAddress::domain("example.com", 443);
+            Socks5Handshake::client_handshake_with_auth(
+                &mut client,
+                CMD_CONNECT,
+                &target,
+                Some(("admin", "pass123")),
+            )
+            .await
+            .unwrap();
         });
 
         srv_task.await.unwrap();

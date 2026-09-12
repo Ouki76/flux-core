@@ -14,6 +14,7 @@ use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
 pub struct SocksInbound {
     tag: String,
     listen_addr: SocketAddr,
+    users: Vec<(String, String)>,
     running: Arc<AtomicBool>,
 }
 
@@ -22,8 +23,14 @@ impl SocksInbound {
         Self {
             tag: tag.into(),
             listen_addr,
+            users: vec![],
             running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
+        self.users = users;
+        self
     }
 }
 
@@ -40,6 +47,7 @@ impl Inbound for SocksInbound {
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let listen_ip = self.listen_addr.ip();
+        let users = Arc::new(self.users.clone());
 
         info!("[{}] SOCKS5 inbound listening on {}", tag, self.listen_addr);
 
@@ -58,13 +66,17 @@ impl Inbound for SocksInbound {
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
+                let user_list = users.clone();
 
                 tokio::spawn(async move {
-                    // 1. SOCKS5 Auth Handshake
-                    if let Err(e) = Socks5Handshake::server_handshake(&mut socket).await {
-                        warn!("[{}] client {} handshake failed: {}", inbound_tag, client_addr, e);
-                        return;
-                    }
+                    // 1. SOCKS5 Auth Handshake (No Auth or RFC 1929 Password)
+                    let auth_user = match Socks5Handshake::server_handshake_with_auth(&mut socket, Some(&user_list)).await {
+                        Ok(u) => u,
+                        Err(e) => {
+                            warn!("[{}] client {} handshake failed: {}", inbound_tag, client_addr, e);
+                            return;
+                        }
+                    };
 
                     // 2. Read Request
                     let req = match Socks5Handshake::read_request(&mut socket).await {
@@ -77,12 +89,15 @@ impl Inbound for SocksInbound {
 
                     match req.command {
                         Socks5Command::Connect => {
-                            let meta = SessionMeta::new(
+                            let mut meta = SessionMeta::new(
                                 client_addr,
                                 req.address,
                                 inbound_tag.clone(),
                                 NetworkType::Tcp,
                             );
+                            if let Some(u) = auth_user {
+                                meta = meta.with_user(u);
+                            }
 
                             let outbound_stream = match disp.dial_outbound(&meta).await {
                                 Ok(s) => s,
@@ -145,12 +160,15 @@ impl Inbound for SocksInbound {
                             let (pkt_tx, pkt_rx) = mpsc::channel::<UdpPacket>(128);
                             let (out_tx, mut out_rx) = mpsc::channel::<UdpPacket>(128);
 
-                            let meta = SessionMeta::new(
+                            let mut meta = SessionMeta::new(
                                 client_addr,
                                 req.address.clone(),
                                 inbound_tag.clone(),
                                 NetworkType::Udp,
                             );
+                            if let Some(u) = auth_user {
+                                meta = meta.with_user(u);
+                            }
 
                             let disp_clone = disp.clone();
                             tokio::spawn(async move {

@@ -11,6 +11,7 @@ use flux_protocol::http::HttpHandshake;
 pub struct MixedInbound {
     tag: String,
     listen_addr: SocketAddr,
+    users: Vec<(String, String)>,
     running: Arc<AtomicBool>,
 }
 
@@ -19,8 +20,14 @@ impl MixedInbound {
         Self {
             tag: tag.into(),
             listen_addr,
+            users: vec![],
             running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
+        self.users = users;
+        self
     }
 }
 
@@ -36,6 +43,7 @@ impl Inbound for MixedInbound {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
+        let users = Arc::new(self.users.clone());
 
         info!("[{}] Mixed (SOCKS5/HTTP) inbound listening on {}", tag, self.listen_addr);
 
@@ -54,6 +62,7 @@ impl Inbound for MixedInbound {
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
+                let user_list = users.clone();
 
                 tokio::spawn(async move {
                     // Peek the first byte to detect protocol
@@ -70,11 +79,15 @@ impl Inbound for MixedInbound {
                     }
 
                     if peek_buf[0] == 0x05 {
-                        // SOCKS5
-                        if let Err(e) = Socks5Handshake::server_handshake(&mut socket).await {
-                            warn!("[{}] SOCKS5 handshake failed: {}", inbound_tag, e);
-                            return;
-                        }
+                        // SOCKS5 with optional auth
+                        let auth_user = match Socks5Handshake::server_handshake_with_auth(&mut socket, Some(&user_list)).await {
+                            Ok(u) => u,
+                            Err(e) => {
+                                warn!("[{}] SOCKS5 handshake failed: {}", inbound_tag, e);
+                                return;
+                            }
+                        };
+
                         let req = match Socks5Handshake::read_request(&mut socket).await {
                             Ok(r) => r,
                             Err(e) => {
@@ -84,12 +97,15 @@ impl Inbound for MixedInbound {
                         };
 
                         if req.command == Socks5Command::Connect {
-                            let meta = SessionMeta::new(
+                            let mut meta = SessionMeta::new(
                                 client_addr,
                                 req.address,
                                 inbound_tag.clone(),
                                 NetworkType::Tcp,
                             );
+                            if let Some(u) = auth_user {
+                                meta = meta.with_user(u);
+                            }
 
                             let outbound_stream = match disp.dial_outbound(&meta).await {
                                 Ok(s) => s,

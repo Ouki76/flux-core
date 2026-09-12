@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use bytes::Bytes;
@@ -16,17 +16,17 @@ pub struct ParsedPacket {
     pub payload: Bytes,
 }
 
-/// Parses raw IP packets into structured session and payload metadata.
+/// Parses raw IP packets (IPv4 and IPv6) into structured session and payload metadata.
 pub fn parse_ip_packet(packet: &[u8]) -> Option<ParsedPacket> {
     if packet.is_empty() {
         return None;
     }
 
     let version = packet[0] >> 4;
-    if version == 4 {
-        parse_ipv4_packet(packet)
-    } else {
-        None
+    match version {
+        4 => parse_ipv4_packet(packet),
+        6 => parse_ipv6_packet(packet),
+        _ => None,
     }
 }
 
@@ -95,6 +95,77 @@ fn parse_ipv4_packet(packet: &[u8]) -> Option<ParsedPacket> {
     }
 }
 
+fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
+    if packet.len() < 40 {
+        return None;
+    }
+
+    let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let next_header = packet[6];
+
+    let mut src_bytes = [0u8; 16];
+    let mut dst_bytes = [0u8; 16];
+    src_bytes.copy_from_slice(&packet[8..24]);
+    dst_bytes.copy_from_slice(&packet[24..40]);
+    let src_ip = Ipv6Addr::from(src_bytes);
+    let dst_ip = Ipv6Addr::from(dst_bytes);
+
+    let actual_len = packet.len().min(40 + payload_len);
+
+    match next_header {
+        17 => {
+            // UDP
+            if actual_len < 40 + 8 {
+                return None;
+            }
+            let src_port = u16::from_be_bytes([packet[40], packet[41]]);
+            let dst_port = u16::from_be_bytes([packet[42], packet[43]]);
+            let udp_len = u16::from_be_bytes([packet[44], packet[45]]) as usize;
+            if udp_len < 8 || actual_len < 40 + udp_len {
+                return None;
+            }
+
+            let payload = Bytes::copy_from_slice(&packet[48..40 + udp_len]);
+            Some(ParsedPacket {
+                src: SocketAddr::new(IpAddr::V6(src_ip), src_port),
+                dst: SocketAddr::new(IpAddr::V6(dst_ip), dst_port),
+                network: NetworkType::Udp,
+                payload,
+            })
+        }
+        6 => {
+            // TCP
+            if actual_len < 40 + 20 {
+                return None;
+            }
+            let src_port = u16::from_be_bytes([packet[40], packet[41]]);
+            let dst_port = u16::from_be_bytes([packet[42], packet[43]]);
+            let data_offset = (((packet[40 + 12] >> 4) * 4) as usize).max(20);
+            if actual_len < 40 + data_offset {
+                return None;
+            }
+
+            let payload = Bytes::copy_from_slice(&packet[40 + data_offset..actual_len]);
+            Some(ParsedPacket {
+                src: SocketAddr::new(IpAddr::V6(src_ip), src_port),
+                dst: SocketAddr::new(IpAddr::V6(dst_ip), dst_port),
+                network: NetworkType::Tcp,
+                payload,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Builds an IPv4 or IPv6 UDP packet with IP checksum.
+pub fn build_ip_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
+    match (src, dst) {
+        (SocketAddr::V4(_), SocketAddr::V4(_)) => build_ipv4_udp_packet(src, dst, payload),
+        (SocketAddr::V6(_), SocketAddr::V6(_)) => build_ipv6_udp_packet(src, dst, payload),
+        _ => None,
+    }
+}
+
 /// Builds an IPv4 UDP packet with IP checksum.
 pub fn build_ipv4_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
     let (src_ip, dst_ip) = match (src.ip(), dst.ip()) {
@@ -133,6 +204,39 @@ pub fn build_ipv4_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -
     // Payload
     buf[28..].copy_from_slice(payload);
 
+    Some(buf)
+}
+
+/// Builds an IPv6 UDP packet.
+pub fn build_ipv6_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
+    let (src_ip, dst_ip) = match (src.ip(), dst.ip()) {
+        (IpAddr::V6(s), IpAddr::V6(d)) => (s, d),
+        _ => return None,
+    };
+
+    let udp_len = 8 + payload.len();
+    let total_len = 40 + udp_len;
+    if total_len > 65535 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; total_len];
+    // Version 6 (0x60)
+    buf[0] = 0x60;
+    buf[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes()); // Payload Length
+    buf[6] = 17; // Next Header: UDP
+    buf[7] = 64; // Hop Limit
+
+    buf[8..24].copy_from_slice(&src_ip.octets());
+    buf[24..40].copy_from_slice(&dst_ip.octets());
+
+    // UDP Header
+    buf[40..42].copy_from_slice(&src.port().to_be_bytes());
+    buf[42..44].copy_from_slice(&dst.port().to_be_bytes());
+    buf[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    buf[46..48].copy_from_slice(&0u16.to_be_bytes());
+
+    buf[48..].copy_from_slice(payload);
     Some(buf)
 }
 
@@ -265,42 +369,42 @@ impl Inbound for TunInbound {
                                     NetworkType::Udp,
                                 );
 
-                                    let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
-                                    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
-                                    let disp = dispatcher.clone();
-                                    tokio::spawn(async move {
-                                        disp.dispatch_packet(meta, pkt_rx, out_tx).await;
-                                    });
+                                let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+                                let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+                                let disp = dispatcher.clone();
+                                tokio::spawn(async move {
+                                    disp.dispatch_packet(meta, pkt_rx, out_tx).await;
+                                });
 
-                                    let _ = pkt_tx.send(UdpPacket::new(
-                                        parsed.payload,
-                                        TargetAddress::Ip(parsed.src),
-                                        TargetAddress::Ip(parsed.dst),
-                                    )).await;
+                                let _ = pkt_tx.send(UdpPacket::new(
+                                    parsed.payload,
+                                    TargetAddress::Ip(parsed.src),
+                                    TargetAddress::Ip(parsed.dst),
+                                )).await;
 
-                                    let afd_clone = async_fd.clone();
-                                    let orig_src = parsed.dst;
-                                    let orig_dst = parsed.src;
-                                    tokio::spawn(async move {
-                                        while let Some(reply) = out_rx.recv().await {
-                                            if let Some(ip_pkt) = build_ipv4_udp_packet(orig_src, orig_dst, &reply.payload) {
-                                                let _ = afd_clone.writable().await.map(|mut g| {
-                                                    g.try_io(|inner| {
-                                                        use std::os::fd::AsRawFd;
-                                                        let res = unsafe {
-                                                            libc::write(inner.as_raw_fd(), ip_pkt.as_ptr() as *const libc::c_void, ip_pkt.len())
-                                                        };
-                                                        if res < 0 {
-                                                            Err(std::io::Error::last_os_error())
-                                                        } else {
-                                                            Ok(res as usize)
-                                                        }
-                                                    })
-                                                });
-                                            }
+                                let afd_clone = async_fd.clone();
+                                let orig_src = parsed.dst;
+                                let orig_dst = parsed.src;
+                                tokio::spawn(async move {
+                                    while let Some(reply) = out_rx.recv().await {
+                                        if let Some(ip_pkt) = build_ip_udp_packet(orig_src, orig_dst, &reply.payload) {
+                                            let _ = afd_clone.writable().await.map(|mut g| {
+                                                g.try_io(|inner| {
+                                                    use std::os::fd::AsRawFd;
+                                                    let res = unsafe {
+                                                        libc::write(inner.as_raw_fd(), ip_pkt.as_ptr() as *const libc::c_void, ip_pkt.len())
+                                                    };
+                                                    if res < 0 {
+                                                        Err(std::io::Error::last_os_error())
+                                                    } else {
+                                                        Ok(res as usize)
+                                                    }
+                                                })
+                                            });
                                         }
-                                    });
-                                }
+                                    }
+                                });
+                            }
                         }
                     });
                 }
@@ -339,6 +443,22 @@ mod tests {
 
         let raw = build_ipv4_udp_packet(src, dst, payload).unwrap();
         assert_eq!(raw.len(), 20 + 8 + payload.len());
+
+        let parsed = parse_ip_packet(&raw).unwrap();
+        assert_eq!(parsed.src, src);
+        assert_eq!(parsed.dst, dst);
+        assert_eq!(parsed.network, NetworkType::Udp);
+        assert_eq!(&parsed.payload[..], payload);
+    }
+
+    #[test]
+    fn test_parse_and_build_ipv6_udp() {
+        let src: SocketAddr = "[2001:db8::1]:12345".parse().unwrap();
+        let dst: SocketAddr = "[2606:4700:4700::1111]:53".parse().unwrap();
+        let payload = b"ping ipv6 dns";
+
+        let raw = build_ipv6_udp_packet(src, dst, payload).unwrap();
+        assert_eq!(raw.len(), 40 + 8 + payload.len());
 
         let parsed = parse_ip_packet(&raw).unwrap();
         assert_eq!(parsed.src, src);

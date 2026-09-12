@@ -1,6 +1,7 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use aes_gcm::Aes256Gcm;
 use chacha20poly1305::{
     aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
@@ -15,6 +16,25 @@ use crate::socks5::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6};
 pub const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
 pub const TAG_LEN: usize = 16;
 pub const SALT_LEN: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CipherKind {
+    #[default]
+    ChaCha20IetfPoly1305,
+    Aes256Gcm,
+}
+
+impl CipherKind {
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "chacha20-ietf-poly1305" | "chacha20" | "2022-blake3-chacha20-poly1305" => {
+                Some(Self::ChaCha20IetfPoly1305)
+            }
+            "aes-256-gcm" | "aes-256" | "2022-blake3-aes-256-gcm" => Some(Self::Aes256Gcm),
+            _ => None,
+        }
+    }
+}
 
 /// Standard Shadowsocks EVP_BytesToKey (MD5) key derivation.
 pub fn derive_master_key(password: &str) -> [u8; 32] {
@@ -41,20 +61,40 @@ pub fn derive_subkey(master_key: &[u8; 32], salt: &[u8; 32]) -> [u8; 32] {
     okm
 }
 
+enum CipherInner {
+    ChaCha(ChaCha20Poly1305),
+    Aes256(Box<Aes256Gcm>),
+}
+
 pub struct ShadowsocksCipher {
-    cipher: ChaCha20Poly1305,
+    cipher: CipherInner,
     nonce: [u8; 12],
+    kind: CipherKind,
 }
 
 impl ShadowsocksCipher {
     pub fn new(subkey: &[u8; 32]) -> Self {
-        let cipher = ChaCha20Poly1305::new_from_slice(subkey).unwrap_or_else(|_| {
-            panic!("valid key len of 32 bytes guaranteed");
-        });
+        Self::with_kind(CipherKind::ChaCha20IetfPoly1305, subkey)
+    }
+
+    pub fn with_kind(kind: CipherKind, subkey: &[u8; 32]) -> Self {
+        let cipher = match kind {
+            CipherKind::ChaCha20IetfPoly1305 => {
+                CipherInner::ChaCha(ChaCha20Poly1305::new_from_slice(subkey).unwrap())
+            }
+            CipherKind::Aes256Gcm => {
+                CipherInner::Aes256(Box::new(Aes256Gcm::new_from_slice(subkey).unwrap()))
+            }
+        };
         Self {
             cipher,
             nonce: [0u8; 12],
+            kind,
         }
+    }
+
+    pub fn kind(&self) -> CipherKind {
+        self.kind
     }
 
     fn next_nonce(&mut self) -> Nonce {
@@ -70,16 +110,20 @@ impl ShadowsocksCipher {
 
     pub fn encrypt(&mut self, plaintext: &[u8]) -> FluxResult<Vec<u8>> {
         let nonce = self.next_nonce();
-        self.cipher
-            .encrypt(&nonce, plaintext)
-            .map_err(|e| FluxError::Crypto(format!("shadowsocks encrypt failed: {}", e)))
+        match &self.cipher {
+            CipherInner::ChaCha(c) => c.encrypt(&nonce, plaintext),
+            CipherInner::Aes256(c) => c.encrypt(&nonce, plaintext),
+        }
+        .map_err(|e| FluxError::Crypto(format!("shadowsocks encrypt failed: {}", e)))
     }
 
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> FluxResult<Vec<u8>> {
         let nonce = self.next_nonce();
-        self.cipher
-            .decrypt(&nonce, ciphertext)
-            .map_err(|e| FluxError::Crypto(format!("shadowsocks decrypt failed: {}", e)))
+        match &self.cipher {
+            CipherInner::ChaCha(c) => c.decrypt(&nonce, ciphertext),
+            CipherInner::Aes256(c) => c.decrypt(&nonce, ciphertext),
+        }
+        .map_err(|e| FluxError::Crypto(format!("shadowsocks decrypt failed: {}", e)))
     }
 }
 
@@ -114,6 +158,7 @@ pub struct ShadowsocksStream<S> {
     inner: S,
     enc: ShadowsocksCipher,
     dec: Option<ShadowsocksCipher>,
+    kind: CipherKind,
     master_key: [u8; 32],
     salt_buf: [u8; SALT_LEN],
     salt_pos: usize,
@@ -138,10 +183,12 @@ impl<S> ShadowsocksStream<S> {
         dec: Option<ShadowsocksCipher>,
         master_key: [u8; 32],
     ) -> Self {
+        let kind = enc.kind();
         Self {
             inner,
             enc,
             dec,
+            kind,
             master_key,
             salt_buf: [0u8; SALT_LEN],
             salt_pos: 0,
@@ -180,7 +227,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                     self.salt_pos += n;
                     if self.salt_pos == SALT_LEN {
                         let subkey = derive_subkey(&self.master_key, &self.salt_buf);
-                        self.dec = Some(ShadowsocksCipher::new(&subkey));
+                        self.dec = Some(ShadowsocksCipher::with_kind(self.kind, &subkey));
                     } else {
                         return Poll::Pending;
                     }
@@ -420,6 +467,23 @@ mod tests {
         let mut dec = ShadowsocksCipher::new(&subkey);
 
         let data = b"Hello Shadowsocks AEAD!";
+        let ciphertext = enc.encrypt(data).unwrap();
+        assert_eq!(ciphertext.len(), data.len() + TAG_LEN);
+
+        let decrypted = dec.decrypt(&ciphertext).unwrap();
+        assert_eq!(&decrypted, data);
+    }
+
+    #[test]
+    fn test_shadowsocks_aes_256_gcm_roundtrip() {
+        let master = derive_master_key("aes-pass-123");
+        let salt = [0x77u8; 32];
+        let subkey = derive_subkey(&master, &salt);
+
+        let mut enc = ShadowsocksCipher::with_kind(CipherKind::Aes256Gcm, &subkey);
+        let mut dec = ShadowsocksCipher::with_kind(CipherKind::Aes256Gcm, &subkey);
+
+        let data = b"Hello Shadowsocks AES-256-GCM hardware accelerated!";
         let ciphertext = enc.encrypt(data).unwrap();
         assert_eq!(ciphertext.len(), data.len() + TAG_LEN);
 

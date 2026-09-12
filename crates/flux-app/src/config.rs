@@ -44,6 +44,12 @@ pub struct FakeIpConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SocksUserConfig {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum InboundConfig {
     #[serde(rename = "socks")]
@@ -51,18 +57,24 @@ pub enum InboundConfig {
         tag: String,
         listen: String,
         listen_port: u16,
+        #[serde(default)]
+        users: Vec<SocksUserConfig>,
     },
     #[serde(rename = "http")]
     Http {
         tag: String,
         listen: String,
         listen_port: u16,
+        #[serde(default)]
+        users: Vec<SocksUserConfig>,
     },
     #[serde(rename = "mixed")]
     Mixed {
         tag: String,
         listen: String,
         listen_port: u16,
+        #[serde(default)]
+        users: Vec<SocksUserConfig>,
     },
     #[serde(rename = "vless")]
     Vless {
@@ -136,12 +148,20 @@ pub enum OutboundConfig {
         tag: String,
         server: String,
         server_port: u16,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
     },
     #[serde(rename = "http")]
     Http {
         tag: String,
         server: String,
         server_port: u16,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
     },
     #[serde(rename = "vless")]
     Vless {
@@ -217,6 +237,8 @@ pub struct RuleSetConfig {
     pub tag: String,
     #[serde(rename = "type")]
     pub set_type: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
     #[serde(default)]
     pub ip_cidr: Vec<String>,
     #[serde(default)]

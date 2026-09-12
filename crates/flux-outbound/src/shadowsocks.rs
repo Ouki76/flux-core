@@ -11,8 +11,8 @@ use flux_types::{
 };
 use flux_dns::DnsResolver;
 use flux_protocol::shadowsocks::{
-    derive_master_key, derive_subkey, encode_ss_address, ShadowsocksCipher, ShadowsocksStream,
-    SALT_LEN, TAG_LEN,
+    derive_master_key, derive_subkey, encode_ss_address, CipherKind, ShadowsocksCipher,
+    ShadowsocksStream, SALT_LEN, TAG_LEN,
 };
 use flux_transport::tcp::TcpTransport;
 
@@ -20,6 +20,7 @@ pub struct ShadowsocksOutbound {
     tag: String,
     server_address: TargetAddress,
     master_key: [u8; 32],
+    cipher_kind: CipherKind,
     resolver: Arc<DnsResolver>,
     connect_timeout: Duration,
 }
@@ -35,9 +36,15 @@ impl ShadowsocksOutbound {
             tag: tag.into(),
             server_address,
             master_key: derive_master_key(password),
+            cipher_kind: CipherKind::ChaCha20IetfPoly1305,
             resolver,
             connect_timeout: Duration::from_secs(10),
         }
+    }
+
+    pub fn with_cipher_kind(mut self, kind: CipherKind) -> Self {
+        self.cipher_kind = kind;
+        self
     }
 }
 
@@ -58,7 +65,7 @@ impl Outbound for ShadowsocksOutbound {
 
         // 2. Derive subkey and cipher
         let subkey = derive_subkey(&self.master_key, &salt);
-        let mut enc = ShadowsocksCipher::new(&subkey);
+        let mut enc = ShadowsocksCipher::with_kind(self.cipher_kind, &subkey);
 
         // 3. Encrypt target address as the first payload
         let addr_bytes = encode_ss_address(&meta.destination);
@@ -83,6 +90,7 @@ impl Outbound for ShadowsocksOutbound {
             udp_socket: Arc::new(udp_socket),
             server_addr,
             master_key: self.master_key,
+            cipher_kind: self.cipher_kind,
         }))
     }
 }
@@ -91,6 +99,7 @@ pub struct ShadowsocksPacketEndpoint {
     udp_socket: Arc<UdpSocket>,
     server_addr: SocketAddr,
     master_key: [u8; 32],
+    cipher_kind: CipherKind,
 }
 
 #[async_trait]
@@ -99,7 +108,7 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
         let mut salt = [0u8; SALT_LEN];
         rand::thread_rng().fill_bytes(&mut salt);
         let subkey = derive_subkey(&self.master_key, &salt);
-        let mut cipher = ShadowsocksCipher::new(&subkey);
+        let mut cipher = ShadowsocksCipher::with_kind(self.cipher_kind, &subkey);
 
         let addr_bytes = encode_ss_address(&packet.destination);
         let mut plain = Vec::with_capacity(addr_bytes.len() + packet.payload.len());
@@ -132,7 +141,7 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
         let mut salt = [0u8; SALT_LEN];
         salt.copy_from_slice(&buf[..SALT_LEN]);
         let subkey = derive_subkey(&self.master_key, &salt);
-        let mut cipher = ShadowsocksCipher::new(&subkey);
+        let mut cipher = ShadowsocksCipher::with_kind(self.cipher_kind, &subkey);
 
         let plain = cipher.decrypt(&buf[SALT_LEN..len])?;
         if plain.is_empty() {

@@ -93,14 +93,20 @@ impl Instance {
                     let out = BlockOutbound::new(tag.clone());
                     registry.insert(tag, Arc::new(out));
                 }
-                OutboundConfig::Socks { tag, server, server_port } => {
+                OutboundConfig::Socks { tag, server, server_port, username, password } => {
                     let target = TargetAddress::domain(server, server_port);
-                    let out = SocksOutbound::new(tag.clone(), target, resolver.clone());
+                    let mut out = SocksOutbound::new(tag.clone(), target, resolver.clone());
+                    if let (Some(u), Some(p)) = (username, password) {
+                        out = out.with_auth(u, p);
+                    }
                     registry.insert(tag, Arc::new(out));
                 }
-                OutboundConfig::Http { tag, server, server_port } => {
+                OutboundConfig::Http { tag, server, server_port, username, password } => {
                     let target = TargetAddress::domain(server, server_port);
-                    let out = flux_outbound::HttpOutbound::new(tag.clone(), target, resolver.clone());
+                    let mut out = flux_outbound::HttpOutbound::new(tag.clone(), target, resolver.clone());
+                    if let (Some(u), Some(p)) = (username, password) {
+                        out = out.with_auth(u, p);
+                    }
                     registry.insert(tag, Arc::new(out));
                 }
                 OutboundConfig::Vless {
@@ -195,15 +201,16 @@ impl Instance {
                     server,
                     server_port,
                     password,
-                    method: _,
+                    method,
                 } => {
                     let target = TargetAddress::domain(server, server_port);
+                    let cipher_kind = method.as_deref().and_then(flux_protocol::shadowsocks::CipherKind::parse_str).unwrap_or_default();
                     let out = flux_outbound::ShadowsocksOutbound::new(
                         tag.clone(),
                         target,
                         &password,
                         resolver.clone(),
-                    );
+                    ).with_cipher_kind(cipher_kind);
                     registry.insert(tag, Arc::new(out));
                 }
                 group @ OutboundConfig::Selector { .. } | group @ OutboundConfig::UrlTest { .. } => {
@@ -251,6 +258,7 @@ impl Instance {
             for rs_cfg in route_cfg.rule_set {
                 let rs = flux_router::RuleSet {
                     tag: rs_cfg.tag,
+                    path: rs_cfg.path,
                     ip_cidr: rs_cfg.ip_cidr,
                     domain: rs_cfg.domain,
                     domain_suffix: rs_cfg.domain_suffix,
@@ -278,26 +286,29 @@ impl Instance {
         let mut inbounds: Vec<Arc<dyn Inbound>> = Vec::new();
         for in_cfg in config.inbounds {
             match in_cfg {
-                InboundConfig::Socks { tag, listen, listen_port } => {
+                InboundConfig::Socks { tag, listen, listen_port, users } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
                         FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                     })?;
-                    inbounds.push(Arc::new(SocksInbound::new(tag, addr)));
+                    let user_pairs = users.into_iter().map(|u| (u.username, u.password)).collect();
+                    inbounds.push(Arc::new(SocksInbound::new(tag, addr).with_users(user_pairs)));
                 }
-                InboundConfig::Http { tag, listen, listen_port } => {
+                InboundConfig::Http { tag, listen, listen_port, users } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
                         FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                     })?;
-                    inbounds.push(Arc::new(HttpInbound::new(tag, addr)));
+                    let user_pairs = users.into_iter().map(|u| (u.username, u.password)).collect();
+                    inbounds.push(Arc::new(HttpInbound::new(tag, addr).with_users(user_pairs)));
                 }
-                InboundConfig::Mixed { tag, listen, listen_port } => {
+                InboundConfig::Mixed { tag, listen, listen_port, users } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
                         FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                     })?;
-                    inbounds.push(Arc::new(MixedInbound::new(tag, addr)));
+                    let user_pairs = users.into_iter().map(|u| (u.username, u.password)).collect();
+                    inbounds.push(Arc::new(MixedInbound::new(tag, addr).with_users(user_pairs)));
                 }
                 InboundConfig::Vless { tag, listen, listen_port, users, tls, reality } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
@@ -369,12 +380,13 @@ impl Instance {
                     let tls_acceptor = TlsTransport::create_server_acceptor(certs, key, vec![])?;
                     inbounds.push(Arc::new(flux_inbound::TrojanInbound::new(tag, addr, password, tls_acceptor)));
                 }
-                InboundConfig::Shadowsocks { tag, listen, listen_port, password, method: _ } => {
+                InboundConfig::Shadowsocks { tag, listen, listen_port, password, method } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
                         FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                     })?;
-                    inbounds.push(Arc::new(flux_inbound::ShadowsocksInbound::new(tag, addr, &password)));
+                    let cipher_kind = method.as_deref().and_then(flux_protocol::shadowsocks::CipherKind::parse_str).unwrap_or_default();
+                    inbounds.push(Arc::new(flux_inbound::ShadowsocksInbound::new(tag, addr, &password).with_cipher_kind(cipher_kind)));
                 }
             }
         }

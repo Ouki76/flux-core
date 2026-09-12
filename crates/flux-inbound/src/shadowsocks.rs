@@ -11,13 +11,15 @@ use flux_types::{
 };
 use flux_protocol::socks5::Socks5Handshake;
 use flux_protocol::shadowsocks::{
-    derive_master_key, derive_subkey, ShadowsocksCipher, ShadowsocksStream, SALT_LEN, TAG_LEN,
+    derive_master_key, derive_subkey, CipherKind, ShadowsocksCipher, ShadowsocksStream, SALT_LEN,
+    TAG_LEN,
 };
 
 pub struct ShadowsocksInbound {
     tag: String,
     listen_addr: SocketAddr,
     master_key: [u8; 32],
+    cipher_kind: CipherKind,
     running: Arc<AtomicBool>,
 }
 
@@ -31,8 +33,14 @@ impl ShadowsocksInbound {
             tag: tag.into(),
             listen_addr,
             master_key: derive_master_key(password),
+            cipher_kind: CipherKind::ChaCha20IetfPoly1305,
             running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_cipher_kind(mut self, kind: CipherKind) -> Self {
+        self.cipher_kind = kind;
+        self
     }
 }
 
@@ -49,6 +57,7 @@ impl Inbound for ShadowsocksInbound {
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let master_key = self.master_key;
+        let cipher_kind = self.cipher_kind;
 
         info!("[{}] Shadowsocks AEAD inbound listening on {}", tag, self.listen_addr);
 
@@ -78,7 +87,7 @@ impl Inbound for ShadowsocksInbound {
 
                     // 2. Derive subkey & cipher
                     let subkey = derive_subkey(&master_key, &salt);
-                    let mut dec = ShadowsocksCipher::new(&subkey);
+                    let mut dec = ShadowsocksCipher::with_kind(cipher_kind, &subkey);
 
                     // 3. Read encrypted payload length (2 bytes + 16 bytes tag)
                     let mut enc_len = [0u8; 2 + TAG_LEN];
@@ -139,7 +148,7 @@ impl Inbound for ShadowsocksInbound {
                         return;
                     }
                     let server_subkey = derive_subkey(&master_key, &server_salt);
-                    let server_enc = ShadowsocksCipher::new(&server_subkey);
+                    let server_enc = ShadowsocksCipher::with_kind(cipher_kind, &server_subkey);
 
                     let ss_stream = ShadowsocksStream::new(socket, server_enc, Some(dec), master_key);
 

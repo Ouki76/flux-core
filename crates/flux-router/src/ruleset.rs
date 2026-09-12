@@ -8,6 +8,8 @@ use flux_types::SessionMeta;
 pub struct RuleSet {
     pub tag: String,
     #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
     pub ip_cidr: Vec<String>,
     #[serde(default)]
     pub domain: Vec<String>,
@@ -27,11 +29,45 @@ pub struct RuleSet {
 }
 
 impl RuleSet {
+    pub fn load_from_file(&mut self, path: &str) -> std::io::Result<()> {
+        let content = std::fs::read_to_string(path)?;
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("//") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("full:") {
+                self.domain.push(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("domain:") {
+                self.domain_suffix.push(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("keyword:") {
+                self.domain_keyword.push(rest.trim().to_string());
+            } else if line.contains('/') || line.parse::<std::net::IpAddr>().is_ok() {
+                self.ip_cidr.push(line.to_string());
+            } else {
+                self.domain_suffix.push(line.to_string());
+            }
+        }
+        Ok(())
+    }
+
     pub fn compile(&mut self) {
+        if let Some(p) = &self.path.clone() {
+            let _ = self.load_from_file(p);
+        }
+
         self.parsed_cidrs = self
             .ip_cidr
             .iter()
-            .filter_map(|s| s.parse::<IpNet>().ok())
+            .filter_map(|s| {
+                if s.contains('/') {
+                    s.parse::<IpNet>().ok()
+                } else if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                    IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).ok()
+                } else {
+                    None
+                }
+            })
             .collect();
 
         self.exact_set.clear();
@@ -144,5 +180,27 @@ mod tests {
             NetworkType::Tcp,
         );
         assert!(!rs.matches(&meta2));
+    }
+
+    #[test]
+    fn test_ruleset_load_from_file() {
+        let file_path = std::env::temp_dir().join(format!("test_domains_{}.txt", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::write(&file_path, "full:exact.com\n.subdomain.org\nkeyword:tele\n1.2.3.4/32\n").unwrap();
+
+        let mut rs = RuleSet {
+            tag: "file-rules".into(),
+            path: Some(file_path.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        rs.compile();
+
+        let meta = SessionMeta::new(
+            "127.0.0.1:1000".parse().unwrap(),
+            TargetAddress::domain("exact.com", 80),
+            "in",
+            NetworkType::Tcp,
+        );
+        assert!(rs.matches(&meta));
+        let _ = std::fs::remove_file(&file_path);
     }
 }

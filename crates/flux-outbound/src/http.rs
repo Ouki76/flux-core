@@ -11,6 +11,7 @@ use flux_transport::tcp::TcpTransport;
 pub struct HttpOutbound {
     tag: String,
     server_address: TargetAddress,
+    auth: Option<(String, String)>,
     resolver: Arc<DnsResolver>,
     connect_timeout: Duration,
 }
@@ -24,9 +25,15 @@ impl HttpOutbound {
         Self {
             tag: tag.into(),
             server_address,
+            auth: None,
             resolver,
             connect_timeout: Duration::from_secs(10),
         }
+    }
+
+    pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.auth = Some((username.into(), password.into()));
+        self
     }
 }
 
@@ -40,7 +47,8 @@ impl Outbound for HttpOutbound {
         let server_addr = self.resolver.resolve(&self.server_address).await?;
         let mut stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
 
-        HttpHandshake::client_handshake(&mut stream, &meta.destination).await?;
+        let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        HttpHandshake::client_handshake_with_auth(&mut stream, &meta.destination, auth_ref).await?;
 
         Ok(Box::new(stream))
     }

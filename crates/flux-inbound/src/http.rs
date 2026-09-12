@@ -10,6 +10,7 @@ use flux_protocol::http::HttpHandshake;
 pub struct HttpInbound {
     tag: String,
     listen_addr: SocketAddr,
+    users: Vec<(String, String)>,
     running: Arc<AtomicBool>,
 }
 
@@ -18,8 +19,14 @@ impl HttpInbound {
         Self {
             tag: tag.into(),
             listen_addr,
+            users: vec![],
             running: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
+        self.users = users;
+        self
     }
 }
 
@@ -35,6 +42,7 @@ impl Inbound for HttpInbound {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
+        let users = Arc::new(self.users.clone());
 
         info!("[{}] HTTP inbound listening on {}", tag, self.listen_addr);
 
@@ -53,9 +61,10 @@ impl Inbound for HttpInbound {
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
+                let user_list = users.clone();
 
                 tokio::spawn(async move {
-                    let (target, prefix_opt) = match HttpHandshake::server_handshake(&mut socket).await {
+                    let (target, prefix_opt, auth_user) = match HttpHandshake::server_handshake_with_auth(&mut socket, Some(&user_list)).await {
                         Ok(t) => t,
                         Err(e) => {
                             warn!("[{}] client {} HTTP handshake failed: {}", inbound_tag, client_addr, e);
@@ -63,12 +72,15 @@ impl Inbound for HttpInbound {
                         }
                     };
 
-                    let meta = SessionMeta::new(
+                    let mut meta = SessionMeta::new(
                         client_addr,
                         target,
                         inbound_tag,
                         NetworkType::Tcp,
                     );
+                    if let Some(u) = auth_user {
+                        meta = meta.with_user(u);
+                    }
 
                     let stream: flux_types::BoxedStream = if let Some(prefix) = prefix_opt {
                         Box::new(flux_common::copy::PrefixedStream::new(socket, prefix))

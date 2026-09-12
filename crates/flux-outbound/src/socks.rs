@@ -16,6 +16,7 @@ use flux_transport::tcp::TcpTransport;
 pub struct SocksOutbound {
     tag: String,
     server_address: TargetAddress,
+    auth: Option<(String, String)>,
     resolver: Arc<DnsResolver>,
     connect_timeout: Duration,
 }
@@ -29,9 +30,15 @@ impl SocksOutbound {
         Self {
             tag: tag.into(),
             server_address,
+            auth: None,
             resolver,
             connect_timeout: Duration::from_secs(10),
         }
+    }
+
+    pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.auth = Some((username.into(), password.into()));
+        self
     }
 }
 
@@ -45,7 +52,8 @@ impl Outbound for SocksOutbound {
         let server_addr = self.resolver.resolve(&self.server_address).await?;
         let mut stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
 
-        Socks5Handshake::client_handshake(&mut stream, CMD_CONNECT, &meta.destination).await?;
+        let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        Socks5Handshake::client_handshake_with_auth(&mut stream, CMD_CONNECT, &meta.destination, auth_ref).await?;
 
         Ok(Box::new(stream))
     }
@@ -54,10 +62,12 @@ impl Outbound for SocksOutbound {
         let server_addr = self.resolver.resolve(&self.server_address).await?;
         let mut tcp_stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
 
-        let relay_opt = Socks5Handshake::client_handshake(
+        let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
+        let relay_opt = Socks5Handshake::client_handshake_with_auth(
             &mut tcp_stream,
             CMD_UDP_ASSOCIATE,
             &meta.destination,
+            auth_ref,
         )
         .await?;
 
