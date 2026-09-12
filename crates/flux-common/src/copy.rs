@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub const DEFAULT_COPY_BUFFER_SIZE: usize = 64 * 1024; // 64 KB L1/L2 cache-friendly buffer
+pub const DEFAULT_COPY_BUFFER_SIZE: usize = 128 * 1024; // 128 KB balanced high-throughput buffer
 
 /// Bidirectional copy between two streams using lock-free Tokio copy with 256KB buffers.
 pub async fn copy_bidirectional<A, B>(mut a: A, mut b: B) -> std::io::Result<(u64, u64)>

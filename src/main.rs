@@ -33,16 +33,13 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
-    let worker_threads = std::env::var("FLUX_WORKERS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(2);
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .thread_stack_size(512 * 1024)
-        .enable_all()
-        .build()?;
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Ok(workers_str) = std::env::var("FLUX_WORKERS") {
+        if let Ok(w) = workers_str.parse::<usize>() {
+            builder.worker_threads(w);
+        }
+    }
+    let rt = builder.enable_all().build()?;
 
     rt.block_on(async_main())
 }

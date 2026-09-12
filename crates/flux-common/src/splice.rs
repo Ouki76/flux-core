@@ -19,6 +19,10 @@ impl Pipe {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
+        // Expand in-kernel pipe capacity to 1MB to saturate multi-gigabit connections
+        unsafe {
+            libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 1048576);
+        };
         Ok(Self {
             reader: fds[0],
             writer: fds[1],
@@ -41,7 +45,7 @@ impl Drop for Pipe {
 async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> io::Result<u64> {
     let pipe = Pipe::new()?;
     let mut transferred: u64 = 0;
-    const SPLICE_CHUNK: usize = 65536;
+    const SPLICE_CHUNK: usize = 1048576;
 
     loop {
         // 1. Splice socket -> pipe
