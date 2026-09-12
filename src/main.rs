@@ -5,8 +5,8 @@ use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 use flux_app::{Config, Instance};
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// #[global_allocator]
+// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
 #[command(name = "flux-core")]
@@ -36,15 +36,11 @@ fn main() -> anyhow::Result<()> {
     let worker_threads = std::env::var("FLUX_WORKERS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|p| p.get().clamp(2, 4))
-                .unwrap_or(2)
-        });
+        .unwrap_or(2);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
-        .thread_stack_size(1024 * 1024)
+        .thread_stack_size(512 * 1024)
         .enable_all()
         .build()?;
 

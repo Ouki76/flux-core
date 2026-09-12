@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use async_trait::async_trait;
 use flux_types::{Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta};
 use flux_protocol::socks5::{Socks5Command, Socks5Handshake, REP_SUCCESS};
@@ -91,7 +91,7 @@ impl Inbound for MixedInbound {
                         let req = match Socks5Handshake::read_request(&mut socket).await {
                             Ok(r) => r,
                             Err(e) => {
-                                warn!("[{}] SOCKS5 read request failed: {}", inbound_tag, e);
+                                debug!("[{}] SOCKS5 read request failed: {}", inbound_tag, e);
                                 return;
                             }
                         };

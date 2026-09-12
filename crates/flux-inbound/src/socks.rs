@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use async_trait::async_trait;
 use flux_types::{
     Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
@@ -82,7 +82,7 @@ impl Inbound for SocksInbound {
                     let req = match Socks5Handshake::read_request(&mut socket).await {
                         Ok(r) => r,
                         Err(e) => {
-                            warn!("[{}] client {} read request failed: {}", inbound_tag, client_addr, e);
+                            debug!("[{}] client {} read request failed: {}", inbound_tag, client_addr, e);
                             return;
                         }
                     };
