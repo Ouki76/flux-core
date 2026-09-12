@@ -45,73 +45,101 @@ impl Drop for Pipe {
 async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> io::Result<u64> {
     let pipe = Pipe::new()?;
     let mut transferred: u64 = 0;
-    const SPLICE_CHUNK: usize = 1048576;
+    const SPLICE_CHUNK: usize = 1048576; // 1 MB batch size
 
     loop {
-        // 1. Splice socket -> pipe
-        let mut n_read = 0;
+        // 1. Drain socket into pipe in a non-blocking kernel loop
+        let mut pipe_filled = 0usize;
+        let mut eof = false;
+
         read_stream
             .async_io(Interest::READABLE, || {
-                let res = unsafe {
-                    libc::splice(
-                        read_stream.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        pipe.writer,
-                        std::ptr::null_mut(),
-                        SPLICE_CHUNK,
-                        libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
-                    )
-                };
-                if res < 0 {
-                    let err = io::Error::last_os_error();
-                    if err.kind() == io::ErrorKind::WouldBlock {
-                        return Err(err);
+                loop {
+                    let to_splice = SPLICE_CHUNK.saturating_sub(pipe_filled);
+                    if to_splice == 0 {
+                        return Ok(());
                     }
-                    return Err(err);
-                }
-                n_read = res as usize;
-                Ok(())
-            })
-            .await?;
 
-        if n_read == 0 {
-            // EOF from reader: signal half-close on writer
-            unsafe {
-                libc::shutdown(write_stream.as_raw_fd(), libc::SHUT_WR);
-            }
-            break;
-        }
-
-        // 2. Splice pipe -> socket
-        let mut pipe_rem = n_read;
-        while pipe_rem > 0 {
-            let mut n_written = 0;
-            write_stream
-                .async_io(Interest::WRITABLE, || {
                     let res = unsafe {
                         libc::splice(
-                            pipe.reader,
+                            read_stream.as_raw_fd(),
                             std::ptr::null_mut(),
-                            write_stream.as_raw_fd(),
+                            pipe.writer,
                             std::ptr::null_mut(),
-                            pipe_rem,
+                            to_splice,
                             libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
                         )
                     };
                     if res < 0 {
                         let err = io::Error::last_os_error();
                         if err.kind() == io::ErrorKind::WouldBlock {
+                            if pipe_filled > 0 {
+                                return Ok(());
+                            }
                             return Err(err);
                         }
                         return Err(err);
                     }
-                    n_written = res as usize;
-                    Ok(())
+                    if res == 0 {
+                        eof = true;
+                        return Ok(());
+                    }
+                    pipe_filled += res as usize;
+                }
+            })
+            .await?;
+
+        if eof && pipe_filled == 0 {
+            unsafe {
+                libc::shutdown(write_stream.as_raw_fd(), libc::SHUT_WR);
+            }
+            break;
+        }
+
+        // 2. Drain in-kernel pipe into output socket in a non-blocking loop
+        let mut pipe_rem = pipe_filled;
+        while pipe_rem > 0 {
+            let mut n_written = 0;
+            write_stream
+                .async_io(Interest::WRITABLE, || {
+                    loop {
+                        if pipe_rem == 0 {
+                            return Ok(());
+                        }
+                        let res = unsafe {
+                            libc::splice(
+                                pipe.reader,
+                                std::ptr::null_mut(),
+                                write_stream.as_raw_fd(),
+                                std::ptr::null_mut(),
+                                pipe_rem,
+                                libc::SPLICE_F_NONBLOCK | libc::SPLICE_F_MOVE,
+                            )
+                        };
+                        if res < 0 {
+                            let err = io::Error::last_os_error();
+                            if err.kind() == io::ErrorKind::WouldBlock {
+                                if n_written > 0 {
+                                    return Ok(());
+                                }
+                                return Err(err);
+                            }
+                            return Err(err);
+                        }
+                        n_written += res as usize;
+                        pipe_rem -= res as usize;
+                    }
                 })
                 .await?;
 
-            pipe_rem -= n_written;
             transferred += n_written as u64;
+        }
+
+        if eof {
+            unsafe {
+                libc::shutdown(write_stream.as_raw_fd(), libc::SHUT_WR);
+            }
+            break;
         }
     }
 

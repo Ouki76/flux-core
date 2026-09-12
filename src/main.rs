@@ -50,10 +50,10 @@ fn parse_args() -> Result<Commands, String> {
 
 fn main() -> anyhow::Result<()> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Ok(workers_str) = std::env::var("FLUX_WORKERS") {
-        if let Ok(w) = workers_str.parse::<usize>() {
-            builder.worker_threads(w);
-        }
+    if let Ok(workers_str) = std::env::var("FLUX_WORKERS")
+        && let Ok(w) = workers_str.parse::<usize>()
+    {
+        builder.worker_threads(w);
     }
     let rt = builder.enable_all().build()?;
 
