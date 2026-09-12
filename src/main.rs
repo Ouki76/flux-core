@@ -1,35 +1,51 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use clap::{Parser, Subcommand};
-use tracing::{error, info};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{error, info, Level};
 use flux_app::{Config, Instance};
 
-// #[global_allocator]
-// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-#[derive(Parser)]
-#[command(name = "flux-core")]
-#[command(about = "High-performance proxy core in Rust", long_about = None)]
-struct Cli {
-    #[command(subcommand)]
-    command: Commands,
+enum Commands {
+    Run { config: PathBuf },
+    Check { config: PathBuf },
+    Version,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Run the proxy core with a configuration file
-    Run {
-        #[arg(short, long, value_name = "FILE")]
-        config: PathBuf,
-    },
-    /// Validate configuration syntax and exit
-    Check {
-        #[arg(short, long, value_name = "FILE")]
-        config: PathBuf,
-    },
-    /// Print version information
-    Version,
+fn parse_args() -> Result<Commands, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return Ok(Commands::Version);
+    }
+    match args[0].as_str() {
+        "run" => {
+            let mut cfg_path = None;
+            let mut i = 1;
+            while i < args.len() {
+                if (args[i] == "-c" || args[i] == "--config") && i + 1 < args.len() {
+                    cfg_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let config = cfg_path.ok_or_else(|| "missing --config / -c argument".to_string())?;
+            Ok(Commands::Run { config })
+        }
+        "check" => {
+            let mut cfg_path = None;
+            let mut i = 1;
+            while i < args.len() {
+                if (args[i] == "-c" || args[i] == "--config") && i + 1 < args.len() {
+                    cfg_path = Some(PathBuf::from(&args[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            let config = cfg_path.ok_or_else(|| "missing --config / -c argument".to_string())?;
+            Ok(Commands::Check { config })
+        }
+        "version" | "-v" | "--version" => Ok(Commands::Version),
+        other => Err(format!("unknown command: {}", other)),
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -45,16 +61,31 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cmd = parse_args().unwrap_or_else(|e| {
+        eprintln!("Error: {}", e);
+        eprintln!("Usage: flux-core [run|check] -c <config.json>");
+        std::process::exit(1);
+    });
 
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(filter)
+    let level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| match s.to_ascii_lowercase().as_str() {
+            "trace" => Some(Level::TRACE),
+            "debug" => Some(Level::DEBUG),
+            "info" => Some(Level::INFO),
+            "warn" => Some(Level::WARN),
+            "error" => Some(Level::ERROR),
+            _ => None,
+        })
+        .unwrap_or(Level::INFO);
+
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(level)
+        .compact()
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
 
-    match cli.command {
+    match cmd {
         Commands::Run { config } => {
             info!("Starting flux-core with config: {:?}", config);
             let content = tokio::fs::read_to_string(&config).await?;
