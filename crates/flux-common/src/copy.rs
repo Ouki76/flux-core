@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub const DEFAULT_COPY_BUFFER_SIZE: usize = 128 * 1024; // 128 KB matches Linux TCP socket wmem/rmem
+pub const DEFAULT_COPY_BUFFER_SIZE: usize = 256 * 1024; // 256 KB saturated buffer
 
 /// Bidirectional copy between two streams using lock-free Tokio copy with 256KB buffers.
 pub async fn copy_bidirectional<A, B>(mut a: A, mut b: B) -> std::io::Result<(u64, u64)>
