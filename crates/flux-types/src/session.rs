@@ -1,9 +1,9 @@
+use crate::address::TargetAddress;
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-use crate::address::TargetAddress;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NetworkType {

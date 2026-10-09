@@ -1,43 +1,72 @@
-use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use crate::socks5::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6};
 use aes_gcm::Aes256Gcm;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     ChaCha20Poly1305, Nonce,
+    aead::{Aead, AeadInPlace, KeyInit},
 };
+use flux_types::{FluxError, FluxResult, TargetAddress};
 use hkdf::Hkdf;
 use md5::{Digest as Md5Digest, Md5};
 use sha1::Sha1;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use flux_types::{FluxError, FluxResult, TargetAddress};
-use crate::socks5::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6};
 
 pub const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
 pub const TAG_LEN: usize = 16;
 pub const SALT_LEN: usize = 32;
+pub const MAX_PAYLOAD_LEN: usize = 0x3FFF; // 16383 bytes (Shadowsocks AEAD RFC specification)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CipherKind {
     #[default]
     ChaCha20IetfPoly1305,
     Aes256Gcm,
+    Ss2022(crate::shadowsocks2022::Ss2022CipherMethod),
 }
 
 impl CipherKind {
     pub fn parse_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "chacha20-ietf-poly1305" | "chacha20" | "2022-blake3-chacha20-poly1305" => {
+            "chacha20-ietf-poly1305" | "chacha20" | "chacha20-poly1305" => {
                 Some(Self::ChaCha20IetfPoly1305)
             }
-            "aes-256-gcm" | "aes-256" | "2022-blake3-aes-256-gcm" => Some(Self::Aes256Gcm),
+            "aes-256-gcm" | "aes-256" => Some(Self::Aes256Gcm),
+            "2022-blake3-aes-128-gcm" => Some(Self::Ss2022(
+                crate::shadowsocks2022::Ss2022CipherMethod::Blake3Aes128Gcm,
+            )),
+            "2022-blake3-aes-256-gcm" => Some(Self::Ss2022(
+                crate::shadowsocks2022::Ss2022CipherMethod::Blake3Aes256Gcm,
+            )),
+            "2022-blake3-chacha20-poly1305" => Some(Self::Ss2022(
+                crate::shadowsocks2022::Ss2022CipherMethod::Blake3ChaCha20Poly1305,
+            )),
             _ => None,
         }
     }
 }
 
-/// Standard Shadowsocks EVP_BytesToKey (MD5) key derivation.
+/// Standard Shadowsocks key derivation:
+/// If password is a 32-byte base64 PSK, decodes directly; otherwise uses standard EVP_BytesToKey (MD5).
 pub fn derive_master_key(password: &str) -> [u8; 32] {
+    let clean = password.trim();
+    use base64::Engine;
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(clean)
+        && bytes.len() == 32
+    {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        return out;
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(clean)
+        && bytes.len() == 32
+    {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        return out;
+    }
+
     let mut key = Vec::with_capacity(32);
     let mut prev = Vec::new();
     while key.len() < 32 {
@@ -79,10 +108,11 @@ impl ShadowsocksCipher {
 
     pub fn with_kind(kind: CipherKind, subkey: &[u8; 32]) -> Self {
         let cipher = match kind {
-            CipherKind::ChaCha20IetfPoly1305 => {
-                CipherInner::ChaCha(ChaCha20Poly1305::new_from_slice(subkey).unwrap())
-            }
-            CipherKind::Aes256Gcm => {
+            CipherKind::ChaCha20IetfPoly1305
+            | CipherKind::Ss2022(
+                crate::shadowsocks2022::Ss2022CipherMethod::Blake3ChaCha20Poly1305,
+            ) => CipherInner::ChaCha(ChaCha20Poly1305::new_from_slice(subkey).unwrap()),
+            CipherKind::Aes256Gcm | CipherKind::Ss2022(_) => {
                 CipherInner::Aes256(Box::new(Aes256Gcm::new_from_slice(subkey).unwrap()))
             }
         };
@@ -109,21 +139,43 @@ impl ShadowsocksCipher {
     }
 
     pub fn encrypt(&mut self, plaintext: &[u8]) -> FluxResult<Vec<u8>> {
-        let nonce = self.next_nonce();
+        let nonce_raw = self.next_nonce();
+        let nonce = Nonce::from_slice(&nonce_raw);
         match &self.cipher {
-            CipherInner::ChaCha(c) => c.encrypt(&nonce, plaintext),
-            CipherInner::Aes256(c) => c.encrypt(&nonce, plaintext),
+            CipherInner::ChaCha(c) => c.encrypt(nonce, plaintext),
+            CipherInner::Aes256(c) => c.encrypt(nonce, plaintext),
         }
         .map_err(|e| FluxError::Crypto(format!("shadowsocks encrypt failed: {}", e)))
     }
 
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> FluxResult<Vec<u8>> {
-        let nonce = self.next_nonce();
+        let nonce_raw = self.next_nonce();
+        let nonce = Nonce::from_slice(&nonce_raw);
         match &self.cipher {
-            CipherInner::ChaCha(c) => c.decrypt(&nonce, ciphertext),
-            CipherInner::Aes256(c) => c.decrypt(&nonce, ciphertext),
+            CipherInner::ChaCha(c) => c.decrypt(nonce, ciphertext),
+            CipherInner::Aes256(c) => c.decrypt(nonce, ciphertext),
         }
         .map_err(|e| FluxError::Crypto(format!("shadowsocks decrypt failed: {}", e)))
+    }
+
+    pub fn encrypt_in_place(&mut self, buffer: &mut Vec<u8>) -> FluxResult<()> {
+        let nonce_raw = self.next_nonce();
+        let nonce = Nonce::from_slice(&nonce_raw);
+        match &self.cipher {
+            CipherInner::ChaCha(c) => c.encrypt_in_place(nonce, b"", buffer),
+            CipherInner::Aes256(c) => c.encrypt_in_place(nonce, b"", buffer),
+        }
+        .map_err(|e| FluxError::Crypto(format!("shadowsocks encrypt in place failed: {}", e)))
+    }
+
+    pub fn decrypt_in_place(&mut self, buffer: &mut Vec<u8>) -> FluxResult<()> {
+        let nonce_raw = self.next_nonce();
+        let nonce = Nonce::from_slice(&nonce_raw);
+        match &self.cipher {
+            CipherInner::ChaCha(c) => c.decrypt_in_place(nonce, b"", buffer),
+            CipherInner::Aes256(c) => c.decrypt_in_place(nonce, b"", buffer),
+        }
+        .map_err(|e| FluxError::Crypto(format!("shadowsocks decrypt in place failed: {}", e)))
     }
 }
 
@@ -144,8 +196,9 @@ pub fn encode_ss_address(addr: &TargetAddress) -> Vec<u8> {
         TargetAddress::Domain(domain, port) => {
             buf.push(ATYP_DOMAIN);
             let bytes = domain.as_bytes();
-            buf.push(bytes.len() as u8);
-            buf.extend_from_slice(bytes);
+            let dlen = bytes.len().min(255);
+            buf.push(dlen as u8);
+            buf.extend_from_slice(&bytes[..dlen]);
             buf.extend_from_slice(&port.to_be_bytes());
         }
     }
@@ -172,6 +225,8 @@ pub struct ShadowsocksStream<S> {
     chunk_pos: usize,
     // Writer chunk state: handles partial socket writes and avoids frame corruption
     write_buf: Vec<u8>,
+    write_len_buf: Vec<u8>,
+    write_payload_buf: Vec<u8>,
     write_pos: usize,
     writing_plain_size: usize,
 }
@@ -182,6 +237,16 @@ impl<S> ShadowsocksStream<S> {
         enc: ShadowsocksCipher,
         dec: Option<ShadowsocksCipher>,
         master_key: [u8; 32],
+    ) -> Self {
+        Self::new_with_initial_chunk(inner, enc, dec, master_key, vec![])
+    }
+
+    pub fn new_with_initial_chunk(
+        inner: S,
+        enc: ShadowsocksCipher,
+        dec: Option<ShadowsocksCipher>,
+        master_key: [u8; 32],
+        initial_chunk: Vec<u8>,
     ) -> Self {
         let kind = enc.kind();
         Self {
@@ -195,11 +260,13 @@ impl<S> ShadowsocksStream<S> {
             len_buf: [0u8; 2 + TAG_LEN],
             len_pos: 0,
             payload_len: 0,
-            payload_buf: Vec::new(),
+            payload_buf: Vec::with_capacity(MAX_PAYLOAD_LEN + TAG_LEN),
             payload_pos: 0,
-            chunk_data: Vec::new(),
+            chunk_data: initial_chunk,
             chunk_pos: 0,
-            write_buf: Vec::new(),
+            write_buf: Vec::with_capacity(MAX_PAYLOAD_LEN + TAG_LEN * 2 + 2),
+            write_len_buf: Vec::with_capacity(2 + TAG_LEN),
+            write_payload_buf: Vec::with_capacity(MAX_PAYLOAD_LEN + TAG_LEN),
             write_pos: 0,
             writing_plain_size: 0,
         }
@@ -274,9 +341,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                             let dec_len = dec.decrypt(&len_buf).map_err(|e| {
                                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                             })?;
-                            self.payload_len = u16::from_be_bytes([dec_len[0], dec_len[1]]) as usize;
+                            let raw_len = u16::from_be_bytes([dec_len[0], dec_len[1]]);
+                            self.payload_len = (raw_len & 0x3FFF) as usize;
+                            let target_len = self.payload_len + TAG_LEN;
+                            self.payload_buf.resize(target_len, 0);
                             self.len_pos = 0;
-                            self.payload_buf = vec![0u8; self.payload_len + TAG_LEN];
                             self.payload_pos = 0;
                         }
                         continue;
@@ -286,13 +355,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                 }
             }
 
-            // Step 4: Read encrypted payload chunk
+            // Step 4: Read encrypted payload chunk via zero-heap stack buffer
             if self.payload_len > 0 {
                 let ppos = self.payload_pos;
                 let target_len = self.payload_len + TAG_LEN;
-                let to_read = target_len - ppos;
-                let mut ptmp = vec![0u8; to_read];
-                let mut ptmp_buf = ReadBuf::new(&mut ptmp);
+                let mut tmp = [0u8; 16 * 1024];
+                let to_read = (target_len - ppos).min(tmp.len());
+                let mut ptmp_buf = ReadBuf::new(&mut tmp[..to_read]);
                 match Pin::new(&mut self.inner).poll_read(cx, &mut ptmp_buf) {
                     Poll::Ready(Ok(())) => {
                         let n = ptmp_buf.filled().len();
@@ -302,20 +371,20 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                                 "EOF in Shadowsocks chunk",
                             )));
                         }
-                        self.payload_buf[ppos..ppos + n].copy_from_slice(&ptmp[..n]);
+                        self.payload_buf[ppos..ppos + n].copy_from_slice(&tmp[..n]);
                         self.payload_pos += n;
                         if self.payload_pos == target_len {
-                            let payload_buf = std::mem::take(&mut self.payload_buf);
-                            let Some(dec) = self.dec.as_mut() else {
+                            let this = self.as_mut().get_mut();
+                            let Some(dec) = this.dec.as_mut() else {
                                 return Poll::Pending;
                             };
-                            let decrypted = dec.decrypt(&payload_buf).map_err(|e| {
+                            dec.decrypt_in_place(&mut this.payload_buf).map_err(|e| {
                                 io::Error::new(io::ErrorKind::InvalidData, e.to_string())
                             })?;
-                            self.chunk_data = decrypted;
-                            self.chunk_pos = 0;
-                            self.payload_len = 0;
-                            self.payload_pos = 0;
+                            std::mem::swap(&mut this.chunk_data, &mut this.payload_buf);
+                            this.chunk_pos = 0;
+                            this.payload_len = 0;
+                            this.payload_pos = 0;
                         }
                         continue;
                     }
@@ -336,11 +405,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowsocksStream<S> {
         // Step 1: If there is an existing buffered frame being transmitted, flush it first
         while self.write_pos < self.write_buf.len() {
             let this = self.as_mut().get_mut();
-            let n = match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
+            let n =
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                };
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -357,39 +427,44 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowsocksStream<S> {
             }
         }
 
-        // Step 2: Prepare next encrypted frame from caller buffer
+        // Step 2: Prepare next encrypted frame from caller buffer using pre-allocated zero-heap buffers
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
 
-        let chunk_size = buf.len().min(16384);
+        let chunk_size = buf.len().min(MAX_PAYLOAD_LEN);
         let plain_chunk = &buf[..chunk_size];
-
-        let len_bytes = (chunk_size as u16).to_be_bytes();
-        let enc_len = self.enc.encrypt(&len_bytes).map_err(|e| {
-            io::Error::other(e.to_string())
-        })?;
-        let enc_data = self.enc.encrypt(plain_chunk).map_err(|e| {
-            io::Error::other(e.to_string())
-        })?;
+        let len_bytes = ((chunk_size as u16) & 0x3FFF).to_be_bytes();
 
         let this = self.as_mut().get_mut();
+        this.write_len_buf.clear();
+        this.write_len_buf.extend_from_slice(&len_bytes);
+        this.enc
+            .encrypt_in_place(&mut this.write_len_buf)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        this.write_payload_buf.clear();
+        this.write_payload_buf.extend_from_slice(plain_chunk);
+        this.enc
+            .encrypt_in_place(&mut this.write_payload_buf)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
         this.write_buf.clear();
-        this.write_buf.reserve(enc_len.len() + enc_data.len());
-        this.write_buf.extend_from_slice(&enc_len);
-        this.write_buf.extend_from_slice(&enc_data);
+        this.write_buf.extend_from_slice(&this.write_len_buf);
+        this.write_buf.extend_from_slice(&this.write_payload_buf);
         this.write_pos = 0;
         this.writing_plain_size = chunk_size;
 
         // Step 3: Write as much of the new frame to inner stream as possible
         while this.write_pos < this.write_buf.len() {
-            let n = match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {
-                    return Poll::Pending;
-                }
-            };
+            let n =
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {
+                        return Poll::Pending;
+                    }
+                };
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -412,11 +487,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowsocksStream<S> {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.write_pos < self.write_buf.len() {
             let this = self.as_mut().get_mut();
-            let n = match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
+            let n =
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                };
             if n == 0 {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -438,11 +514,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowsocksStream<S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.write_pos < self.write_buf.len() {
             let this = self.as_mut().get_mut();
-            let n = match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
-                Poll::Ready(Ok(n)) => n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            };
+            let n =
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                };
             if n == 0 {
                 break;
             }

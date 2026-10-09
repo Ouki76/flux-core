@@ -1,0 +1,11 @@
+{
+  // External nodes included from another file
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "external-socks",
+      "server": "127.0.0.1",
+      "server_port": 1080
+    }
+  ]
+}

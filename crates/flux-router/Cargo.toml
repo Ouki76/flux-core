@@ -8,4 +8,5 @@ flux-types = { workspace = true }
 ipnet = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
+maxminddb = { workspace = true }
+parking_lot = { workspace = true }

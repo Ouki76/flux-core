@@ -1,0 +1,164 @@
+use flux_types::{FluxError, FluxResult};
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+
+/// A bidirectional stream operating over an active QUIC stream.
+pub struct QuicBiStream {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+}
+
+impl QuicBiStream {
+    pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        Self { send, recv }
+    }
+}
+
+impl AsyncRead for QuicBiStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for QuicBiStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.send)
+            .poll_write(cx, buf)
+            .map_err(io::Error::other)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.send).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.send)
+            .poll_shutdown(cx)
+            .map_err(io::Error::other)
+    }
+}
+
+pub struct QuicTransport;
+
+impl QuicTransport {
+    /// Creates a client QUIC Endpoint with the specified ALPN protocols.
+    pub fn create_client_endpoint(
+        is_ipv6: bool,
+        alpn: Vec<Vec<u8>>,
+        insecure: bool,
+    ) -> FluxResult<quinn::Endpoint> {
+        let mut root_store = RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+        let crypto = if insecure {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::tls::NoVerifier))
+                .with_no_client_auth()
+        } else {
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+
+        let mut config = crypto;
+        config.alpn_protocols = alpn;
+
+        let client_cfg = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(config).map_err(|e| {
+                FluxError::Crypto(format!("failed to configure QUIC TLS 1.3: {}", e))
+            })?,
+        ));
+
+        let bind_addr = if is_ipv6 {
+            SocketAddr::from(([0; 16], 0))
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        };
+
+        let mut endpoint = quinn::Endpoint::client(bind_addr).map_err(FluxError::Io)?;
+        endpoint.set_default_client_config(client_cfg);
+        Ok(endpoint)
+    }
+
+    /// Establishes an authenticated QUIC connection to the destination server.
+    pub async fn connect(
+        endpoint: &quinn::Endpoint,
+        server_addr: SocketAddr,
+        server_name: &str,
+    ) -> FluxResult<quinn::Connection> {
+        endpoint
+            .connect(server_addr, server_name)
+            .map_err(|e| FluxError::Network(format!("QUIC connection setup failed: {}", e)))?
+            .await
+            .map_err(|e| FluxError::Network(format!("QUIC handshake failed: {}", e)))
+    }
+
+    /// Opens a bidirectional QUIC stream on the connection.
+    pub async fn open_bi_stream(conn: &quinn::Connection) -> FluxResult<QuicBiStream> {
+        let (send, recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| FluxError::Network(format!("failed to open QUIC stream: {}", e)))?;
+        Ok(QuicBiStream::new(send, recv))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_quic_endpoint_address_family_matching() {
+        let ep_v4 =
+            QuicTransport::create_client_endpoint(false, vec![b"test".to_vec()], true).unwrap();
+        let addr_v4 = ep_v4.local_addr().unwrap();
+        assert!(!addr_v4.is_ipv6());
+
+        let ep_v6 =
+            QuicTransport::create_client_endpoint(true, vec![b"test".to_vec()], true).unwrap();
+        let addr_v6 = ep_v6.local_addr().unwrap();
+        assert!(addr_v6.is_ipv6());
+
+        let peer_v4: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let peer_v6: SocketAddr = "[::1]:443".parse().unwrap();
+
+        assert!(
+            ep_v4
+                .local_addr()
+                .map(|a| a.is_ipv6() == peer_v4.is_ipv6())
+                .unwrap_or(false)
+        );
+        assert!(
+            !ep_v4
+                .local_addr()
+                .map(|a| a.is_ipv6() == peer_v6.is_ipv6())
+                .unwrap_or(false)
+        );
+        assert!(
+            ep_v6
+                .local_addr()
+                .map(|a| a.is_ipv6() == peer_v6.is_ipv6())
+                .unwrap_or(false)
+        );
+        assert!(
+            !ep_v6
+                .local_addr()
+                .map(|a| a.is_ipv6() == peer_v4.is_ipv6())
+                .unwrap_or(false)
+        );
+    }
+}

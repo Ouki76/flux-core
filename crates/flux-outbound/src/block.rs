@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use flux_types::{
-    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta,
-};
+use flux_types::{BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta};
 
 pub struct BlockOutbound {
     tag: String,
@@ -17,6 +15,10 @@ impl BlockOutbound {
 impl Outbound for BlockOutbound {
     fn tag(&self) -> &str {
         &self.tag
+    }
+
+    fn protocol(&self) -> &'static str {
+        "block"
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {

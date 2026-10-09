@@ -7,7 +7,6 @@ edition = "2024"
 flux-types = { workspace = true }
 flux-common = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
@@ -18,6 +17,10 @@ aes-gcm = { workspace = true }
 hkdf = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+x25519-dalek = { workspace = true }
+lru = { workspace = true }
+parking_lot = { workspace = true }
+hmac = { workspace = true }

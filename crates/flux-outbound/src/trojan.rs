@@ -1,26 +1,23 @@
-use std::sync::Arc;
-use std::time::Duration;
+use crate::dialer::LazyPipelineDialer;
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
-use flux_types::{
-    BoxedStream, FluxError, FluxResult, NetworkType, Outbound, PacketEndpoint, SessionMeta,
-    TargetAddress, UdpPacket,
-};
 use flux_dns::DnsResolver;
+use flux_protocol::socks5::Socks5Handshake;
 use flux_protocol::trojan::TrojanProtocol;
 use flux_protocol::udp::encode_trojan_udp;
-use flux_protocol::socks5::Socks5Handshake;
-use flux_transport::tcp::TcpTransport;
-use flux_transport::tls::{TlsClientConfig, TlsTransport};
+use flux_transport::pipeline::{FramingLayer, SecurityLayer};
+use flux_transport::tls::TlsClientConfig;
+use flux_types::{
+    BoxedStream, FluxError, FluxResult, NetworkType, Outbound, PacketEndpoint, SessionMeta,
+    StreamDialer, TargetAddress, UdpPacket,
+};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 pub struct TrojanOutbound {
     tag: String,
-    server_address: TargetAddress,
-    password: String,
-    resolver: Arc<DnsResolver>,
-    tls_config: TlsClientConfig,
-    connect_timeout: Duration,
+    password_hash: String,
+    dialer: Arc<dyn StreamDialer>,
 }
 
 impl TrojanOutbound {
@@ -31,13 +28,27 @@ impl TrojanOutbound {
         resolver: Arc<DnsResolver>,
         tls_config: TlsClientConfig,
     ) -> Self {
+        let dialer = Arc::new(LazyPipelineDialer::new(
+            server_address,
+            resolver,
+            SecurityLayer::Tls(tls_config),
+            FramingLayer::Raw,
+        ));
+
+        Self::new_with_dialer(tag, password, dialer)
+    }
+
+    pub fn new_with_dialer(
+        tag: impl Into<String>,
+        password: impl Into<String>,
+        dialer: Arc<dyn StreamDialer>,
+    ) -> Self {
+        let password_str = password.into();
+        let password_hash = flux_protocol::trojan::hash_trojan_password(&password_str);
         Self {
             tag: tag.into(),
-            server_address,
-            password: password.into(),
-            resolver,
-            tls_config,
-            connect_timeout: Duration::from_secs(10),
+            password_hash,
+            dialer,
         }
     }
 }
@@ -48,80 +59,96 @@ impl Outbound for TrojanOutbound {
         &self.tag
     }
 
+    fn protocol(&self) -> &'static str {
+        "trojan"
+    }
+
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let server_addr = self.resolver.resolve(&self.server_address).await?;
-        let tcp_stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
+        let mut stream = self.dialer.dial().await?;
 
-        // Trojan always runs over TLS
-        let mut tls_stream = TlsTransport::connect(tcp_stream, &self.tls_config).await?;
-
-        TrojanProtocol::write_request_header(
-            &mut tls_stream,
-            &self.password,
+        TrojanProtocol::write_request_header_with_hash(
+            &mut stream,
+            &self.password_hash,
             NetworkType::Tcp,
             &meta.destination,
         )
         .await?;
 
-        Ok(tls_stream)
+        Ok(stream)
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
-        let server_addr = self.resolver.resolve(&self.server_address).await?;
-        let tcp_stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
-        let mut tls_stream = TlsTransport::connect(tcp_stream, &self.tls_config).await?;
+        let mut stream = self.dialer.dial().await?;
 
-        TrojanProtocol::write_request_header(
-            &mut tls_stream,
-            &self.password,
+        TrojanProtocol::write_request_header_with_hash(
+            &mut stream,
+            &self.password_hash,
             NetworkType::Udp,
             &meta.destination,
         )
         .await?;
 
+        let (reader, writer) = tokio::io::split(stream);
+
         Ok(Box::new(TrojanPacketEndpoint {
-            stream: Arc::new(Mutex::new(tls_stream)),
-            server_target: meta.destination.clone(),
+            reader: Arc::new(Mutex::new(reader)),
+            writer: Arc::new(Mutex::new(writer)),
+            _server_target: meta.destination.clone(),
         }))
     }
 }
 
 pub struct TrojanPacketEndpoint {
-    stream: Arc<Mutex<BoxedStream>>,
-    server_target: TargetAddress,
+    reader: Arc<Mutex<tokio::io::ReadHalf<BoxedStream>>>,
+    writer: Arc<Mutex<tokio::io::WriteHalf<BoxedStream>>>,
+    _server_target: TargetAddress,
 }
 
 #[async_trait]
 impl PacketEndpoint for TrojanPacketEndpoint {
     async fn send_packet(&self, packet: UdpPacket) -> FluxResult<()> {
         let encoded = encode_trojan_udp(&packet);
-        let mut guard = self.stream.lock().await;
+        let mut guard = self.writer.lock().await;
         guard.write_all(&encoded).await.map_err(FluxError::Io)?;
         guard.flush().await.map_err(FluxError::Io)?;
         Ok(())
     }
 
     async fn recv_packet(&self) -> FluxResult<UdpPacket> {
-        let mut guard = self.stream.lock().await;
+        let mut guard = self.reader.lock().await;
 
         let mut atyp_buf = [0u8; 1];
-        guard.read_exact(&mut atyp_buf).await.map_err(FluxError::Io)?;
+        guard
+            .read_exact(&mut atyp_buf)
+            .await
+            .map_err(FluxError::Io)?;
         let target = Socks5Handshake::read_address(&mut *guard, atyp_buf[0]).await?;
 
         let mut len_buf = [0u8; 2];
-        guard.read_exact(&mut len_buf).await.map_err(FluxError::Io)?;
+        guard
+            .read_exact(&mut len_buf)
+            .await
+            .map_err(FluxError::Io)?;
         let payload_len = u16::from_be_bytes(len_buf) as usize;
+        if payload_len > 65507 {
+            return Err(FluxError::Protocol {
+                protocol: "trojan",
+                message: format!(
+                    "trojan UDP payload size {} exceeds 65507 bytes",
+                    payload_len
+                ),
+            });
+        }
 
         let mut crlf = [0u8; 2];
         guard.read_exact(&mut crlf).await.map_err(FluxError::Io)?;
 
         let mut payload = vec![0u8; payload_len];
-        guard.read_exact(&mut payload).await.map_err(FluxError::Io)?;
+        guard
+            .read_exact(&mut payload)
+            .await
+            .map_err(FluxError::Io)?;
 
-        Ok(UdpPacket::new(
-            bytes::Bytes::from(payload),
-            self.server_target.clone(),
-            target,
-        ))
+        Ok(UdpPacket::new(payload.into(), target.clone(), target))
     }
 }

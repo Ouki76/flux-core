@@ -1,6 +1,6 @@
 # flux-core
 
-A high-performance, asynchronous proxy core written in Rust.
+A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 
 ## Features
 
@@ -8,43 +8,52 @@ A high-performance, asynchronous proxy core written in Rust.
 - **VLESS**: REALITY (X25519, ChaCha20-Poly1305) and `xtls-rprx-vision` flow.
 - **Trojan**: SHA-224 password hashing over TLS.
 - **Shadowsocks**: AEAD (ChaCha20-Poly1305, HKDF key derivation).
-- **SOCKS5**: TCP CONNECT and UDP ASSOCIATE support.
+- **SOCKS5**: TCP CONNECT and UDP ASSOCIATE support with user/password authentication.
 - **HTTP / HTTP CONNECT**: Forward proxy and tunneling.
 - **Mixed Inbound**: Auto-detection of SOCKS5 and HTTP protocols on a single port.
-- **TUN**: Network interface abstraction for transparent proxying.
+- **TUN**: Network interface abstraction for transparent proxying with userspace TCP framing and UDP relay.
+- **Modern QUIC & UDP Carriers**: WireGuard (AmneziaWG dialect), Shadowsocks-2022 (TCP & UDP), TUIC v5 (QUIC carrier via `quinn`), Hysteria 2 (QUIC carrier, Brutal pacer, port-hopping).
 
 ### Transport & Performance
 - **Linux Zero-Copy**: Socket-to-socket `splice(2)` data transfer.
-- **Buffer Pooling**: Memory chunk reuse without per-connection allocations.
-- **TLS**: Async TLS 1.3/1.2 powered by `rustls`.
+- **Buffer Pooling**: Memory chunk reuse via `BufferPool` without per-connection allocations.
+- **TLS**: Async TLS 1.3/1.2 powered by `rustls` with ALPN negotiation.
 
 ### Routing & DNS
-- **Rule Engine**: Matching by domain (exact, suffix, keyword), IP CIDR, ports, and rule sets.
-- **Rule Sets**: High-capacity GeoIP and GeoSite list matching.
-- **DNS**: Built-in resolver with Fake-IP (`198.18.0.0/15`) and DNS-over-HTTPS (DoH, RFC 8484).
+- **Rule Engine**: Matching by domain (exact, suffix, keyword), IP CIDR, ports, network (TCP/UDP), rule sets, and inverted matching (`invert: true`).
+- **Rule Sets**: High-capacity GeoIP and GeoSite list matching with O(1) hash lookups and O(L) suffix climbing.
+- **DNS**: Built-in resolver with Fake-IP (`198.18.0.0/15`), wireformat parser (IPv4 `A` & IPv6 `AAAA`), and DNS-over-HTTPS (DoH, RFC 8484) client.
 
 ### Outbound Groups
 - **Selector**: Manual or programmatic outbound node selection.
 - **URLTest**: Latency-based automated failover with tolerance thresholding.
+- **Fallback**: Priority-ordered active-passive failover with healthcheck probing.
+- **LoadBalance**: Round-robin and consistent-hashing traffic distribution.
+
+### Configuration & Modularity
+- **Multi-Format**: Seamless support for YAML (`.yaml`, `.yml`), JSON, and JSON with comments (`.jsonc`).
+- **Modular Includes**: `$include` / `include` directives supporting individual files and glob patterns (e.g. `outbounds/*.json`).
+- **Environment Variables**: Automatic `${ENV_VAR}` and `${ENV_VAR:-default}` expansion across configs.
+- **Strict Graph Validation**: Pre-flight verification of outbound dependencies and cycle detection in groups.
 
 ### Management & Control
-- **REST API**: External controller with endpoints for traffic, proxies, and connection state.
+- **Flux Core Native REST API**: Native control plane API (`/api/v1/*`) over TCP or Unix Domain Sockets (`unix://...`) with Bearer token authentication, real-time traffic metering, dynamic outbound selector switching, delay/latency probing, route simulation dry-run, and connection lifecycle management.
 - **Zero-Downtime Reload**: Configuration reload via `SIGHUP` without terminating active streams.
 
 ## Architecture
 
 The project is organized as a Cargo workspace with modular crates:
 
-- `crates/flux-types`: Core types, session metadata, and common traits (`Inbound`, `Outbound`, `Dispatcher`).
-- `crates/flux-common`: Memory pool, zero-copy socket pipe (`splice`), and bidirectional copying.
-- `crates/flux-router`: Rule evaluation engine and rule-set registry.
-- `crates/flux-dns`: Fake-IP engine, DNS wireformat parser, and DoH client.
+- `crates/flux-types`: Core types, session metadata, target addresses, and common traits (`Inbound`, `Outbound`, `Dispatcher`).
+- `crates/flux-common`: Memory pool (`BufferPool`), zero-copy socket pipe (`splice`), and bidirectional copying.
+- `crates/flux-router`: Rule evaluation engine, CIDR matching, and rule-set registry.
+- `crates/flux-dns`: Fake-IP engine, DNS wireformat parser (A and AAAA records), and DoH client.
 - `crates/flux-transport`: TLS, TCP, and REALITY transport implementations.
 - `crates/flux-protocol`: SOCKS5, HTTP, VLESS, Trojan, and Shadowsocks protocol implementations.
-- `crates/flux-inbound`: Inbound listener adapters.
-- `crates/flux-outbound`: Outbound connection adapters and group balancers.
+- `crates/flux-inbound`: Inbound listener adapters (Mixed, SOCKS, HTTP, VLESS, Trojan, SS, TUN).
+- `crates/flux-outbound`: Outbound connection adapters and group balancers (Selector, UrlTest, Fallback, LoadBalance).
 - `crates/flux-app`: Dispatcher, configuration parser, and runtime lifecycle manager.
-- `src/main.rs`: CLI entry point.
+- `src/main.rs`: Modern CLI entry point with `clap`.
 
 ## Building
 
@@ -72,11 +81,11 @@ cargo bench --bench throughput
 ## Usage
 
 ```bash
-# Validate a configuration file
-./target/release/flux-core check -c config.json
+# Validate a configuration file (supports .yaml, .json, .jsonc)
+./target/release/flux-core check -c examples/config.yaml
 
 # Run the core
-./target/release/flux-core run -c config.json
+./target/release/flux-core run -c examples/config.yaml
 
 # Print version information
 ./target/release/flux-core version
@@ -88,20 +97,12 @@ Send a `SIGHUP` signal to reload the configuration file at runtime:
 kill -HUP <PID>
 ```
 
-## Docker
+## Configuration Examples
 
-```bash
-docker build -t flux-core:latest .
-docker run -d \
-  --name flux-core \
-  --network host \
-  --cap-add=NET_ADMIN \
-  --cap-add=NET_BIND_SERVICE \
-  -v $(pwd)/config.json:/etc/flux-core/config.json:ro \
-  flux-core:latest
-```
+Complete configuration examples are provided in the `examples/` directory:
+- `examples/config.yaml`: Full YAML configuration with VLESS Reality, Trojan, SS, DoH, and all Outbound Groups.
+- `examples/config.jsonc`: JSON with comments and modular `$include` demonstrating file splitting.
 
 ## License
 
 MIT License
-

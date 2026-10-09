@@ -1,0 +1,56 @@
+{
+  // Modular inclusion of external files & globs
+  "$include": [
+    "nodes.json"
+  ],
+
+  // Logging
+  "log": {
+    "level": "info"
+  },
+
+  // DNS resolver with DoH
+  "dns": {
+    "servers": [
+      "https://1.1.1.1/dns-query"
+    ],
+    "fakeip": {
+      "enabled": true,
+      "inet4_range": "198.18.0.0/15"
+    }
+  },
+
+  // Inbound listeners
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+
+  // Outbounds
+  "outbounds": [
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" },
+    {
+      "type": "selector",
+      "tag": "proxy",
+      // external-socks is loaded via $include from nodes.json!
+      "outbounds": ["external-socks", "direct"],
+      "default": "external-socks"
+    }
+  ],
+
+  // Routing rules
+  "route": {
+    "rules": [
+      {
+        "domain_suffix": [".google.com"],
+        "outbound": "proxy"
+      }
+    ],
+    "final": "direct"
+  }
+}

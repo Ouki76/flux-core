@@ -35,7 +35,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.15", features = ["v4"] }
+base64 = "0.22"
+uuid = { version = "1.15", features = ["v4", "serde"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "0.26"
@@ -52,9 +53,19 @@ dashmap = "6.1"
 lru = "0.13"
 ipnet = { version = "2.11", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+serde_yaml_ng = "0.10"
+glob = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 mimalloc = { version = "0.1", default-features = false }
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+parking_lot = "0.12"
+pem = "3"
+hmac = "0.12"
+blake3 = "1.8"
+h2 = "0.4"
+maxminddb = "0.32"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "ring"] }
 
 [profile.release]
 opt-level = 3
@@ -69,6 +80,15 @@ edition = "2024"
 
 [dependencies]
 flux-types = { workspace = true }
+flux-app = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
 flux-common = { workspace = true }
 flux-router = { workspace = true }
 flux-dns = { workspace = true }
@@ -76,19 +96,24 @@ flux-transport = { workspace = true }
 flux-protocol = { workspace = true }
 flux-inbound = { workspace = true }
 flux-outbound = { workspace = true }
-flux-app = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
-
-[dev-dependencies]
 tempfile = "3"
 uuid = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
+sha1 = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
 criterion = { workspace = true }
 rcgen = { workspace = true }
 
 [[bench]]
 name = "throughput"
 harness = false
+
+[[example]]
+name = "stress_bench"
+path = "examples/stress_bench.rs"
+
+[[example]]
+name = "bench_native"
+path = "examples/bench_native.rs"

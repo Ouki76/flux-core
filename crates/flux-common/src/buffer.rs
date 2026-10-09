@@ -1,34 +1,48 @@
+use parking_lot::Mutex;
 use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
-use bytes::Bytes;
-use parking_lot::Mutex;
 
 pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024; // 16 KB
+pub const PACKET_BUFFER_SIZE: usize = 65536; // 64 KB for UDP datagrams
 
-/// A thread-safe buffer pool to reuse 16KB byte buffers without malloc pressure.
+const NUM_SHARDS: usize = 16;
+
+/// A thread-safe, 16-way sharded buffer pool to reuse 16KB byte buffers without malloc pressure or lock contention.
 pub struct BufferPool {
     buffer_size: usize,
-    pool: Mutex<Vec<Vec<u8>>>,
-    max_capacity: usize,
+    shards: [Mutex<Vec<Vec<u8>>>; NUM_SHARDS],
+    shard_capacity: usize,
+    shard_counter: std::sync::atomic::AtomicUsize,
 }
 
 impl BufferPool {
     pub fn new(buffer_size: usize, max_capacity: usize) -> Self {
+        let shard_capacity = (max_capacity / NUM_SHARDS).max(1);
         Self {
             buffer_size,
-            pool: Mutex::new(Vec::with_capacity(max_capacity)),
-            max_capacity,
+            shards: std::array::from_fn(|_| Mutex::new(Vec::with_capacity(shard_capacity))),
+            shard_capacity,
+            shard_counter: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     pub fn default_pool() -> &'static Self {
         static INSTANCE: OnceLock<BufferPool> = OnceLock::new();
-        INSTANCE.get_or_init(|| BufferPool::new(DEFAULT_BUFFER_SIZE, 64))
+        INSTANCE.get_or_init(|| BufferPool::new(DEFAULT_BUFFER_SIZE, 256))
+    }
+
+    pub fn packet_pool() -> &'static Self {
+        static PACKET_INSTANCE: OnceLock<BufferPool> = OnceLock::new();
+        PACKET_INSTANCE.get_or_init(|| BufferPool::new(PACKET_BUFFER_SIZE, 64))
     }
 
     /// Acquire a buffer from the pool or allocate a new one.
     pub fn acquire(&self) -> Vec<u8> {
-        let mut guard = self.pool.lock();
+        let idx = self
+            .shard_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % NUM_SHARDS;
+        let mut guard = self.shards[idx].lock();
         guard.pop().unwrap_or_else(|| vec![0u8; self.buffer_size])
     }
 
@@ -40,15 +54,21 @@ impl BufferPool {
         }
     }
 
-    /// Release a buffer back to the pool.
+    /// Release a buffer back to the pool, securely zeroing contents to prevent cross-session data leakage.
     pub fn release(&self, mut buf: Vec<u8>) {
         if buf.capacity() < self.buffer_size {
             return;
         }
-        buf.clear();
-        buf.resize(self.buffer_size, 0);
-        let mut guard = self.pool.lock();
-        if guard.len() < self.max_capacity {
+        if buf.len() != self.buffer_size {
+            buf.resize(self.buffer_size, 0);
+        }
+        buf.fill(0);
+        let idx = self
+            .shard_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % NUM_SHARDS;
+        let mut guard = self.shards[idx].lock();
+        if guard.len() < self.shard_capacity {
             guard.push(buf);
         }
     }
@@ -78,11 +98,6 @@ impl Drop for BufferGuard {
             self.pool.release(buf);
         }
     }
-}
-
-/// Helper to wrap bytes into zero-copy Bytes.
-pub fn into_bytes(buf: &[u8]) -> Bytes {
-    Bytes::copy_from_slice(buf)
 }
 
 #[cfg(test)]

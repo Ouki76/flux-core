@@ -1,30 +1,33 @@
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, info, warn};
 use async_trait::async_trait;
+use flux_protocol::socks5::{REP_SUCCESS, Socks5Command, Socks5Handshake};
+use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
 use flux_types::{
     Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
 };
-use flux_protocol::socks5::{Socks5Command, Socks5Handshake, REP_SUCCESS};
-use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::net::UdpSocket;
+use tokio::sync::{Mutex, mpsc};
+use tracing::{debug, error, info, warn};
 
 pub struct SocksInbound {
     tag: String,
     listen_addr: SocketAddr,
     users: Vec<(String, String)>,
     running: Arc<AtomicBool>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl SocksInbound {
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr) -> Self {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             tag: tag.into(),
             listen_addr,
             users: vec![],
             running: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
         }
     }
 
@@ -40,25 +43,42 @@ impl Inbound for SocksInbound {
         &self.tag
     }
 
+    fn protocol(&self) -> &'static str {
+        "socks"
+    }
+
+    fn listen_addr(&self) -> Option<String> {
+        Some(self.listen_addr.to_string())
+    }
+
     async fn start(&self, dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()> {
-        let listener = TcpListener::bind(self.listen_addr).await.map_err(FluxError::Io)?;
+        let listener = crate::create_reuse_port_listener(self.listen_addr)?;
 
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let listen_ip = self.listen_addr.ip();
         let users = Arc::new(self.users.clone());
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] SOCKS5 inbound listening on {}", tag, self.listen_addr);
 
         tokio::spawn(async move {
-            while running.load(Ordering::Relaxed) {
-                let (mut socket, client_addr) = match listener.accept().await {
-                    Ok(res) => res,
-                    Err(e) => {
-                        if running.load(Ordering::Relaxed) {
-                            warn!("[{}] accept error: {}", tag, e);
+            loop {
+                let (mut socket, client_addr) = tokio::select! {
+                    res = listener.accept() => {
+                        match res {
+                            Ok(res) => res,
+                            Err(e) => {
+                                if running.load(Ordering::Relaxed) {
+                                    warn!("[{}] accept error: {}", tag, e);
+                                }
+                                break;
+                            }
                         }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        debug!("[{}] SOCKS5 listener shutting down cleanly", tag);
                         break;
                     }
                 };
@@ -69,20 +89,36 @@ impl Inbound for SocksInbound {
                 let user_list = users.clone();
 
                 tokio::spawn(async move {
-                    // 1. SOCKS5 Auth Handshake (No Auth or RFC 1929 Password)
-                    let auth_user = match Socks5Handshake::server_handshake_with_auth(&mut socket, Some(&user_list)).await {
-                        Ok(u) => u,
-                        Err(e) => {
-                            warn!("[{}] client {} handshake failed: {}", inbound_tag, client_addr, e);
-                            return;
-                        }
+                    // 1. SOCKS5 Auth Handshake (No Auth or RFC 1929 Password) with bounded timeout
+                    let handshake_fut = async {
+                        let auth_user = Socks5Handshake::server_handshake_with_auth(
+                            &mut socket,
+                            Some(&user_list),
+                        )
+                        .await?;
+                        let req = Socks5Handshake::read_request(&mut socket).await?;
+                        Ok::<_, FluxError>((auth_user, req))
                     };
 
-                    // 2. Read Request
-                    let req = match Socks5Handshake::read_request(&mut socket).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            debug!("[{}] client {} read request failed: {}", inbound_tag, client_addr, e);
+                    let (auth_user, req) = match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        handshake_fut,
+                    )
+                    .await
+                    {
+                        Ok(Ok(res)) => res,
+                        Ok(Err(e)) => {
+                            warn!(
+                                "[{}] client {} handshake failed: {}",
+                                inbound_tag, client_addr, e
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            debug!(
+                                "[{}] client {} handshake timed out",
+                                inbound_tag, client_addr
+                            );
                             return;
                         }
                     };
@@ -102,31 +138,48 @@ impl Inbound for SocksInbound {
                             let outbound_stream = match disp.dial_outbound(&meta).await {
                                 Ok(s) => s,
                                 Err(FluxError::Blocked(msg)) => {
-                                    warn!("[{}] connection to {} blocked: {}", inbound_tag, meta.destination, msg);
-                                    let _ = Socks5Handshake::send_reply(&mut socket, 0x02, None).await; // 0x02 = connection not allowed by ruleset
+                                    warn!(
+                                        "[{}] connection to {} blocked: {}",
+                                        inbound_tag, meta.destination, msg
+                                    );
+                                    let _ =
+                                        Socks5Handshake::send_reply(&mut socket, 0x02, None).await; // 0x02 = connection not allowed by ruleset
                                     return;
                                 }
                                 Err(e) => {
-                                    warn!("[{}] connection to {} failed: {}", inbound_tag, meta.destination, e);
-                                    let _ = Socks5Handshake::send_reply(&mut socket, 0x05, None).await; // 0x05 = connection refused
+                                    warn!(
+                                        "[{}] connection to {} failed: {}",
+                                        inbound_tag, meta.destination, e
+                                    );
+                                    let _ =
+                                        Socks5Handshake::send_reply(&mut socket, 0x05, None).await; // 0x05 = connection refused
                                     return;
                                 }
                             };
 
-                            if let Err(e) = Socks5Handshake::send_reply(&mut socket, REP_SUCCESS, None).await {
+                            if let Err(e) =
+                                Socks5Handshake::send_reply(&mut socket, REP_SUCCESS, None).await
+                            {
                                 warn!("[{}] failed to send reply: {}", inbound_tag, e);
                                 return;
                             }
 
-                            disp.bridge_streams(meta, Box::new(socket), outbound_stream).await;
+                            disp.bridge_streams(meta, Box::new(socket), outbound_stream)
+                                .await;
                         }
                         Socks5Command::UdpAssociate => {
                             // Bind local UDP socket for relaying on the matching inbound interface
-                            let udp_socket = match UdpSocket::bind(SocketAddr::new(listen_ip, 0)).await {
+                            let udp_socket = match UdpSocket::bind(SocketAddr::new(listen_ip, 0))
+                                .await
+                            {
                                 Ok(s) => Arc::new(s),
                                 Err(e) => {
-                                    error!("[{}] failed to bind UDP relay socket on {}: {}", inbound_tag, listen_ip, e);
-                                    let _ = Socks5Handshake::send_reply(&mut socket, 0x01, None).await;
+                                    error!(
+                                        "[{}] failed to bind UDP relay socket on {}: {}",
+                                        inbound_tag, listen_ip, e
+                                    );
+                                    let _ =
+                                        Socks5Handshake::send_reply(&mut socket, 0x01, None).await;
                                     return;
                                 }
                             };
@@ -140,7 +193,10 @@ impl Inbound for SocksInbound {
                             };
 
                             let reply_addr = if listen_ip.is_unspecified() {
-                                socket.local_addr().map(|a| SocketAddr::new(a.ip(), local_udp_addr.port())).unwrap_or(local_udp_addr)
+                                socket
+                                    .local_addr()
+                                    .map(|a| SocketAddr::new(a.ip(), local_udp_addr.port()))
+                                    .unwrap_or(local_udp_addr)
                             } else {
                                 local_udp_addr
                             };
@@ -152,7 +208,10 @@ impl Inbound for SocksInbound {
                             )
                             .await
                             {
-                                warn!("[{}] failed to send UDP associate reply: {}", inbound_tag, e);
+                                warn!(
+                                    "[{}] failed to send UDP associate reply: {}",
+                                    inbound_tag, e
+                                );
                                 return;
                             }
 
@@ -175,8 +234,14 @@ impl Inbound for SocksInbound {
                                 disp_clone.dispatch_packet(meta, pkt_rx, out_tx).await;
                             });
 
-                            let client_udp_peer: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+                            let client_udp_peer: Arc<Mutex<Option<SocketAddr>>> =
+                                Arc::new(Mutex::new(None));
                             let client_peer_clone = client_udp_peer.clone();
+                            let allowed_client_ip = match &req.address {
+                                TargetAddress::Ip(sa) if !sa.ip().is_unspecified() => sa.ip(),
+                                _ => client_addr.ip(),
+                            };
+                            let tag_for_recv = inbound_tag.clone();
 
                             // Task to receive packets from UDP socket and forward to dispatcher
                             let udp_recv = udp_socket.clone();
@@ -188,10 +253,33 @@ impl Inbound for SocksInbound {
                                         Err(_) => break,
                                     };
 
-                                    *client_peer_clone.lock().await = Some(src);
+                                    // Verify source IP matches authenticated TCP client to prevent session hijacking
+                                    if src.ip() != allowed_client_ip {
+                                        warn!(
+                                            "[{}] dropped unauthorized UDP packet from {} (expected client IP: {})",
+                                            tag_for_recv, src, allowed_client_ip
+                                        );
+                                        continue;
+                                    }
+
+                                    // Pin UDP session to the first packet's source port to prevent cross-port hijacking
+                                    let mut peer_guard = client_peer_clone.lock().await;
+                                    if let Some(pinned_peer) = *peer_guard {
+                                        if src != pinned_peer {
+                                            warn!(
+                                                "[{}] dropped UDP packet from unexpected source {} (session pinned to {})",
+                                                tag_for_recv, src, pinned_peer
+                                            );
+                                            continue;
+                                        }
+                                    } else {
+                                        *peer_guard = Some(src);
+                                    }
+                                    drop(peer_guard);
 
                                     let payload = bytes::Bytes::copy_from_slice(&buf[..len]);
-                                    if let Ok(pkt) = decode_socks5_udp(TargetAddress::Ip(src), payload)
+                                    if let Ok(pkt) =
+                                        decode_socks5_udp(TargetAddress::Ip(src), payload)
                                         && pkt_tx.send(pkt).await.is_err()
                                     {
                                         break;
@@ -211,10 +299,15 @@ impl Inbound for SocksInbound {
                                 }
                             });
 
-                            // Wait until TCP socket closes
-                            let mut dummy = [0u8; 1];
+                            // Keep alive until TCP control stream closes (client disconnects)
+                            let mut probe_buf = [0u8; 1];
                             use tokio::io::AsyncReadExt;
-                            let _ = socket.read(&mut dummy).await;
+                            loop {
+                                match socket.read(&mut probe_buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(_) => continue,
+                                }
+                            }
 
                             recv_task.abort();
                             send_task.abort();
@@ -232,6 +325,7 @@ impl Inbound for SocksInbound {
 
     async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
+        let _ = self.shutdown_tx.send(());
         Ok(())
     }
 }

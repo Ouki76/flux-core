@@ -1,12 +1,12 @@
-use std::sync::Arc;
-use std::time::Duration;
 use async_trait::async_trait;
-use flux_types::{
-    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
-};
 use flux_dns::DnsResolver;
 use flux_protocol::http::HttpHandshake;
 use flux_transport::tcp::TcpTransport;
+use flux_types::{
+    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
+};
+use std::sync::Arc;
+use std::time::Duration;
 
 pub struct HttpOutbound {
     tag: String,
@@ -43,14 +43,26 @@ impl Outbound for HttpOutbound {
         &self.tag
     }
 
+    fn protocol(&self) -> &'static str {
+        "http"
+    }
+
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
         let server_addr = self.resolver.resolve(&self.server_address).await?;
         let mut stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
 
         let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-        HttpHandshake::client_handshake_with_auth(&mut stream, &meta.destination, auth_ref).await?;
+        let excess_opt =
+            HttpHandshake::client_handshake_with_auth(&mut stream, &meta.destination, auth_ref)
+                .await?;
 
-        Ok(Box::new(stream))
+        if let Some(excess) = excess_opt {
+            Ok(Box::new(flux_common::copy::PrefixedStream::new(
+                stream, excess,
+            )))
+        } else {
+            Ok(Box::new(stream))
+        }
     }
 
     async fn dial_packet(&self, _meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {

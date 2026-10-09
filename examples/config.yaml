@@ -1,0 +1,169 @@
+# ==============================================================================
+# flux-core Configuration Example (YAML)
+# ==============================================================================
+
+log:
+  level: debug
+
+# Built-in DNS resolver with DoH (DNS-over-HTTPS) and Fake-IP pool
+dns:
+  servers:
+    - https://1.1.1.1/dns-query
+    - 8.8.8.8:53
+  fakeip:
+    enabled: true
+    inet4_range: 198.18.0.0/15
+
+# Inbound listeners
+inbounds:
+  # Mixed inbound (SOCKS5 + HTTP CONNECT auto-detected on single port)
+  - type: mixed
+    tag: mixed-in
+    listen: 127.0.0.1
+    listen_port: 7890
+
+  # Native SOCKS5 inbound with authentication
+  - type: socks
+    tag: socks-in
+    listen: 127.0.0.1
+    listen_port: 10808
+    users:
+      - username: user1
+        password: password123
+
+  # Transparent proxy TUN interface (Linux /dev/net/tun with TCP/UDP stack)
+  - type: tun
+    tag: tun-in
+    interface_name: tun0
+    mtu: 1500
+
+# Outbounds and group balancers
+outbounds:
+  - type: direct
+    tag: direct
+
+  - type: block
+    tag: block
+
+  # VLESS with REALITY security and Vision flow
+  - type: vless
+    tag: vless-reality-node
+    server: 1.2.3.4
+    server_port: 443
+    uuid: a1b2c3d4-e5f6-7890-1234-56789abcdef0
+    flow: xtls-rprx-vision
+    tls:
+      enabled: true
+      server_name: www.microsoft.com
+    reality:
+      enabled: true
+      public_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      short_id: "0123456789abcdef"
+
+  # Trojan over TLS
+  - type: trojan
+    tag: trojan-node
+    server: trojan.example.com
+    server_port: 443
+    password: my-trojan-password
+    tls:
+      enabled: true
+      server_name: trojan.example.com
+
+  # VLESS over TLS + WebSocket framing (Cloudflare CDN-compatible)
+  - type: vless
+    tag: vless-ws-node
+    server: cdn.example.com
+    server_port: 443
+    uuid: a1b2c3d4-e5f6-7890-1234-56789abcdef0
+    tls:
+      enabled: true
+      server_name: cdn.example.com
+    transport:
+      type: ws
+      path: /my-secret-tunnel
+      headers:
+        Host: custom.host.org
+
+  # Shadowsocks AEAD
+  - type: shadowsocks
+    tag: ss-node
+    server: ss.example.com
+    server_port: 8388
+    password: my-ss-password
+    method: 2022-blake3-chacha20-poly1305
+
+  # Selector group: manual selection through dashboard
+  - type: selector
+    tag: proxy-selector
+    outbounds:
+      - vless-reality-node
+      - trojan-node
+      - ss-node
+      - direct
+    default: vless-reality-node
+
+  # UrlTest group: latency-based automated failover
+  - type: urltest
+    tag: auto-latency
+    outbounds:
+      - vless-reality-node
+      - trojan-node
+      - ss-node
+    url: http://cp.cloudflare.com/generate_204
+    interval: 300s
+    tolerance: 50
+
+  # Fallback group: priority active-passive failover
+  - type: fallback
+    tag: auto-fallback
+    outbounds:
+      - vless-reality-node
+      - trojan-node
+      - direct
+
+  # LoadBalance group: round-robin or consistent-hashing
+  - type: loadbalance
+    tag: auto-loadbalance
+    outbounds:
+      - vless-reality-node
+      - trojan-node
+    strategy: round-robin
+
+# Routing engine rules
+route:
+  rules:
+    # Direct local and private networks
+    - ip_cidr:
+        - 127.0.0.0/8
+        - 10.0.0.0/8
+        - 172.16.0.0/12
+        - 192.168.0.0/16
+      outbound: direct
+
+    # Block telemetry & ads
+    - domain_keyword:
+        - telemetry
+        - analytics
+      outbound: block
+
+    # Route specific domains through proxy selector
+    - domain_suffix:
+        - google.com
+        - youtube.com
+        - telegram.org
+      outbound: proxy-selector
+
+    # Route TCP traffic on port 443 through latency balancer
+    - network:
+        - tcp
+      port:
+        - 443
+      outbound: auto-latency
+
+  final: auto-fallback
+
+# Flux Core Native REST API
+api:
+  listen: 127.0.0.1:9090
+  secret: ${FLUX_API_SECRET:-mysecret}

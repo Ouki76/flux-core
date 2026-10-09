@@ -1,6 +1,19 @@
 use base64::prelude::*;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use flux_types::{FluxError, FluxResult, TargetAddress};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 pub struct HttpHandshake;
 
@@ -19,24 +32,41 @@ impl HttpHandshake {
         users: Option<&[(String, String)]>,
     ) -> FluxResult<(TargetAddress, Option<Vec<u8>>, Option<String>)> {
         let mut buf = Vec::with_capacity(1024);
-        let mut byte = [0u8; 1];
+        let mut chunk = [0u8; 512];
+        let mut header_end = None;
 
-        // Read until \r\n\r\n (end of HTTP headers)
+        // Read until \r\n\r\n or \n\n (end of HTTP headers)
         while buf.len() < 8192 {
-            stream.read_exact(&mut byte).await.map_err(|e| {
-                FluxError::Protocol {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| FluxError::Protocol {
                     protocol: "http",
-                    message: format!("failed to read http header byte: {}", e),
-                }
-            })?;
-            buf.push(byte[0]);
+                    message: format!("failed to read http header: {}", e),
+                })?;
+            if n == 0 {
+                return Err(FluxError::Protocol {
+                    protocol: "http",
+                    message: "unexpected EOF reading http header".into(),
+                });
+            }
+            buf.extend_from_slice(&chunk[..n]);
 
-            if buf.ends_with(b"\r\n\r\n") || buf.ends_with(b"\n\n") {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+                break;
+            } else if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                header_end = Some(pos + 2);
                 break;
             }
         }
 
-        let header_str = String::from_utf8_lossy(&buf);
+        let h_end = header_end.ok_or_else(|| FluxError::Protocol {
+            protocol: "http",
+            message: "http header too large or missing terminal CRLF".into(),
+        })?;
+
+        let header_str = String::from_utf8_lossy(&buf[..h_end]);
         let mut lines = header_str.lines();
         let request_line = lines.next().ok_or_else(|| FluxError::Protocol {
             protocol: "http",
@@ -60,7 +90,9 @@ impl HttpHandshake {
             }
         }
 
-        if let Some(user_list) = users && !user_list.is_empty() {
+        if let Some(user_list) = users
+            && !user_list.is_empty()
+        {
             let mut auth_ok = false;
             if let Some(auth_val) = &proxy_auth_header_val
                 && let Some(b64) = auth_val.strip_prefix("Basic ")
@@ -68,7 +100,9 @@ impl HttpHandshake {
             {
                 let cred_str = String::from_utf8_lossy(&decoded);
                 if let Some((u, p)) = cred_str.split_once(':')
-                    && user_list.iter().any(|(lu, lp)| lu == u && lp == p)
+                    && user_list
+                        .iter()
+                        .any(|(lu, lp)| constant_time_eq_str(lu, u) && constant_time_eq_str(lp, p))
                 {
                     auth_ok = true;
                     authenticated_user = Some(u.to_string());
@@ -79,7 +113,9 @@ impl HttpHandshake {
                 let resp = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"flux-core\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
                 stream.write_all(resp.as_bytes()).await?;
                 stream.flush().await?;
-                return Err(FluxError::AuthFailed("HTTP proxy authentication required".into()));
+                return Err(FluxError::AuthFailed(
+                    "HTTP proxy authentication required".into(),
+                ));
             }
         }
 
@@ -90,13 +126,21 @@ impl HttpHandshake {
             })?;
 
             // Send 200 Connection Established
-            stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await?;
             stream.flush().await?;
 
-            Ok((target, None, authenticated_user))
+            let prefix = if buf.len() > h_end {
+                Some(buf[h_end..].to_vec())
+            } else {
+                None
+            };
+
+            Ok((target, prefix, authenticated_user))
         } else {
-            // Forward proxy GET/POST/HEAD http://example.com:80/path
-            if uri.starts_with("http://") || uri.starts_with("https://") {
+            // Forward proxy GET/POST/HEAD http://example.com:80/path OR origin-form /path with Host: header
+            let (target, path) = if uri.starts_with("http://") || uri.starts_with("https://") {
                 let without_scheme = uri.split_once("://").map(|(_, rest)| rest).unwrap_or(uri);
                 let (host_and_port, path) = match without_scheme.split_once('/') {
                     Some((hp, p)) => (hp, format!("/{}", p)),
@@ -107,31 +151,60 @@ impl HttpHandshake {
                 } else {
                     format!("{}:80", host_and_port).parse()?
                 };
-
-                // Reconstruct HTTP request line in origin-form: METHOD /path HTTP/1.1
-                // Filter out Proxy-Authorization so credentials are not leaked upstream
-                let new_request_line = format!("{} {} {}\r\n", method, path, version);
-                let mut reconstructed = Vec::new();
-                reconstructed.extend_from_slice(new_request_line.as_bytes());
-
-                for line in header_str.lines().skip(1) {
-                    if let Some((k, _)) = line.split_once(':')
-                        && k.trim().eq_ignore_ascii_case("proxy-authorization")
-                    {
-                        continue; // Skip auth header upstream
-                    }
-                    reconstructed.extend_from_slice(line.as_bytes());
-                    reconstructed.extend_from_slice(b"\r\n");
+                (target, path)
+            } else if let Some(host_hdr) = header_str.lines().find_map(|l| {
+                if let Some((k, v)) = l.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("host")
+                {
+                    Some(v.trim())
+                } else {
+                    None
                 }
-                reconstructed.extend_from_slice(b"\r\n");
-
-                Ok((target, Some(reconstructed), authenticated_user))
+            }) {
+                let target: TargetAddress = if host_hdr.contains(':') {
+                    host_hdr.parse()?
+                } else {
+                    format!("{}:80", host_hdr).parse()?
+                };
+                let path = if uri.is_empty() {
+                    "/".to_string()
+                } else {
+                    uri.to_string()
+                };
+                (target, path)
             } else {
-                Err(FluxError::Protocol {
+                return Err(FluxError::Protocol {
                     protocol: "http",
-                    message: format!("unsupported http proxy method: {}", method),
-                })
+                    message: format!(
+                        "unsupported http proxy request (no absolute URI or Host header): {}",
+                        method
+                    ),
+                });
+            };
+
+            // Reconstruct HTTP request line in origin-form: METHOD /path HTTP/1.1
+            // Filter out Proxy-Authorization so credentials are not leaked upstream
+            let new_request_line = format!("{} {} {}\r\n", method, path, version);
+            let mut reconstructed = Vec::new();
+            reconstructed.extend_from_slice(new_request_line.as_bytes());
+
+            for line in header_str.lines().skip(1) {
+                if let Some((k, _)) = line.split_once(':')
+                    && k.trim().eq_ignore_ascii_case("proxy-authorization")
+                {
+                    continue; // Skip auth header upstream
+                }
+                reconstructed.extend_from_slice(line.as_bytes());
+                reconstructed.extend_from_slice(b"\r\n");
             }
+            reconstructed.extend_from_slice(b"\r\n");
+
+            // Append any body payload already read
+            if buf.len() > h_end {
+                reconstructed.extend_from_slice(&buf[h_end..]);
+            }
+
+            Ok((target, Some(reconstructed), authenticated_user))
         }
     }
 
@@ -139,16 +212,17 @@ impl HttpHandshake {
     pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
         target: &TargetAddress,
-    ) -> FluxResult<()> {
+    ) -> FluxResult<Option<Vec<u8>>> {
         Self::client_handshake_with_auth(stream, target, None).await
     }
 
     /// Client-side: establish HTTP CONNECT tunnel with optional Basic credentials.
+    /// Returns any excess buffered payload received beyond the 200 Connection Established header.
     pub async fn client_handshake_with_auth<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
         target: &TargetAddress,
         auth: Option<(&str, &str)>,
-    ) -> FluxResult<()> {
+    ) -> FluxResult<Option<Vec<u8>>> {
         let auth_hdr = if let Some((user, pass)) = auth {
             let cred = format!("{}:{}", user, pass);
             let b64 = BASE64_STANDARD.encode(cred);
@@ -166,16 +240,40 @@ impl HttpHandshake {
 
         // Read response until \r\n\r\n
         let mut buf = Vec::with_capacity(512);
-        let mut byte = [0u8; 1];
+        let mut chunk = [0u8; 256];
+        let mut header_end = None;
+
         while buf.len() < 4096 {
-            stream.read_exact(&mut byte).await?;
-            buf.push(byte[0]);
-            if buf.ends_with(b"\r\n\r\n") || buf.ends_with(b"\n\n") {
+            let n = stream
+                .read(&mut chunk)
+                .await
+                .map_err(|e| FluxError::Protocol {
+                    protocol: "http",
+                    message: format!("failed to read http connect response: {}", e),
+                })?;
+            if n == 0 {
+                return Err(FluxError::Protocol {
+                    protocol: "http",
+                    message: "unexpected EOF reading http connect response".into(),
+                });
+            }
+            buf.extend_from_slice(&chunk[..n]);
+
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = Some(pos + 4);
+                break;
+            } else if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                header_end = Some(pos + 2);
                 break;
             }
         }
 
-        let resp_str = String::from_utf8_lossy(&buf);
+        let h_end = header_end.ok_or_else(|| FluxError::Protocol {
+            protocol: "http",
+            message: "http connect response header too large or missing terminal CRLF".into(),
+        })?;
+
+        let resp_str = String::from_utf8_lossy(&buf[..h_end]);
         let first_line = resp_str.lines().next().unwrap_or("");
         if !first_line.contains("200") {
             return Err(FluxError::Protocol {
@@ -184,7 +282,13 @@ impl HttpHandshake {
             });
         }
 
-        Ok(())
+        let excess = if buf.len() > h_end {
+            Some(buf[h_end..].to_vec())
+        } else {
+            None
+        };
+
+        Ok(excess)
     }
 }
 
@@ -204,7 +308,9 @@ mod tests {
 
         let cli = tokio::spawn(async move {
             let target = TargetAddress::domain("example.com", 443);
-            HttpHandshake::client_handshake(&mut client, &target).await.unwrap();
+            HttpHandshake::client_handshake(&mut client, &target)
+                .await
+                .unwrap();
         });
 
         srv.await.unwrap();
@@ -217,9 +323,10 @@ mod tests {
         let allowed = vec![("agent".to_string(), "supersecret".to_string())];
 
         let srv = tokio::spawn(async move {
-            let (target, _, user) = HttpHandshake::server_handshake_with_auth(&mut server, Some(&allowed))
-                .await
-                .unwrap();
+            let (target, _, user) =
+                HttpHandshake::server_handshake_with_auth(&mut server, Some(&allowed))
+                    .await
+                    .unwrap();
             assert_eq!(target.host(), "example.com");
             assert_eq!(user, Some("agent".to_string()));
         });

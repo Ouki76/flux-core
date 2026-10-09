@@ -1,6 +1,6 @@
+use flux_types::{FluxError, FluxResult, TargetAddress};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use flux_types::{FluxError, FluxResult, TargetAddress};
 
 pub const SOCKS5_VERSION: u8 = 0x05;
 pub const METHOD_NO_AUTH: u8 = 0x00;
@@ -35,6 +35,19 @@ pub struct Socks5Request {
     pub address: TargetAddress,
 }
 
+fn constant_time_eq_str(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    if a_bytes.len() != b_bytes.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// SOCKS5 protocol handler supporting RFC 1928 and RFC 1929 authentication.
 pub struct Socks5Handshake;
 
@@ -43,7 +56,9 @@ impl Socks5Handshake {
     pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         stream: &mut S,
     ) -> FluxResult<()> {
-        Self::server_handshake_with_auth(stream, None).await.map(|_| ())
+        Self::server_handshake_with_auth(stream, None)
+            .await
+            .map(|_| ())
     }
 
     /// Server-side: negotiate auth with optional RFC 1929 username/password list.
@@ -52,12 +67,13 @@ impl Socks5Handshake {
         users: Option<&[(String, String)]>,
     ) -> FluxResult<Option<String>> {
         let mut ver_nmethods = [0u8; 2];
-        stream.read_exact(&mut ver_nmethods).await.map_err(|e| {
-            FluxError::Protocol {
+        stream
+            .read_exact(&mut ver_nmethods)
+            .await
+            .map_err(|e| FluxError::Protocol {
                 protocol: "socks5",
                 message: format!("failed to read version & nmethods: {}", e),
-            }
-        })?;
+            })?;
 
         if ver_nmethods[0] != SOCKS5_VERSION {
             return Err(FluxError::Protocol {
@@ -67,20 +83,27 @@ impl Socks5Handshake {
         }
 
         let nmethods = ver_nmethods[1] as usize;
-        let mut methods = vec![0u8; nmethods];
-        stream.read_exact(&mut methods).await.map_err(|e| {
-            FluxError::Protocol {
+        let mut methods = [0u8; 256];
+        stream
+            .read_exact(&mut methods[..nmethods])
+            .await
+            .map_err(|e| FluxError::Protocol {
                 protocol: "socks5",
                 message: format!("failed to read auth methods: {}", e),
-            }
-        })?;
+            })?;
 
-        if let Some(user_list) = users && !user_list.is_empty() {
+        if let Some(user_list) = users
+            && !user_list.is_empty()
+        {
             // Server requires username/password
-            if !methods.contains(&METHOD_PASSWORD) {
-                stream.write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE]).await?;
+            if !methods[..nmethods].contains(&METHOD_PASSWORD) {
+                stream
+                    .write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE])
+                    .await?;
                 stream.flush().await?;
-                return Err(FluxError::AuthFailed("client does not support password auth".into()));
+                return Err(FluxError::AuthFailed(
+                    "client does not support password auth".into(),
+                ));
             }
 
             stream.write_all(&[SOCKS5_VERSION, METHOD_PASSWORD]).await?;
@@ -108,7 +131,9 @@ impl Socks5Handshake {
             stream.read_exact(&mut p_buf).await?;
             let password = String::from_utf8_lossy(&p_buf).to_string();
 
-            let matched = user_list.iter().any(|(u, p)| u == &username && p == &password);
+            let matched = user_list.iter().any(|(u, p)| {
+                constant_time_eq_str(u, &username) && constant_time_eq_str(p, &password)
+            });
             if matched {
                 // Success: 0x01 0x00
                 stream.write_all(&[0x01, 0x00]).await?;
@@ -118,7 +143,10 @@ impl Socks5Handshake {
                 // Fail: 0x01 0x01
                 stream.write_all(&[0x01, 0x01]).await?;
                 stream.flush().await?;
-                Err(FluxError::AuthFailed(format!("invalid credentials for user '{}'", username)))
+                Err(FluxError::AuthFailed(format!(
+                    "invalid credentials for user '{}'",
+                    username
+                )))
             }
         } else {
             // No auth required
@@ -127,7 +155,9 @@ impl Socks5Handshake {
                 stream.flush().await?;
                 Ok(None)
             } else {
-                stream.write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE]).await?;
+                stream
+                    .write_all(&[SOCKS5_VERSION, METHOD_NO_ACCEPTABLE])
+                    .await?;
                 stream.flush().await?;
                 Err(FluxError::AuthFailed("no acceptable auth method".into()))
             }
@@ -139,12 +169,13 @@ impl Socks5Handshake {
         stream: &mut S,
     ) -> FluxResult<Socks5Request> {
         let mut header = [0u8; 4];
-        stream.read_exact(&mut header).await.map_err(|e| {
-            FluxError::Protocol {
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(|e| FluxError::Protocol {
                 protocol: "socks5",
                 message: format!("failed to read request header: {}", e),
-            }
-        })?;
+            })?;
 
         if header[0] != SOCKS5_VERSION {
             return Err(FluxError::Protocol {
@@ -179,73 +210,65 @@ impl Socks5Handshake {
     ) -> FluxResult<TargetAddress> {
         match atyp {
             ATYP_IPV4 => {
-                let mut ip_bytes = [0u8; 4];
-                stream.read_exact(&mut ip_bytes).await.map_err(|e| {
-                    FluxError::Protocol {
+                let mut buf = [0u8; 6];
+                stream
+                    .read_exact(&mut buf)
+                    .await
+                    .map_err(|e| FluxError::Protocol {
                         protocol: "socks5",
-                        message: format!("failed to read ipv4: {}", e),
-                    }
-                })?;
-                let mut port_bytes = [0u8; 2];
-                stream.read_exact(&mut port_bytes).await.map_err(|e| {
-                    FluxError::Protocol {
-                        protocol: "socks5",
-                        message: format!("failed to read port: {}", e),
-                    }
-                })?;
-                let ip = Ipv4Addr::from(ip_bytes);
-                let port = u16::from_be_bytes(port_bytes);
+                        message: format!("failed to read ipv4 and port: {}", e),
+                    })?;
+                let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
+                let port = u16::from_be_bytes([buf[4], buf[5]]);
                 Ok(TargetAddress::Ip(SocketAddr::new(ip.into(), port)))
             }
             ATYP_DOMAIN => {
                 let mut len = [0u8; 1];
-                stream.read_exact(&mut len).await.map_err(|e| {
-                    FluxError::Protocol {
+                stream
+                    .read_exact(&mut len)
+                    .await
+                    .map_err(|e| FluxError::Protocol {
                         protocol: "socks5",
                         message: format!("failed to read domain len: {}", e),
-                    }
-                })?;
+                    })?;
                 let domain_len = len[0] as usize;
-                let mut domain_buf = vec![0u8; domain_len];
-                stream.read_exact(&mut domain_buf).await.map_err(|e| {
-                    FluxError::Protocol {
+                if domain_len == 0 {
+                    return Err(FluxError::Protocol {
                         protocol: "socks5",
-                        message: format!("failed to read domain string: {}", e),
-                    }
-                })?;
-                let domain = String::from_utf8(domain_buf).map_err(|e| {
-                    FluxError::Protocol {
+                        message: "empty domain length in socks5 request".into(),
+                    });
+                }
+                let mut buf = [0u8; 257]; // Max RFC 1928 domain (255) + port (2)
+                let to_read = domain_len + 2;
+                stream
+                    .read_exact(&mut buf[..to_read])
+                    .await
+                    .map_err(|e| FluxError::Protocol {
+                        protocol: "socks5",
+                        message: format!("failed to read domain string and port: {}", e),
+                    })?;
+                let domain = std::str::from_utf8(&buf[..domain_len])
+                    .map_err(|e| FluxError::Protocol {
                         protocol: "socks5",
                         message: format!("invalid utf-8 domain: {}", e),
-                    }
-                })?;
-                let mut port_bytes = [0u8; 2];
-                stream.read_exact(&mut port_bytes).await.map_err(|e| {
-                    FluxError::Protocol {
-                        protocol: "socks5",
-                        message: format!("failed to read port: {}", e),
-                    }
-                })?;
-                let port = u16::from_be_bytes(port_bytes);
+                    })?
+                    .to_string();
+                let port = u16::from_be_bytes([buf[domain_len], buf[domain_len + 1]]);
                 Ok(TargetAddress::Domain(domain, port))
             }
             ATYP_IPV6 => {
+                let mut buf = [0u8; 18];
+                stream
+                    .read_exact(&mut buf)
+                    .await
+                    .map_err(|e| FluxError::Protocol {
+                        protocol: "socks5",
+                        message: format!("failed to read ipv6 and port: {}", e),
+                    })?;
                 let mut ip_bytes = [0u8; 16];
-                stream.read_exact(&mut ip_bytes).await.map_err(|e| {
-                    FluxError::Protocol {
-                        protocol: "socks5",
-                        message: format!("failed to read ipv6: {}", e),
-                    }
-                })?;
-                let mut port_bytes = [0u8; 2];
-                stream.read_exact(&mut port_bytes).await.map_err(|e| {
-                    FluxError::Protocol {
-                        protocol: "socks5",
-                        message: format!("failed to read port: {}", e),
-                    }
-                })?;
+                ip_bytes.copy_from_slice(&buf[..16]);
                 let ip = Ipv6Addr::from(ip_bytes);
-                let port = u16::from_be_bytes(port_bytes);
+                let port = u16::from_be_bytes([buf[16], buf[17]]);
                 Ok(TargetAddress::Ip(SocketAddr::new(ip.into(), port)))
             }
             _ => Err(FluxError::Protocol {
@@ -307,13 +330,17 @@ impl Socks5Handshake {
     ) -> FluxResult<Option<SocketAddr>> {
         if let Some((user, pass)) = auth {
             // Client supports Password Auth
-            stream.write_all(&[SOCKS5_VERSION, 1, METHOD_PASSWORD]).await?;
+            stream
+                .write_all(&[SOCKS5_VERSION, 1, METHOD_PASSWORD])
+                .await?;
             stream.flush().await?;
 
             let mut resp = [0u8; 2];
             stream.read_exact(&mut resp).await?;
             if resp[0] != SOCKS5_VERSION || resp[1] != METHOD_PASSWORD {
-                return Err(FluxError::AuthFailed("server rejected password auth method".into()));
+                return Err(FluxError::AuthFailed(
+                    "server rejected password auth method".into(),
+                ));
             }
 
             // Send RFC 1929 Auth Request
@@ -333,7 +360,9 @@ impl Socks5Handshake {
             }
         } else {
             // Client greeting (No Auth)
-            stream.write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH]).await?;
+            stream
+                .write_all(&[SOCKS5_VERSION, 1, METHOD_NO_AUTH])
+                .await?;
             stream.flush().await?;
 
             let mut resp = [0u8; 2];
@@ -411,17 +440,23 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(1024);
 
         let srv_task = tokio::spawn(async move {
-            Socks5Handshake::server_handshake(&mut server).await.unwrap();
+            Socks5Handshake::server_handshake(&mut server)
+                .await
+                .unwrap();
             let req = Socks5Handshake::read_request(&mut server).await.unwrap();
             assert_eq!(req.command, Socks5Command::Connect);
             assert_eq!(req.address.host(), "example.com");
             assert_eq!(req.address.port(), 443);
-            Socks5Handshake::send_reply(&mut server, REP_SUCCESS, None).await.unwrap();
+            Socks5Handshake::send_reply(&mut server, REP_SUCCESS, None)
+                .await
+                .unwrap();
         });
 
         let client_task = tokio::spawn(async move {
             let target = TargetAddress::domain("example.com", 443);
-            Socks5Handshake::client_handshake(&mut client, CMD_CONNECT, &target).await.unwrap();
+            Socks5Handshake::client_handshake(&mut client, CMD_CONNECT, &target)
+                .await
+                .unwrap();
         });
 
         srv_task.await.unwrap();
@@ -434,11 +469,15 @@ mod tests {
         let allowed = vec![("admin".to_string(), "pass123".to_string())];
 
         let srv_task = tokio::spawn(async move {
-            let user = Socks5Handshake::server_handshake_with_auth(&mut server, Some(&allowed)).await.unwrap();
+            let user = Socks5Handshake::server_handshake_with_auth(&mut server, Some(&allowed))
+                .await
+                .unwrap();
             assert_eq!(user, Some("admin".to_string()));
             let req = Socks5Handshake::read_request(&mut server).await.unwrap();
             assert_eq!(req.command, Socks5Command::Connect);
-            Socks5Handshake::send_reply(&mut server, REP_SUCCESS, None).await.unwrap();
+            Socks5Handshake::send_reply(&mut server, REP_SUCCESS, None)
+                .await
+                .unwrap();
         });
 
         let client_task = tokio::spawn(async move {

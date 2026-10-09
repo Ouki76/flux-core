@@ -13,9 +13,15 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
-serde = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
 rand = { workspace = true }
-parking_lot = "0.12"
+parking_lot = { workspace = true }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+tokio-util = { workspace = true }

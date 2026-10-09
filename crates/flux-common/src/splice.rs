@@ -1,6 +1,6 @@
+use std::io;
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::io;
 #[cfg(target_os = "linux")]
 use tokio::io::Interest;
 use tokio::net::TcpStream;
@@ -19,14 +19,40 @@ impl Pipe {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
-        // Expand in-kernel pipe capacity to 1MB to saturate multi-gigabit connections
+        // Set in-kernel pipe capacity to 64KB (optimal performance while staying within kernel user pipe limits)
         unsafe {
-            libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 1048576);
+            libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 65536);
         };
         Ok(Self {
             reader: fds[0],
             writer: fds[1],
         })
+    }
+
+    /// Drains any remaining bytes from the in-kernel pipe in non-blocking mode
+    /// to prevent cross-connection data leakage when recycled into the pool.
+    fn drain(&self) -> bool {
+        let mut scratch = [0u8; 16384];
+        loop {
+            let res = unsafe {
+                libc::read(
+                    self.reader,
+                    scratch.as_mut_ptr() as *mut libc::c_void,
+                    scratch.len(),
+                )
+            };
+            if res < 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EAGAIN)
+                    || err.raw_os_error() == Some(libc::EWOULDBLOCK)
+                {
+                    return true;
+                }
+                return false;
+            } else if res == 0 {
+                return true;
+            }
+        }
     }
 }
 
@@ -40,12 +66,73 @@ impl Drop for Pipe {
     }
 }
 
+#[cfg(target_os = "linux")]
+struct PipePool {
+    pool: parking_lot::Mutex<Vec<Pipe>>,
+}
+
+#[cfg(target_os = "linux")]
+impl PipePool {
+    fn global() -> &'static Self {
+        static INSTANCE: std::sync::OnceLock<PipePool> = std::sync::OnceLock::new();
+        INSTANCE.get_or_init(|| PipePool {
+            pool: parking_lot::Mutex::new(Vec::with_capacity(64)),
+        })
+    }
+
+    fn acquire() -> io::Result<PooledPipe> {
+        if let Some(pipe) = Self::global().pool.lock().pop() {
+            return Ok(PooledPipe { pipe: Some(pipe) });
+        }
+        let pipe = Pipe::new()?;
+        Ok(PooledPipe { pipe: Some(pipe) })
+    }
+
+    fn release(pipe: Pipe) {
+        if !pipe.drain() {
+            // Do not recycle pipe if draining failed or descriptors encountered an error
+            return;
+        }
+        let mut guard = Self::global().pool.lock();
+        if guard.len() < 128 {
+            guard.push(pipe);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PooledPipe {
+    pipe: Option<Pipe>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::ops::Deref for PooledPipe {
+    type Target = Pipe;
+    fn deref(&self) -> &Self::Target {
+        self.pipe.as_ref().unwrap()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PooledPipe {
+    fn drop(&mut self) {
+        if let Some(pipe) = self.pipe.take() {
+            PipePool::release(pipe);
+        }
+    }
+}
+
 /// Linux zero-copy unidirectional splice between two TCP streams via an in-kernel pipe.
 #[cfg(target_os = "linux")]
-async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> io::Result<u64> {
-    let pipe = Pipe::new()?;
+async fn splice_direction(
+    read_stream: &TcpStream,
+    write_stream: &TcpStream,
+    c1: Option<&std::sync::atomic::AtomicU64>,
+    c2: Option<&std::sync::atomic::AtomicU64>,
+) -> io::Result<u64> {
+    let pipe = PipePool::acquire()?;
     let mut transferred: u64 = 0;
-    const SPLICE_CHUNK: usize = 1048576; // 1 MB batch size
+    const SPLICE_CHUNK: usize = 65536; // Matches optimal in-kernel pipe size
 
     loop {
         // 1. Drain socket into pipe in a non-blocking kernel loop
@@ -72,11 +159,13 @@ async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> 
                     };
                     if res < 0 {
                         let err = io::Error::last_os_error();
-                        if err.kind() == io::ErrorKind::WouldBlock {
+                        if err.kind() == io::ErrorKind::WouldBlock
+                            || err.raw_os_error() == Some(libc::ENOSPC)
+                        {
                             if pipe_filled > 0 {
                                 return Ok(());
                             }
-                            return Err(err);
+                            return Err(io::Error::from_raw_os_error(libc::EAGAIN));
                         }
                         return Err(err);
                     }
@@ -118,11 +207,13 @@ async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> 
                         };
                         if res < 0 {
                             let err = io::Error::last_os_error();
-                            if err.kind() == io::ErrorKind::WouldBlock {
+                            if err.kind() == io::ErrorKind::WouldBlock
+                                || err.raw_os_error() == Some(libc::ENOSPC)
+                            {
                                 if n_written > 0 {
                                     return Ok(());
                                 }
-                                return Err(err);
+                                return Err(io::Error::from_raw_os_error(libc::EAGAIN));
                             }
                             return Err(err);
                         }
@@ -133,6 +224,12 @@ async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> 
                 .await?;
 
             transferred += n_written as u64;
+            if let Some(c) = c1 {
+                c.fetch_add(n_written as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            if let Some(c) = c2 {
+                c.fetch_add(n_written as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         if eof {
@@ -148,22 +245,93 @@ async fn splice_direction(read_stream: &TcpStream, write_stream: &TcpStream) -> 
 
 /// Linux zero-copy bidirectional splice.
 /// Falls back to standard copy_bidirectional if splice is unsupported or on non-Linux OS.
-pub async fn copy_bidirectional_zero_copy(
+pub async fn copy_bidirectional_zero_copy(a: &TcpStream, b: &TcpStream) -> io::Result<(u64, u64)> {
+    copy_bidirectional_zero_copy_metered(a, b, None, None, None, None).await
+}
+
+async fn copy_direction_ref(
+    read_stream: &TcpStream,
+    write_stream: &TcpStream,
+    c1: Option<&std::sync::atomic::AtomicU64>,
+    c2: Option<&std::sync::atomic::AtomicU64>,
+) -> io::Result<u64> {
+    let mut transferred: u64 = 0;
+    let mut buf = [0u8; 16384];
+    loop {
+        read_stream.readable().await?;
+        let n = match read_stream.try_read(&mut buf) {
+            Ok(0) => {
+                #[cfg(unix)]
+                unsafe {
+                    use std::os::fd::AsRawFd;
+                    libc::shutdown(write_stream.as_raw_fd(), libc::SHUT_WR);
+                };
+                break;
+            }
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e),
+        };
+
+        let mut pos = 0;
+        while pos < n {
+            write_stream.writable().await?;
+            match write_stream.try_write(&buf[pos..n]) {
+                Ok(w) => {
+                    pos += w;
+                    transferred += w as u64;
+                    if let Some(c) = c1 {
+                        c.fetch_add(w as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Some(c) = c2 {
+                        c.fetch_add(w as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(transferred)
+}
+
+/// Linux zero-copy bidirectional splice with optional real-time atomic traffic metering.
+pub async fn copy_bidirectional_zero_copy_metered(
     a: &TcpStream,
     b: &TcpStream,
+    a_to_b_1: Option<&std::sync::atomic::AtomicU64>,
+    a_to_b_2: Option<&std::sync::atomic::AtomicU64>,
+    b_to_a_1: Option<&std::sync::atomic::AtomicU64>,
+    b_to_a_2: Option<&std::sync::atomic::AtomicU64>,
 ) -> io::Result<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
-        let t1 = splice_direction(a, b);
-        let t2 = splice_direction(b, a);
-        tokio::try_join!(t1, t2)
+        let t1 = splice_direction(a, b, a_to_b_1, a_to_b_2);
+        let t2 = splice_direction(b, a, b_to_a_1, b_to_a_2);
+        match tokio::try_join!(t1, t2) {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                let code = e.raw_os_error();
+                if code == Some(libc::EINVAL)
+                    || code == Some(libc::ENOSYS)
+                    || code == Some(libc::EMFILE)
+                    || code == Some(libc::ENFILE)
+                {
+                    let f1 = copy_direction_ref(a, b, a_to_b_1, a_to_b_2);
+                    let f2 = copy_direction_ref(b, a, b_to_a_1, b_to_a_2);
+                    tokio::try_join!(f1, f2)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let mut ca = a.try_clone().await?;
-        let mut cb = b.try_clone().await?;
-        crate::copy::copy_bidirectional(&mut ca, &mut cb).await
+        let f1 = copy_direction_ref(a, b, a_to_b_1, a_to_b_2);
+        let f2 = copy_direction_ref(b, a, b_to_a_1, b_to_a_2);
+        tokio::try_join!(f1, f2)
     }
 }
 
@@ -205,5 +373,23 @@ mod tests {
         let mut buf = vec![0u8; 12];
         client.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"SPLICE_REPLY");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pipe_drain_on_recycle() {
+        let pipe = Pipe::new().unwrap();
+        // Write dirty bytes to pipe
+        unsafe {
+            libc::write(
+                pipe.writer,
+                b"DIRTY_LEAKED_BYTES".as_ptr() as *const libc::c_void,
+                18,
+            );
+        }
+        // Draining must empty the pipe
+        assert!(pipe.drain());
+        // Second drain must also succeed and report clean
+        assert!(pipe.drain());
     }
 }

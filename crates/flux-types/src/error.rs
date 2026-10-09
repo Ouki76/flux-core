@@ -40,6 +40,9 @@ pub enum FluxError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Network error: {0}")]
+    Network(String),
 }
 
 pub type FluxResult<T> = Result<T, FluxError>;

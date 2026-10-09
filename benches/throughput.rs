@@ -1,10 +1,10 @@
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use flux_app::{Config, Instance};
+use flux_protocol::socks5::{CMD_CONNECT, Socks5Handshake};
+use flux_router::Router;
+use flux_types::{NetworkType, SessionMeta, TargetAddress};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use flux_types::{NetworkType, SessionMeta, TargetAddress};
-use flux_router::Router;
-use flux_app::{Config, Instance};
-use flux_protocol::socks5::{Socks5Handshake, CMD_CONNECT};
 
 fn bench_router(c: &mut Criterion) {
     let mut rules = Vec::new();
@@ -100,7 +100,7 @@ fn bench_proxy_throughput(c: &mut Criterion) {
     });
 
     let chunk_size = 64 * 1024; // 64 KB per chunk
-    let total_chunks = 16;       // 1 MB total per run
+    let total_chunks = 16; // 1 MB total per run
     let payload = vec![0x42u8; chunk_size];
 
     let mut group = c.benchmark_group("socks5_proxy_throughput");

@@ -1,8 +1,8 @@
+use flux_types::{FluxError, FluxResult};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use flux_types::{FluxError, FluxResult};
 
 pub struct TcpTransport;
 
@@ -11,7 +11,12 @@ impl TcpTransport {
         let stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => return Err(FluxError::Io(e)),
-            Err(_) => return Err(FluxError::Timeout(format!("connecting to {} timed out", addr))),
+            Err(_) => {
+                return Err(FluxError::Timeout(format!(
+                    "connecting to {} timed out",
+                    addr
+                )));
+            }
         };
 
         let _ = stream.set_nodelay(true);
@@ -37,7 +42,9 @@ mod tests {
             drop(conn);
         });
 
-        let cli = TcpTransport::connect(local_addr, Duration::from_secs(1)).await.unwrap();
+        let cli = TcpTransport::connect(local_addr, Duration::from_secs(1))
+            .await
+            .unwrap();
         drop(cli);
         srv.await.unwrap();
     }

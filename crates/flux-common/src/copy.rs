@@ -1,16 +1,106 @@
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub const DEFAULT_COPY_BUFFER_SIZE: usize = 128 * 1024; // 128 KB balanced high-throughput buffer
+pub const DEFAULT_COPY_BUFFER_SIZE: usize = 256 * 1024; // 256 KB optimal saturated buffer
 
-/// Bidirectional copy between two streams using lock-free Tokio copy with 256KB buffers.
+/// An AsyncRead + AsyncWrite stream wrapper that updates atomic counters in real time.
+pub struct MeteredStream<S> {
+    inner: S,
+    read_bytes: Arc<AtomicU64>,
+    written_bytes: Arc<AtomicU64>,
+    global_read: Option<Arc<AtomicU64>>,
+    global_written: Option<Arc<AtomicU64>>,
+}
+
+impl<S> MeteredStream<S> {
+    pub fn new(inner: S, read_bytes: Arc<AtomicU64>, written_bytes: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            read_bytes,
+            written_bytes,
+            global_read: None,
+            global_written: None,
+        }
+    }
+
+    pub fn with_global(
+        mut self,
+        global_read: Arc<AtomicU64>,
+        global_written: Arc<AtomicU64>,
+    ) -> Self {
+        self.global_read = Some(global_read);
+        self.global_written = Some(global_written);
+        self
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for MeteredStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            let n = buf.filled().len().saturating_sub(before);
+            if n > 0 {
+                self.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(ref g) = self.global_read {
+                    g.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for MeteredStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let res = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &res
+            && *n > 0
+        {
+            self.written_bytes.fetch_add(*n as u64, Ordering::Relaxed);
+            if let Some(ref g) = self.global_written {
+                g.fetch_add(*n as u64, Ordering::Relaxed);
+            }
+        }
+        res
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Bidirectional copy between two streams leveraging non-deadlocking simultaneous read/write polling.
 pub async fn copy_bidirectional<A, B>(mut a: A, mut b: B) -> std::io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::io::copy_bidirectional_with_sizes(&mut a, &mut b, DEFAULT_COPY_BUFFER_SIZE, DEFAULT_COPY_BUFFER_SIZE).await
+    tokio::io::copy_bidirectional(&mut a, &mut b).await
+}
+
+/// Bidirectional stream copy between two mutable stream references without mutual deadlock.
+pub async fn copy_bidirectional_pooled<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::io::copy_bidirectional(a, b).await
 }
 
 /// A stream that prepends a prefix byte buffer before delegating to the inner stream.
@@ -83,13 +173,17 @@ mod tests {
             client.write_all(b"hello from client").await.unwrap();
             client.shutdown().await.unwrap();
             let mut buf = Vec::new();
-            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut buf).await.unwrap();
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut buf)
+                .await
+                .unwrap();
             assert_eq!(buf, b"reply from server");
         });
 
         let t2 = tokio::spawn(async move {
             let mut buf = vec![0u8; 17];
-            tokio::io::AsyncReadExt::read_exact(&mut proxy_out, &mut buf).await.unwrap();
+            tokio::io::AsyncReadExt::read_exact(&mut proxy_out, &mut buf)
+                .await
+                .unwrap();
             assert_eq!(&buf, b"hello from client");
             proxy_out.write_all(b"reply from server").await.unwrap();
             proxy_out.shutdown().await.unwrap();

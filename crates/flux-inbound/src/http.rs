@@ -1,26 +1,28 @@
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tracing::{info, warn};
 use async_trait::async_trait;
-use flux_types::{Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta};
 use flux_protocol::http::HttpHandshake;
+use flux_types::{Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta};
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, info, warn};
 
 pub struct HttpInbound {
     tag: String,
     listen_addr: SocketAddr,
     users: Vec<(String, String)>,
     running: Arc<AtomicBool>,
+    shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
 
 impl HttpInbound {
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr) -> Self {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             tag: tag.into(),
             listen_addr,
             users: vec![],
             running: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
         }
     }
 
@@ -36,24 +38,41 @@ impl Inbound for HttpInbound {
         &self.tag
     }
 
+    fn protocol(&self) -> &'static str {
+        "http"
+    }
+
+    fn listen_addr(&self) -> Option<String> {
+        Some(self.listen_addr.to_string())
+    }
+
     async fn start(&self, dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()> {
-        let listener = TcpListener::bind(self.listen_addr).await.map_err(FluxError::Io)?;
+        let listener = crate::create_reuse_port_listener(self.listen_addr)?;
 
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let users = Arc::new(self.users.clone());
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] HTTP inbound listening on {}", tag, self.listen_addr);
 
         tokio::spawn(async move {
-            while running.load(Ordering::Relaxed) {
-                let (mut socket, client_addr) = match listener.accept().await {
-                    Ok(res) => res,
-                    Err(e) => {
-                        if running.load(Ordering::Relaxed) {
-                            warn!("[{}] accept error: {}", tag, e);
+            loop {
+                let (mut socket, client_addr) = tokio::select! {
+                    res = listener.accept() => {
+                        match res {
+                            Ok(res) => res,
+                            Err(e) => {
+                                if running.load(Ordering::Relaxed) {
+                                    warn!("[{}] accept error: {}", tag, e);
+                                }
+                                break;
+                            }
                         }
+                    }
+                    _ = shutdown_rx.recv() => {
+                        debug!("[{}] HTTP listener shutting down cleanly", tag);
                         break;
                     }
                 };
@@ -64,20 +83,33 @@ impl Inbound for HttpInbound {
                 let user_list = users.clone();
 
                 tokio::spawn(async move {
-                    let (target, prefix_opt, auth_user) = match HttpHandshake::server_handshake_with_auth(&mut socket, Some(&user_list)).await {
-                        Ok(t) => t,
-                        Err(e) => {
-                            warn!("[{}] client {} HTTP handshake failed: {}", inbound_tag, client_addr, e);
+                    let handshake_fut =
+                        HttpHandshake::server_handshake_with_auth(&mut socket, Some(&user_list));
+                    let (target, prefix_opt, auth_user) = match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        handshake_fut,
+                    )
+                    .await
+                    {
+                        Ok(Ok(t)) => t,
+                        Ok(Err(e)) => {
+                            warn!(
+                                "[{}] client {} HTTP handshake failed: {}",
+                                inbound_tag, client_addr, e
+                            );
+                            return;
+                        }
+                        Err(_) => {
+                            debug!(
+                                "[{}] client {} HTTP handshake timed out",
+                                inbound_tag, client_addr
+                            );
                             return;
                         }
                     };
 
-                    let mut meta = SessionMeta::new(
-                        client_addr,
-                        target,
-                        inbound_tag,
-                        NetworkType::Tcp,
-                    );
+                    let mut meta =
+                        SessionMeta::new(client_addr, target, inbound_tag, NetworkType::Tcp);
                     if let Some(u) = auth_user {
                         meta = meta.with_user(u);
                     }
@@ -98,6 +130,7 @@ impl Inbound for HttpInbound {
 
     async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
+        let _ = self.shutdown_tx.send(());
         Ok(())
     }
 }

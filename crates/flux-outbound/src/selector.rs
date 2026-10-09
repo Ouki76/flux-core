@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, OutboundLookup, PacketEndpoint, SessionMeta,
 };
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 pub struct SelectorOutbound {
     tag: String,
@@ -53,6 +53,10 @@ impl Outbound for SelectorOutbound {
         &self.tag
     }
 
+    fn protocol(&self) -> &'static str {
+        "selector"
+    }
+
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
         let active = self.get_active()?;
         active.dial_stream(meta).await
@@ -68,7 +72,7 @@ impl Outbound for SelectorOutbound {
     }
 
     fn group_type(&self) -> Option<&'static str> {
-        Some("Selector")
+        Some("selector")
     }
 
     fn select(&self, tag: &str) -> FluxResult<()> {

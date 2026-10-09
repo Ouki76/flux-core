@@ -1,71 +1,99 @@
+use clap::{Parser, Subcommand};
+use flux_app::{ConfigFormat, Instance, load_any_config};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info, Level};
-use flux_app::{Config, Instance};
+use tracing::{Level, error, info};
 
+#[derive(Parser)]
+#[command(
+    name = "flux-core",
+    author = "flux team",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "High-performance asynchronous proxy core in Rust",
+    long_about = None
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
 enum Commands {
-    Run { config: PathBuf },
-    Check { config: PathBuf },
+    /// Run the proxy core with the specified configuration file
+    Run {
+        /// Path to configuration file (.json, .jsonc, .yaml, .yml)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Config format: auto, json, yaml
+        #[arg(short, long, default_value = "auto")]
+        format: String,
+        /// Number of worker threads (default: all CPU cores)
+        #[arg(short, long)]
+        workers: Option<usize>,
+    },
+    /// Validate configuration file without starting listeners
+    Check {
+        /// Path to configuration file (.json, .jsonc, .yaml, .yml)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Config format: auto, json, yaml
+        #[arg(short, long, default_value = "auto")]
+        format: String,
+    },
+    /// Trace how a target destination will be routed through the rules
+    Trace {
+        /// Path to configuration file (.json, .jsonc, .yaml, .yml)
+        #[arg(short, long)]
+        config: PathBuf,
+        /// Destination address to simulate (e.g. "google.com:443" or "1.1.1.1:53")
+        #[arg(short, long)]
+        destination: String,
+        /// Network protocol: tcp or udp (default: tcp)
+        #[arg(short, long, default_value = "tcp")]
+        network: String,
+        /// Inbound tag (default: "default")
+        #[arg(short, long, default_value = "default")]
+        inbound: String,
+        /// Config format: auto, json, yaml
+        #[arg(short, long, default_value = "auto")]
+        format: String,
+    },
+    /// Print detailed version information
     Version,
 }
 
-fn parse_args() -> Result<Commands, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() {
-        return Ok(Commands::Version);
-    }
-    match args[0].as_str() {
-        "run" => {
-            let mut cfg_path = None;
-            let mut i = 1;
-            while i < args.len() {
-                if (args[i] == "-c" || args[i] == "--config") && i + 1 < args.len() {
-                    cfg_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            let config = cfg_path.ok_or_else(|| "missing --config / -c argument".to_string())?;
-            Ok(Commands::Run { config })
-        }
-        "check" => {
-            let mut cfg_path = None;
-            let mut i = 1;
-            while i < args.len() {
-                if (args[i] == "-c" || args[i] == "--config") && i + 1 < args.len() {
-                    cfg_path = Some(PathBuf::from(&args[i + 1]));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            let config = cfg_path.ok_or_else(|| "missing --config / -c argument".to_string())?;
-            Ok(Commands::Check { config })
-        }
-        "version" | "-v" | "--version" => Ok(Commands::Version),
-        other => Err(format!("unknown command: {}", other)),
-    }
-}
-
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // Restrict glibc heap arenas to eliminate multi-megabyte arena fragmentation
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
+    let cli = Cli::parse();
+
     let mut builder = tokio::runtime::Builder::new_multi_thread();
-    if let Ok(workers_str) = std::env::var("FLUX_WORKERS")
-        && let Ok(w) = workers_str.parse::<usize>()
-    {
+    let workers = match &cli.command {
+        Some(Commands::Run { workers, .. }) => *workers,
+        _ => None,
+    }
+    .or_else(|| {
+        std::env::var("FLUX_WORKERS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+    });
+
+    if let Some(w) = workers {
         builder.worker_threads(w);
     }
+    builder.thread_stack_size(512 * 1024);
+
     let rt = builder.enable_all().build()?;
 
-    rt.block_on(async_main())
+    rt.block_on(async_main(cli))
 }
 
-async fn async_main() -> anyhow::Result<()> {
-    let cmd = parse_args().unwrap_or_else(|e| {
-        eprintln!("Error: {}", e);
-        eprintln!("Usage: flux-core [run|check] -c <config.json>");
-        std::process::exit(1);
-    });
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
+    let cmd = cli.command.unwrap_or(Commands::Version);
 
     let level = std::env::var("RUST_LOG")
         .ok()
@@ -86,17 +114,27 @@ async fn async_main() -> anyhow::Result<()> {
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     match cmd {
-        Commands::Run { config } => {
-            info!("Starting flux-core with config: {:?}", config);
-            let content = tokio::fs::read_to_string(&config).await?;
-            let cfg = Config::from_json_str(&content)?;
+        Commands::Run {
+            config,
+            format,
+            workers: _,
+        } => {
+            let fmt: ConfigFormat = format.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
+            info!(
+                "Starting flux-core with config: {:?} (format: {:?})",
+                config, fmt
+            );
+            let cfg = load_any_config(&config, Some(fmt))?;
             let mut current_instance = Arc::new(Instance::new(cfg)?);
             current_instance.start().await?;
 
-            info!("flux-core started successfully. Press Ctrl+C to terminate, or send SIGHUP to hot-reload.");
+            info!(
+                "flux-core started successfully. Press Ctrl+C to terminate, or send SIGHUP to hot-reload."
+            );
 
             #[cfg(unix)]
-            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+            let mut sighup =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
 
             loop {
                 #[cfg(unix)]
@@ -107,30 +145,36 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                     _ = sighup.recv() => {
                         info!("Received SIGHUP! Reloading configuration from {:?}...", config);
-                        match tokio::fs::read_to_string(&config).await {
-                            Ok(new_content) => {
-                                match Config::from_json_str(&new_content) {
-                                    Ok(new_cfg) => {
-                                        match Instance::new(new_cfg) {
-                                            Ok(new_instance) => {
-                                                if let Err(e) = new_instance.start().await {
-                                                    error!("Failed to start new instance during reload: {}", e);
-                                                } else {
-                                                    let old = current_instance.clone();
-                                                    current_instance = Arc::new(new_instance);
-                                                    tokio::spawn(async move {
-                                                        let _ = old.stop().await;
-                                                    });
-                                                    info!("Configuration hot-reloaded successfully with 0 downtime!");
-                                                }
+                        match load_any_config(&config, Some(fmt)) {
+                            Ok(new_cfg) => {
+                                match Instance::new(new_cfg) {
+                                    Ok(new_instance) => {
+                                        let has_tun = new_instance.inbounds.iter().any(|i| i.protocol() == "tun")
+                                            || current_instance.inbounds.iter().any(|i| i.protocol() == "tun");
+                                        if has_tun {
+                                            // TUN interface FD must be released before new instance can bind to tun0
+                                            let _ = current_instance.stop().await;
+                                        }
+                                        if let Err(e) = new_instance.start().await {
+                                            error!("Failed to start new instance during reload: {}", e);
+                                            if has_tun {
+                                                let _ = current_instance.start().await;
                                             }
-                                            Err(e) => error!("Failed to initialize new instance: {}", e),
+                                        } else {
+                                            let old = current_instance.clone();
+                                            current_instance = Arc::new(new_instance);
+                                            if !has_tun {
+                                                tokio::spawn(async move {
+                                                    let _ = old.stop().await;
+                                                });
+                                            }
+                                            info!("Configuration hot-reloaded successfully!");
                                         }
                                     }
-                                    Err(e) => error!("Failed to parse reloaded config: {}", e),
+                                    Err(e) => error!("Failed to initialize new instance: {}", e),
                                 }
                             }
-                            Err(e) => error!("Failed to read config file during reload: {}", e),
+                            Err(e) => error!("Failed to reload config from {:?}: {}", config, e),
                         }
                     }
                 }
@@ -146,10 +190,10 @@ async fn async_main() -> anyhow::Result<()> {
             current_instance.stop().await?;
             info!("Shutdown complete.");
         }
-        Commands::Check { config } => {
-            info!("Validating config: {:?}", config);
-            let content = tokio::fs::read_to_string(&config).await?;
-            match Config::from_json_str(&content) {
+        Commands::Check { config, format } => {
+            let fmt: ConfigFormat = format.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
+            info!("Validating config: {:?} (format: {:?})", config, fmt);
+            match load_any_config(&config, Some(fmt)) {
                 Ok(cfg) => {
                     let _instance = Instance::new(cfg)?;
                     println!("Configuration is valid!");
@@ -160,11 +204,55 @@ async fn async_main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Trace {
+            config,
+            destination,
+            network,
+            inbound,
+            format,
+        } => {
+            let fmt: ConfigFormat = format.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
+            let cfg = load_any_config(&config, Some(fmt))?;
+            let instance = Instance::new(cfg)?;
+
+            let net = match network.to_ascii_lowercase().as_str() {
+                "udp" => flux_types::NetworkType::Udp,
+                _ => flux_types::NetworkType::Tcp,
+            };
+            let dst: flux_types::TargetAddress = destination
+                .parse()
+                .unwrap_or_else(|_| flux_types::TargetAddress::domain(&destination, 80));
+            let dummy_src = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+            let meta = flux_types::SessionMeta::new(dummy_src, dst.clone(), inbound.as_str(), net);
+
+            let (matched_outbound, active_node) = instance.trace_route(&meta);
+            println!("=== flux-core Route Simulation ===");
+            println!("Destination: {}", dst);
+            println!("Network:     {}", net);
+            println!("Inbound:     {}", inbound);
+            println!("----------------------------------");
+            println!("Matched Rule Outbound: [{}]", matched_outbound);
+            println!("Active Exit Node:      [{}]", active_node);
+            println!("==================================");
+        }
         Commands::Version => {
             println!("flux-core v{}", env!("CARGO_PKG_VERSION"));
-            println!("Target: x86_64-unknown-linux-gnu");
-            println!("Protocols: SOCKS5, HTTP CONNECT, VLESS, REALITY, VISION, TROJAN, SHADOWSOCKS, TUN");
-            println!("Features: Clash REST API, Fake-IP, Hot-Reload, Linux Zero-Copy Splice");
+            println!(
+                "Target: {}-{}",
+                std::env::consts::ARCH,
+                std::env::consts::OS
+            );
+            println!(
+                "Configuration: Native Flux format (.json, .jsonc, .yaml, .yml) with modular $include"
+            );
+            println!(
+                "Protocols: SOCKS5, HTTP CONNECT, VLESS (Reality & Vision), TROJAN, SHADOWSOCKS (AEAD & 2022), VMESS (AEAD), TUN, REDIRECT, TPROXY"
+            );
+            println!(
+                "Carriers: TCP, TLS, QUIC, WebSocket, gRPC, H2, HTTPUpgrade, ShadowTLS v3, WireGuard/AmneziaWG, TUIC v5, Hysteria 2"
+            );
+            println!("Groups: Selector, UrlTest, Fallback, LoadBalance");
+            println!("API: Flux Core Native API (/api/v1/*, Unix Socket, Route Tracer)");
         }
     }
 

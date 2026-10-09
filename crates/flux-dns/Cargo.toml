@@ -5,11 +5,17 @@ edition = "2024"
 
 [dependencies]
 flux-types = { workspace = true }
+flux-transport = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 lru = { workspace = true }
 ipnet = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
+futures-util = { workspace = true }
 rand = { workspace = true }
-parking_lot = "0.12"
+parking_lot = { workspace = true }
+quinn = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+serde = { workspace = true }
+dashmap = { workspace = true }

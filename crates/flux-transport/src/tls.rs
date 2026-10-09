@@ -1,18 +1,21 @@
+use flux_types::{AsyncStream, BoxedStream, FluxError, FluxResult};
 use std::sync::Arc;
-use tokio_rustls::rustls::{self, ClientConfig, ServerConfig, RootCertStore};
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio_rustls::{TlsConnector, TlsAcceptor};
-use flux_types::{FluxError, FluxResult, AsyncStream, BoxedStream};
+use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+pub use crate::fingerprint::TlsFingerprint;
 
 pub fn init_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TlsClientConfig {
     pub server_name: String,
     pub alpn: Vec<Vec<u8>>,
     pub insecure: bool,
+    pub fingerprint: Option<TlsFingerprint>,
 }
 
 impl TlsClientConfig {
@@ -21,6 +24,7 @@ impl TlsClientConfig {
             server_name: server_name.into(),
             alpn: vec![],
             insecure: false,
+            fingerprint: None,
         }
     }
 
@@ -33,11 +37,16 @@ impl TlsClientConfig {
         self.alpn = alpn.into_iter().map(|s| s.into_bytes()).collect();
         self
     }
+
+    pub fn with_fingerprint(mut self, fp: TlsFingerprint) -> Self {
+        self.fingerprint = Some(fp);
+        self
+    }
 }
 
 /// Dangerous verifier that accepts any certificate (for testing / self-signed)
 #[derive(Debug)]
-struct NoVerifier;
+pub(crate) struct NoVerifier;
 
 impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
@@ -70,7 +79,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -78,18 +89,31 @@ pub struct TlsTransport;
 
 impl TlsTransport {
     pub fn create_client_connector(cfg: &TlsClientConfig) -> FluxResult<TlsConnector> {
-        init_crypto_provider();
+        let provider = match cfg.fingerprint.unwrap_or_default() {
+            TlsFingerprint::Chrome => crate::fingerprint::create_chrome_provider(),
+            TlsFingerprint::Firefox => crate::fingerprint::create_firefox_provider(),
+            TlsFingerprint::Safari => crate::fingerprint::create_safari_provider(),
+            TlsFingerprint::Random => match rand::random::<u8>() % 3 {
+                0 => crate::fingerprint::create_chrome_provider(),
+                1 => crate::fingerprint::create_firefox_provider(),
+                _ => crate::fingerprint::create_safari_provider(),
+            },
+        };
 
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
         let client_config = if cfg.insecure {
-            ClientConfig::builder()
+            ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| FluxError::Crypto(format!("failed to set TLS versions: {}", e)))?
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
                 .with_no_client_auth()
         } else {
-            ClientConfig::builder()
+            ClientConfig::builder_with_provider(Arc::new(provider))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| FluxError::Crypto(format!("failed to set TLS versions: {}", e)))?
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
@@ -97,6 +121,8 @@ impl TlsTransport {
         let mut config = client_config;
         if !cfg.alpn.is_empty() {
             config.alpn_protocols = cfg.alpn.clone();
+        } else {
+            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         }
 
         Ok(TlsConnector::from(Arc::new(config)))
@@ -112,7 +138,9 @@ impl TlsTransport {
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
-            .map_err(|e| FluxError::Crypto(format!("failed to configure TLS server cert: {}", e)))?;
+            .map_err(|e| {
+                FluxError::Crypto(format!("failed to configure TLS server cert: {}", e))
+            })?;
 
         if !alpn.is_empty() {
             config.alpn_protocols = alpn;
@@ -136,7 +164,9 @@ impl TlsTransport {
             .collect();
 
         if certs.is_empty() {
-            return Err(FluxError::Crypto("no certificates found in pem file".into()));
+            return Err(FluxError::Crypto(
+                "no certificates found in pem file".into(),
+            ));
         }
 
         let key_pem = pem::parse(&key_content)
@@ -152,20 +182,22 @@ impl TlsTransport {
         Ok((certs, key))
     }
 
-    pub async fn connect<S>(
-        stream: S,
-        cfg: &TlsClientConfig,
-    ) -> FluxResult<BoxedStream>
+    pub async fn connect<S>(stream: S, cfg: &TlsClientConfig) -> FluxResult<BoxedStream>
     where
         S: AsyncStream + 'static,
     {
         let connector = Self::create_client_connector(cfg)?;
         let domain = ServerName::try_from(cfg.server_name.clone())
-            .map_err(|e| FluxError::Crypto(format!("invalid server name {}: {}", cfg.server_name, e)))?
+            .map_err(|e| {
+                FluxError::Crypto(format!("invalid server name {}: {}", cfg.server_name, e))
+            })?
             .to_owned();
 
         let tls_stream = connector.connect(domain, stream).await.map_err(|e| {
-            FluxError::Crypto(format!("TLS handshake failed with {}: {}", cfg.server_name, e))
+            FluxError::Crypto(format!(
+                "TLS handshake failed with {}: {}",
+                cfg.server_name, e
+            ))
         })?;
 
         Ok(Box::new(tls_stream))
@@ -185,7 +217,8 @@ mod tests {
         let cert_der = CertificateDer::from(cert.cert);
         let key_der = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
 
-        let acceptor = TlsTransport::create_server_acceptor(vec![cert_der], key_der, vec![]).unwrap();
+        let acceptor =
+            TlsTransport::create_server_acceptor(vec![cert_der], key_der, vec![]).unwrap();
         let client_cfg = TlsClientConfig::new("localhost").with_insecure(true);
 
         let (client_raw, server_raw) = tokio::io::duplex(4096);
@@ -200,7 +233,9 @@ mod tests {
         });
 
         let cli_task = tokio::spawn(async move {
-            let mut cli_tls = TlsTransport::connect(client_raw, &client_cfg).await.unwrap();
+            let mut cli_tls = TlsTransport::connect(client_raw, &client_cfg)
+                .await
+                .unwrap();
             cli_tls.write_all(b"ping!").await.unwrap();
             let mut buf = vec![0u8; 5];
             cli_tls.read_exact(&mut buf).await.unwrap();

@@ -8,7 +8,6 @@ flux-types = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-libc = { version = "0.2" }
-parking_lot = "0.12"
+libc = { workspace = true }
+parking_lot = { workspace = true }
+socket2 = { workspace = true }

@@ -1,7 +1,23 @@
-pub mod tls;
+pub mod fingerprint;
+pub mod fragment;
+pub mod grpc;
+pub mod h2;
+pub mod httpupgrade;
+pub mod pipeline;
+pub mod quic;
 pub mod reality;
+pub mod shadowtls;
 pub mod tcp;
+pub mod tls;
+pub mod websocket;
 
-pub use tls::*;
+pub use fingerprint::*;
+pub use fragment::*;
+pub use grpc::*;
+pub use h2::*;
+pub use pipeline::*;
+pub use quic::*;
 pub use reality::*;
+pub use shadowtls::*;
 pub use tcp::*;
+pub use tls::*;

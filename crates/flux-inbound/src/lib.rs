@@ -1,22 +1,21 @@
-pub mod socks;
 pub mod http;
 pub mod mixed;
-pub mod vless;
-pub mod tun;
-pub mod trojan;
+pub mod redirect;
 pub mod shadowsocks;
+pub mod socks;
+pub mod tproxy;
+pub mod trojan;
+pub mod tun;
+pub mod vless;
 
-pub use socks::*;
 pub use http::*;
 pub use mixed::*;
-pub use vless::*;
-pub use tun::*;
-pub use trojan::*;
+pub use redirect::*;
 pub use shadowsocks::*;
+pub use socks::*;
+pub use tproxy::*;
+pub use trojan::*;
+pub use tun::*;
+pub use vless::*;
 
-/// Applies kernel socket performance tuning: TCP_NODELAY and SO_KEEPALIVE while preserving Linux TCP autotuning.
-pub fn optimize_tcp_socket(socket: &tokio::net::TcpStream) {
-    let _ = socket.set_nodelay(true);
-    let sock_ref = socket2::SockRef::from(socket);
-    let _ = sock_ref.set_keepalive(true);
-}
+pub use flux_common::{create_reuse_port_listener, optimize_tcp_socket};

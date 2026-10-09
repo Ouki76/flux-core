@@ -1,28 +1,28 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use crate::dialer::LazyPipelineDialer;
 use async_trait::async_trait;
-use rand::RngCore;
-use tokio::io::AsyncWriteExt;
-use tokio::net::UdpSocket;
-use flux_types::{
-    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
-    UdpPacket,
-};
 use flux_dns::DnsResolver;
 use flux_protocol::shadowsocks::{
-    derive_master_key, derive_subkey, encode_ss_address, CipherKind, ShadowsocksCipher,
-    ShadowsocksStream, SALT_LEN, TAG_LEN,
+    CipherKind, SALT_LEN, ShadowsocksCipher, ShadowsocksStream, TAG_LEN, derive_master_key,
+    derive_subkey, encode_ss_address,
 };
-use flux_transport::tcp::TcpTransport;
+use flux_transport::pipeline::{FramingLayer, SecurityLayer};
+use flux_types::{
+    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, StreamDialer,
+    TargetAddress, UdpPacket,
+};
+use rand::RngCore;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UdpSocket;
 
 pub struct ShadowsocksOutbound {
     tag: String,
-    server_address: TargetAddress,
     master_key: [u8; 32],
     cipher_kind: CipherKind,
+    dialer: Arc<dyn StreamDialer>,
+    server_address: TargetAddress,
     resolver: Arc<DnsResolver>,
-    connect_timeout: Duration,
 }
 
 impl ShadowsocksOutbound {
@@ -32,13 +32,30 @@ impl ShadowsocksOutbound {
         password: &str,
         resolver: Arc<DnsResolver>,
     ) -> Self {
+        let dialer = Arc::new(LazyPipelineDialer::new(
+            server_address.clone(),
+            resolver.clone(),
+            SecurityLayer::None,
+            FramingLayer::Raw,
+        ));
+
+        Self::new_with_dialer(tag, server_address, password, resolver, dialer)
+    }
+
+    pub fn new_with_dialer(
+        tag: impl Into<String>,
+        server_address: TargetAddress,
+        password: &str,
+        resolver: Arc<DnsResolver>,
+        dialer: Arc<dyn StreamDialer>,
+    ) -> Self {
         Self {
             tag: tag.into(),
-            server_address,
             master_key: derive_master_key(password),
             cipher_kind: CipherKind::ChaCha20IetfPoly1305,
+            dialer,
+            server_address,
             resolver,
-            connect_timeout: Duration::from_secs(10),
         }
     }
 
@@ -54,9 +71,24 @@ impl Outbound for ShadowsocksOutbound {
         &self.tag
     }
 
+    fn protocol(&self) -> &'static str {
+        "shadowsocks"
+    }
+
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let server_addr = self.resolver.resolve(&self.server_address).await?;
-        let mut stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
+        let mut stream = self.dialer.dial().await?;
+
+        if let CipherKind::Ss2022(method) = self.cipher_kind {
+            let key_bytes = &self.master_key[..method.key_len()];
+            let ss_stream = flux_protocol::shadowsocks2022::Ss2022Protocol::client_handshake(
+                stream,
+                method,
+                key_bytes,
+                &meta.destination,
+            )
+            .await?;
+            return Ok(Box::new(ss_stream));
+        }
 
         // 1. Generate client salt
         let mut salt = [0u8; SALT_LEN];
@@ -84,42 +116,80 @@ impl Outbound for ShadowsocksOutbound {
 
     async fn dial_packet(&self, _meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
         let server_addr = self.resolver.resolve(&self.server_address).await?;
-        let udp_socket = UdpSocket::bind("0.0.0.0:0").await.map_err(FluxError::Io)?;
+        let is_v6 = server_addr.is_ipv6();
+        let udp_socket = if is_v6 {
+            match UdpSocket::bind("[::]:0").await {
+                Ok(s) => s,
+                Err(_) => UdpSocket::bind("0.0.0.0:0").await.map_err(FluxError::Io)?,
+            }
+        } else {
+            UdpSocket::bind("0.0.0.0:0").await.map_err(FluxError::Io)?
+        };
+
+        let inner = match self.cipher_kind {
+            CipherKind::Ss2022(method) => {
+                let psk = &self.master_key[..method.key_len()];
+                let cipher =
+                    flux_protocol::shadowsocks2022::Ss2022UdpPacketCipher::new(method, psk);
+                ShadowsocksPacketEndpointInner::Ss2022(Arc::new(cipher))
+            }
+            legacy_kind => ShadowsocksPacketEndpointInner::Legacy {
+                master_key: self.master_key,
+                cipher_kind: legacy_kind,
+            },
+        };
 
         Ok(Box::new(ShadowsocksPacketEndpoint {
             udp_socket: Arc::new(udp_socket),
             server_addr,
-            master_key: self.master_key,
-            cipher_kind: self.cipher_kind,
+            inner,
         }))
     }
+}
+
+enum ShadowsocksPacketEndpointInner {
+    Legacy {
+        master_key: [u8; 32],
+        cipher_kind: CipherKind,
+    },
+    Ss2022(Arc<flux_protocol::shadowsocks2022::Ss2022UdpPacketCipher>),
 }
 
 pub struct ShadowsocksPacketEndpoint {
     udp_socket: Arc<UdpSocket>,
     server_addr: SocketAddr,
-    master_key: [u8; 32],
-    cipher_kind: CipherKind,
+    inner: ShadowsocksPacketEndpointInner,
 }
 
 #[async_trait]
 impl PacketEndpoint for ShadowsocksPacketEndpoint {
     async fn send_packet(&self, packet: UdpPacket) -> FluxResult<()> {
-        let mut salt = [0u8; SALT_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
-        let subkey = derive_subkey(&self.master_key, &salt);
-        let mut cipher = ShadowsocksCipher::with_kind(self.cipher_kind, &subkey);
+        let out = match &self.inner {
+            ShadowsocksPacketEndpointInner::Ss2022(cipher) => {
+                cipher.encrypt_packet(&packet.destination, &packet.payload)?
+            }
+            ShadowsocksPacketEndpointInner::Legacy {
+                master_key,
+                cipher_kind,
+            } => {
+                let mut salt = [0u8; SALT_LEN];
+                rand::thread_rng().fill_bytes(&mut salt);
+                let subkey = derive_subkey(master_key, &salt);
+                let mut cipher = ShadowsocksCipher::with_kind(*cipher_kind, &subkey);
 
-        let addr_bytes = encode_ss_address(&packet.destination);
-        let mut plain = Vec::with_capacity(addr_bytes.len() + packet.payload.len());
-        plain.extend_from_slice(&addr_bytes);
-        plain.extend_from_slice(&packet.payload);
+                let addr_bytes = encode_ss_address(&packet.destination);
+                let mut plain = Vec::with_capacity(addr_bytes.len() + packet.payload.len());
+                plain.extend_from_slice(&addr_bytes);
+                plain.extend_from_slice(&packet.payload);
 
-        let ciphertext = cipher.encrypt(&plain)?;
+                let ciphertext = cipher.encrypt(&plain)?;
 
-        let mut out = Vec::with_capacity(SALT_LEN + ciphertext.len());
-        out.extend_from_slice(&salt);
-        out.extend_from_slice(&ciphertext);
+                let mut out = Vec::with_capacity(SALT_LEN + ciphertext.len());
+                out.extend_from_slice(&salt);
+                out.extend_from_slice(&ciphertext);
+                out
+            }
+        };
 
         self.udp_socket
             .send_to(&out, self.server_addr)
@@ -129,38 +199,51 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
     }
 
     async fn recv_packet(&self) -> FluxResult<UdpPacket> {
-        let mut buf = vec![0u8; 65535];
-        let (len, from) = self.udp_socket.recv_from(&mut buf).await.map_err(FluxError::Io)?;
-        if len < SALT_LEN + TAG_LEN {
-            return Err(FluxError::Protocol {
-                protocol: "shadowsocks-udp",
-                message: "received packet too short".into(),
-            });
+        let mut guard = flux_common::BufferPool::packet_pool().acquire_guard();
+        let (len, from) = self
+            .udp_socket
+            .recv_from(&mut guard)
+            .await
+            .map_err(FluxError::Io)?;
+
+        match &self.inner {
+            ShadowsocksPacketEndpointInner::Ss2022(cipher) => {
+                let (target, payload) = cipher.decrypt_packet(&guard[..len]).await?;
+                Ok(UdpPacket::new(payload, TargetAddress::Ip(from), target))
+            }
+            ShadowsocksPacketEndpointInner::Legacy {
+                master_key,
+                cipher_kind,
+            } => {
+                if len < SALT_LEN + TAG_LEN {
+                    return Err(FluxError::Protocol {
+                        protocol: "shadowsocks-udp",
+                        message: "received packet too short".into(),
+                    });
+                }
+
+                let mut salt = [0u8; SALT_LEN];
+                salt.copy_from_slice(&guard[..SALT_LEN]);
+                let subkey = derive_subkey(master_key, &salt);
+                let mut cipher = ShadowsocksCipher::with_kind(*cipher_kind, &subkey);
+
+                let plain = cipher.decrypt(&guard[SALT_LEN..len])?;
+                if plain.is_empty() {
+                    return Err(FluxError::Protocol {
+                        protocol: "shadowsocks-udp",
+                        message: "empty payload after decrypt".into(),
+                    });
+                }
+
+                let atyp = plain[0];
+                let mut cursor = std::io::Cursor::new(&plain[1..]);
+                let target =
+                    flux_protocol::socks5::Socks5Handshake::read_address(&mut cursor, atyp).await?;
+                let pos = 1 + cursor.position() as usize;
+                let payload = bytes::Bytes::copy_from_slice(&plain[pos..]);
+
+                Ok(UdpPacket::new(payload, TargetAddress::Ip(from), target))
+            }
         }
-
-        let mut salt = [0u8; SALT_LEN];
-        salt.copy_from_slice(&buf[..SALT_LEN]);
-        let subkey = derive_subkey(&self.master_key, &salt);
-        let mut cipher = ShadowsocksCipher::with_kind(self.cipher_kind, &subkey);
-
-        let plain = cipher.decrypt(&buf[SALT_LEN..len])?;
-        if plain.is_empty() {
-            return Err(FluxError::Protocol {
-                protocol: "shadowsocks-udp",
-                message: "empty payload after decrypt".into(),
-            });
-        }
-
-        let atyp = plain[0];
-        let mut cursor = std::io::Cursor::new(&plain[1..]);
-        let target = flux_protocol::socks5::Socks5Handshake::read_address(&mut cursor, atyp).await?;
-        let pos = 1 + cursor.position() as usize;
-        let payload = bytes::Bytes::copy_from_slice(&plain[pos..]);
-
-        Ok(UdpPacket::new(
-            payload,
-            TargetAddress::Ip(from),
-            target,
-        ))
     }
 }

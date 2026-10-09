@@ -1,10 +1,10 @@
+use flux_types::{FluxError, FluxResult, NetworkType, TargetAddress};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use uuid::Uuid;
-use flux_types::{FluxError, FluxResult, NetworkType, TargetAddress};
 
 pub const VLESS_VERSION: u8 = 0x00;
 
@@ -21,6 +21,7 @@ pub struct VlessRequest {
     pub uuid: Uuid,
     pub command: u8,
     pub address: TargetAddress,
+    pub is_vision: bool,
 }
 
 /// Stream wrapper for VLESS client that lazily strips the VLESS response header
@@ -137,6 +138,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VlessClientStream<S> {
     }
 }
 
+fn constant_time_eq_uuid(a: &Uuid, b: &Uuid) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut diff = 0u8;
+    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 pub struct VlessProtocol;
 
 impl VlessProtocol {
@@ -186,7 +197,9 @@ impl VlessProtocol {
                 buf.push(VLESS_ATYP_DOMAIN);
                 let bytes = domain.as_bytes();
                 if bytes.len() > 255 {
-                    return Err(FluxError::InvalidAddress("domain too long for VLESS".into()));
+                    return Err(FluxError::InvalidAddress(
+                        "domain too long for VLESS".into(),
+                    ));
                 }
                 buf.push(bytes.len() as u8);
                 buf.extend_from_slice(bytes);
@@ -203,116 +216,141 @@ impl VlessProtocol {
         stream: &mut S,
         valid_uuids: &[Uuid],
     ) -> FluxResult<VlessRequest> {
-        let mut ver = [0u8; 1];
-        stream.read_exact(&mut ver).await.map_err(|e| {
-            FluxError::Protocol {
+        let mut ver_uuid = [0u8; 17];
+        stream
+            .read_exact(&mut ver_uuid)
+            .await
+            .map_err(|e| FluxError::Protocol {
                 protocol: "vless",
-                message: format!("failed to read vless version: {}", e),
-            }
-        })?;
+                message: format!("failed to read vless version & uuid: {}", e),
+            })?;
 
-        if ver[0] != VLESS_VERSION {
+        if ver_uuid[0] != VLESS_VERSION {
             return Err(FluxError::Protocol {
                 protocol: "vless",
-                message: format!("invalid vless version: {}", ver[0]),
+                message: format!("invalid vless version: {}", ver_uuid[0]),
             });
         }
 
         let mut uuid_bytes = [0u8; 16];
-        stream.read_exact(&mut uuid_bytes).await.map_err(|e| {
-            FluxError::Protocol {
-                protocol: "vless",
-                message: format!("failed to read vless uuid: {}", e),
-            }
-        })?;
+        uuid_bytes.copy_from_slice(&ver_uuid[1..17]);
 
         let client_uuid = Uuid::from_bytes(uuid_bytes);
-        if !valid_uuids.is_empty() && !valid_uuids.contains(&client_uuid) {
-            return Err(FluxError::AuthFailed(format!("unauthorized vless uuid: {}", client_uuid)));
+        if !valid_uuids.is_empty()
+            && !valid_uuids
+                .iter()
+                .any(|u| constant_time_eq_uuid(u, &client_uuid))
+        {
+            return Err(FluxError::AuthFailed(format!(
+                "unauthorized vless uuid: {}",
+                client_uuid
+            )));
         }
 
         let mut addon_len_buf = [0u8; 1];
-        stream.read_exact(&mut addon_len_buf).await.map_err(|e| {
-            FluxError::Protocol {
+        stream
+            .read_exact(&mut addon_len_buf)
+            .await
+            .map_err(|e| FluxError::Protocol {
                 protocol: "vless",
                 message: format!("failed to read vless addon length: {}", e),
-            }
-        })?;
+            })?;
 
         let addon_len = addon_len_buf[0] as usize;
+        let mut is_vision = false;
         if addon_len > 0 {
-            let mut addon_buf = vec![0u8; addon_len];
-            stream.read_exact(&mut addon_buf).await.map_err(|e| {
-                FluxError::Protocol {
+            let mut addon_buf = [0u8; 256];
+            stream
+                .read_exact(&mut addon_buf[..addon_len])
+                .await
+                .map_err(|e| FluxError::Protocol {
                     protocol: "vless",
                     message: format!("failed to read vless addons: {}", e),
-                }
-            })?;
+                })?;
+            let slice = &addon_buf[..addon_len];
+            if slice
+                .windows(crate::vision::VISION_FLOW.len())
+                .any(|w| w == crate::vision::VISION_FLOW.as_bytes())
+            {
+                is_vision = true;
+            }
         }
 
         let mut cmd_and_port = [0u8; 3];
-        stream.read_exact(&mut cmd_and_port).await.map_err(|e| {
-            FluxError::Protocol {
+        stream
+            .read_exact(&mut cmd_and_port)
+            .await
+            .map_err(|e| FluxError::Protocol {
                 protocol: "vless",
                 message: format!("failed to read vless command and port: {}", e),
-            }
-        })?;
+            })?;
 
         let command = cmd_and_port[0];
         let port = u16::from_be_bytes([cmd_and_port[1], cmd_and_port[2]]);
 
         let mut atyp_buf = [0u8; 1];
-        stream.read_exact(&mut atyp_buf).await.map_err(|e| {
-            FluxError::Protocol {
+        stream
+            .read_exact(&mut atyp_buf)
+            .await
+            .map_err(|e| FluxError::Protocol {
                 protocol: "vless",
                 message: format!("failed to read vless address type: {}", e),
-            }
-        })?;
+            })?;
 
         let address = match atyp_buf[0] {
             VLESS_ATYP_IPV4 => {
                 let mut ip_bytes = [0u8; 4];
-                stream.read_exact(&mut ip_bytes).await.map_err(|e| {
-                    FluxError::Protocol {
+                stream
+                    .read_exact(&mut ip_bytes)
+                    .await
+                    .map_err(|e| FluxError::Protocol {
                         protocol: "vless",
                         message: format!("failed to read ipv4: {}", e),
-                    }
-                })?;
+                    })?;
                 let ip = Ipv4Addr::from(ip_bytes);
                 TargetAddress::Ip(SocketAddr::new(ip.into(), port))
             }
             VLESS_ATYP_DOMAIN => {
                 let mut dlen = [0u8; 1];
-                stream.read_exact(&mut dlen).await.map_err(|e| {
-                    FluxError::Protocol {
+                stream
+                    .read_exact(&mut dlen)
+                    .await
+                    .map_err(|e| FluxError::Protocol {
                         protocol: "vless",
                         message: format!("failed to read domain length: {}", e),
-                    }
-                })?;
+                    })?;
                 let len = dlen[0] as usize;
-                let mut domain_buf = vec![0u8; len];
-                stream.read_exact(&mut domain_buf).await.map_err(|e| {
-                    FluxError::Protocol {
+                if len == 0 {
+                    return Err(FluxError::Protocol {
+                        protocol: "vless",
+                        message: "empty domain length in vless request".into(),
+                    });
+                }
+                let mut domain_buf = [0u8; 256];
+                stream
+                    .read_exact(&mut domain_buf[..len])
+                    .await
+                    .map_err(|e| FluxError::Protocol {
                         protocol: "vless",
                         message: format!("failed to read domain string: {}", e),
-                    }
-                })?;
-                let domain = String::from_utf8(domain_buf).map_err(|e| {
-                    FluxError::Protocol {
+                    })?;
+                let domain = std::str::from_utf8(&domain_buf[..len])
+                    .map_err(|e| FluxError::Protocol {
                         protocol: "vless",
                         message: format!("invalid utf-8 domain: {}", e),
-                    }
-                })?;
+                    })?
+                    .to_string();
                 TargetAddress::Domain(domain, port)
             }
             VLESS_ATYP_IPV6 => {
                 let mut ip_bytes = [0u8; 16];
-                stream.read_exact(&mut ip_bytes).await.map_err(|e| {
-                    FluxError::Protocol {
+                stream
+                    .read_exact(&mut ip_bytes)
+                    .await
+                    .map_err(|e| FluxError::Protocol {
                         protocol: "vless",
                         message: format!("failed to read ipv6: {}", e),
-                    }
-                })?;
+                    })?;
                 let ip = Ipv6Addr::from(ip_bytes);
                 TargetAddress::Ip(SocketAddr::new(ip.into(), port))
             }
@@ -328,13 +366,12 @@ impl VlessProtocol {
             uuid: client_uuid,
             command,
             address,
+            is_vision,
         })
     }
 
     /// Server-side: write VLESS response header (version 0, addons length 0).
-    pub async fn write_response_header<S: AsyncWrite + Unpin>(
-        stream: &mut S,
-    ) -> FluxResult<()> {
+    pub async fn write_response_header<S: AsyncWrite + Unpin>(stream: &mut S) -> FluxResult<()> {
         stream.write_all(&[VLESS_VERSION, 0x00]).await?;
         stream.flush().await?;
         Ok(())
@@ -352,7 +389,9 @@ mod tests {
 
         let srv = tokio::spawn(async move {
             // Server sends response header followed by payload
-            VlessProtocol::write_response_header(&mut server_raw).await.unwrap();
+            VlessProtocol::write_response_header(&mut server_raw)
+                .await
+                .unwrap();
             server_raw.write_all(b"response-data").await.unwrap();
         });
 

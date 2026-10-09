@@ -1,17 +1,17 @@
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
 use async_trait::async_trait;
-use tokio::net::{TcpStream, UdpSocket};
-use tokio::sync::Mutex;
+use flux_dns::DnsResolver;
+use flux_protocol::socks5::{CMD_CONNECT, CMD_UDP_ASSOCIATE, Socks5Handshake};
+use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
+use flux_transport::tcp::TcpTransport;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
     UdpPacket,
 };
-use flux_dns::DnsResolver;
-use flux_protocol::socks5::{Socks5Handshake, CMD_CONNECT, CMD_UDP_ASSOCIATE};
-use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
-use flux_transport::tcp::TcpTransport;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::Mutex;
 
 pub struct SocksOutbound {
     tag: String,
@@ -48,12 +48,22 @@ impl Outbound for SocksOutbound {
         &self.tag
     }
 
+    fn protocol(&self) -> &'static str {
+        "socks"
+    }
+
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
         let server_addr = self.resolver.resolve(&self.server_address).await?;
         let mut stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
 
         let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
-        Socks5Handshake::client_handshake_with_auth(&mut stream, CMD_CONNECT, &meta.destination, auth_ref).await?;
+        Socks5Handshake::client_handshake_with_auth(
+            &mut stream,
+            CMD_CONNECT,
+            &meta.destination,
+            auth_ref,
+        )
+        .await?;
 
         Ok(Box::new(stream))
     }
@@ -71,19 +81,26 @@ impl Outbound for SocksOutbound {
         )
         .await?;
 
-        let mut relay_addr = relay_opt.ok_or_else(|| {
-            FluxError::Protocol {
-                protocol: "socks5-out",
-                message: "server did not provide a valid relay address in UDP associate response".into(),
-            }
+        let mut relay_addr = relay_opt.ok_or_else(|| FluxError::Protocol {
+            protocol: "socks5-out",
+            message: "server did not provide a valid relay address in UDP associate response"
+                .into(),
         })?;
 
-        // If relay address returned 0.0.0.0, use the server's IP address
+        // If relay address returned 0.0.0.0 or [::], use the server's IP address
         if relay_addr.ip().is_unspecified() {
             relay_addr = SocketAddr::new(server_addr.ip(), relay_addr.port());
         }
 
-        let udp_socket = UdpSocket::bind("0.0.0.0:0").await.map_err(FluxError::Io)?;
+        let is_v6 = relay_addr.is_ipv6();
+        let udp_socket = if is_v6 {
+            match UdpSocket::bind("[::]:0").await {
+                Ok(s) => s,
+                Err(_) => UdpSocket::bind("0.0.0.0:0").await.map_err(FluxError::Io)?,
+            }
+        } else {
+            UdpSocket::bind("0.0.0.0:0").await.map_err(FluxError::Io)?
+        };
 
         Ok(Box::new(SocksPacketEndpoint {
             _tcp_conn: Arc::new(Mutex::new(tcp_stream)),
@@ -111,10 +128,18 @@ impl PacketEndpoint for SocksPacketEndpoint {
     }
 
     async fn recv_packet(&self) -> FluxResult<UdpPacket> {
-        let mut buf = vec![0u8; 65535];
-        let (len, _from) = self.udp_socket.recv_from(&mut buf).await.map_err(FluxError::Io)?;
-        buf.truncate(len);
+        let mut guard = flux_common::BufferPool::packet_pool().acquire_guard();
+        let (len, _from) = self
+            .udp_socket
+            .recv_from(&mut guard)
+            .await
+            .map_err(FluxError::Io)?;
+        let payload = bytes::Bytes::copy_from_slice(&guard[..len]);
 
-        decode_socks5_udp(TargetAddress::Ip(self.relay_addr), bytes::Bytes::from(buf))
+        let mut pkt = decode_socks5_udp(TargetAddress::Ip(self.relay_addr), payload)?;
+        let remote = pkt.destination.clone();
+        pkt.source = remote.clone();
+        pkt.destination = remote;
+        Ok(pkt)
     }
 }
