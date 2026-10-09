@@ -74,11 +74,29 @@ impl AntiReplayWindow {
         }
     }
 
-    pub fn check_and_update(&mut self, counter: u64) -> bool {
+    /// Checks if counter is eligible without mutating state.
+    pub fn check(&self, counter: u64) -> bool {
+        if self.bitmap == 0 && self.last_counter == 0 {
+            return true;
+        }
+
+        if counter > self.last_counter {
+            true
+        } else {
+            let diff = self.last_counter - counter;
+            if diff >= 64 {
+                return false;
+            }
+            (self.bitmap & (1 << diff)) == 0
+        }
+    }
+
+    /// Mutates the sliding window bitmap and advances counter. Strictly called after auth succeeds!
+    pub fn update(&mut self, counter: u64) {
         if self.bitmap == 0 && self.last_counter == 0 {
             self.last_counter = counter;
             self.bitmap = 1;
-            return true;
+            return;
         }
 
         if counter > self.last_counter {
@@ -90,17 +108,11 @@ impl AntiReplayWindow {
                 self.bitmap = 1;
             }
             self.last_counter = counter;
-            true
         } else {
             let diff = self.last_counter - counter;
-            if diff >= 64 {
-                return false;
+            if diff < 64 {
+                self.bitmap |= 1 << diff;
             }
-            if (self.bitmap & (1 << diff)) != 0 {
-                return false;
-            }
-            self.bitmap |= 1 << diff;
-            true
         }
     }
 }
@@ -181,7 +193,7 @@ impl WireGuardSession {
         counter_bytes.copy_from_slice(&packet[8..16]);
         let counter = u64::from_le_bytes(counter_bytes);
 
-        if !self.replay_window.check_and_update(counter) {
+        if !self.replay_window.check(counter) {
             return Err(FluxError::AuthFailed(
                 "wireguard packet rejected by anti-replay sliding window".into(),
             ));
@@ -196,6 +208,8 @@ impl WireGuardSession {
             .decrypt(ChaChaNonce::from_slice(&nonce_bytes), ciphertext)
             .map_err(|e| FluxError::Crypto(format!("wireguard decrypt data failed: {}", e)))?;
 
+        // Mutate replay window ONLY after decryption & auth verification succeeds!
+        self.replay_window.update(counter);
         self.recv_counter = counter.wrapping_add(1);
         Ok(plaintext)
     }
@@ -351,27 +365,76 @@ mod tests {
 
         // Replay attack test: second decryption of the exact same packet MUST FAIL!
         let replay_res = recv_session.decrypt_data_packet(&data_pkt);
-        assert!(replay_res.is_err(), "Replayed WireGuard packet must be rejected");
+        assert!(
+            replay_res.is_err(),
+            "Replayed WireGuard packet must be rejected"
+        );
     }
 
     #[test]
     fn test_wireguard_anti_replay_window_logic() {
         let mut window = AntiReplayWindow::new();
-        assert!(window.check_and_update(0));
-        assert!(!window.check_and_update(0), "replaying 0 must fail");
+        assert!(window.check(0));
+        window.update(0);
+        assert!(!window.check(0), "replaying 0 must fail");
 
-        assert!(window.check_and_update(1));
-        assert!(window.check_and_update(2));
-        assert!(!window.check_and_update(1), "replaying 1 must fail");
-        assert!(!window.check_and_update(2), "replaying 2 must fail");
+        assert!(window.check(1));
+        window.update(1);
+        assert!(window.check(2));
+        window.update(2);
+        assert!(!window.check(1), "replaying 1 must fail");
+        assert!(!window.check(2), "replaying 2 must fail");
 
         // Jump forward
-        assert!(window.check_and_update(10));
-        assert!(window.check_and_update(5)); // in window (< 64), not seen yet
-        assert!(!window.check_and_update(5), "replaying 5 must fail");
+        assert!(window.check(10));
+        window.update(10);
+        assert!(window.check(5)); // in window (< 64), not seen yet
+        window.update(5);
+        assert!(!window.check(5), "replaying 5 must fail");
 
         // Jump 100 packets forward
-        assert!(window.check_and_update(120));
-        assert!(!window.check_and_update(10), "packet 10 is now older than window (>64 diff) and must fail");
+        assert!(window.check(120));
+        window.update(120);
+        assert!(
+            !window.check(10),
+            "packet 10 is now older than window (>64 diff) and must fail"
+        );
+    }
+
+    #[test]
+    fn test_wireguard_unauthenticated_counter_forgery_does_not_poison_window() {
+        let awg = AwgConfig::default();
+        let static_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let peer_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let peer_pub = X25519PublicKey::from(&peer_secret);
+
+        let (_init_pkt, send_k, recv_k) =
+            WireGuardHandshake::create_initiation(&static_secret, &peer_pub, 1337, &awg);
+
+        let mut send_session = WireGuardSession::new(send_k, recv_k, 1337, 7331, Some(awg.clone()));
+        let mut recv_session = WireGuardSession::new(recv_k, send_k, 7331, 1337, Some(awg));
+
+        // Generate legitimate packet with counter 0
+        let legitimate_pkt_0 = send_session
+            .encrypt_data_packet(b"legitimate packet 0")
+            .unwrap();
+
+        // Attacker sends forged unauthenticated packet with huge counter (e.g. 500_000)
+        let mut forged_pkt = vec![0u8; 64];
+        forged_pkt[0..4].copy_from_slice(&4u32.to_le_bytes()); // H4 data
+        forged_pkt[4..8].copy_from_slice(&7331u32.to_le_bytes()); // receiver index
+        forged_pkt[8..16].copy_from_slice(&500_000u64.to_le_bytes()); // huge counter
+
+        // Forged packet decryption must fail authentication
+        let forged_res = recv_session.decrypt_data_packet(&forged_pkt);
+        assert!(forged_res.is_err(), "Forged packet must fail decryption");
+
+        // Legitimate packet 0 MUST still be accepted because window was not poisoned!
+        let legit_res = recv_session.decrypt_data_packet(&legitimate_pkt_0);
+        assert!(
+            legit_res.is_ok(),
+            "Legitimate packet 0 must succeed; replay window must not be poisoned by forged packet"
+        );
+        assert_eq!(&legit_res.unwrap(), b"legitimate packet 0");
     }
 }

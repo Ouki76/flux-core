@@ -50,9 +50,8 @@ impl DohClient {
             (host_port.to_string(), default_port)
         };
 
-        let streams: Vec<Mutex<Option<BoxedStream>>> = (0..DOH_POOL_SIZE)
-            .map(|_| Mutex::new(None))
-            .collect();
+        let streams: Vec<Mutex<Option<BoxedStream>>> =
+            (0..DOH_POOL_SIZE).map(|_| Mutex::new(None)).collect();
 
         Self {
             server_ip: host.clone(),
@@ -103,7 +102,10 @@ impl DohClient {
             query_wire.len()
         );
 
-        let idx = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % DOH_POOL_SIZE;
+        let idx = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            % DOH_POOL_SIZE;
         let mut guard = self.streams[idx].lock().await;
 
         for attempt in 0..2 {
@@ -211,5 +213,74 @@ impl DohClient {
                 "expected IPv4 address from DoH, got IPv6".into(),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn test_doh_client_pool_init() {
+        let doh = DohClient::new("https://1.1.1.1/dns-query");
+        assert_eq!(doh.streams.len(), DOH_POOL_SIZE);
+        assert_eq!(doh.server_ip, "1.1.1.1");
+        assert_eq!(doh.server_port, 443);
+        assert_eq!(doh.path, "/dns-query");
+        assert!(doh.is_tls);
+        assert_eq!(doh.counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn test_doh_client_rotation_and_mock_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let srv_addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    if let Ok(n) = sock.read(&mut buf).await
+                        && n > 0
+                    {
+                        // Synthesize valid DNS A response (1.2.3.4)
+                        let dns_resp = vec![
+                            0x12, 0x34, // ID
+                            0x81, 0x80, // Response, NoError
+                            0x00, 0x01, // QDCOUNT = 1
+                            0x00, 0x01, // ANCOUNT = 1
+                            0x00, 0x00, 0x00, 0x00, // QNAME: example.com
+                            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm',
+                            0x00, 0x00, 0x01, 0x00, 0x01, // Type A, Class IN
+                            // ANSWER: Name pointer to QNAME (0xc00c)
+                            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, // Type A, Class IN
+                            0x00, 0x00, 0x01, 0x2c, // TTL 300
+                            0x00, 0x04, // RDLENGTH 4
+                            0x01, 0x02, 0x03, 0x04, // 1.2.3.4
+                        ];
+                        let http_resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+                            dns_resp.len()
+                        );
+                        let _ = sock.write_all(http_resp.as_bytes()).await;
+                        let _ = sock.write_all(&dns_resp).await;
+                        let _ = sock.flush().await;
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://{}/dns-query", srv_addr);
+        let doh = DohClient::new(&url);
+
+        // Perform multiple parallel queries and verify round-robin rotation
+        let ip1 = doh.query_doh("example.com").await.unwrap();
+        assert_eq!(ip1, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+
+        let ip2 = doh.query_doh("example.com").await.unwrap();
+        assert_eq!(ip2, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+
+        assert!(doh.counter.load(Ordering::Relaxed) >= 2);
     }
 }

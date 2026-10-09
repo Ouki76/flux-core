@@ -1147,17 +1147,26 @@ impl Inbound for TunInbound {
                                             let mut ooo = session.ooo_buffer.lock();
                                             while let Some(entry) = ooo.first_entry() {
                                                 if *entry.key() == expected_seq {
+                                                    // Peek before removing to prevent silent drop if channel is full
+                                                    if session.payload_tx.capacity() == 0 {
+                                                        break;
+                                                    }
                                                     let next_chunk = entry.remove();
                                                     let next_len = next_chunk.len() as u32;
                                                     let _ = session.payload_tx.try_send(next_chunk);
-                                                    expected_seq = expected_seq.wrapping_add(next_len);
+                                                    expected_seq =
+                                                        expected_seq.wrapping_add(next_len);
                                                 } else {
                                                     break;
                                                 }
                                             }
-                                            session.client_seq.store(expected_seq, Ordering::SeqCst);
-                                        } else if parsed.tcp_seq > expected_seq {
-                                            // Buffer out-of-order packet (up to 32 segments) to prevent packet loss
+                                            session
+                                                .client_seq
+                                                .store(expected_seq, Ordering::SeqCst);
+                                        } else if (parsed.tcp_seq.wrapping_sub(expected_seq) as i32)
+                                            > 0
+                                        {
+                                            // Buffer out-of-order packet (up to 32 segments) using RFC 793 serial number arithmetic
                                             let mut ooo = session.ooo_buffer.lock();
                                             if ooo.len() < 32 {
                                                 ooo.insert(parsed.tcp_seq, parsed.payload);
@@ -1338,5 +1347,65 @@ mod tests {
         assert_eq!(reply[40], 129); // Type 129 Echo Reply
         assert_eq!(reply[41], 0);
         assert_eq!(&reply[44..48], &[0xaa, 0xbb, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn test_tun_tcp_out_of_order_reassembly_and_wrap() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+        let session = TunTcpSession {
+            client_seq: AtomicU32::new(100),
+            server_seq: AtomicU32::new(500),
+            payload_tx: tx,
+            last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            ooo_buffer: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+        };
+
+        // Scenario: Packet with seq 110 (len 10) arrives BEFORE packet with seq 100 (len 10)
+        let chunk_ooo = Bytes::from_static(b"WORLD_1234");
+        let chunk_in_order = Bytes::from_static(b"HELLO_1234");
+
+        // 1. Process out-of-order segment 110
+        let expected_seq = session.client_seq.load(Ordering::Relaxed);
+        assert_eq!(expected_seq, 100);
+        let seq_110 = 110u32;
+        if (seq_110.wrapping_sub(expected_seq) as i32) > 0 {
+            session.ooo_buffer.lock().insert(seq_110, chunk_ooo);
+        }
+
+        // Verify buffer has 1 entry and rx hasn't received anything
+        assert_eq!(session.ooo_buffer.lock().len(), 1);
+        assert!(rx.try_recv().is_err());
+
+        // 2. Process in-order segment 100
+        let seq_100 = 100u32;
+        let mut curr_expected = session.client_seq.load(Ordering::Relaxed);
+        assert_eq!(seq_100, curr_expected);
+
+        session.payload_tx.try_send(chunk_in_order).unwrap();
+        curr_expected = curr_expected.wrapping_add(10);
+
+        // Drain contiguous segments
+        let mut ooo = session.ooo_buffer.lock();
+        while let Some(entry) = ooo.first_entry() {
+            if *entry.key() == curr_expected {
+                let next_chunk = entry.remove();
+                let next_len = next_chunk.len() as u32;
+                session.payload_tx.try_send(next_chunk).unwrap();
+                curr_expected = curr_expected.wrapping_add(next_len);
+            } else {
+                break;
+            }
+        }
+        drop(ooo);
+        session.client_seq.store(curr_expected, Ordering::SeqCst);
+
+        // Verify client_seq advanced to 120 (100 + 10 + 10)
+        assert_eq!(session.client_seq.load(Ordering::Relaxed), 120);
+
+        // Verify rx received both segments in strictly correct order: "HELLO_1234" then "WORLD_1234"
+        let p1 = rx.try_recv().unwrap();
+        assert_eq!(&p1[..], b"HELLO_1234");
+        let p2 = rx.try_recv().unwrap();
+        assert_eq!(&p2[..], b"WORLD_1234");
     }
 }

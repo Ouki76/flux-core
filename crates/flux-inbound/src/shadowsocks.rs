@@ -372,7 +372,7 @@ impl Inbound for ShadowsocksInbound {
                                             .ok()
                                     } else {
                                         let mut salt = [0u8; SALT_LEN];
-                                        rand::thread_rng().fill_bytes(&mut salt);
+                                        rand::rngs::OsRng.fill_bytes(&mut salt);
                                         let subkey = derive_subkey(&master_key, &salt);
                                         let mut cipher =
                                             ShadowsocksCipher::with_kind(cipher_kind, &subkey);

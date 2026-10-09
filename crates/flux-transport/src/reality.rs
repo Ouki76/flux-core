@@ -190,11 +190,13 @@ impl RealityHandshake {
 
         // 1. Read TLS Record Header (5 bytes)
         let mut header = [0u8; 5];
-        stream.read_exact(&mut header).await.map_err(|e| {
-            FluxError::Crypto(format!("failed to read reality TLS record header: {}", e))
-        })?;
-
-        if header[0] != TLS_RECORD_HANDSHAKE {
+        if stream.read_exact(&mut header).await.is_err() || header[0] != TLS_RECORD_HANDSHAKE {
+            if let Some(ref fb) = cfg.fallback {
+                let _ = relay_to_fallback(stream, &header, &[], fb).await;
+                return Err(FluxError::AuthFailed(
+                    "reality active probe redirected to decoy fallback server".into(),
+                ));
+            }
             return Err(FluxError::Crypto(
                 "expected TLS handshake record in reality".into(),
             ));
@@ -202,79 +204,95 @@ impl RealityHandshake {
 
         let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
         if record_len > MAX_PLAINTEXT_CHUNK + 1024 {
+            if let Some(ref fb) = cfg.fallback {
+                let _ = relay_to_fallback(stream, &header, &[], fb).await;
+                return Err(FluxError::AuthFailed(
+                    "reality active probe redirected to decoy fallback server".into(),
+                ));
+            }
             return Err(FluxError::Crypto(
                 "reality client hello length exceeds maximum TLS record size".into(),
             ));
         }
-        let mut record_buf = vec![0u8; record_len];
-        stream.read_exact(&mut record_buf).await.map_err(|e| {
-            FluxError::Crypto(format!("failed to read reality TLS ClientHello: {}", e))
-        })?;
 
-        if record_buf.is_empty() || record_buf[0] != TLS_CLIENT_HELLO {
+        let mut record_buf = vec![0u8; record_len];
+        if stream.read_exact(&mut record_buf).await.is_err()
+            || record_buf.is_empty()
+            || record_buf[0] != TLS_CLIENT_HELLO
+        {
+            if let Some(ref fb) = cfg.fallback {
+                let _ = relay_to_fallback(stream, &header, &record_buf, fb).await;
+                return Err(FluxError::AuthFailed(
+                    "reality active probe redirected to decoy fallback server".into(),
+                ));
+            }
             return Err(FluxError::Crypto(
                 "expected TLS ClientHello in reality".into(),
             ));
         }
 
-        // Parse ClientHello to extract Session ID (which contains client_pub)
-        if record_buf.len() < 4 + 2 + 32 + 1 + 32 {
-            return Err(FluxError::Crypto("reality ClientHello too short".into()));
-        }
-
-        let session_id_len = record_buf[4 + 2 + 32] as usize;
-        if session_id_len != 32 {
-            return Err(FluxError::Crypto(
-                "reality ClientHello invalid session id length".into(),
-            ));
-        }
-
-        let session_id_start = 4 + 2 + 32 + 1;
-        let mut client_pub_bytes = [0u8; 32];
-        client_pub_bytes.copy_from_slice(&record_buf[session_id_start..session_id_start + 32]);
-
-        // Find SessionTicket extension (0x0023) or legacy compat (0xffa1) in extensions
-        let mut pos = session_id_start + 32;
-        // Skip cipher suites
-        if pos + 2 > record_buf.len() {
-            return Err(FluxError::Crypto("truncated cipher suites".into()));
-        }
-        let cs_len = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]) as usize;
-        pos += 2 + cs_len;
-        // Skip compression methods
-        if pos + 1 > record_buf.len() {
-            return Err(FluxError::Crypto("truncated compression methods".into()));
-        }
-        let comp_len = record_buf[pos] as usize;
-        pos += 1 + comp_len;
-
-        // Extensions
-        if pos + 2 > record_buf.len() {
-            return Err(FluxError::Crypto("truncated extensions header".into()));
-        }
-        let ext_total_len = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]) as usize;
-        pos += 2;
-
-        let ext_end = pos + ext_total_len;
-        let mut auth_ciphertext: Option<Vec<u8>> = None;
-
-        while pos + 4 <= ext_end && pos + 4 <= record_buf.len() {
-            let ext_type = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]);
-            let ext_len = u16::from_be_bytes([record_buf[pos + 2], record_buf[pos + 3]]) as usize;
-            pos += 4;
-            if pos + ext_len > record_buf.len() {
-                break;
+        let auth_res: Result<(ChaCha20Poly1305, ChaCha20Poly1305, [u8; 32]), FluxError> = (|| {
+            // Parse ClientHello to extract Session ID (which contains client_pub)
+            if record_buf.len() < 4 + 2 + 32 + 1 + 32 {
+                return Err(FluxError::AuthFailed(
+                    "reality ClientHello too short".into(),
+                ));
             }
-            if ext_type == EXT_SESSION_TICKET || ext_type == EXT_CUSTOM_COMPAT {
-                auth_ciphertext = Some(record_buf[pos..pos + ext_len].to_vec());
-                break;
-            }
-            pos += ext_len;
-        }
 
-        let auth_res: Result<(ChaCha20Poly1305, ChaCha20Poly1305), FluxError> = (|| {
+            let session_id_len = record_buf[4 + 2 + 32] as usize;
+            if session_id_len != 32 {
+                return Err(FluxError::AuthFailed(
+                    "reality ClientHello invalid session id length".into(),
+                ));
+            }
+
+            let session_id_start = 4 + 2 + 32 + 1;
+            let mut client_pub_bytes = [0u8; 32];
+            client_pub_bytes.copy_from_slice(&record_buf[session_id_start..session_id_start + 32]);
+
+            // Find SessionTicket extension (0x0023) or legacy compat (0xffa1) in extensions
+            let mut pos = session_id_start + 32;
+            if pos + 2 > record_buf.len() {
+                return Err(FluxError::AuthFailed("truncated cipher suites".into()));
+            }
+            let cs_len = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]) as usize;
+            pos += 2 + cs_len;
+            if pos + 1 > record_buf.len() {
+                return Err(FluxError::AuthFailed(
+                    "truncated compression methods".into(),
+                ));
+            }
+            let comp_len = record_buf[pos] as usize;
+            pos += 1 + comp_len;
+
+            if pos + 2 > record_buf.len() {
+                return Err(FluxError::AuthFailed("truncated extensions header".into()));
+            }
+            let ext_total_len = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]) as usize;
+            pos += 2;
+
+            let ext_end = pos + ext_total_len;
+            let mut auth_ciphertext: Option<Vec<u8>> = None;
+
+            while pos + 4 <= ext_end && pos + 4 <= record_buf.len() {
+                let ext_type = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]);
+                let ext_len =
+                    u16::from_be_bytes([record_buf[pos + 2], record_buf[pos + 3]]) as usize;
+                pos += 4;
+                if pos + ext_len > record_buf.len() {
+                    break;
+                }
+                if ext_type == EXT_SESSION_TICKET || ext_type == EXT_CUSTOM_COMPAT {
+                    auth_ciphertext = Some(record_buf[pos..pos + ext_len].to_vec());
+                    break;
+                }
+                pos += ext_len;
+            }
+
             let ciphertext = auth_ciphertext.ok_or_else(|| {
-                FluxError::AuthFailed("missing reality auth ticket extension in TLS ClientHello".into())
+                FluxError::AuthFailed(
+                    "missing reality auth ticket extension in TLS ClientHello".into(),
+                )
             })?;
 
             // Cryptographic verification
@@ -304,14 +322,17 @@ impl RealityHandshake {
                 .map_err(|_| FluxError::AuthFailed("reality auth tag decryption failed".into()))?;
 
             // Check if decrypted short_id is permitted
-            if !cfg.short_ids.is_empty() && !cfg.short_ids.iter().any(|id| id == &decrypted_short_id) {
+            if !cfg.short_ids.is_empty()
+                && !cfg.short_ids.iter().any(|id| id == &decrypted_short_id)
+            {
                 return Err(FluxError::AuthFailed("invalid reality short_id".into()));
             }
 
-            Ok((client_cipher, server_cipher))
-        })();
+            Ok((client_cipher, server_cipher, client_pub_bytes))
+        })(
+        );
 
-        let (client_cipher, server_cipher) = match auth_res {
+        let (client_cipher, server_cipher, client_pub_bytes) = match auth_res {
             Ok(ciphers) => ciphers,
             Err(e) => {
                 if let Some(ref fb) = cfg.fallback {
@@ -393,11 +414,8 @@ async fn relay_to_fallback<S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'st
             })?
     };
 
-    let mut dest_stream = crate::tcp::TcpTransport::connect(
-        fallback_addr,
-        std::time::Duration::from_secs(5),
-    )
-    .await?;
+    let mut dest_stream =
+        crate::tcp::TcpTransport::connect(fallback_addr, std::time::Duration::from_secs(5)).await?;
     dest_stream
         .write_all(record_hdr)
         .await
@@ -816,5 +834,9 @@ mod tests {
         fake_probe.flush().await.unwrap();
 
         let _ = srv.await;
+
+        let mut resp_buf = [0u8; 14];
+        fake_probe.read_exact(&mut resp_buf).await.unwrap();
+        assert_eq!(&resp_buf, b"DECOY_RESPONSE");
     }
 }
