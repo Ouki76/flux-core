@@ -1,10 +1,9 @@
 use async_trait::async_trait;
 use flux_protocol::vmess::{VMESS_CMD_UDP, VmessProtocol, VmessStream};
-use flux_types::{BoxedStream, Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta};
+use flux_types::{Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio_rustls::TlsAcceptor;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -12,7 +11,7 @@ pub struct VmessInbound {
     tag: String,
     listen_addr: SocketAddr,
     users: Vec<Uuid>,
-    tls_acceptor: Option<TlsAcceptor>,
+    pipeline: flux_transport::pipeline::ServerTransportPipeline,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -22,14 +21,14 @@ impl VmessInbound {
         tag: impl Into<String>,
         listen_addr: SocketAddr,
         users: Vec<Uuid>,
-        tls_acceptor: Option<TlsAcceptor>,
+        pipeline: flux_transport::pipeline::ServerTransportPipeline,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             tag: tag.into(),
             listen_addr,
             users,
-            tls_acceptor,
+            pipeline,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -57,7 +56,7 @@ impl Inbound for VmessInbound {
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let users = Arc::new(self.users.clone());
-        let tls_acceptor = self.tls_acceptor.clone();
+        let pipeline = self.pipeline.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] VMess inbound listening on {}", tag, self.listen_addr);
@@ -81,34 +80,18 @@ impl Inbound for VmessInbound {
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
                 let user_list = users.clone();
-                let acceptor_opt = tls_acceptor.clone();
+                let pipe = pipeline.clone();
 
                 tokio::spawn(async move {
-                    let mut stream: BoxedStream = if let Some(ref acceptor) = acceptor_opt {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            acceptor.accept(socket),
-                        )
-                        .await
-                        {
-                            Ok(Ok(tls_stream)) => Box::new(tls_stream),
-                            Ok(Err(e)) => {
-                                warn!(
-                                    "[{}] TLS handshake failed from {}: {}",
-                                    inbound_tag, client_addr, e
-                                );
-                                return;
-                            }
-                            Err(_) => {
-                                warn!(
-                                    "[{}] TLS handshake timed out from {}",
-                                    inbound_tag, client_addr
-                                );
-                                return;
-                            }
+                    let mut stream = match pipe.unwrap(socket).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "[{}] VMess transport handshake failed from {}: {}",
+                                inbound_tag, client_addr, e
+                            );
+                            return;
                         }
-                    } else {
-                        Box::new(socket)
                     };
 
                     let req = match tokio::time::timeout(

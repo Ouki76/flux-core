@@ -6,7 +6,6 @@ use flux_types::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -14,9 +13,7 @@ pub struct VlessInbound {
     tag: String,
     listen_addr: SocketAddr,
     uuids: Vec<Uuid>,
-    tls_acceptor: Option<TlsAcceptor>,
-    reality_config: Option<flux_transport::reality::RealityServerConfig>,
-    ws_path: Option<String>,
+    pipeline: flux_transport::pipeline::ServerTransportPipeline,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -26,25 +23,17 @@ impl VlessInbound {
         tag: impl Into<String>,
         listen_addr: SocketAddr,
         uuids: Vec<Uuid>,
-        tls_acceptor: Option<TlsAcceptor>,
-        reality_config: Option<flux_transport::reality::RealityServerConfig>,
+        pipeline: flux_transport::pipeline::ServerTransportPipeline,
     ) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
             tag: tag.into(),
             listen_addr,
             uuids,
-            tls_acceptor,
-            reality_config,
-            ws_path: None,
+            pipeline,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
-    }
-
-    pub fn with_ws_path(mut self, path: Option<String>) -> Self {
-        self.ws_path = path;
-        self
     }
 }
 
@@ -69,9 +58,7 @@ impl Inbound for VlessInbound {
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let uuids = self.uuids.clone();
-        let tls_acceptor = self.tls_acceptor.clone();
-        let reality_config = self.reality_config.clone();
-        let ws_path = self.ws_path.clone();
+        let pipeline = self.pipeline.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] VLESS inbound listening on {}", tag, self.listen_addr);
@@ -100,34 +87,11 @@ impl Inbound for VlessInbound {
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
                 let uuids = uuids.clone();
-                let acceptor = tls_acceptor.clone();
-                let reality_cfg = reality_config.clone();
-                let ws = ws_path.clone();
+                let pipe = pipeline.clone();
 
                 tokio::spawn(async move {
                     let handshake_fut = async {
-                        let mut stream: BoxedStream = if let Some(r_cfg) = reality_cfg {
-                            let s = flux_transport::reality::RealityHandshake::server_handshake(
-                                socket, &r_cfg,
-                            )
-                            .await?;
-                            Box::new(s)
-                        } else if let Some(tls) = acceptor {
-                            let s = tls.accept(socket).await.map_err(FluxError::Io)?;
-                            Box::new(s)
-                        } else {
-                            Box::new(socket)
-                        };
-
-                        if let Some(ref path) = ws {
-                            let ws_stream = flux_transport::websocket::server_handshake(
-                                stream,
-                                Some(path.as_str()),
-                            )
-                            .await?;
-                            stream = Box::new(ws_stream);
-                        }
-
+                        let mut stream = pipe.unwrap(socket).await?;
                         let req = VlessProtocol::read_request_header(&mut stream, &uuids).await?;
                         VlessProtocol::write_response_header(&mut stream).await?;
                         Ok::<_, FluxError>((stream, req))

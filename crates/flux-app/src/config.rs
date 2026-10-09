@@ -192,7 +192,12 @@ pub enum InboundConfig {
         listen_port: u16,
         #[serde(default)]
         password: Vec<String>,
+        #[serde(default)]
         tls: Option<InboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<InboundRealityConfig>,
+        #[serde(default)]
+        transport: Option<TransportConfig>,
     },
     #[serde(rename = "shadowsocks")]
     Shadowsocks {
@@ -200,7 +205,14 @@ pub enum InboundConfig {
         listen: String,
         listen_port: u16,
         password: String,
+        #[serde(default)]
         method: Option<String>,
+        #[serde(default)]
+        tls: Option<InboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<InboundRealityConfig>,
+        #[serde(default)]
+        transport: Option<TransportConfig>,
     },
     #[serde(rename = "redirect")]
     Redirect {
@@ -220,7 +232,12 @@ pub enum InboundConfig {
         listen: String,
         listen_port: u16,
         users: Vec<VlessUserConfig>,
+        #[serde(default)]
         tls: Option<InboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<InboundRealityConfig>,
+        #[serde(default)]
+        transport: Option<TransportConfig>,
     },
     #[serde(rename = "tuic", alias = "tuic5")]
     Tuic {

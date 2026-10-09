@@ -1,12 +1,12 @@
 use crate::api::{ApiServer, TrafficMeter};
 use crate::config::{
-    Config, InboundConfig, OutboundConfig, OutboundRealityConfig, OutboundTlsConfig,
-    TransportConfig,
+    Config, InboundConfig, InboundRealityConfig, InboundTlsConfig, OutboundConfig,
+    OutboundRealityConfig, OutboundTlsConfig, TransportConfig,
 };
 use crate::dispatcher::DefaultDispatcher;
 use dashmap::DashMap;
 use flux_dns::{DnsResolver, FakeIpPool};
-use flux_inbound::{HttpInbound, MixedInbound, SocksInbound, VlessInbound};
+use flux_inbound::{HttpInbound, MixedInbound, SocksInbound};
 use flux_outbound::{
     BlockOutbound, DirectOutbound, SelectorOutbound, SocksOutbound, UrlTestOutbound, VlessOutbound,
 };
@@ -581,65 +581,10 @@ impl Instance {
                         uuids.push(parsed);
                     }
 
-                    let tls_acceptor = if let Some(t) = tls {
-                        if t.enabled {
-                            let (certs, key) =
-                                if let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path) {
-                                    TlsTransport::load_certs_and_key(cp, kp)?
-                                } else {
-                                    let cert = rcgen::generate_simple_self_signed(vec![
-                                        "localhost".to_string(),
-                                    ])
-                                    .map_err(|e| {
-                                        FluxError::Crypto(format!("failed to generate cert: {}", e))
-                                    })?;
-                                    (
-                                        vec![CertificateDer::from(cert.cert)],
-                                        PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
-                                    )
-                                };
-                            Some(TlsTransport::create_server_acceptor(certs, key, vec![])?)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let reality_config = if let Some(r) = reality {
-                        if r.enabled {
-                            let pk_bytes = crate::config::decode_key_32bytes(&r.private_key)?;
-                            let short_ids = r
-                                .short_ids
-                                .into_iter()
-                                .filter_map(|s| flux_types::decode_hex(&s))
-                                .collect();
-                            Some(flux_transport::reality::RealityServerConfig {
-                                server_names: r.server_names,
-                                private_key: pk_bytes,
-                                short_ids,
-                            })
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let ws_path = transport.and_then(|t| {
-                        if t.transport_type.eq_ignore_ascii_case("ws")
-                            || t.transport_type.eq_ignore_ascii_case("websocket")
-                        {
-                            Some(t.path.unwrap_or_else(|| "/".into()))
-                        } else {
-                            None
-                        }
-                    });
-
-                    inbounds.push(Arc::new(
-                        VlessInbound::new(tag, addr, uuids, tls_acceptor, reality_config)
-                            .with_ws_path(ws_path),
-                    ));
+                    let pipe = build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
+                    inbounds.push(Arc::new(flux_inbound::VlessInbound::new(
+                        tag, addr, uuids, pipe,
+                    )));
                 }
                 InboundConfig::Tun {
                     tag,
@@ -655,32 +600,27 @@ impl Instance {
                     listen_port,
                     password,
                     tls,
+                    reality,
+                    transport,
                 } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
                         FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                     })?;
-                    let (certs, key) = if let Some(t) = &tls
-                        && let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path)
-                    {
-                        TlsTransport::load_certs_and_key(cp, kp)?
-                    } else {
-                        let cert =
-                            rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                                .map_err(|e| {
-                                    FluxError::Crypto(format!("failed to generate cert: {}", e))
-                                })?;
-                        (
-                            vec![CertificateDer::from(cert.cert)],
-                            PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
-                        )
+                    let default_trojan_tls = InboundTlsConfig {
+                        enabled: true,
+                        server_name: None,
+                        certificate_path: None,
+                        key_path: None,
                     };
-                    let tls_acceptor = TlsTransport::create_server_acceptor(certs, key, vec![])?;
+                    let effective_tls = tls.as_ref().or(if reality.is_none() {
+                        Some(&default_trojan_tls)
+                    } else {
+                        None
+                    });
+                    let pipe = build_server_pipeline(effective_tls, reality, transport.as_ref())?;
                     inbounds.push(Arc::new(flux_inbound::TrojanInbound::new(
-                        tag,
-                        addr,
-                        password,
-                        tls_acceptor,
+                        tag, addr, password, pipe,
                     )));
                 }
                 InboundConfig::Shadowsocks {
@@ -689,6 +629,9 @@ impl Instance {
                     listen_port,
                     password,
                     method,
+                    tls,
+                    reality,
+                    transport,
                 } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
@@ -698,9 +641,11 @@ impl Instance {
                         .as_deref()
                         .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
                         .unwrap_or_default();
+                    let pipe = build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
                     inbounds.push(Arc::new(
                         flux_inbound::ShadowsocksInbound::new(tag, addr, &password)
-                            .with_cipher_kind(cipher_kind),
+                            .with_cipher_kind(cipher_kind)
+                            .with_pipeline(pipe),
                     ));
                 }
                 InboundConfig::Redirect {
@@ -731,6 +676,8 @@ impl Instance {
                     listen_port,
                     users,
                     tls,
+                    reality,
+                    transport,
                 } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
@@ -743,35 +690,9 @@ impl Instance {
                         })?;
                         uuids.push(parsed);
                     }
-                    let tls_acceptor = if let Some(t) = tls {
-                        if t.enabled {
-                            let (certs, key) =
-                                if let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path) {
-                                    TlsTransport::load_certs_and_key(cp, kp)?
-                                } else {
-                                    let cert = rcgen::generate_simple_self_signed(vec![
-                                        "localhost".to_string(),
-                                    ])
-                                    .map_err(|e| {
-                                        FluxError::Crypto(format!("failed to generate cert: {}", e))
-                                    })?;
-                                    (
-                                        vec![CertificateDer::from(cert.cert)],
-                                        PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
-                                    )
-                                };
-                            Some(TlsTransport::create_server_acceptor(certs, key, vec![])?)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
+                    let pipe = build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
                     inbounds.push(Arc::new(flux_inbound::VmessInbound::new(
-                        tag,
-                        addr,
-                        uuids,
-                        tls_acceptor,
+                        tag, addr, uuids, pipe,
                     )));
                 }
                 InboundConfig::Tuic {
@@ -1035,4 +956,75 @@ fn build_layered_dialer(
     Ok(Arc::new(flux_outbound::LazyPipelineDialer::new(
         server, resolver, sec, framing,
     )))
+}
+
+fn build_server_pipeline(
+    tls: Option<&InboundTlsConfig>,
+    reality: Option<InboundRealityConfig>,
+    transport: Option<&TransportConfig>,
+) -> FluxResult<flux_transport::pipeline::ServerTransportPipeline> {
+    let reality_cfg = if let Some(r) = reality {
+        if r.enabled {
+            let pk_bytes = crate::config::decode_key_32bytes(&r.private_key)?;
+            let short_ids = r
+                .short_ids
+                .iter()
+                .filter_map(|s| flux_types::decode_hex(s.as_str()))
+                .collect();
+            Some(flux_transport::reality::RealityServerConfig {
+                server_names: r.server_names,
+                private_key: pk_bytes,
+                short_ids,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let sec = if let Some(r) = reality_cfg {
+        flux_transport::pipeline::ServerSecurityLayer::Reality(r)
+    } else if let Some(t) = tls {
+        if t.enabled {
+            let (certs, key) = if let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path) {
+                TlsTransport::load_certs_and_key(cp, kp)?
+            } else {
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
+                (
+                    vec![CertificateDer::from(cert.cert)],
+                    PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+                )
+            };
+            let acceptor = TlsTransport::create_server_acceptor(certs, key, vec![])?;
+            flux_transport::pipeline::ServerSecurityLayer::Tls(acceptor)
+        } else {
+            flux_transport::pipeline::ServerSecurityLayer::None
+        }
+    } else {
+        flux_transport::pipeline::ServerSecurityLayer::None
+    };
+
+    let framing = if let Some(tr) = transport {
+        match tr.transport_type.to_ascii_lowercase().as_str() {
+            "ws" | "websocket" => flux_transport::pipeline::ServerFramingLayer::WebSocket {
+                path: tr.path.clone(),
+            },
+            "httpupgrade" | "upgrade" => {
+                flux_transport::pipeline::ServerFramingLayer::HttpUpgrade {
+                    path: tr.path.clone(),
+                }
+            }
+            "h2" | "http2" => flux_transport::pipeline::ServerFramingLayer::Http2,
+            "grpc" | "gun" => flux_transport::pipeline::ServerFramingLayer::Grpc,
+            _ => flux_transport::pipeline::ServerFramingLayer::Raw,
+        }
+    } else {
+        flux_transport::pipeline::ServerFramingLayer::Raw
+    };
+
+    Ok(flux_transport::pipeline::ServerTransportPipeline::new(
+        sec, framing,
+    ))
 }

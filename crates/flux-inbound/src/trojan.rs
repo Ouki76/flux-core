@@ -1,19 +1,16 @@
 use async_trait::async_trait;
 use flux_protocol::trojan::{TROJAN_CMD_CONNECT, TrojanProtocol, hash_trojan_password};
-use flux_types::{
-    BoxedStream, Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta,
-};
+use flux_types::{Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
 pub struct TrojanInbound {
     tag: String,
     listen_addr: SocketAddr,
     password_hashes: Vec<String>,
-    tls_acceptor: TlsAcceptor,
+    pipeline: flux_transport::pipeline::ServerTransportPipeline,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -23,7 +20,7 @@ impl TrojanInbound {
         tag: impl Into<String>,
         listen_addr: SocketAddr,
         passwords: Vec<String>,
-        tls_acceptor: TlsAcceptor,
+        pipeline: flux_transport::pipeline::ServerTransportPipeline,
     ) -> Self {
         let password_hashes = passwords
             .into_iter()
@@ -34,7 +31,7 @@ impl TrojanInbound {
             tag: tag.into(),
             listen_addr,
             password_hashes,
-            tls_acceptor,
+            pipeline,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -62,7 +59,7 @@ impl Inbound for TrojanInbound {
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let hashes = self.password_hashes.clone();
-        let acceptor = self.tls_acceptor.clone();
+        let pipeline = self.pipeline.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] Trojan inbound listening on {}", tag, self.listen_addr);
@@ -91,15 +88,14 @@ impl Inbound for TrojanInbound {
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
                 let valid_hashes = hashes.clone();
-                let tls = acceptor.clone();
+                let pipe = pipeline.clone();
 
                 tokio::spawn(async move {
                     let handshake_fut = async {
-                        let mut tls_stream = tls.accept(socket).await.map_err(FluxError::Io)?;
+                        let mut stream = pipe.unwrap(socket).await?;
                         let (cmd, target) =
-                            TrojanProtocol::read_request_header(&mut tls_stream, &valid_hashes)
-                                .await?;
-                        Ok::<_, FluxError>((Box::new(tls_stream) as BoxedStream, cmd, target))
+                            TrojanProtocol::read_request_header(&mut stream, &valid_hashes).await?;
+                        Ok::<_, FluxError>((stream, cmd, target))
                     };
 
                     let (tls_stream, cmd, target) = match tokio::time::timeout(

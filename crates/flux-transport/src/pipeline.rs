@@ -1,8 +1,9 @@
-use crate::reality::{RealityClientConfig, RealityHandshake};
+use crate::reality::{RealityClientConfig, RealityHandshake, RealityServerConfig};
+use crate::shadowtls::{ShadowTlsClientConfig, ShadowTlsHandshake, ShadowTlsServerConfig};
 use crate::tcp::TcpTransport;
 use crate::tls::{TlsClientConfig, TlsTransport};
 use async_trait::async_trait;
-use flux_types::{BoxedStream, FluxResult, StreamDialer, TargetAddress};
+use flux_types::{BoxedStream, FluxError, FluxResult, StreamDialer, TargetAddress};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ pub enum SecurityLayer {
     None,
     Tls(TlsClientConfig),
     Reality(RealityClientConfig),
+    ShadowTls(ShadowTlsClientConfig),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +102,9 @@ impl StreamDialer for LayeredTransportPipeline {
                     let s = RealityHandshake::client_handshake(tcp_stream, cfg).await?;
                     Box::new(s)
                 }
+                SecurityLayer::ShadowTls(cfg) => {
+                    ShadowTlsHandshake::client_handshake(tcp_stream, cfg).await?
+                }
             };
 
             // 3. Layer 3 (Framing): Apply WebSocket, HTTPUpgrade, or Raw Stream
@@ -158,6 +163,117 @@ impl StreamDialer for LayeredTransportPipeline {
                 "layered transport dial to {} timed out after {:?}",
                 self.server_address, self.connect_timeout
             ))),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum ServerSecurityLayer {
+    None,
+    Tls(tokio_rustls::TlsAcceptor),
+    Reality(RealityServerConfig),
+    ShadowTls(ShadowTlsServerConfig),
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum ServerFramingLayer {
+    #[default]
+    Raw,
+    WebSocket {
+        path: Option<String>,
+    },
+    HttpUpgrade {
+        path: Option<String>,
+    },
+    Http2,
+    Grpc,
+}
+
+pub struct ServerLayeredTransportPipeline;
+
+impl ServerLayeredTransportPipeline {
+    pub async fn unwrap_server_stream(
+        stream: BoxedStream,
+        security: &ServerSecurityLayer,
+        framing: &ServerFramingLayer,
+    ) -> FluxResult<BoxedStream> {
+        // 1. Unwrap security layer
+        let secure_stream: BoxedStream = match security {
+            ServerSecurityLayer::None => stream,
+            ServerSecurityLayer::Tls(acceptor) => {
+                let s = acceptor.accept(stream).await.map_err(FluxError::Io)?;
+                Box::new(s)
+            }
+            ServerSecurityLayer::Reality(cfg) => {
+                let s = RealityHandshake::server_handshake(stream, cfg).await?;
+                Box::new(s)
+            }
+            ServerSecurityLayer::ShadowTls(cfg) => {
+                ShadowTlsHandshake::server_handshake(stream, cfg).await?
+            }
+        };
+
+        // 2. Unwrap framing layer
+        let framed_stream: BoxedStream = match framing {
+            ServerFramingLayer::Raw => secure_stream,
+            ServerFramingLayer::WebSocket { path } => {
+                let ws = crate::websocket::server_handshake(secure_stream, path.as_deref()).await?;
+                Box::new(ws)
+            }
+            ServerFramingLayer::HttpUpgrade { path } => {
+                crate::httpupgrade::server_handshake(secure_stream, path.as_deref()).await?
+            }
+            ServerFramingLayer::Http2 => {
+                let h2 = crate::h2::H2Transport::server_handshake(secure_stream).await?;
+                Box::new(h2)
+            }
+            ServerFramingLayer::Grpc => {
+                let grpc = crate::grpc::GrpcTransport::server_handshake(secure_stream).await?;
+                Box::new(grpc)
+            }
+        };
+
+        Ok(framed_stream)
+    }
+}
+
+#[derive(Clone)]
+pub struct ServerTransportPipeline {
+    pub security: ServerSecurityLayer,
+    pub framing: ServerFramingLayer,
+    pub timeout: Duration,
+}
+
+impl ServerTransportPipeline {
+    pub fn new(security: ServerSecurityLayer, framing: ServerFramingLayer) -> Self {
+        Self {
+            security,
+            framing,
+            timeout: Duration::from_secs(15),
+        }
+    }
+
+    pub fn raw() -> Self {
+        Self::new(ServerSecurityLayer::None, ServerFramingLayer::Raw)
+    }
+
+    pub async fn unwrap<
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    >(
+        &self,
+        carrier_stream: S,
+    ) -> FluxResult<BoxedStream> {
+        let boxed: BoxedStream = Box::new(carrier_stream);
+        let fut = ServerLayeredTransportPipeline::unwrap_server_stream(
+            boxed,
+            &self.security,
+            &self.framing,
+        );
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(FluxError::Timeout(
+                "server transport pipeline handshake timed out".into(),
+            )),
         }
     }
 }

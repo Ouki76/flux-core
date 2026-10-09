@@ -21,7 +21,7 @@ pub struct ShadowsocksInbound {
     master_key: [u8; 32],
     cipher_kind: CipherKind,
     replay_filter: Arc<flux_protocol::shadowsocks2022::ReplayFilter>,
-    reality_config: Option<flux_transport::reality::RealityServerConfig>,
+    pipeline: flux_transport::pipeline::ServerTransportPipeline,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -35,7 +35,7 @@ impl ShadowsocksInbound {
             master_key: derive_master_key(password),
             cipher_kind: CipherKind::ChaCha20IetfPoly1305,
             replay_filter: Arc::new(flux_protocol::shadowsocks2022::ReplayFilter::new(10000)),
-            reality_config: None,
+            pipeline: flux_transport::pipeline::ServerTransportPipeline::raw(),
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -46,8 +46,11 @@ impl ShadowsocksInbound {
         self
     }
 
-    pub fn with_reality(mut self, cfg: Option<flux_transport::reality::RealityServerConfig>) -> Self {
-        self.reality_config = cfg;
+    pub fn with_pipeline(
+        mut self,
+        pipeline: flux_transport::pipeline::ServerTransportPipeline,
+    ) -> Self {
+        self.pipeline = pipeline;
         self
     }
 }
@@ -86,10 +89,11 @@ impl Inbound for ShadowsocksInbound {
         let tag_tcp = tag.clone();
         let running_tcp = running.clone();
         let replay_tcp = replay_filter.clone();
+        let pipeline_tcp = Arc::new(self.pipeline.clone());
 
         tokio::spawn(async move {
             loop {
-                let (mut socket, client_addr) = tokio::select! {
+                let (socket, client_addr) = tokio::select! {
                     res = listener.accept() => {
                         match res {
                             Ok(res) => res,
@@ -111,13 +115,25 @@ impl Inbound for ShadowsocksInbound {
                 let disp = disp_tcp.clone();
                 let inbound_tag = tag_tcp.clone();
                 let replay = replay_tcp.clone();
+                let pipe = pipeline_tcp.clone();
 
                 tokio::spawn(async move {
+                    let mut stream: flux_types::BoxedStream = match pipe.unwrap(socket).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "[{}] transport handshake error from {}: {}",
+                                inbound_tag, client_addr, e
+                            );
+                            return;
+                        }
+                    };
+
                     if let CipherKind::Ss2022(method) = cipher_kind {
                         let key_bytes = &master_key[..method.key_len()];
                         let handshake_2022 =
                             flux_protocol::shadowsocks2022::Ss2022Protocol::server_handshake(
-                                socket, method, key_bytes, &replay,
+                                stream, method, key_bytes, &replay,
                             );
                         let (ss_stream, target, extra) = match tokio::time::timeout(
                             std::time::Duration::from_secs(10),
@@ -157,7 +173,7 @@ impl Inbound for ShadowsocksInbound {
                     let handshake_fut = async {
                         // 1. Read client salt
                         let mut salt = [0u8; SALT_LEN];
-                        socket.read_exact(&mut salt).await.map_err(FluxError::Io)?;
+                        stream.read_exact(&mut salt).await.map_err(FluxError::Io)?;
 
                         if !replay.check_and_insert_salt(&salt) {
                             return Err(FluxError::AuthFailed(
@@ -171,7 +187,7 @@ impl Inbound for ShadowsocksInbound {
 
                         // 3. Read encrypted payload length (2 bytes + 16 bytes tag)
                         let mut enc_len = [0u8; 2 + TAG_LEN];
-                        socket
+                        stream
                             .read_exact(&mut enc_len)
                             .await
                             .map_err(FluxError::Io)?;
@@ -181,7 +197,7 @@ impl Inbound for ShadowsocksInbound {
 
                         // 4. Read encrypted payload (address)
                         let mut enc_payload = vec![0u8; payload_len + TAG_LEN];
-                        socket
+                        stream
                             .read_exact(&mut enc_payload)
                             .await
                             .map_err(FluxError::Io)?;
@@ -236,14 +252,14 @@ impl Inbound for ShadowsocksInbound {
                     // Generate server salt and prepare server encoder
                     let mut server_salt = [0u8; SALT_LEN];
                     rand::thread_rng().fill_bytes(&mut server_salt);
-                    if socket.write_all(&server_salt).await.is_err() {
+                    if stream.write_all(&server_salt).await.is_err() {
                         return;
                     }
                     let server_subkey = derive_subkey(&master_key, &server_salt);
                     let server_enc = ShadowsocksCipher::with_kind(cipher_kind, &server_subkey);
 
                     let ss_stream = ShadowsocksStream::new_with_initial_chunk(
-                        socket,
+                        stream,
                         server_enc,
                         Some(dec),
                         master_key,
