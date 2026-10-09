@@ -19,6 +19,7 @@ pub struct TuicInbound {
     password: String,
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    pipeline: Option<flux_transport::pipeline::ServerTransportPipeline>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -40,6 +41,28 @@ impl TuicInbound {
             password: password.into(),
             certs,
             key,
+            pipeline: None,
+            running: Arc::new(AtomicBool::new(false)),
+            shutdown_tx,
+        }
+    }
+
+    pub fn new_with_pipeline(
+        tag: impl Into<String>,
+        listen_addr: SocketAddr,
+        users: Vec<Uuid>,
+        password: impl Into<String>,
+        pipeline: flux_transport::pipeline::ServerTransportPipeline,
+    ) -> Self {
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        Self {
+            tag: tag.into(),
+            listen_addr,
+            users,
+            password: password.into(),
+            certs: vec![],
+            key: PrivateKeyDer::Pkcs8(vec![].into()),
+            pipeline: Some(pipeline),
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -61,6 +84,123 @@ impl Inbound for TuicInbound {
     }
 
     async fn start(&self, dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()> {
+        if let Some(pipe) = self.pipeline.clone() {
+            let listener = crate::create_reuse_port_listener(self.listen_addr)?;
+            self.running.store(true, Ordering::SeqCst);
+            let tag: Arc<str> = Arc::from(self.tag.as_str());
+            let users = Arc::new(self.users.clone());
+            let password = Arc::new(self.password.clone());
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+
+            info!(
+                "[{}] TUIC v5 Stream/TCP inbound listening on {}",
+                tag, self.listen_addr
+            );
+
+            tokio::spawn(async move {
+                loop {
+                    let (socket, client_addr) = tokio::select! {
+                        res = listener.accept() => match res {
+                            Ok(res) => res,
+                            Err(_) => break,
+                        },
+                        _ = shutdown_rx.recv() => break,
+                    };
+                    crate::optimize_tcp_socket(&socket);
+                    let disp = dispatcher.clone();
+                    let inbound_tag = tag.clone();
+                    let user_list = users.clone();
+                    let pw = password.clone();
+                    let p = pipe.clone();
+
+                    tokio::spawn(async move {
+                        let mut stream = match p.unwrap(socket).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!(
+                                    "[{}] TUIC transport handshake failed from {}: {}",
+                                    inbound_tag, client_addr, e
+                                );
+                                return;
+                            }
+                        };
+
+                        let mut auth_buf = [0u8; 57];
+                        if stream.read_exact(&mut auth_buf).await.is_err() {
+                            return;
+                        }
+
+                        let uuid =
+                            match TuicV5Protocol::verify_auth_frame(&auth_buf, &pw, &user_list) {
+                                Ok(u) => u,
+                                Err(_) => return,
+                            };
+
+                        let mut cmd_hdr = [0u8; 4];
+                        if stream.read_exact(&mut cmd_hdr).await.is_err() {
+                            return;
+                        }
+
+                        let atyp = cmd_hdr[3];
+                        let mut full_cmd = cmd_hdr.to_vec();
+
+                        match atyp {
+                            1 => {
+                                let mut ip_bytes = [0u8; 4];
+                                if stream.read_exact(&mut ip_bytes).await.is_err() {
+                                    return;
+                                }
+                                full_cmd.extend_from_slice(&ip_bytes);
+                            }
+                            3 => {
+                                let mut len_byte = [0u8; 1];
+                                if stream.read_exact(&mut len_byte).await.is_err() {
+                                    return;
+                                }
+                                let dlen = len_byte[0] as usize;
+                                let mut domain_buf = vec![0u8; dlen];
+                                if stream.read_exact(&mut domain_buf).await.is_err() {
+                                    return;
+                                }
+                                full_cmd.push(len_byte[0]);
+                                full_cmd.extend_from_slice(&domain_buf);
+                            }
+                            4 => {
+                                let mut ip_bytes = [0u8; 16];
+                                if stream.read_exact(&mut ip_bytes).await.is_err() {
+                                    return;
+                                }
+                                full_cmd.extend_from_slice(&ip_bytes);
+                            }
+                            _ => return,
+                        }
+
+                        let (cmd, target_addr) =
+                            match TuicV5Protocol::parse_command_frame(&full_cmd) {
+                                Ok(res) => res,
+                                Err(_) => return,
+                            };
+
+                        let meta = SessionMeta::new(
+                            client_addr,
+                            target_addr,
+                            inbound_tag,
+                            if cmd == TUIC_CMD_PACKET {
+                                NetworkType::Udp
+                            } else {
+                                NetworkType::Tcp
+                            },
+                        )
+                        .with_user(uuid.to_string());
+
+                        disp.dispatch_stream(meta, stream).await;
+                    });
+                }
+            });
+
+            return Ok(());
+        }
+
         let alpn = vec![b"tuic-v5".to_vec(), b"h3".to_vec()];
         let endpoint = QuicTransport::create_server_endpoint(
             self.listen_addr,

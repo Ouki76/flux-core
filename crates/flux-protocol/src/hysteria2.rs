@@ -21,6 +21,63 @@ pub struct Hysteria2Config {
     pub insecure: bool,
     #[serde(default)]
     pub server_name: Option<String>,
+    #[serde(default)]
+    pub obfs: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SalamanderObfs {
+    key: [u8; 32],
+}
+
+impl SalamanderObfs {
+    pub fn new(password: &str) -> Self {
+        let key = blake3::hash(password.as_bytes());
+        Self {
+            key: *key.as_bytes(),
+        }
+    }
+
+    pub fn obfuscate(&self, packet: &[u8]) -> Vec<u8> {
+        use rand::RngCore;
+        let mut salt = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut salt);
+        let mut hasher = blake3::Hasher::new_keyed(&self.key);
+        hasher.update(&salt);
+        let mut xof = hasher.finalize_xof();
+
+        let mut out = Vec::with_capacity(16 + packet.len());
+        out.extend_from_slice(&salt);
+
+        let mut keystream = vec![0u8; packet.len()];
+        xof.fill(&mut keystream);
+
+        for (p, k) in packet.iter().zip(keystream.iter()) {
+            out.push(p ^ k);
+        }
+        out
+    }
+
+    pub fn deobfuscate(&self, data: &[u8]) -> Option<Vec<u8>> {
+        if data.len() < 16 {
+            return None;
+        }
+        let salt = &data[..16];
+        let payload = &data[16..];
+
+        let mut hasher = blake3::Hasher::new_keyed(&self.key);
+        hasher.update(salt);
+        let mut xof = hasher.finalize_xof();
+
+        let mut keystream = vec![0u8; payload.len()];
+        xof.fill(&mut keystream);
+
+        let mut out = Vec::with_capacity(payload.len());
+        for (p, k) in payload.iter().zip(keystream.iter()) {
+            out.push(p ^ k);
+        }
+        Some(out)
+    }
 }
 
 fn default_hop_interval_secs() -> u64 {
@@ -283,5 +340,15 @@ mod tests {
         // Force hop elapsed
         hopper.last_hop = Instant::now() - Duration::from_secs(10);
         assert_eq!(hopper.current_port(), 40001);
+    }
+
+    #[test]
+    fn test_salamander_obfs_roundtrip() {
+        let obfs = SalamanderObfs::new("my-salamander-secret");
+        let plain = b"QUIC Initial Packet Data Simulated";
+        let scrambled = obfs.obfuscate(plain);
+        assert_ne!(&scrambled[16..], plain);
+        let recovered = obfs.deobfuscate(&scrambled).unwrap();
+        assert_eq!(&recovered, plain);
     }
 }

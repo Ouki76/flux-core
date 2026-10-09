@@ -15,6 +15,7 @@ pub struct TuicOutbound {
     resolver: Arc<flux_dns::DnsResolver>,
     endpoint: Arc<Mutex<Option<quinn::Endpoint>>>,
     connection: Arc<Mutex<Option<quinn::Connection>>>,
+    dialer: Option<Arc<dyn flux_types::StreamDialer>>,
 }
 
 impl TuicOutbound {
@@ -29,6 +30,23 @@ impl TuicOutbound {
             resolver,
             endpoint: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(None)),
+            dialer: None,
+        }
+    }
+
+    pub fn new_with_dialer(
+        tag: impl Into<String>,
+        config: TuicV5Config,
+        dialer: Arc<dyn flux_types::StreamDialer>,
+    ) -> Self {
+        let resolver = Arc::new(flux_dns::DnsResolver::new(None));
+        Self {
+            tag: tag.into(),
+            config,
+            resolver,
+            endpoint: Arc::new(Mutex::new(None)),
+            connection: Arc::new(Mutex::new(None)),
+            dialer: Some(dialer),
         }
     }
 
@@ -86,8 +104,12 @@ impl Outbound for TuicOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let conn = self.get_connection().await?;
-        let mut stream = QuicTransport::open_bi_stream(&conn).await?;
+        let mut stream: BoxedStream = if let Some(ref d) = self.dialer {
+            d.dial().await?
+        } else {
+            let conn = self.get_connection().await?;
+            Box::new(QuicTransport::open_bi_stream(&conn).await?)
+        };
 
         // Send TUIC v5 Auth frame + Connect command over the encrypted QUIC stream
         let auth_frame = TuicV5Protocol::build_auth_frame(&self.config.uuid, &self.config.password);
@@ -97,7 +119,7 @@ impl Outbound for TuicOutbound {
         stream.write_all(&cmd_frame).await.map_err(FluxError::Io)?;
         stream.flush().await.map_err(FluxError::Io)?;
 
-        Ok(Box::new(stream))
+        Ok(stream)
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {

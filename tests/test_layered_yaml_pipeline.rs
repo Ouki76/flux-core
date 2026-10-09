@@ -448,3 +448,88 @@ outbounds:
     let cfg = Config::from_yaml_str(yaml).unwrap();
     assert!(Instance::new(cfg).is_ok());
 }
+
+#[tokio::test]
+async fn test_layered_yaml_hysteria2_over_tcp_reality_e2e() {
+    let echo_addr = start_tcp_echo_server().await;
+    let srv_port = get_free_tcp_port().await;
+
+    let server_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let server_pub = x25519_dalek::PublicKey::from(&server_secret);
+    let private_key_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_secret.to_bytes());
+    let public_key_b64 =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_pub.as_bytes());
+
+    let srv_yaml = format!(
+        r#"
+inbounds:
+  - tag: hy2-reality-in
+    carrier:
+      type: tcp
+      listen: "127.0.0.1"
+      listen_port: {}
+    security:
+      type: reality
+      server_names: ["www.microsoft.com"]
+      private_key: "{}"
+      short_ids: ["01020304"]
+    protocol:
+      type: hysteria2
+      password: "hy2-stealth-password"
+
+outbounds:
+  - type: direct
+    tag: direct
+"#,
+        srv_port, private_key_b64
+    );
+
+    let srv_cfg = Config::from_yaml_str(&srv_yaml).unwrap();
+    let srv_instance = Instance::new(srv_cfg).unwrap();
+    srv_instance.start().await.unwrap();
+
+    let cli_yaml = format!(
+        r#"
+outbounds:
+  - tag: hy2-reality-out
+    carrier:
+      type: tcp
+      address: "127.0.0.1:{}"
+    security:
+      type: reality
+      sni: "www.microsoft.com"
+      public_key: "{}"
+      short_id: "01020304"
+    protocol:
+      type: hysteria2
+      password: "hy2-stealth-password"
+"#,
+        srv_port, public_key_b64
+    );
+
+    let cli_cfg = Config::from_yaml_str(&cli_yaml).unwrap();
+    let cli_instance = Instance::new(cli_cfg).unwrap();
+    let hy2_out = cli_instance
+        .registry
+        .get_outbound("hy2-reality-out")
+        .unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:50005".parse().unwrap(),
+        TargetAddress::Ip(echo_addr),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = hy2_out.dial_stream(&meta).await.unwrap();
+
+    let payload = b"Hysteria 2 over TCP + REALITY End-To-End Verified!";
+    stream.write_all(payload).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    srv_instance.stop().await.unwrap();
+}

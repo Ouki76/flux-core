@@ -20,6 +20,7 @@ pub struct Hysteria2Outbound {
     pacer: Arc<Mutex<BrutalPacer>>,
     endpoint: Arc<Mutex<Option<quinn::Endpoint>>>,
     connection: Arc<Mutex<Option<quinn::Connection>>>,
+    dialer: Option<Arc<dyn flux_types::StreamDialer>>,
 }
 
 impl Hysteria2Outbound {
@@ -39,6 +40,28 @@ impl Hysteria2Outbound {
             pacer: Arc::new(Mutex::new(pacer)),
             endpoint: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(None)),
+            dialer: None,
+        }
+    }
+
+    pub fn new_with_dialer(
+        tag: impl Into<String>,
+        config: Hysteria2Config,
+        dialer: Arc<dyn flux_types::StreamDialer>,
+    ) -> Self {
+        let hopper = PortHopper::new(config.ports.clone(), config.hop_interval_secs);
+        let pacer = BrutalPacer::new(config.up_mbps);
+        let resolver = Arc::new(flux_dns::DnsResolver::new(None));
+
+        Self {
+            tag: tag.into(),
+            config,
+            resolver,
+            port_hopper: Arc::new(Mutex::new(hopper)),
+            pacer: Arc::new(Mutex::new(pacer)),
+            endpoint: Arc::new(Mutex::new(None)),
+            connection: Arc::new(Mutex::new(None)),
+            dialer: Some(dialer),
         }
     }
 
@@ -102,10 +125,14 @@ impl Outbound for Hysteria2Outbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let conn = self.get_connection().await?;
-        let mut stream = QuicTransport::open_bi_stream(&conn).await?;
+        let mut stream: BoxedStream = if let Some(ref d) = self.dialer {
+            d.dial().await?
+        } else {
+            let conn = self.get_connection().await?;
+            Box::new(QuicTransport::open_bi_stream(&conn).await?)
+        };
 
-        // Send Hysteria 2 Auth + Request frames over the encrypted QUIC stream
+        // Send Hysteria 2 Auth + Request frames over the stream
         let auth_frame = Hysteria2Protocol::build_auth_frame(&self.config.password);
         let req_frame =
             Hysteria2Protocol::build_request_frame(HYSTERIA2_CMD_TCP, &meta.destination);
@@ -114,7 +141,7 @@ impl Outbound for Hysteria2Outbound {
         stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
         stream.flush().await.map_err(FluxError::Io)?;
 
-        Ok(Box::new(stream))
+        Ok(stream)
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
@@ -203,6 +230,7 @@ mod tests {
             hop_interval_secs: 30,
             insecure: false,
             server_name: None,
+            obfs: None,
         };
         let resolver = Arc::new(flux_dns::DnsResolver::new(None));
         let outbound = Hysteria2Outbound::new("hy2-out", cfg, resolver);

@@ -363,6 +363,7 @@ impl Instance {
                             hop_interval_secs: hop_interval_secs.unwrap_or(30),
                             insecure,
                             server_name,
+                            obfs: None,
                         };
                         tracing::info!(
                             "[{}] Hysteria 2 outbound initialized (QUIC/quinn carrier, Brutal pacer, port-hopping)",
@@ -1386,8 +1387,10 @@ fn build_layered_outbound(
                 hop_interval_secs: hop_interval_secs.unwrap_or(30),
                 insecure: false,
                 server_name: None,
+                obfs: None,
             };
-            let out = flux_outbound::Hysteria2Outbound::new(tag.clone(), hy2_cfg, resolver.clone());
+            let out =
+                flux_outbound::Hysteria2Outbound::new_with_dialer(tag.clone(), hy2_cfg, dialer);
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Tuic {
@@ -1408,7 +1411,7 @@ fn build_layered_outbound(
                 insecure: false,
                 server_name: None,
             };
-            let out = flux_outbound::TuicOutbound::new(tag.clone(), tuic_cfg, resolver.clone());
+            let out = flux_outbound::TuicOutbound::new_with_dialer(tag.clone(), tuic_cfg, dialer);
             registry.insert(tag, Arc::new(out));
         }
     }
@@ -1655,29 +1658,45 @@ fn build_layered_inbound(
             ));
         }
         ProtocolConfig::Hysteria2 { password, .. } => {
-            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
-            let certs = vec![CertificateDer::from(cert.cert)];
-            let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-            inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new(
-                tag, addr, password, certs, key,
-            )));
+            if pipeline.securities.is_empty() && pipeline.framings.is_empty() {
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
+                let certs = vec![CertificateDer::from(cert.cert)];
+                let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+                inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new(
+                    tag, addr, password, certs, key,
+                )));
+            } else {
+                inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new_with_pipeline(
+                    tag, addr, password, pipeline,
+                )));
+            }
         }
         ProtocolConfig::Tuic { uuid, password, .. } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid tuic uuid {}: {}", uuid, e)))?;
-            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
-            let certs = vec![CertificateDer::from(cert.cert)];
-            let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-            inbounds.push(Arc::new(flux_inbound::TuicInbound::new(
-                tag,
-                addr,
-                vec![parsed_uuid],
-                password,
-                certs,
-                key,
-            )));
+            if pipeline.securities.is_empty() && pipeline.framings.is_empty() {
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
+                let certs = vec![CertificateDer::from(cert.cert)];
+                let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+                inbounds.push(Arc::new(flux_inbound::TuicInbound::new(
+                    tag,
+                    addr,
+                    vec![parsed_uuid],
+                    password,
+                    certs,
+                    key,
+                )));
+            } else {
+                inbounds.push(Arc::new(flux_inbound::TuicInbound::new_with_pipeline(
+                    tag,
+                    addr,
+                    vec![parsed_uuid],
+                    password,
+                    pipeline,
+                )));
+            }
         }
     }
     Ok(())
