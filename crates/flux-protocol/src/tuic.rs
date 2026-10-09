@@ -22,6 +22,10 @@ pub struct TuicV5Config {
     pub congestion_control: String,
     #[serde(default = "default_zero_rtt")]
     pub zero_rtt: bool,
+    #[serde(default)]
+    pub insecure: bool,
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 fn default_congestion() -> String {

@@ -55,12 +55,21 @@ impl TuicOutbound {
             ep.clone()
         } else {
             let alpn = vec![b"tuic-v5".to_vec(), b"h3".to_vec()];
-            let ep = QuicTransport::create_client_endpoint(peer_addr.is_ipv6(), alpn, false)?;
+            let ep = QuicTransport::create_client_endpoint(
+                peer_addr.is_ipv6(),
+                alpn,
+                self.config.insecure,
+            )?;
             *ep_guard = Some(ep.clone());
             ep
         };
 
-        let conn = QuicTransport::connect(&endpoint, peer_addr, &self.config.server).await?;
+        let sni = self
+            .config
+            .server_name
+            .as_deref()
+            .unwrap_or(&self.config.server);
+        let conn = QuicTransport::connect(&endpoint, peer_addr, sni).await?;
         *conn_guard = Some(conn.clone());
         Ok(conn)
     }
@@ -171,6 +180,8 @@ mod tests {
             password: "test".into(),
             congestion_control: "bbr".into(),
             zero_rtt: false,
+            insecure: false,
+            server_name: None,
         };
         let resolver = Arc::new(flux_dns::DnsResolver::new(None));
         let outbound = TuicOutbound::new("tuic-out", cfg, resolver);

@@ -110,6 +110,7 @@ impl ProxySpec {
                     password,
                     congestion_control: None,
                     zero_rtt: None,
+                    tls: self.tls,
                 })
             }
             "hy2" | "hysteria2" => {
@@ -123,6 +124,7 @@ impl ProxySpec {
                     up_mbps: 100,
                     down_mbps: 100,
                     hop_interval_secs: None,
+                    tls: self.tls,
                 })
             }
             other => {

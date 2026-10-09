@@ -94,6 +94,30 @@ impl QuicTransport {
         Ok(endpoint)
     }
 
+    /// Creates a server QUIC Endpoint with certificates, private key, and ALPN protocols.
+    pub fn create_server_endpoint(
+        listen_addr: SocketAddr,
+        certs: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+        key: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+        alpn: Vec<Vec<u8>>,
+    ) -> FluxResult<quinn::Endpoint> {
+        let mut server_crypto = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| {
+                FluxError::Crypto(format!("failed to configure QUIC server TLS: {}", e))
+            })?;
+        server_crypto.alpn_protocols = alpn;
+
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).map_err(|e| {
+                FluxError::Crypto(format!("failed to create QUIC server config: {}", e))
+            })?,
+        ));
+
+        quinn::Endpoint::server(server_config, listen_addr).map_err(FluxError::Io)
+    }
+
     /// Establishes an authenticated QUIC connection to the destination server.
     pub async fn connect(
         endpoint: &quinn::Endpoint,

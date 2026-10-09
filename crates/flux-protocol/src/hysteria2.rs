@@ -17,6 +17,10 @@ pub struct Hysteria2Config {
     pub down_mbps: u64,
     #[serde(default = "default_hop_interval_secs")]
     pub hop_interval_secs: u64,
+    #[serde(default)]
+    pub insecure: bool,
+    #[serde(default)]
+    pub server_name: Option<String>,
 }
 
 fn default_hop_interval_secs() -> u64 {

@@ -295,11 +295,17 @@ impl Instance {
                     up_mbps,
                     down_mbps,
                     hop_interval_secs,
+                    tls,
                 } => {
                     let mut port_list = ports;
                     if port_list.is_empty() {
                         port_list.push(server_port.unwrap_or(443));
                     }
+                    let (insecure, server_name) = if let Some(t) = tls {
+                        (t.insecure, t.server_name)
+                    } else {
+                        (false, None)
+                    };
                     let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
                         server,
                         ports: port_list,
@@ -307,6 +313,8 @@ impl Instance {
                         up_mbps,
                         down_mbps,
                         hop_interval_secs: hop_interval_secs.unwrap_or(30),
+                        insecure,
+                        server_name,
                     };
                     tracing::info!(
                         "[{}] Hysteria 2 outbound initialized (QUIC/quinn carrier, Brutal pacer, port-hopping)",
@@ -327,10 +335,16 @@ impl Instance {
                     password,
                     congestion_control,
                     zero_rtt,
+                    tls,
                 } => {
                     let parsed_uuid = Uuid::parse_str(&uuid).map_err(|e| {
                         FluxError::Config(format!("invalid tuic uuid {}: {}", uuid, e))
                     })?;
+                    let (insecure, server_name) = if let Some(t) = tls {
+                        (t.insecure, t.server_name)
+                    } else {
+                        (false, None)
+                    };
                     let tuic_cfg = flux_protocol::tuic::TuicV5Config {
                         server,
                         server_port,
@@ -338,6 +352,8 @@ impl Instance {
                         password,
                         congestion_control: congestion_control.unwrap_or_else(|| "bbr".into()),
                         zero_rtt: zero_rtt.unwrap_or(true),
+                        insecure,
+                        server_name,
                     };
                     tracing::info!(
                         "[{}] TUIC v5 outbound initialized (QUIC/quinn carrier, BBR congestion control)",
@@ -706,6 +722,123 @@ impl Instance {
                         FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                     })?;
                     inbounds.push(Arc::new(flux_inbound::TproxyInbound::new(tag, addr)));
+                }
+                InboundConfig::Vmess {
+                    tag,
+                    listen,
+                    listen_port,
+                    users,
+                    tls,
+                } => {
+                    let addr_str = format!("{}:{}", listen, listen_port);
+                    let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                        FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
+                    })?;
+                    let mut uuids = Vec::new();
+                    for u in users {
+                        let parsed = Uuid::parse_str(&u.uuid).map_err(|e| {
+                            FluxError::Config(format!("invalid vmess uuid {}: {}", u.uuid, e))
+                        })?;
+                        uuids.push(parsed);
+                    }
+                    let tls_acceptor = if let Some(t) = tls {
+                        if t.enabled {
+                            let (certs, key) =
+                                if let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path) {
+                                    TlsTransport::load_certs_and_key(cp, kp)?
+                                } else {
+                                    let cert = rcgen::generate_simple_self_signed(vec![
+                                        "localhost".to_string(),
+                                    ])
+                                    .map_err(|e| {
+                                        FluxError::Crypto(format!("failed to generate cert: {}", e))
+                                    })?;
+                                    (
+                                        vec![CertificateDer::from(cert.cert)],
+                                        PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+                                    )
+                                };
+                            Some(TlsTransport::create_server_acceptor(certs, key, vec![])?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    inbounds.push(Arc::new(flux_inbound::VmessInbound::new(
+                        tag,
+                        addr,
+                        uuids,
+                        tls_acceptor,
+                    )));
+                }
+                InboundConfig::Tuic {
+                    tag,
+                    listen,
+                    listen_port,
+                    users,
+                    password,
+                    tls,
+                } => {
+                    let addr_str = format!("{}:{}", listen, listen_port);
+                    let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                        FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
+                    })?;
+                    let mut uuids = Vec::new();
+                    for u in users {
+                        let parsed = Uuid::parse_str(&u.uuid).map_err(|e| {
+                            FluxError::Config(format!("invalid tuic uuid {}: {}", u.uuid, e))
+                        })?;
+                        uuids.push(parsed);
+                    }
+                    let (certs, key) = if let Some(t) = &tls
+                        && let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path)
+                    {
+                        TlsTransport::load_certs_and_key(cp, kp)?
+                    } else {
+                        let cert =
+                            rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                                .map_err(|e| {
+                                    FluxError::Crypto(format!("failed to generate cert: {}", e))
+                                })?;
+                        (
+                            vec![CertificateDer::from(cert.cert)],
+                            PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+                        )
+                    };
+                    inbounds.push(Arc::new(flux_inbound::TuicInbound::new(
+                        tag, addr, uuids, password, certs, key,
+                    )));
+                }
+                InboundConfig::Hysteria2 {
+                    tag,
+                    listen,
+                    listen_port,
+                    password,
+                    tls,
+                } => {
+                    let addr_str = format!("{}:{}", listen, listen_port);
+                    let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                        FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
+                    })?;
+                    let (certs, key) = if let Some(t) = &tls
+                        && let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path)
+                    {
+                        TlsTransport::load_certs_and_key(cp, kp)?
+                    } else {
+                        let cert =
+                            rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                                .map_err(|e| {
+                                    FluxError::Crypto(format!("failed to generate cert: {}", e))
+                                })?;
+                        (
+                            vec![CertificateDer::from(cert.cert)],
+                            PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+                        )
+                    };
+                    inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new(
+                        tag, addr, password, certs, key,
+                    )));
                 }
             }
         }

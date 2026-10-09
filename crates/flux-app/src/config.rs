@@ -214,6 +214,31 @@ pub enum InboundConfig {
         listen: String,
         listen_port: u16,
     },
+    #[serde(rename = "vmess")]
+    Vmess {
+        tag: String,
+        listen: String,
+        listen_port: u16,
+        users: Vec<VlessUserConfig>,
+        tls: Option<InboundTlsConfig>,
+    },
+    #[serde(rename = "tuic", alias = "tuic5")]
+    Tuic {
+        tag: String,
+        listen: String,
+        listen_port: u16,
+        users: Vec<VlessUserConfig>,
+        password: String,
+        tls: Option<InboundTlsConfig>,
+    },
+    #[serde(rename = "hysteria2", alias = "hy2")]
+    Hysteria2 {
+        tag: String,
+        listen: String,
+        listen_port: u16,
+        password: String,
+        tls: Option<InboundTlsConfig>,
+    },
 }
 
 impl InboundConfig {
@@ -227,7 +252,10 @@ impl InboundConfig {
             | Self::Trojan { tag, .. }
             | Self::Shadowsocks { tag, .. }
             | Self::Redirect { tag, .. }
-            | Self::Tproxy { tag, .. } => tag,
+            | Self::Tproxy { tag, .. }
+            | Self::Vmess { tag, .. }
+            | Self::Tuic { tag, .. }
+            | Self::Hysteria2 { tag, .. } => tag,
         }
     }
 }
@@ -355,6 +383,8 @@ pub enum OutboundConfig {
         down_mbps: u64,
         #[serde(default)]
         hop_interval_secs: Option<u64>,
+        #[serde(default)]
+        tls: Option<OutboundTlsConfig>,
     },
     #[serde(rename = "tuic", alias = "tuic5")]
     Tuic {
@@ -367,6 +397,8 @@ pub enum OutboundConfig {
         congestion_control: Option<String>,
         #[serde(default)]
         zero_rtt: Option<bool>,
+        #[serde(default)]
+        tls: Option<OutboundTlsConfig>,
     },
     #[serde(rename = "selector")]
     Selector {

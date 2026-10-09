@@ -1036,3 +1036,183 @@ async fn test_18_shadowsocks_aead_replay_defense() {
 
     instance.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_19_vmess_inbound_server_e2e() {
+    let echo_addr = start_tcp_echo_server().await;
+    let srv_port = get_free_tcp_port().await;
+    let test_uuid_str = "b2c3d4e5-f6a7-8901-2345-6789abcdef01";
+
+    let srv_cfg = Config::from_json_str(&format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "vmess",
+                "tag": "vmess-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"uuid": "{}"}}]
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        srv_port, test_uuid_str
+    ))
+    .unwrap();
+    let srv_instance = Instance::new(srv_cfg).unwrap();
+    srv_instance.start().await.unwrap();
+
+    let cli_cfg = Config::from_json_str(&format!(
+        r#"{{
+            "outbounds": [{{
+                "type": "vmess",
+                "tag": "vmess-out",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "uuid": "{}",
+                "security": "aes-128-gcm"
+            }}]
+        }}"#,
+        srv_port, test_uuid_str
+    ))
+    .unwrap();
+    let cli_instance = Instance::new(cli_cfg).unwrap();
+    let vmess_out = cli_instance.registry.get_outbound("vmess-out").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:40030".parse().unwrap(),
+        TargetAddress::Ip(echo_addr),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = vmess_out.dial_stream(&meta).await.unwrap();
+
+    let payload = b"VMess Server <-> Client End-To-End Verified!";
+    stream.write_all(payload).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    srv_instance.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_20_tuic_v5_inbound_server_e2e() {
+    let echo_addr = start_tcp_echo_server().await;
+    let srv_port = get_free_tcp_port().await;
+    let test_uuid_str = "c3d4e5f6-a7b8-9012-3456-789abcdef012";
+    let password = "tuic-secret-password";
+
+    let srv_cfg = Config::from_json_str(&format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "tuic",
+                "tag": "tuic-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"uuid": "{}"}}],
+                "password": "{}"
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        srv_port, test_uuid_str, password
+    ))
+    .unwrap();
+    let srv_instance = Instance::new(srv_cfg).unwrap();
+    srv_instance.start().await.unwrap();
+
+    let cli_cfg = Config::from_json_str(&format!(
+        r#"{{
+            "outbounds": [{{
+                "type": "tuic",
+                "tag": "tuic-out",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "uuid": "{}",
+                "password": "{}",
+                "tls": {{ "enabled": true, "insecure": true }}
+            }}]
+        }}"#,
+        srv_port, test_uuid_str, password
+    ))
+    .unwrap();
+    let cli_instance = Instance::new(cli_cfg).unwrap();
+    let tuic_out = cli_instance.registry.get_outbound("tuic-out").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:40032".parse().unwrap(),
+        TargetAddress::Ip(echo_addr),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = tuic_out.dial_stream(&meta).await.unwrap();
+
+    let payload = b"TUIC v5 Full QUIC Inbound Server Verified!";
+    stream.write_all(payload).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    srv_instance.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_21_hysteria2_inbound_server_e2e() {
+    let echo_addr = start_tcp_echo_server().await;
+    let srv_port = get_free_tcp_port().await;
+    let password = "hy2-secret-password";
+
+    let srv_cfg = Config::from_json_str(&format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "hysteria2",
+                "tag": "hy2-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "password": "{}"
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        srv_port, password
+    ))
+    .unwrap();
+    let srv_instance = Instance::new(srv_cfg).unwrap();
+    srv_instance.start().await.unwrap();
+
+    let cli_cfg = Config::from_json_str(&format!(
+        r#"{{
+            "outbounds": [{{
+                "type": "hysteria2",
+                "tag": "hy2-out",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "password": "{}",
+                "tls": {{ "enabled": true, "insecure": true }}
+            }}]
+        }}"#,
+        srv_port, password
+    ))
+    .unwrap();
+    let cli_instance = Instance::new(cli_cfg).unwrap();
+    let hy2_out = cli_instance.registry.get_outbound("hy2-out").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:40034".parse().unwrap(),
+        TargetAddress::Ip(echo_addr),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = hy2_out.dial_stream(&meta).await.unwrap();
+
+    let payload = b"Hysteria 2 Full QUIC Inbound Server Verified!";
+    stream.write_all(payload).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    srv_instance.stop().await.unwrap();
+}

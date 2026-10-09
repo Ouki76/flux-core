@@ -1,21 +1,27 @@
 pub mod http;
+pub mod hysteria2;
 pub mod mixed;
 pub mod redirect;
 pub mod shadowsocks;
 pub mod socks;
 pub mod tproxy;
 pub mod trojan;
+pub mod tuic;
 pub mod tun;
 pub mod vless;
+pub mod vmess;
 
 pub use http::*;
+pub use hysteria2::*;
 pub use mixed::*;
 pub use redirect::*;
 pub use shadowsocks::*;
 pub use socks::*;
 pub use tproxy::*;
 pub use trojan::*;
+pub use tuic::*;
 pub use tun::*;
 pub use vless::*;
+pub use vmess::*;
 
 pub use flux_common::{create_reuse_port_listener, optimize_tcp_socket};

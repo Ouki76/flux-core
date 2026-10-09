@@ -4,15 +4,18 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 
 ## Features
 
-### Protocols
-- **VLESS**: REALITY (X25519, ChaCha20-Poly1305) and `xtls-rprx-vision` flow.
-- **Trojan**: SHA-224 password hashing over TLS.
-- **Shadowsocks**: AEAD (ChaCha20-Poly1305, HKDF key derivation).
-- **SOCKS5**: TCP CONNECT and UDP ASSOCIATE support with user/password authentication.
-- **HTTP / HTTP CONNECT**: Forward proxy and tunneling.
+### Protocols (Server & Client)
+- **VLESS**: REALITY (X25519, ChaCha20-Poly1305), `xtls-rprx-vision` flow, TLS, WebSocket.
+- **Trojan**: SHA-224 password hashing over TLS (Inbound & Outbound).
+- **VMess**: AEAD header authentication, AES-128-GCM and ChaCha20-Poly1305 ciphers (Inbound & Outbound).
+- **Shadowsocks & Shadowsocks-2022**: AEAD (ChaCha20-Poly1305, AES-256-GCM), 2022 Blake3-ciphers, ReplayFilter defense (Inbound & Outbound).
+- **TUIC v5**: Full QUIC/quinn carrier, BBR congestion control, TCP stream & UDP relay (Inbound & Outbound).
+- **Hysteria 2**: Full QUIC/quinn carrier, Brutal pacer, port-hopping, TCP stream & UDP relay (Inbound & Outbound).
+- **SOCKS5**: TCP CONNECT and UDP ASSOCIATE support with user/password authentication (Inbound & Outbound).
+- **HTTP / HTTP CONNECT**: Forward proxy, tunneling, Basic authentication (Inbound & Outbound).
 - **Mixed Inbound**: Auto-detection of SOCKS5 and HTTP protocols on a single port.
-- **TUN**: Network interface abstraction for transparent proxying with userspace TCP framing and UDP relay.
-- **Modern QUIC & UDP Carriers**: WireGuard (AmneziaWG dialect), Shadowsocks-2022 (TCP & UDP), TUIC v5 (QUIC carrier via `quinn`), Hysteria 2 (QUIC carrier, Brutal pacer, port-hopping).
+- **Transparent Inbounds**: TUN (userspace TCP stack & UDP relay), REDIRECT (`SO_ORIGINAL_DST`), TPROXY (`IP_TRANSPARENT`).
+- **WireGuard**: AmneziaWG dialect with junk packet obfuscation (Outbound tunnel).
 
 ### Transport & Performance
 - **Linux Zero-Copy**: Socket-to-socket `splice(2)` data transfer.
