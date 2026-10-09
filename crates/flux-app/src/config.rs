@@ -150,6 +150,12 @@ pub enum InboundConfig {
         listen_port: u16,
         #[serde(default)]
         users: Vec<SocksUserConfig>,
+        #[serde(default)]
+        tls: Option<InboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<InboundRealityConfig>,
+        #[serde(default)]
+        transport: Option<TransportConfig>,
     },
     #[serde(rename = "http")]
     Http {
@@ -158,6 +164,12 @@ pub enum InboundConfig {
         listen_port: u16,
         #[serde(default)]
         users: Vec<SocksUserConfig>,
+        #[serde(default)]
+        tls: Option<InboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<InboundRealityConfig>,
+        #[serde(default)]
+        transport: Option<TransportConfig>,
     },
     #[serde(rename = "mixed")]
     Mixed {
@@ -166,6 +178,12 @@ pub enum InboundConfig {
         listen_port: u16,
         #[serde(default)]
         users: Vec<SocksUserConfig>,
+        #[serde(default)]
+        tls: Option<InboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<InboundRealityConfig>,
+        #[serde(default)]
+        transport: Option<TransportConfig>,
     },
     #[serde(rename = "vless")]
     Vless {
@@ -334,6 +352,12 @@ pub enum OutboundConfig {
         username: Option<String>,
         #[serde(default)]
         password: Option<String>,
+        #[serde(default)]
+        tls: Option<OutboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<OutboundRealityConfig>,
+        #[serde(default)]
+        transport: Option<TransportConfig>,
     },
     #[serde(rename = "http")]
     Http {
@@ -344,6 +368,12 @@ pub enum OutboundConfig {
         username: Option<String>,
         #[serde(default)]
         password: Option<String>,
+        #[serde(default)]
+        tls: Option<OutboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<OutboundRealityConfig>,
+        #[serde(default)]
+        transport: Option<TransportConfig>,
     },
     #[serde(rename = "vless")]
     Vless {

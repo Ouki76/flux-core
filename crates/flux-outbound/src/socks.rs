@@ -4,8 +4,8 @@ use flux_protocol::socks5::{CMD_CONNECT, CMD_UDP_ASSOCIATE, Socks5Handshake};
 use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
 use flux_transport::tcp::TcpTransport;
 use flux_types::{
-    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
-    UdpPacket,
+    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, StreamDialer,
+    TargetAddress, UdpPacket,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ pub struct SocksOutbound {
     auth: Option<(String, String)>,
     resolver: Arc<DnsResolver>,
     connect_timeout: Duration,
+    dialer: Option<Arc<dyn StreamDialer>>,
 }
 
 impl SocksOutbound {
@@ -33,6 +34,23 @@ impl SocksOutbound {
             auth: None,
             resolver,
             connect_timeout: Duration::from_secs(10),
+            dialer: None,
+        }
+    }
+
+    pub fn new_with_dialer(
+        tag: impl Into<String>,
+        server_address: TargetAddress,
+        resolver: Arc<DnsResolver>,
+        dialer: Arc<dyn StreamDialer>,
+    ) -> Self {
+        Self {
+            tag: tag.into(),
+            server_address,
+            auth: None,
+            resolver,
+            connect_timeout: Duration::from_secs(10),
+            dialer: Some(dialer),
         }
     }
 
@@ -53,8 +71,12 @@ impl Outbound for SocksOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let server_addr = self.resolver.resolve(&self.server_address).await?;
-        let mut stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
+        let mut stream: BoxedStream = if let Some(ref d) = self.dialer {
+            d.dial().await?
+        } else {
+            let server_addr = self.resolver.resolve(&self.server_address).await?;
+            Box::new(TcpTransport::connect(server_addr, self.connect_timeout).await?)
+        };
 
         let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         Socks5Handshake::client_handshake_with_auth(
@@ -65,7 +87,7 @@ impl Outbound for SocksOutbound {
         )
         .await?;
 
-        Ok(Box::new(stream))
+        Ok(stream)
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {

@@ -86,6 +86,9 @@ impl ProxySpec {
                 server_port: self.port,
                 username: self.username,
                 password: self.password,
+                tls: self.tls,
+                reality: self.reality,
+                transport: self.transport,
             }),
             "http" | "https" => Ok(OutboundConfig::Http {
                 tag: self.tag,
@@ -93,6 +96,9 @@ impl ProxySpec {
                 server_port: self.port,
                 username: self.username,
                 password: self.password,
+                tls: self.tls,
+                reality: self.reality,
+                transport: self.transport,
             }),
             "direct" => Ok(OutboundConfig::Direct {
                 tag: self.tag,

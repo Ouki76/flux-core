@@ -3,7 +3,8 @@ use flux_dns::DnsResolver;
 use flux_protocol::http::HttpHandshake;
 use flux_transport::tcp::TcpTransport;
 use flux_types::{
-    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
+    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, StreamDialer,
+    TargetAddress,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,6 +15,7 @@ pub struct HttpOutbound {
     auth: Option<(String, String)>,
     resolver: Arc<DnsResolver>,
     connect_timeout: Duration,
+    dialer: Option<Arc<dyn StreamDialer>>,
 }
 
 impl HttpOutbound {
@@ -28,6 +30,23 @@ impl HttpOutbound {
             auth: None,
             resolver,
             connect_timeout: Duration::from_secs(10),
+            dialer: None,
+        }
+    }
+
+    pub fn new_with_dialer(
+        tag: impl Into<String>,
+        server_address: TargetAddress,
+        resolver: Arc<DnsResolver>,
+        dialer: Arc<dyn StreamDialer>,
+    ) -> Self {
+        Self {
+            tag: tag.into(),
+            server_address,
+            auth: None,
+            resolver,
+            connect_timeout: Duration::from_secs(10),
+            dialer: Some(dialer),
         }
     }
 
@@ -48,8 +67,12 @@ impl Outbound for HttpOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let server_addr = self.resolver.resolve(&self.server_address).await?;
-        let mut stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
+        let mut stream: BoxedStream = if let Some(ref d) = self.dialer {
+            d.dial().await?
+        } else {
+            let server_addr = self.resolver.resolve(&self.server_address).await?;
+            Box::new(TcpTransport::connect(server_addr, self.connect_timeout).await?)
+        };
 
         let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         let excess_opt =
@@ -61,7 +84,7 @@ impl Outbound for HttpOutbound {
                 stream, excess,
             )))
         } else {
-            Ok(Box::new(stream))
+            Ok(stream)
         }
     }
 

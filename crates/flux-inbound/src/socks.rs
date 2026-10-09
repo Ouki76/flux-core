@@ -15,6 +15,7 @@ pub struct SocksInbound {
     tag: String,
     listen_addr: SocketAddr,
     users: Vec<(String, String)>,
+    pipeline: flux_transport::pipeline::ServerTransportPipeline,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -26,6 +27,7 @@ impl SocksInbound {
             tag: tag.into(),
             listen_addr,
             users: vec![],
+            pipeline: flux_transport::pipeline::ServerTransportPipeline::raw(),
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -33,6 +35,14 @@ impl SocksInbound {
 
     pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
         self.users = users;
+        self
+    }
+
+    pub fn with_pipeline(
+        mut self,
+        pipe: flux_transport::pipeline::ServerTransportPipeline,
+    ) -> Self {
+        self.pipeline = pipe;
         self
     }
 }
@@ -59,13 +69,14 @@ impl Inbound for SocksInbound {
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let listen_ip = self.listen_addr.ip();
         let users = Arc::new(self.users.clone());
+        let pipeline = Arc::new(self.pipeline.clone());
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] SOCKS5 inbound listening on {}", tag, self.listen_addr);
 
         tokio::spawn(async move {
             loop {
-                let (mut socket, client_addr) = tokio::select! {
+                let (socket, client_addr) = tokio::select! {
                     res = listener.accept() => {
                         match res {
                             Ok(res) => res,
@@ -83,20 +94,33 @@ impl Inbound for SocksInbound {
                     }
                 };
                 crate::optimize_tcp_socket(&socket);
+                let local_sock_addr = socket.local_addr().ok();
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
                 let user_list = users.clone();
+                let pipe = pipeline.clone();
 
                 tokio::spawn(async move {
+                    let mut stream: flux_types::BoxedStream = match pipe.unwrap(socket).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "[{}] client {} transport handshake failed: {}",
+                                inbound_tag, client_addr, e
+                            );
+                            return;
+                        }
+                    };
+
                     // 1. SOCKS5 Auth Handshake (No Auth or RFC 1929 Password) with bounded timeout
                     let handshake_fut = async {
                         let auth_user = Socks5Handshake::server_handshake_with_auth(
-                            &mut socket,
+                            &mut stream,
                             Some(&user_list),
                         )
                         .await?;
-                        let req = Socks5Handshake::read_request(&mut socket).await?;
+                        let req = Socks5Handshake::read_request(&mut stream).await?;
                         Ok::<_, FluxError>((auth_user, req))
                     };
 
@@ -143,7 +167,7 @@ impl Inbound for SocksInbound {
                                         inbound_tag, meta.destination, msg
                                     );
                                     let _ =
-                                        Socks5Handshake::send_reply(&mut socket, 0x02, None).await; // 0x02 = connection not allowed by ruleset
+                                        Socks5Handshake::send_reply(&mut stream, 0x02, None).await; // 0x02 = connection not allowed by ruleset
                                     return;
                                 }
                                 Err(e) => {
@@ -152,20 +176,19 @@ impl Inbound for SocksInbound {
                                         inbound_tag, meta.destination, e
                                     );
                                     let _ =
-                                        Socks5Handshake::send_reply(&mut socket, 0x05, None).await; // 0x05 = connection refused
+                                        Socks5Handshake::send_reply(&mut stream, 0x05, None).await; // 0x05 = connection refused
                                     return;
                                 }
                             };
 
                             if let Err(e) =
-                                Socks5Handshake::send_reply(&mut socket, REP_SUCCESS, None).await
+                                Socks5Handshake::send_reply(&mut stream, REP_SUCCESS, None).await
                             {
                                 warn!("[{}] failed to send reply: {}", inbound_tag, e);
                                 return;
                             }
 
-                            disp.bridge_streams(meta, Box::new(socket), outbound_stream)
-                                .await;
+                            disp.bridge_streams(meta, stream, outbound_stream).await;
                         }
                         Socks5Command::UdpAssociate => {
                             // Bind local UDP socket for relaying on the matching inbound interface
@@ -179,7 +202,7 @@ impl Inbound for SocksInbound {
                                         inbound_tag, listen_ip, e
                                     );
                                     let _ =
-                                        Socks5Handshake::send_reply(&mut socket, 0x01, None).await;
+                                        Socks5Handshake::send_reply(&mut stream, 0x01, None).await;
                                     return;
                                 }
                             };
@@ -193,8 +216,7 @@ impl Inbound for SocksInbound {
                             };
 
                             let reply_addr = if listen_ip.is_unspecified() {
-                                socket
-                                    .local_addr()
+                                local_sock_addr
                                     .map(|a| SocketAddr::new(a.ip(), local_udp_addr.port()))
                                     .unwrap_or(local_udp_addr)
                             } else {
@@ -202,7 +224,7 @@ impl Inbound for SocksInbound {
                             };
 
                             if let Err(e) = Socks5Handshake::send_reply(
-                                &mut socket,
+                                &mut stream,
                                 REP_SUCCESS,
                                 Some(reply_addr),
                             )
@@ -303,7 +325,7 @@ impl Inbound for SocksInbound {
                             let mut probe_buf = [0u8; 1];
                             use tokio::io::AsyncReadExt;
                             loop {
-                                match socket.read(&mut probe_buf).await {
+                                match stream.read(&mut probe_buf).await {
                                     Ok(0) | Err(_) => break,
                                     Ok(_) => continue,
                                 }

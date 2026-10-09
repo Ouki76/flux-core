@@ -138,9 +138,24 @@ impl Instance {
                     server_port,
                     username,
                     password,
+                    tls,
+                    reality,
+                    transport,
                 } => {
                     let target = TargetAddress::domain(server, server_port);
-                    let mut out = SocksOutbound::new(tag.clone(), target, resolver.clone());
+                    let dialer = build_layered_dialer(
+                        target.clone(),
+                        resolver.clone(),
+                        tls,
+                        reality,
+                        transport,
+                    )?;
+                    let mut out = SocksOutbound::new_with_dialer(
+                        tag.clone(),
+                        target,
+                        resolver.clone(),
+                        dialer,
+                    );
                     if let (Some(u), Some(p)) = (username, password) {
                         out = out.with_auth(u, p);
                     }
@@ -152,10 +167,24 @@ impl Instance {
                     server_port,
                     username,
                     password,
+                    tls,
+                    reality,
+                    transport,
                 } => {
                     let target = TargetAddress::domain(server, server_port);
-                    let mut out =
-                        flux_outbound::HttpOutbound::new(tag.clone(), target, resolver.clone());
+                    let dialer = build_layered_dialer(
+                        target.clone(),
+                        resolver.clone(),
+                        tls,
+                        reality,
+                        transport,
+                    )?;
+                    let mut out = flux_outbound::HttpOutbound::new_with_dialer(
+                        tag.clone(),
+                        target,
+                        resolver.clone(),
+                        dialer,
+                    );
                     if let (Some(u), Some(p)) = (username, password) {
                         out = out.with_auth(u, p);
                     }
@@ -512,6 +541,9 @@ impl Instance {
                     listen,
                     listen_port,
                     users,
+                    tls,
+                    reality,
+                    transport,
                 } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
@@ -521,8 +553,11 @@ impl Instance {
                         .into_iter()
                         .map(|u| (u.username, u.password))
                         .collect();
+                    let pipe = build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
                     inbounds.push(Arc::new(
-                        SocksInbound::new(tag, addr).with_users(user_pairs),
+                        SocksInbound::new(tag, addr)
+                            .with_users(user_pairs)
+                            .with_pipeline(pipe),
                     ));
                 }
                 InboundConfig::Http {
@@ -530,6 +565,9 @@ impl Instance {
                     listen,
                     listen_port,
                     users,
+                    tls,
+                    reality,
+                    transport,
                 } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {
@@ -539,13 +577,21 @@ impl Instance {
                         .into_iter()
                         .map(|u| (u.username, u.password))
                         .collect();
-                    inbounds.push(Arc::new(HttpInbound::new(tag, addr).with_users(user_pairs)));
+                    let pipe = build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
+                    inbounds.push(Arc::new(
+                        HttpInbound::new(tag, addr)
+                            .with_users(user_pairs)
+                            .with_pipeline(pipe),
+                    ));
                 }
                 InboundConfig::Mixed {
                     tag,
                     listen,
                     listen_port,
                     users,
+                    tls: _,
+                    reality: _,
+                    transport: _,
                 } => {
                     let addr_str = format!("{}:{}", listen, listen_port);
                     let addr: SocketAddr = addr_str.parse().map_err(|e| {

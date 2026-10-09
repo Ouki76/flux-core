@@ -10,6 +10,7 @@ pub struct HttpInbound {
     tag: String,
     listen_addr: SocketAddr,
     users: Vec<(String, String)>,
+    pipeline: flux_transport::pipeline::ServerTransportPipeline,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -21,6 +22,7 @@ impl HttpInbound {
             tag: tag.into(),
             listen_addr,
             users: vec![],
+            pipeline: flux_transport::pipeline::ServerTransportPipeline::raw(),
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -28,6 +30,14 @@ impl HttpInbound {
 
     pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
         self.users = users;
+        self
+    }
+
+    pub fn with_pipeline(
+        mut self,
+        pipe: flux_transport::pipeline::ServerTransportPipeline,
+    ) -> Self {
+        self.pipeline = pipe;
         self
     }
 }
@@ -53,13 +63,14 @@ impl Inbound for HttpInbound {
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let users = Arc::new(self.users.clone());
+        let pipeline = Arc::new(self.pipeline.clone());
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] HTTP inbound listening on {}", tag, self.listen_addr);
 
         tokio::spawn(async move {
             loop {
-                let (mut socket, client_addr) = tokio::select! {
+                let (socket, client_addr) = tokio::select! {
                     res = listener.accept() => {
                         match res {
                             Ok(res) => res,
@@ -81,10 +92,22 @@ impl Inbound for HttpInbound {
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
                 let user_list = users.clone();
+                let pipe = pipeline.clone();
 
                 tokio::spawn(async move {
+                    let mut stream = match pipe.unwrap(socket).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!(
+                                "[{}] client {} HTTP transport handshake failed: {}",
+                                inbound_tag, client_addr, e
+                            );
+                            return;
+                        }
+                    };
+
                     let handshake_fut =
-                        HttpHandshake::server_handshake_with_auth(&mut socket, Some(&user_list));
+                        HttpHandshake::server_handshake_with_auth(&mut stream, Some(&user_list));
                     let (target, prefix_opt, auth_user) = match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
                         handshake_fut,
@@ -115,9 +138,9 @@ impl Inbound for HttpInbound {
                     }
 
                     let stream: flux_types::BoxedStream = if let Some(prefix) = prefix_opt {
-                        Box::new(flux_common::copy::PrefixedStream::new(socket, prefix))
+                        Box::new(flux_common::copy::PrefixedStream::new(stream, prefix))
                     } else {
-                        Box::new(socket)
+                        stream
                     };
 
                     disp.dispatch_stream(meta, stream).await;
