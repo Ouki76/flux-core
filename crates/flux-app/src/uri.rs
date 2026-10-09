@@ -63,6 +63,7 @@ impl ProxySpec {
                     server_port: self.port,
                     password,
                     tls: self.tls,
+                    reality: self.reality,
                     transport: self.transport,
                 })
             }
@@ -75,6 +76,7 @@ impl ProxySpec {
                     password,
                     method: self.method,
                     tls: self.tls,
+                    reality: self.reality,
                     transport: self.transport,
                 })
             }

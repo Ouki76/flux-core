@@ -210,11 +210,12 @@ impl Instance {
                     server_port,
                     password,
                     tls,
+                    reality,
                     transport,
                 } => {
                     let target = TargetAddress::domain(server, server_port);
                     let dialer =
-                        build_layered_dialer(target, resolver.clone(), tls, None, transport)?;
+                        build_layered_dialer(target, resolver.clone(), tls, reality, transport)?;
                     let out = flux_outbound::TrojanOutbound::new_with_dialer(
                         tag.clone(),
                         password,
@@ -229,6 +230,7 @@ impl Instance {
                     password,
                     method,
                     tls,
+                    reality,
                     transport,
                 } => {
                     let target = TargetAddress::domain(server, server_port);
@@ -236,7 +238,7 @@ impl Instance {
                         target.clone(),
                         resolver.clone(),
                         tls,
-                        None,
+                        reality,
                         transport,
                     )?;
                     let cipher_kind = method

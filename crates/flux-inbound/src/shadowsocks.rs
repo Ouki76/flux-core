@@ -21,6 +21,7 @@ pub struct ShadowsocksInbound {
     master_key: [u8; 32],
     cipher_kind: CipherKind,
     replay_filter: Arc<flux_protocol::shadowsocks2022::ReplayFilter>,
+    reality_config: Option<flux_transport::reality::RealityServerConfig>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -34,6 +35,7 @@ impl ShadowsocksInbound {
             master_key: derive_master_key(password),
             cipher_kind: CipherKind::ChaCha20IetfPoly1305,
             replay_filter: Arc::new(flux_protocol::shadowsocks2022::ReplayFilter::new(10000)),
+            reality_config: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -41,6 +43,11 @@ impl ShadowsocksInbound {
 
     pub fn with_cipher_kind(mut self, kind: CipherKind) -> Self {
         self.cipher_kind = kind;
+        self
+    }
+
+    pub fn with_reality(mut self, cfg: Option<flux_transport::reality::RealityServerConfig>) -> Self {
+        self.reality_config = cfg;
         self
     }
 }

@@ -436,6 +436,8 @@ pub enum OutboundConfig {
         #[serde(default)]
         tls: Option<OutboundTlsConfig>,
         #[serde(default)]
+        reality: Option<OutboundRealityConfig>,
+        #[serde(default)]
         transport: Option<TransportConfig>,
     },
     #[serde(rename = "shadowsocks")]
@@ -448,6 +450,8 @@ pub enum OutboundConfig {
         method: Option<String>,
         #[serde(default)]
         tls: Option<OutboundTlsConfig>,
+        #[serde(default)]
+        reality: Option<OutboundRealityConfig>,
         #[serde(default)]
         transport: Option<TransportConfig>,
     },
