@@ -17,7 +17,11 @@ async fn test_selector_and_urltest_groups() {
     let cfg_json = format!(
         r#"{{
             "inbounds": [
-                {{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }}
+                {{
+                    "tag": "socks-in",
+                    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                    "protocol": {{ "type": "socks" }}
+                }}
             ],
             "outbounds": [
                 {{ "type": "direct", "tag": "direct-node1" }},

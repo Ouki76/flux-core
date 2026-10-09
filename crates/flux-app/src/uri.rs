@@ -1,5 +1,6 @@
 use crate::config::{
-    OutboundConfig, OutboundRealityConfig, OutboundTlsConfig, TaggedOutboundConfig, TransportConfig,
+    CarrierConfig, FlexibleList, FramingConfig, LayeredOutboundNode, OutboundConfig,
+    OutboundGroupConfig, ProtocolConfig, SecurityConfig,
 };
 use base64::Engine;
 use flux_types::{FluxError, FluxResult};
@@ -17,9 +18,16 @@ pub struct ProxySpec {
     pub password: Option<String>, // socks/http/trojan password
     pub method: Option<String>,   // cipher method for ss
     pub flow: Option<String>,     // flow for vless (e.g. xtls-rprx-vision)
-    pub tls: Option<OutboundTlsConfig>,
-    pub reality: Option<OutboundRealityConfig>,
-    pub transport: Option<TransportConfig>,
+    pub sni: Option<String>,
+    pub insecure: bool,
+    pub alpn: Vec<String>,
+    pub utls: Option<String>,
+    pub reality_public_key: Option<String>,
+    pub reality_short_id: Option<String>,
+    pub transport_type: Option<String>,
+    pub transport_path: Option<String>,
+    pub transport_service_name: Option<String>,
+    pub transport_headers: HashMap<String, String>,
 }
 
 impl ProxySpec {
@@ -41,119 +49,72 @@ impl ProxySpec {
     /// Builds canonical `OutboundConfig` from this proxy specification.
     pub fn build(self) -> FluxResult<OutboundConfig> {
         let proto = self.protocol.trim().to_ascii_lowercase();
-        match proto.as_str() {
+        let carrier = CarrierConfig::Tcp {
+            address: None,
+            server: Some(self.server),
+            port: Some(self.port),
+        };
+
+        let protocol = match proto.as_str() {
             "vless" => {
                 let uuid = self.auth.or(self.password).ok_or_else(|| {
                     FluxError::Config(format!("outbound '{}': missing uuid for vless", self.tag))
                 })?;
-                Ok(OutboundConfig::Tagged(Box::new(
-                    TaggedOutboundConfig::Vless {
-                        tag: self.tag,
-                        server: self.server,
-                        server_port: self.port,
-                        uuid,
-                        flow: self.flow,
-                        tls: self.tls,
-                        reality: self.reality,
-                        transport: self.transport,
-                    },
-                )))
+                ProtocolConfig::Vless {
+                    uuid,
+                    flow: self.flow,
+                }
             }
             "trojan" => {
                 let password = self.auth.or(self.password).unwrap_or_default();
-                Ok(OutboundConfig::Tagged(Box::new(
-                    TaggedOutboundConfig::Trojan {
-                        tag: self.tag,
-                        server: self.server,
-                        server_port: self.port,
-                        password,
-                        tls: self.tls,
-                        reality: self.reality,
-                        transport: self.transport,
-                    },
-                )))
+                ProtocolConfig::Trojan { password }
             }
             "ss" | "shadowsocks" => {
                 let password = self.auth.or(self.password).unwrap_or_default();
-                Ok(OutboundConfig::Tagged(Box::new(
-                    TaggedOutboundConfig::Shadowsocks {
-                        tag: self.tag,
-                        server: self.server,
-                        server_port: self.port,
-                        password,
-                        method: self.method,
-                        tls: self.tls,
-                        reality: self.reality,
-                        transport: self.transport,
-                    },
-                )))
+                ProtocolConfig::Shadowsocks {
+                    password,
+                    method: self.method,
+                }
             }
-            "socks" | "socks5" => Ok(OutboundConfig::Tagged(Box::new(
-                TaggedOutboundConfig::Socks {
-                    tag: self.tag,
-                    server: self.server,
-                    server_port: self.port,
-                    username: self.username,
-                    password: self.password,
-                    tls: self.tls,
-                    reality: self.reality,
-                    transport: self.transport,
-                },
-            ))),
-            "http" | "https" => Ok(OutboundConfig::Tagged(Box::new(
-                TaggedOutboundConfig::Http {
-                    tag: self.tag,
-                    server: self.server,
-                    server_port: self.port,
-                    username: self.username,
-                    password: self.password,
-                    tls: self.tls,
-                    reality: self.reality,
-                    transport: self.transport,
-                },
-            ))),
-            "direct" => Ok(OutboundConfig::Tagged(Box::new(
-                TaggedOutboundConfig::Direct {
-                    tag: self.tag,
-                    tls_fragment: None,
-                },
-            ))),
-            "block" => Ok(OutboundConfig::Tagged(Box::new(
-                TaggedOutboundConfig::Block { tag: self.tag },
-            ))),
+            "socks" | "socks5" => ProtocolConfig::Socks {
+                username: self.username,
+                password: self.password,
+            },
+            "http" | "https" => ProtocolConfig::Http {
+                username: self.username,
+                password: self.password,
+            },
             "tuic" => {
                 let uuid = self.auth.ok_or_else(|| {
                     FluxError::Config(format!("outbound '{}': missing uuid for tuic", self.tag))
                 })?;
                 let password = self.password.unwrap_or_default();
-                Ok(OutboundConfig::Tagged(Box::new(
-                    TaggedOutboundConfig::Tuic {
-                        tag: self.tag,
-                        server: self.server,
-                        server_port: self.port,
-                        uuid,
-                        password,
-                        congestion_control: None,
-                        zero_rtt: None,
-                        tls: self.tls,
-                    },
-                )))
+                ProtocolConfig::Tuic {
+                    uuid,
+                    password,
+                    congestion_control: None,
+                    zero_rtt: None,
+                }
             }
             "hy2" | "hysteria2" => {
                 let password = self.auth.or(self.password).unwrap_or_default();
-                Ok(OutboundConfig::Tagged(Box::new(
-                    TaggedOutboundConfig::Hysteria2 {
-                        tag: self.tag,
-                        server: self.server,
-                        server_port: Some(self.port),
-                        ports: vec![self.port],
-                        password,
-                        up_mbps: 100,
-                        down_mbps: 100,
-                        hop_interval_secs: None,
-                        tls: self.tls,
-                    },
-                )))
+                ProtocolConfig::Hysteria2 {
+                    password,
+                    up_mbps: 100,
+                    down_mbps: 100,
+                    hop_interval_secs: None,
+                }
+            }
+            "direct" => {
+                return Ok(OutboundConfig::Group(OutboundGroupConfig::Direct {
+                    tag: self.tag,
+                    tls_fragment: None,
+                }));
+            }
+            "block" => {
+                return Ok(OutboundConfig::Group(OutboundGroupConfig::Block {
+                    tag: self.tag,
+                }));
             }
             other => {
                 tracing::warn!(
@@ -161,18 +122,69 @@ impl ProxySpec {
                     other,
                     self.tag
                 );
-                Ok(OutboundConfig::Tagged(Box::new(
-                    TaggedOutboundConfig::Direct {
-                        tag: self.tag,
-                        tls_fragment: None,
-                    },
-                )))
+                return Ok(OutboundConfig::Group(OutboundGroupConfig::Direct {
+                    tag: self.tag,
+                    tls_fragment: None,
+                }));
             }
-        }
+        };
+
+        let security = if let Some(pub_k) = self.reality_public_key {
+            Some(FlexibleList::Single(SecurityConfig::Reality {
+                sni: self.sni,
+                public_key: pub_k,
+                short_id: self.reality_short_id,
+            }))
+        } else if self.sni.is_some() || self.insecure || !self.alpn.is_empty() {
+            Some(FlexibleList::Single(SecurityConfig::Tls {
+                sni: self.sni,
+                alpn: self.alpn,
+                insecure: self.insecure,
+                utls: self.utls,
+            }))
+        } else {
+            None
+        };
+
+        let framing = if let Some(tr_type) = self.transport_type {
+            match tr_type.to_ascii_lowercase().as_str() {
+                "ws" | "websocket" => Some(FlexibleList::Single(FramingConfig::WebSocket {
+                    path: self.transport_path.unwrap_or_else(|| "/".into()),
+                    headers: self.transport_headers,
+                })),
+                "httpupgrade" | "upgrade" => {
+                    Some(FlexibleList::Single(FramingConfig::HttpUpgrade {
+                        path: self.transport_path.unwrap_or_else(|| "/".into()),
+                        headers: self.transport_headers,
+                    }))
+                }
+                "h2" | "http2" => Some(FlexibleList::Single(FramingConfig::Http2 {
+                    path: self.transport_path.unwrap_or_else(|| "/".into()),
+                    headers: self.transport_headers,
+                })),
+                "grpc" | "gun" => Some(FlexibleList::Single(FramingConfig::Grpc {
+                    service_name: self
+                        .transport_service_name
+                        .unwrap_or_else(|| "GunService".into()),
+                    headers: self.transport_headers,
+                })),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        Ok(OutboundConfig::Node(Box::new(LayeredOutboundNode {
+            tag: self.tag,
+            carrier,
+            protocol,
+            security,
+            framing,
+        })))
     }
 }
 
-/// Parses standard proxy sharing links (VLESS, Trojan, Shadowsocks, SOCKS5, HTTP)
+/// Parses standard proxy sharing links (VLESS, Trojan, Shadowsocks, SOCKS5, HTTP, Hysteria 2, TUIC)
 /// into an `OutboundConfig`.
 pub fn parse_proxy_uri(uri: &str) -> FluxResult<OutboundConfig> {
     let clean = uri.trim();
@@ -199,7 +211,6 @@ pub fn parse_proxy_uri(uri: &str) -> FluxResult<OutboundConfig> {
 }
 
 fn parse_vless_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    // vless://uuid@host:port?security=reality&sni=...&pbk=...&sid=...&flow=...#Tag
     let without_scheme = uri.strip_prefix("vless://").unwrap_or(uri);
     let (body, tag) = extract_tag(without_scheme, "vless-node");
     let (user_host_port, query) = body.split_once('?').unwrap_or((body, ""));
@@ -216,51 +227,37 @@ fn parse_vless_uri(uri: &str) -> FluxResult<OutboundConfig> {
         .cloned()
         .or_else(|| params.get("peer").cloned());
     let flow = params.get("flow").cloned();
-
     let fp = params
         .get("fp")
         .cloned()
         .or_else(|| params.get("utls").cloned());
 
-    let tls_config = if security == "tls" || security == "reality" {
-        Some(OutboundTlsConfig {
-            enabled: true,
-            server_name: sni.clone(),
-            insecure: params
-                .get("allowInsecure")
-                .map(|v| v == "1" || v == "true")
-                .unwrap_or(false),
-            alpn: params
-                .get("alpn")
-                .map(|a| a.split(',').map(|s| s.trim().to_string()).collect())
-                .unwrap_or_default(),
-            utls: fp,
-        })
-    } else {
-        None
-    };
-
-    let reality_config = if security == "reality" {
-        let public_key = params
+    let (reality_pk, reality_sid) = if security == "reality" {
+        let pk = params
             .get("pbk")
             .or_else(|| params.get("public_key"))
             .cloned()
             .ok_or_else(|| {
                 FluxError::Config("missing pbk (public key) in reality vless uri".into())
             })?;
-        let short_id = params
+        let sid = params
             .get("sid")
             .or_else(|| params.get("short_id"))
             .cloned();
-
-        Some(OutboundRealityConfig {
-            enabled: true,
-            public_key,
-            short_id,
-        })
+        (Some(pk), sid)
     } else {
-        None
+        (None, None)
     };
+
+    let alpn: Vec<String> = params
+        .get("alpn")
+        .map(|a| a.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let insecure = params
+        .get("allowInsecure")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
 
     ProxySpec {
         tag,
@@ -269,19 +266,22 @@ fn parse_vless_uri(uri: &str) -> FluxResult<OutboundConfig> {
         port,
         auth: Some(uuid.to_string()),
         flow,
-        tls: tls_config,
-        reality: reality_config,
+        sni,
+        insecure,
+        alpn,
+        utls: fp,
+        reality_public_key: reality_pk,
+        reality_short_id: reality_sid,
         ..Default::default()
     }
     .build()
 }
 
 fn parse_trojan_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    // trojan://password@host:port?sni=...#Tag
     let without_scheme = uri.strip_prefix("trojan://").unwrap_or(uri);
     let (body, tag) = extract_tag(without_scheme, "trojan-node");
-    let (pass_host_port, query) = body.split_once('?').unwrap_or((body, ""));
-    let (password, host_port) = pass_host_port
+    let (user_host_port, query) = body.split_once('?').unwrap_or((body, ""));
+    let (password, host_port) = user_host_port
         .split_once('@')
         .ok_or_else(|| FluxError::Config("missing password in trojan uri".into()))?;
     let (host, port) = parse_host_port(host_port, 443)?;
@@ -292,15 +292,14 @@ fn parse_trojan_uri(uri: &str) -> FluxResult<OutboundConfig> {
         .or_else(|| params.get("peer"))
         .cloned()
         .unwrap_or_else(|| host.clone());
-    let insecure = params
-        .get("allowInsecure")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
-
     let fp = params
         .get("fp")
         .cloned()
         .or_else(|| params.get("utls").cloned());
+    let insecure = params
+        .get("allowInsecure")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
 
     ProxySpec {
         tag,
@@ -308,21 +307,15 @@ fn parse_trojan_uri(uri: &str) -> FluxResult<OutboundConfig> {
         server: host,
         port,
         auth: Some(password.to_string()),
-        tls: Some(OutboundTlsConfig {
-            enabled: true,
-            server_name: Some(sni),
-            insecure,
-            alpn: vec![],
-            utls: fp,
-        }),
+        sni: Some(sni),
+        insecure,
+        utls: fp,
         ..Default::default()
     }
     .build()
 }
 
 fn parse_shadowsocks_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    // ss://BASE64(method:password@host:port)#Tag
-    // or ss://BASE64(method:password)@host:port#Tag
     let without_scheme = uri.strip_prefix("ss://").unwrap_or(uri);
     let (body, tag) = extract_tag(without_scheme, "ss-node");
 
@@ -344,7 +337,6 @@ fn parse_shadowsocks_uri(uri: &str) -> FluxResult<OutboundConfig> {
         }
         .build()
     } else {
-        // Full body base64
         let decoded = decode_base64_or_plain(body)?;
         let (userinfo, host_port) = decoded
             .split_once('@')
@@ -487,13 +479,23 @@ fn extract_tag<'a>(s: &'a str, default_prefix: &str) -> (&'a str, String) {
 }
 
 fn parse_host_port(s: &str, default_port: u16) -> FluxResult<(String, u16)> {
-    let clean = s.split('?').next().unwrap_or(s).trim();
+    let clean = s.trim();
+    if clean.starts_with('[') {
+        if let Some((h, p)) = clean.split_once("]:") {
+            let port = p.parse::<u16>().map_err(|_| {
+                FluxError::Config(format!("invalid port in IPv6 address: {}", clean))
+            })?;
+            return Ok((format!("{}]", h), port));
+        } else if clean.ends_with(']') {
+            return Ok((clean.to_string(), default_port));
+        }
+    }
+
     if let Some((h, p)) = clean.rsplit_once(':') {
         let port = p
             .parse::<u16>()
-            .map_err(|_| FluxError::Config(format!("invalid port '{}' in {}", p, s)))?;
-        let host = h.trim_start_matches('[').trim_end_matches(']').to_string();
-        Ok((host, port))
+            .map_err(|_| FluxError::Config(format!("invalid port in address: {}", clean)))?;
+        Ok((h.to_string(), port))
     } else {
         Ok((clean.to_string(), default_port))
     }
@@ -501,8 +503,8 @@ fn parse_host_port(s: &str, default_port: u16) -> FluxResult<(String, u16)> {
 
 fn parse_query(q: &str) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for part in q.split('&') {
-        if let Some((k, v)) = part.split_once('=') {
+    for pair in q.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
             map.insert(k.trim().to_string(), urlencoding_decode(v.trim()));
         }
     }
@@ -510,25 +512,23 @@ fn parse_query(q: &str) -> HashMap<String, String> {
 }
 
 fn decode_base64_or_plain(s: &str) -> FluxResult<String> {
-    let engine = base64::engine::general_purpose::STANDARD;
-    let url_engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-    if let Ok(bytes) = engine.decode(s)
-        && let Ok(utf8) = String::from_utf8(bytes)
+    let clean = s.trim();
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(clean)
+        && let Ok(decoded) = String::from_utf8(bytes)
     {
-        return Ok(utf8);
+        return Ok(decoded);
     }
-    if let Ok(bytes) = url_engine.decode(s)
-        && let Ok(utf8) = String::from_utf8(bytes)
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(clean)
+        && let Ok(decoded) = String::from_utf8(bytes)
     {
-        return Ok(utf8);
+        return Ok(decoded);
     }
-    Ok(s.to_string())
+    Ok(clean.to_string())
 }
 
 pub fn urlencoding_decode(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
-    let mut chars = s.bytes().peekable();
+    let mut chars = s.bytes();
     while let Some(b) = chars.next() {
         if b == b'%' {
             let h1 = chars.next();
@@ -572,28 +572,33 @@ mod tests {
         let out = parse_proxy_uri(uri).unwrap();
         assert_eq!(out.tag(), "My-Reality-Node");
         match out {
-            OutboundConfig::Tagged(tagged) => match *tagged {
-                TaggedOutboundConfig::Vless {
-                    server,
-                    server_port,
-                    reality,
-                    flow,
-                    ..
-                } => {
-                    assert_eq!(server, "1.2.3.4");
-                    assert_eq!(server_port, 443);
-                    assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
-                    let r = reality.unwrap();
-                    assert!(r.enabled);
-                    assert_eq!(
-                        r.public_key,
-                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                    );
-                    assert_eq!(r.short_id.as_deref(), Some("0123456789abcdef"));
+            OutboundConfig::Node(node) => {
+                assert_eq!(node.tag, "My-Reality-Node");
+                match node.protocol {
+                    ProtocolConfig::Vless { uuid, flow } => {
+                        assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
+                        assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
+                    }
+                    _ => panic!("expected vless protocol"),
                 }
-                _ => panic!("expected vless outbound"),
-            },
-            _ => panic!("expected tagged outbound"),
+                let sec = node.security.unwrap().into_vec().pop().unwrap();
+                match sec {
+                    SecurityConfig::Reality {
+                        sni,
+                        public_key,
+                        short_id,
+                    } => {
+                        assert_eq!(sni.as_deref(), Some("www.microsoft.com"));
+                        assert_eq!(
+                            public_key,
+                            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        );
+                        assert_eq!(short_id.as_deref(), Some("0123456789abcdef"));
+                    }
+                    _ => panic!("expected reality security"),
+                }
+            }
+            _ => panic!("expected node outbound"),
         }
     }
 
@@ -603,20 +608,23 @@ mod tests {
         let out = parse_proxy_uri(uri).unwrap();
         assert_eq!(out.tag(), "Trojan-US");
         match out {
-            OutboundConfig::Tagged(tagged) => match *tagged {
-                TaggedOutboundConfig::Trojan {
-                    server,
-                    server_port,
-                    password,
-                    ..
-                } => {
-                    assert_eq!(server, "trojan.example.com");
-                    assert_eq!(server_port, 443);
-                    assert_eq!(password, "mypassword123");
+            OutboundConfig::Node(node) => {
+                assert_eq!(node.tag, "Trojan-US");
+                match node.protocol {
+                    ProtocolConfig::Trojan { password } => {
+                        assert_eq!(password, "mypassword123");
+                    }
+                    _ => panic!("expected trojan protocol"),
                 }
-                _ => panic!("expected trojan outbound"),
-            },
-            _ => panic!("expected tagged outbound"),
+                let sec = node.security.unwrap().into_vec().pop().unwrap();
+                match sec {
+                    SecurityConfig::Tls { sni, .. } => {
+                        assert_eq!(sni.as_deref(), Some("trojan.example.com"));
+                    }
+                    _ => panic!("expected tls security"),
+                }
+            }
+            _ => panic!("expected node outbound"),
         }
     }
 
@@ -626,20 +634,16 @@ mod tests {
         let out = parse_proxy_uri(uri).unwrap();
         assert_eq!(out.tag(), "Hy2-Fast");
         match out {
-            OutboundConfig::Tagged(tagged) => match *tagged {
-                TaggedOutboundConfig::Hysteria2 {
-                    server,
-                    server_port,
-                    password,
-                    ..
-                } => {
-                    assert_eq!(server, "hy2.example.com");
-                    assert_eq!(server_port, Some(443));
-                    assert_eq!(password, "mypassword");
+            OutboundConfig::Node(node) => {
+                assert_eq!(node.tag, "Hy2-Fast");
+                match node.protocol {
+                    ProtocolConfig::Hysteria2 { password, .. } => {
+                        assert_eq!(password, "mypassword");
+                    }
+                    _ => panic!("expected hysteria2 protocol"),
                 }
-                _ => panic!("expected hysteria2 outbound"),
-            },
-            _ => panic!("expected tagged outbound"),
+            }
+            _ => panic!("expected node outbound"),
         }
     }
 
@@ -650,22 +654,17 @@ mod tests {
         let out = parse_proxy_uri(uri).unwrap();
         assert_eq!(out.tag(), "TUIC-Node");
         match out {
-            OutboundConfig::Tagged(tagged) => match *tagged {
-                TaggedOutboundConfig::Tuic {
-                    server,
-                    server_port,
-                    uuid,
-                    password,
-                    ..
-                } => {
-                    assert_eq!(server, "tuic.example.com");
-                    assert_eq!(server_port, 8443);
-                    assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
-                    assert_eq!(password, "tuicpass");
+            OutboundConfig::Node(node) => {
+                assert_eq!(node.tag, "TUIC-Node");
+                match node.protocol {
+                    ProtocolConfig::Tuic { uuid, password, .. } => {
+                        assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
+                        assert_eq!(password, "tuicpass");
+                    }
+                    _ => panic!("expected tuic protocol"),
                 }
-                _ => panic!("expected tuic outbound"),
-            },
-            _ => panic!("expected tagged outbound"),
+            }
+            _ => panic!("expected node outbound"),
         }
     }
 

@@ -22,14 +22,16 @@ inbounds:
     listen: 127.0.0.1
     listen_port: 7890
 
-  # Native SOCKS5 inbound with authentication
-  - type: socks
-    tag: socks-in
-    listen: 127.0.0.1
-    listen_port: 10808
-    users:
-      - username: user1
-        password: password123
+  # Layered SOCKS5 inbound
+  - tag: socks-in
+    carrier:
+      type: tcp
+      listen: 127.0.0.1
+      listen_port: 10808
+    protocol:
+      type: socks
+      username: user1
+      password: password123
 
   # Transparent proxy TUN interface (Linux /dev/net/tun with TCP/UDP stack)
   - type: tun

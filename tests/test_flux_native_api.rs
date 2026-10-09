@@ -21,7 +21,11 @@ async fn test_flux_native_api_and_route_tracer() {
                 "secret": "native-flux-secret"
             }},
             "inbounds": [
-                {{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 10999 }}
+                {{
+                    "tag": "socks-in",
+                    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": 10999 }},
+                    "protocol": {{ "type": "socks" }}
+                }}
             ],
             "outbounds": [
                 {{ "type": "direct", "tag": "direct-node" }},

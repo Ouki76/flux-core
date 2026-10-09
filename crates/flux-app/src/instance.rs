@@ -1,15 +1,13 @@
 use crate::api::{ApiServer, TrafficMeter};
 use crate::config::{
     CarrierConfig, Config, FlexibleList, FramingConfig, InboundCarrierConfig, InboundConfig,
-    InboundFramingConfig, InboundRealityConfig, InboundSecurityConfig, InboundTlsConfig,
-    LayeredInboundNode, LayeredOutboundNode, OutboundConfig, OutboundRealityConfig,
-    OutboundTlsConfig, ProtocolConfig, SecurityConfig, TaggedInboundConfig, TaggedOutboundConfig,
-    TransportConfig,
+    InboundFramingConfig, InboundSecurityConfig, LayeredInboundNode, LayeredOutboundNode,
+    OutboundConfig, OutboundGroupConfig, ProtocolConfig, SecurityConfig, SystemInboundConfig,
 };
 use crate::dispatcher::DefaultDispatcher;
 use dashmap::DashMap;
 use flux_dns::{DnsResolver, FakeIpPool};
-use flux_inbound::{HttpInbound, MixedInbound, SocksInbound};
+use flux_inbound::MixedInbound;
 use flux_outbound::{
     BlockOutbound, DirectOutbound, SelectorOutbound, SocksOutbound, UrlTestOutbound, VlessOutbound,
 };
@@ -124,302 +122,26 @@ impl Instance {
 
         for out_cfg in config.outbounds {
             match out_cfg {
-                OutboundConfig::Layered(node) => {
+                OutboundConfig::Node(node) => {
                     build_layered_outbound(*node, &registry, &resolver)?;
                 }
-                OutboundConfig::Tagged(tagged) => match *tagged {
-                    TaggedOutboundConfig::Direct { tag, tls_fragment } => {
+                OutboundConfig::Group(group) => match group {
+                    OutboundGroupConfig::Direct { tag, tls_fragment } => {
                         let mut out = DirectOutbound::new(tag.clone(), resolver.clone());
                         if let Some(frag) = tls_fragment {
                             out = out.with_fragmentation(frag);
                         }
                         registry.insert(tag, Arc::new(out));
                     }
-                    TaggedOutboundConfig::Block { tag } => {
+                    OutboundGroupConfig::Block { tag } => {
                         let out = BlockOutbound::new(tag.clone());
                         registry.insert(tag, Arc::new(out));
                     }
-                    TaggedOutboundConfig::Socks {
-                        tag,
-                        server,
-                        server_port,
-                        username,
-                        password,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let target = TargetAddress::domain(server, server_port);
-                        let dialer = build_layered_dialer(
-                            target.clone(),
-                            resolver.clone(),
-                            tls,
-                            reality,
-                            transport,
-                        )?;
-                        let mut out = SocksOutbound::new_with_dialer(
-                            tag.clone(),
-                            target,
-                            resolver.clone(),
-                            dialer,
-                        );
-                        if let (Some(u), Some(p)) = (username, password) {
-                            out = out.with_auth(u, p);
-                        }
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    TaggedOutboundConfig::Http {
-                        tag,
-                        server,
-                        server_port,
-                        username,
-                        password,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let target = TargetAddress::domain(server, server_port);
-                        let dialer = build_layered_dialer(
-                            target.clone(),
-                            resolver.clone(),
-                            tls,
-                            reality,
-                            transport,
-                        )?;
-                        let mut out = flux_outbound::HttpOutbound::new_with_dialer(
-                            tag.clone(),
-                            target,
-                            resolver.clone(),
-                            dialer,
-                        );
-                        if let (Some(u), Some(p)) = (username, password) {
-                            out = out.with_auth(u, p);
-                        }
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    TaggedOutboundConfig::Vless {
-                        tag,
-                        server,
-                        server_port,
-                        uuid,
-                        flow,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let parsed_uuid = Uuid::parse_str(&uuid).map_err(|e| {
-                            FluxError::Config(format!("invalid vless uuid {}: {}", uuid, e))
-                        })?;
-                        let target = TargetAddress::domain(server, server_port);
-                        let dialer = build_layered_dialer(
-                            target,
-                            resolver.clone(),
-                            tls,
-                            reality,
-                            transport,
-                        )?;
-                        let out =
-                            VlessOutbound::new_with_dialer(tag.clone(), parsed_uuid, flow, dialer);
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    TaggedOutboundConfig::Vmess {
-                        tag,
-                        server,
-                        server_port,
-                        uuid,
-                        security,
-                        tls,
-                        transport,
-                    } => {
-                        let parsed_uuid = Uuid::parse_str(&uuid).map_err(|e| {
-                            FluxError::Config(format!("invalid vmess uuid {}: {}", uuid, e))
-                        })?;
-                        let target = TargetAddress::domain(server, server_port);
-                        let dialer =
-                            build_layered_dialer(target, resolver.clone(), tls, None, transport)?;
-                        let out = flux_outbound::VmessOutbound::new(
-                            tag.clone(),
-                            parsed_uuid,
-                            security.as_deref(),
-                            dialer,
-                        );
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    TaggedOutboundConfig::Trojan {
-                        tag,
-                        server,
-                        server_port,
-                        password,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let target = TargetAddress::domain(server, server_port);
-                        let dialer = build_layered_dialer(
-                            target,
-                            resolver.clone(),
-                            tls,
-                            reality,
-                            transport,
-                        )?;
-                        let out = flux_outbound::TrojanOutbound::new_with_dialer(
-                            tag.clone(),
-                            password,
-                            dialer,
-                        );
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    TaggedOutboundConfig::Shadowsocks {
-                        tag,
-                        server,
-                        server_port,
-                        password,
-                        method,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let target = TargetAddress::domain(server, server_port);
-                        let dialer = build_layered_dialer(
-                            target.clone(),
-                            resolver.clone(),
-                            tls,
-                            reality,
-                            transport,
-                        )?;
-                        let cipher_kind = method
-                            .as_deref()
-                            .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
-                            .unwrap_or_default();
-                        let out = flux_outbound::ShadowsocksOutbound::new_with_dialer(
-                            tag.clone(),
-                            target,
-                            &password,
-                            resolver.clone(),
-                            dialer,
-                        )
-                        .with_cipher_kind(cipher_kind);
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    TaggedOutboundConfig::WireGuard {
-                        tag,
-                        server,
-                        server_port,
-                        private_key,
-                        peer_public_key,
-                        preshared_key,
-                        awg,
-                    } => {
-                        let priv_k = crate::config::decode_key_32bytes(&private_key)?;
-                        let pub_k = crate::config::decode_key_32bytes(&peer_public_key)?;
-                        let psk =
-                            preshared_key.and_then(|k| crate::config::decode_key_32bytes(&k).ok());
-                        let target = TargetAddress::domain(server, server_port);
-
-                        let wg_cfg = flux_protocol::wireguard::WireGuardConfig {
-                            private_key: priv_k,
-                            peer_public_key: pub_k,
-                            preshared_key: psk,
-                            server_address: target,
-                            awg,
-                        };
-                        tracing::info!(
-                            "[{}] WireGuard / AmneziaWG outbound initialized (Noise IK handshake, junk packet obfuscation)",
-                            tag
-                        );
-                        let out = flux_outbound::WireGuardOutbound::new(
-                            tag.clone(),
-                            wg_cfg,
-                            resolver.clone(),
-                        );
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    TaggedOutboundConfig::Hysteria2 {
-                        tag,
-                        server,
-                        ports,
-                        server_port,
-                        password,
-                        up_mbps,
-                        down_mbps,
-                        hop_interval_secs,
-                        tls,
-                    } => {
-                        let mut port_list = ports;
-                        if port_list.is_empty() {
-                            port_list.push(server_port.unwrap_or(443));
-                        }
-                        let (insecure, server_name) = if let Some(t) = tls {
-                            (t.insecure, t.server_name)
-                        } else {
-                            (false, None)
-                        };
-                        let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
-                            server,
-                            ports: port_list,
-                            password,
-                            up_mbps,
-                            down_mbps,
-                            hop_interval_secs: hop_interval_secs.unwrap_or(30),
-                            insecure,
-                            server_name,
-                            obfs: None,
-                        };
-                        tracing::info!(
-                            "[{}] Hysteria 2 outbound initialized (QUIC/quinn carrier, Brutal pacer, port-hopping)",
-                            tag
-                        );
-                        let out = flux_outbound::Hysteria2Outbound::new(
-                            tag.clone(),
-                            hy2_cfg,
-                            resolver.clone(),
-                        );
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    TaggedOutboundConfig::Tuic {
-                        tag,
-                        server,
-                        server_port,
-                        uuid,
-                        password,
-                        congestion_control,
-                        zero_rtt,
-                        tls,
-                    } => {
-                        let parsed_uuid = Uuid::parse_str(&uuid).map_err(|e| {
-                            FluxError::Config(format!("invalid tuic uuid {}: {}", uuid, e))
-                        })?;
-                        let (insecure, server_name) = if let Some(t) = tls {
-                            (t.insecure, t.server_name)
-                        } else {
-                            (false, None)
-                        };
-                        let tuic_cfg = flux_protocol::tuic::TuicV5Config {
-                            server,
-                            server_port,
-                            uuid: parsed_uuid,
-                            password,
-                            congestion_control: congestion_control.unwrap_or_else(|| "bbr".into()),
-                            zero_rtt: zero_rtt.unwrap_or(true),
-                            insecure,
-                            server_name,
-                        };
-                        tracing::info!(
-                            "[{}] TUIC v5 outbound initialized (QUIC/quinn carrier, BBR congestion control)",
-                            tag
-                        );
-                        let out = flux_outbound::TuicOutbound::new(
-                            tag.clone(),
-                            tuic_cfg,
-                            resolver.clone(),
-                        );
-                        registry.insert(tag, Arc::new(out));
-                    }
-                    group @ TaggedOutboundConfig::Selector { .. }
-                    | group @ TaggedOutboundConfig::UrlTest { .. }
-                    | group @ TaggedOutboundConfig::Fallback { .. }
-                    | group @ TaggedOutboundConfig::LoadBalance { .. } => {
-                        group_configs.push(group);
+                    g @ OutboundGroupConfig::Selector { .. }
+                    | g @ OutboundGroupConfig::UrlTest { .. }
+                    | g @ OutboundGroupConfig::Fallback { .. }
+                    | g @ OutboundGroupConfig::LoadBalance { .. } => {
+                        group_configs.push(g);
                     }
                 },
             }
@@ -436,7 +158,7 @@ impl Instance {
         // Pass 2: Group outbounds (selector, urltest)
         for group in group_configs {
             match group {
-                TaggedOutboundConfig::Selector {
+                OutboundGroupConfig::Selector {
                     tag,
                     outbounds,
                     default,
@@ -445,7 +167,7 @@ impl Instance {
                         SelectorOutbound::new(tag.clone(), outbounds, default, registry.clone());
                     registry.insert(tag, Arc::new(selector));
                 }
-                TaggedOutboundConfig::UrlTest {
+                OutboundGroupConfig::UrlTest {
                     tag,
                     outbounds,
                     url,
@@ -469,7 +191,7 @@ impl Instance {
                     urltest.start_probing();
                     registry.insert(tag, urltest);
                 }
-                TaggedOutboundConfig::Fallback {
+                OutboundGroupConfig::Fallback {
                     tag,
                     outbounds,
                     url,
@@ -486,7 +208,7 @@ impl Instance {
                     fallback.start_probing();
                     registry.insert(tag, fallback);
                 }
-                TaggedOutboundConfig::LoadBalance {
+                OutboundGroupConfig::LoadBalance {
                     tag,
                     outbounds,
                     strategy,
@@ -558,68 +280,23 @@ impl Instance {
         let mut inbounds: Vec<Arc<dyn Inbound>> = Vec::new();
         for in_cfg in config.inbounds {
             match in_cfg {
-                InboundConfig::Layered(node) => {
+                InboundConfig::Node(node) => {
                     build_layered_inbound(*node, &mut inbounds)?;
                 }
-                InboundConfig::Tagged(tagged) => match *tagged {
-                    TaggedInboundConfig::Socks {
+                InboundConfig::System(sys) => match sys {
+                    SystemInboundConfig::Tun {
                         tag,
-                        listen,
-                        listen_port,
-                        users,
-                        tls,
-                        reality,
-                        transport,
+                        interface_name,
+                        mtu,
                     } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
-                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
-                        })?;
-                        let user_pairs = users
-                            .into_iter()
-                            .map(|u| (u.username, u.password))
-                            .collect();
-                        let pipe =
-                            build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
-                        inbounds.push(Arc::new(
-                            SocksInbound::new(tag, addr)
-                                .with_users(user_pairs)
-                                .with_pipeline(pipe),
-                        ));
+                        let ifname = interface_name.unwrap_or_else(|| "tun0".into());
+                        inbounds.push(Arc::new(flux_inbound::TunInbound::new(tag, ifname, mtu)));
                     }
-                    TaggedInboundConfig::Http {
+                    SystemInboundConfig::Mixed {
                         tag,
                         listen,
                         listen_port,
                         users,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
-                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
-                        })?;
-                        let user_pairs = users
-                            .into_iter()
-                            .map(|u| (u.username, u.password))
-                            .collect();
-                        let pipe =
-                            build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
-                        inbounds.push(Arc::new(
-                            HttpInbound::new(tag, addr)
-                                .with_users(user_pairs)
-                                .with_pipeline(pipe),
-                        ));
-                    }
-                    TaggedInboundConfig::Mixed {
-                        tag,
-                        listen,
-                        listen_port,
-                        users,
-                        tls: _,
-                        reality: _,
-                        transport: _,
                     } => {
                         let addr_str = format!("{}:{}", listen, listen_port);
                         let addr: SocketAddr = addr_str.parse().map_err(|e| {
@@ -633,99 +310,7 @@ impl Instance {
                             MixedInbound::new(tag, addr).with_users(user_pairs),
                         ));
                     }
-                    TaggedInboundConfig::Vless {
-                        tag,
-                        listen,
-                        listen_port,
-                        users,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
-                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
-                        })?;
-
-                        let mut uuids = Vec::new();
-                        for u in users {
-                            let parsed = Uuid::parse_str(&u.uuid).map_err(|e| {
-                                FluxError::Config(format!("invalid vless uuid {}: {}", u.uuid, e))
-                            })?;
-                            uuids.push(parsed);
-                        }
-
-                        let pipe =
-                            build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
-                        inbounds.push(Arc::new(flux_inbound::VlessInbound::new(
-                            tag, addr, uuids, pipe,
-                        )));
-                    }
-                    TaggedInboundConfig::Tun {
-                        tag,
-                        interface_name,
-                        mtu,
-                    } => {
-                        let ifname = interface_name.unwrap_or_else(|| "tun0".into());
-                        inbounds.push(Arc::new(flux_inbound::TunInbound::new(tag, ifname, mtu)));
-                    }
-                    TaggedInboundConfig::Trojan {
-                        tag,
-                        listen,
-                        listen_port,
-                        password,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
-                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
-                        })?;
-                        let default_trojan_tls = InboundTlsConfig {
-                            enabled: true,
-                            server_name: None,
-                            certificate_path: None,
-                            key_path: None,
-                        };
-                        let effective_tls = tls.as_ref().or(if reality.is_none() {
-                            Some(&default_trojan_tls)
-                        } else {
-                            None
-                        });
-                        let pipe =
-                            build_server_pipeline(effective_tls, reality, transport.as_ref())?;
-                        inbounds.push(Arc::new(flux_inbound::TrojanInbound::new(
-                            tag, addr, password, pipe,
-                        )));
-                    }
-                    TaggedInboundConfig::Shadowsocks {
-                        tag,
-                        listen,
-                        listen_port,
-                        password,
-                        method,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
-                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
-                        })?;
-                        let cipher_kind = method
-                            .as_deref()
-                            .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
-                            .unwrap_or_default();
-                        let pipe =
-                            build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
-                        inbounds.push(Arc::new(
-                            flux_inbound::ShadowsocksInbound::new(tag, addr, &password)
-                                .with_cipher_kind(cipher_kind)
-                                .with_pipeline(pipe),
-                        ));
-                    }
-                    TaggedInboundConfig::Redirect {
+                    SystemInboundConfig::Redirect {
                         tag,
                         listen,
                         listen_port,
@@ -736,7 +321,7 @@ impl Instance {
                         })?;
                         inbounds.push(Arc::new(flux_inbound::RedirectInbound::new(tag, addr)));
                     }
-                    TaggedInboundConfig::Tproxy {
+                    SystemInboundConfig::Tproxy {
                         tag,
                         listen,
                         listen_port,
@@ -746,100 +331,6 @@ impl Instance {
                             FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                         })?;
                         inbounds.push(Arc::new(flux_inbound::TproxyInbound::new(tag, addr)));
-                    }
-                    TaggedInboundConfig::Vmess {
-                        tag,
-                        listen,
-                        listen_port,
-                        users,
-                        tls,
-                        reality,
-                        transport,
-                    } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
-                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
-                        })?;
-                        let mut uuids = Vec::new();
-                        for u in users {
-                            let parsed = Uuid::parse_str(&u.uuid).map_err(|e| {
-                                FluxError::Config(format!("invalid vmess uuid {}: {}", u.uuid, e))
-                            })?;
-                            uuids.push(parsed);
-                        }
-                        let pipe =
-                            build_server_pipeline(tls.as_ref(), reality, transport.as_ref())?;
-                        inbounds.push(Arc::new(flux_inbound::VmessInbound::new(
-                            tag, addr, uuids, pipe,
-                        )));
-                    }
-                    TaggedInboundConfig::Tuic {
-                        tag,
-                        listen,
-                        listen_port,
-                        users,
-                        password,
-                        tls,
-                    } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
-                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
-                        })?;
-                        let mut uuids = Vec::new();
-                        for u in users {
-                            let parsed = Uuid::parse_str(&u.uuid).map_err(|e| {
-                                FluxError::Config(format!("invalid tuic uuid {}: {}", u.uuid, e))
-                            })?;
-                            uuids.push(parsed);
-                        }
-                        let (certs, key) = if let Some(t) = &tls
-                            && let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path)
-                        {
-                            TlsTransport::load_certs_and_key(cp, kp)?
-                        } else {
-                            let cert =
-                                rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                                    .map_err(|e| {
-                                    FluxError::Crypto(format!("failed to generate cert: {}", e))
-                                })?;
-                            (
-                                vec![CertificateDer::from(cert.cert)],
-                                PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
-                            )
-                        };
-                        inbounds.push(Arc::new(flux_inbound::TuicInbound::new(
-                            tag, addr, uuids, password, certs, key,
-                        )));
-                    }
-                    TaggedInboundConfig::Hysteria2 {
-                        tag,
-                        listen,
-                        listen_port,
-                        password,
-                        tls,
-                    } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
-                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
-                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
-                        })?;
-                        let (certs, key) = if let Some(t) = &tls
-                            && let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path)
-                        {
-                            TlsTransport::load_certs_and_key(cp, kp)?
-                        } else {
-                            let cert =
-                                rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                                    .map_err(|e| {
-                                    FluxError::Crypto(format!("failed to generate cert: {}", e))
-                                })?;
-                            (
-                                vec![CertificateDer::from(cert.cert)],
-                                PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
-                            )
-                        };
-                        inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new(
-                            tag, addr, password, certs, key,
-                        )));
                     }
                 },
             }
@@ -944,169 +435,6 @@ fn parse_duration(s: &str) -> Option<Duration> {
     } else {
         s.parse::<u64>().ok().map(Duration::from_secs)
     }
-}
-
-fn build_layered_dialer(
-    server: TargetAddress,
-    resolver: Arc<DnsResolver>,
-    tls: Option<OutboundTlsConfig>,
-    reality: Option<OutboundRealityConfig>,
-    transport: Option<TransportConfig>,
-) -> FluxResult<Arc<dyn flux_types::StreamDialer>> {
-    let server_name_default = server.host();
-    let tls_cfg = if let Some(t) = tls {
-        if t.enabled {
-            let sni = t.server_name.unwrap_or_else(|| server_name_default.clone());
-            let mut cfg = TlsClientConfig::new(sni)
-                .with_insecure(t.insecure)
-                .with_alpn(t.alpn);
-            if let Some(ref u) = t.utls
-                && let Some(fp) = flux_transport::TlsFingerprint::parse_str(u)
-            {
-                cfg = cfg.with_fingerprint(fp);
-            }
-            Some(cfg)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let reality_cfg = if let Some(r) = reality {
-        if r.enabled {
-            let pk_bytes = crate::config::decode_key_32bytes(&r.public_key)?;
-            let short_id = if let Some(sid) = r.short_id {
-                flux_types::decode_hex(&sid).unwrap_or_default()
-            } else {
-                vec![]
-            };
-
-            Some(RealityClientConfig {
-                server_name: tls_cfg
-                    .as_ref()
-                    .map(|c| c.server_name.clone())
-                    .unwrap_or(server_name_default),
-                public_key: pk_bytes,
-                short_id,
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let sec = if let Some(r) = reality_cfg {
-        flux_transport::pipeline::SecurityLayer::Reality(r)
-    } else if let Some(t) = tls_cfg {
-        flux_transport::pipeline::SecurityLayer::Tls(t)
-    } else {
-        flux_transport::pipeline::SecurityLayer::None
-    };
-
-    let framing = if let Some(tr) = transport {
-        match tr.transport_type.to_ascii_lowercase().as_str() {
-            "ws" | "websocket" => flux_transport::pipeline::FramingLayer::WebSocket {
-                path: tr.path.unwrap_or_else(|| "/".into()),
-                headers: tr.headers,
-            },
-            "httpupgrade" | "upgrade" => flux_transport::pipeline::FramingLayer::HttpUpgrade {
-                path: tr.path.unwrap_or_else(|| "/".into()),
-                headers: tr.headers,
-            },
-            "h2" | "http2" => flux_transport::pipeline::FramingLayer::Http2 {
-                path: tr.path.unwrap_or_else(|| "/".into()),
-                headers: tr.headers,
-            },
-            "grpc" | "gun" => flux_transport::pipeline::FramingLayer::Grpc {
-                service_name: tr
-                    .service_name
-                    .or(tr.path)
-                    .unwrap_or_else(|| "GunService".into()),
-                headers: tr.headers,
-            },
-            _ => flux_transport::pipeline::FramingLayer::Raw,
-        }
-    } else {
-        flux_transport::pipeline::FramingLayer::Raw
-    };
-
-    Ok(Arc::new(flux_outbound::LazyPipelineDialer::new(
-        server, resolver, sec, framing,
-    )))
-}
-
-fn build_server_pipeline(
-    tls: Option<&InboundTlsConfig>,
-    reality: Option<InboundRealityConfig>,
-    transport: Option<&TransportConfig>,
-) -> FluxResult<flux_transport::pipeline::ServerTransportPipeline> {
-    let reality_cfg = if let Some(r) = reality {
-        if r.enabled {
-            let pk_bytes = crate::config::decode_key_32bytes(&r.private_key)?;
-            let short_ids = r
-                .short_ids
-                .iter()
-                .filter_map(|s| flux_types::decode_hex(s.as_str()))
-                .collect();
-            Some(flux_transport::reality::RealityServerConfig {
-                server_names: r.server_names,
-                private_key: pk_bytes,
-                short_ids,
-                fallback: r.fallback,
-            })
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let sec = if let Some(r) = reality_cfg {
-        flux_transport::pipeline::ServerSecurityLayer::Reality(r)
-    } else if let Some(t) = tls {
-        if t.enabled {
-            let (certs, key) = if let (Some(cp), Some(kp)) = (&t.certificate_path, &t.key_path) {
-                TlsTransport::load_certs_and_key(cp, kp)?
-            } else {
-                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
-                    .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
-                (
-                    vec![CertificateDer::from(cert.cert)],
-                    PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
-                )
-            };
-            let acceptor = TlsTransport::create_server_acceptor(certs, key, vec![])?;
-            flux_transport::pipeline::ServerSecurityLayer::Tls(acceptor)
-        } else {
-            flux_transport::pipeline::ServerSecurityLayer::None
-        }
-    } else {
-        flux_transport::pipeline::ServerSecurityLayer::None
-    };
-
-    let framing = if let Some(tr) = transport {
-        match tr.transport_type.to_ascii_lowercase().as_str() {
-            "ws" | "websocket" => flux_transport::pipeline::ServerFramingLayer::WebSocket {
-                path: tr.path.clone(),
-            },
-            "httpupgrade" | "upgrade" => {
-                flux_transport::pipeline::ServerFramingLayer::HttpUpgrade {
-                    path: tr.path.clone(),
-                }
-            }
-            "h2" | "http2" => flux_transport::pipeline::ServerFramingLayer::Http2,
-            "grpc" | "gun" => flux_transport::pipeline::ServerFramingLayer::Grpc,
-            _ => flux_transport::pipeline::ServerFramingLayer::Raw,
-        }
-    } else {
-        flux_transport::pipeline::ServerFramingLayer::Raw
-    };
-
-    Ok(flux_transport::pipeline::ServerTransportPipeline::single(
-        sec, framing,
-    ))
 }
 
 fn parse_outbound_carrier(carrier: &CarrierConfig) -> FluxResult<(TargetAddress, bool)> {
@@ -1278,9 +606,74 @@ fn build_layered_outbound(
                 registry.insert(tag, Arc::new(out));
                 return Ok(());
             }
+            ProtocolConfig::WireGuard {
+                private_key,
+                peer_public_key,
+                preshared_key,
+                awg,
+            } => {
+                let priv_k = crate::config::decode_key_32bytes(&private_key)?;
+                let pub_k = crate::config::decode_key_32bytes(&peer_public_key)?;
+                let psk = preshared_key.and_then(|k| crate::config::decode_key_32bytes(&k).ok());
+                let wg_cfg = flux_protocol::wireguard::WireGuardConfig {
+                    private_key: priv_k,
+                    peer_public_key: pub_k,
+                    preshared_key: psk,
+                    server_address: target,
+                    awg,
+                };
+                let out =
+                    flux_outbound::WireGuardOutbound::new(tag.clone(), wg_cfg, resolver.clone());
+                registry.insert(tag, Arc::new(out));
+                return Ok(());
+            }
+            ProtocolConfig::Hysteria2 {
+                password,
+                up_mbps,
+                down_mbps,
+                hop_interval_secs,
+            } => {
+                let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
+                    server: target.host(),
+                    ports: vec![target.port()],
+                    password,
+                    up_mbps,
+                    down_mbps,
+                    hop_interval_secs: hop_interval_secs.unwrap_or(30),
+                    insecure: true,
+                    server_name: None,
+                    obfs: None,
+                };
+                let out =
+                    flux_outbound::Hysteria2Outbound::new(tag.clone(), hy2_cfg, resolver.clone());
+                registry.insert(tag, Arc::new(out));
+                return Ok(());
+            }
+            ProtocolConfig::Tuic {
+                uuid,
+                password,
+                congestion_control,
+                zero_rtt,
+            } => {
+                let parsed_uuid = Uuid::parse_str(&uuid)
+                    .map_err(|e| FluxError::Config(format!("invalid tuic uuid {}: {}", uuid, e)))?;
+                let tuic_cfg = flux_protocol::tuic::TuicV5Config {
+                    server: target.host(),
+                    server_port: target.port(),
+                    uuid: parsed_uuid,
+                    password,
+                    congestion_control: congestion_control.unwrap_or_else(|| "bbr".into()),
+                    zero_rtt: zero_rtt.unwrap_or(true),
+                    insecure: true,
+                    server_name: None,
+                };
+                let out = flux_outbound::TuicOutbound::new(tag.clone(), tuic_cfg, resolver.clone());
+                registry.insert(tag, Arc::new(out));
+                return Ok(());
+            }
             _ => {
                 return Err(FluxError::Config(format!(
-                    "outbound '{}': carrier UDP currently supports shadowsocks",
+                    "outbound '{}': carrier UDP currently supports shadowsocks, wireguard, hysteria2, tuic",
                     tag
                 )));
             }
@@ -1571,21 +964,51 @@ fn build_layered_inbound(
     let (addr, is_udp) = parse_inbound_carrier(&node.carrier)?;
 
     if is_udp {
-        if let ProtocolConfig::Shadowsocks { password, method } = node.protocol {
-            let cipher_kind = method
-                .as_deref()
-                .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
-                .unwrap_or_default();
-            inbounds.push(Arc::new(
-                flux_inbound::ShadowsocksInbound::new(tag, addr, &password)
-                    .with_cipher_kind(cipher_kind),
-            ));
-            return Ok(());
-        } else {
-            return Err(FluxError::Config(format!(
-                "inbound '{}': carrier UDP currently supports shadowsocks",
-                tag
-            )));
+        match node.protocol {
+            ProtocolConfig::Shadowsocks { password, method } => {
+                let cipher_kind = method
+                    .as_deref()
+                    .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
+                    .unwrap_or_default();
+                inbounds.push(Arc::new(
+                    flux_inbound::ShadowsocksInbound::new(tag, addr, &password)
+                        .with_cipher_kind(cipher_kind),
+                ));
+                return Ok(());
+            }
+            ProtocolConfig::Hysteria2 { password, .. } => {
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
+                let certs = vec![CertificateDer::from(cert.cert)];
+                let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+                inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new(
+                    tag, addr, password, certs, key,
+                )));
+                return Ok(());
+            }
+            ProtocolConfig::Tuic { uuid, password, .. } => {
+                let parsed_uuid = Uuid::parse_str(&uuid)
+                    .map_err(|e| FluxError::Config(format!("invalid tuic uuid {}: {}", uuid, e)))?;
+                let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
+                let certs = vec![CertificateDer::from(cert.cert)];
+                let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+                inbounds.push(Arc::new(flux_inbound::TuicInbound::new(
+                    tag,
+                    addr,
+                    vec![parsed_uuid],
+                    password,
+                    certs,
+                    key,
+                )));
+                return Ok(());
+            }
+            _ => {
+                return Err(FluxError::Config(format!(
+                    "inbound '{}': carrier UDP currently supports shadowsocks, hysteria2, tuic",
+                    tag
+                )));
+            }
         }
     }
 

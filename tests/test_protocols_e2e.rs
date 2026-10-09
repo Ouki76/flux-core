@@ -27,11 +27,16 @@ async fn test_01_socks5_end_to_end() {
 
     let cfg = Config::from_json_str(&format!(
         r#"{{
-            "inbounds": [{{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": {} }}],
+            "inbounds": [{{
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "socks" }}
+            }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
         srv_port
-    )).unwrap();
+    ))
+    .unwrap();
     let instance = Instance::new(cfg).unwrap();
     instance.start().await.unwrap();
 
@@ -69,11 +74,16 @@ async fn test_02_http_connect_end_to_end() {
 
     let cfg = Config::from_json_str(&format!(
         r#"{{
-            "inbounds": [{{ "type": "http", "tag": "in", "listen": "127.0.0.1", "listen_port": {} }}],
+            "inbounds": [{{
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "http" }}
+            }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
         srv_port
-    )).unwrap();
+    ))
+    .unwrap();
     let instance = Instance::new(cfg).unwrap();
     instance.start().await.unwrap();
 
@@ -113,11 +123,16 @@ async fn test_03_vless_plain_end_to_end() {
 
     let cfg = Config::from_json_str(&format!(
         r#"{{
-            "inbounds": [{{ "type": "vless", "tag": "in", "listen": "127.0.0.1", "listen_port": {}, "users": [{{"uuid": "{}"}}] }}],
+            "inbounds": [{{
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
+            }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
         srv_port, uuid_str
-    )).unwrap();
+    ))
+    .unwrap();
     let instance = Instance::new(cfg).unwrap();
     instance.start().await.unwrap();
 
@@ -162,9 +177,10 @@ async fn test_04_vless_tls_end_to_end() {
     let cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "vless", "tag": "in", "listen": "127.0.0.1", "listen_port": {},
-                "users": [{{"uuid": "{}"}}],
-                "tls": {{"enabled": true}}
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "security": {{ "type": "tls" }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
@@ -215,8 +231,10 @@ async fn test_05_trojan_tls_end_to_end() {
     let cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "trojan", "tag": "in", "listen": "127.0.0.1", "listen_port": {},
-                "password": ["{}"]
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "security": {{ "type": "tls" }},
+                "protocol": {{ "type": "trojan", "password": "{}" }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
@@ -265,8 +283,9 @@ async fn test_06_shadowsocks_aead_end_to_end() {
     let cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "shadowsocks", "tag": "in", "listen": "127.0.0.1", "listen_port": {},
-                "password": "{}"
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "shadowsocks", "password": "{}" }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
@@ -311,11 +330,16 @@ async fn test_07_socks5_udp_associate_relay() {
 
     let cfg = Config::from_json_str(&format!(
         r#"{{
-            "inbounds": [{{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": {} }}],
+            "inbounds": [{{
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "socks" }}
+            }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
         srv_port
-    )).unwrap();
+    ))
+    .unwrap();
     let instance = Instance::new(cfg).unwrap();
     instance.start().await.unwrap();
 
@@ -529,21 +553,19 @@ async fn test_09_vless_reality_end_to_end() {
     let srv_cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "vless",
                 "tag": "vless-reality-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "users": [{{ "uuid": "{}" }}],
-                "reality": {{
-                    "enabled": true,
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "security": {{
+                    "type": "reality",
                     "server_names": ["www.microsoft.com"],
                     "private_key": "{}",
                     "short_ids": ["01020304"]
-                }}
+                }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
-        srv_port, uuid_str, private_key_b64
+        srv_port, private_key_b64, uuid_str
     ))
     .unwrap();
     let srv_instance = Instance::new(srv_cfg).unwrap();
@@ -552,23 +574,18 @@ async fn test_09_vless_reality_end_to_end() {
     let client_cfg = Config::from_json_str(&format!(
         r#"{{
             "outbounds": [{{
-                "type": "vless",
                 "tag": "vless-reality-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "uuid": "{}",
-                "reality": {{
-                    "enabled": true,
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "security": {{
+                    "type": "reality",
+                    "sni": "www.microsoft.com",
                     "public_key": "{}",
                     "short_id": "01020304"
                 }},
-                "tls": {{
-                    "enabled": true,
-                    "server_name": "www.microsoft.com"
-                }}
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
             }}]
         }}"#,
-        srv_port, uuid_str, public_key_b64
+        srv_port, public_key_b64, uuid_str
     ))
     .unwrap();
     let cli_instance = Instance::new(client_cfg).unwrap();
@@ -666,7 +683,11 @@ async fn test_11_fakeip_domain_routing_recovery() {
             "dns": {{
                 "fakeip": {{ "enabled": true, "inet4_range": "198.18.0.0/15" }}
             }},
-            "inbounds": [{{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }}],
+            "inbounds": [{{
+                "tag": "socks-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "socks" }}
+            }}],
             "outbounds": [
                 {{ "type": "block", "tag": "block" }},
                 {{ "type": "direct", "tag": "direct" }}
@@ -723,21 +744,29 @@ async fn test_12_vmess_aead_end_to_end() {
 
     let cfg = Config::from_json_str(&format!(
         r#"{{
-            "inbounds": [{{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }}],
+            "inbounds": [{{
+                "tag": "socks-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "socks" }}
+            }}],
             "outbounds": [
                 {{
-                    "type": "vmess",
                     "tag": "vmess-out",
-                    "server": "127.0.0.1",
-                    "server_port": {},
-                    "uuid": "{}",
-                    "security": "aes-128-gcm"
+                    "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                    "protocol": {{
+                        "type": "vmess",
+                        "uuid": "{}",
+                        "security": "aes-128-gcm"
+                    }}
                 }},
                 {{ "type": "direct", "tag": "direct" }}
             ]
         }}"#,
-        srv_port, echo_addr.port(), uuid
-    )).unwrap();
+        srv_port,
+        echo_addr.port(),
+        uuid
+    ))
+    .unwrap();
     let instance = Instance::new(cfg).unwrap();
     let vmess_out = instance.registry.get_outbound("vmess-out").unwrap();
 
@@ -760,12 +789,13 @@ async fn test_13_shadowsocks_2022_end_to_end() {
     let srv_cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "shadowsocks",
                 "tag": "ss2022-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "password": "{}",
-                "method": "2022-blake3-aes-128-gcm"
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{
+                    "type": "shadowsocks",
+                    "password": "{}",
+                    "method": "2022-blake3-aes-128-gcm"
+                }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
@@ -778,12 +808,13 @@ async fn test_13_shadowsocks_2022_end_to_end() {
     let cli_cfg = Config::from_json_str(&format!(
         r#"{{
             "outbounds": [{{
-                "type": "shadowsocks",
                 "tag": "ss2022-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "password": "{}",
-                "method": "2022-blake3-aes-128-gcm"
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "protocol": {{
+                    "type": "shadowsocks",
+                    "password": "{}",
+                    "method": "2022-blake3-aes-128-gcm"
+                }}
             }}]
         }}"#,
         srv_port, psk_b64
@@ -820,22 +851,23 @@ async fn test_14_wireguard_amnezia_outbound_init() {
     let cfg_json = format!(
         r#"{{
             "outbounds": [{{
-                "type": "wireguard",
                 "tag": "awg-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "private_key": "{}",
-                "peer_public_key": "{}",
-                "awg": {{
-                    "jc": 3,
-                    "jmin": 40,
-                    "jmax": 70,
-                    "s1": 16,
-                    "s2": 16,
-                    "h1": 10001,
-                    "h2": 10002,
-                    "h3": 10003,
-                    "h4": 10004
+                "carrier": {{ "type": "udp", "address": "127.0.0.1:{}" }},
+                "protocol": {{
+                    "type": "wireguard",
+                    "private_key": "{}",
+                    "peer_public_key": "{}",
+                    "awg": {{
+                        "jc": 3,
+                        "jmin": 40,
+                        "jmax": 70,
+                        "s1": 16,
+                        "s2": 16,
+                        "h1": 10001,
+                        "h2": 10002,
+                        "h3": 10003,
+                        "h4": 10004
+                    }}
                 }}
             }}]
         }}"#,
@@ -853,14 +885,15 @@ async fn test_14_wireguard_amnezia_outbound_init() {
 async fn test_15_hysteria2_outbound_init() {
     let cfg_json = r#"{
         "outbounds": [{
-            "type": "hysteria2",
             "tag": "hy2-out",
-            "server": "127.0.0.1",
-            "ports": [443, 444, 445],
-            "password": "secret_hy2_password",
-            "up_mbps": 50,
-            "down_mbps": 100,
-            "hop_interval_secs": 15
+            "carrier": { "type": "udp", "address": "127.0.0.1:443" },
+            "protocol": {
+                "type": "hysteria2",
+                "password": "secret_hy2_password",
+                "up_mbps": 50,
+                "down_mbps": 100,
+                "hop_interval_secs": 15
+            }
         }]
     }"#;
 
@@ -876,14 +909,15 @@ async fn test_16_tuic_v5_outbound_init() {
     let cfg_json = format!(
         r#"{{
             "outbounds": [{{
-                "type": "tuic",
                 "tag": "tuic-out",
-                "server": "127.0.0.1",
-                "server_port": 8443,
-                "uuid": "{}",
-                "password": "tuic_secret_pw",
-                "congestion_control": "bbr",
-                "zero_rtt": true
+                "carrier": {{ "type": "udp", "address": "127.0.0.1:8443" }},
+                "protocol": {{
+                    "type": "tuic",
+                    "uuid": "{}",
+                    "password": "tuic_secret_pw",
+                    "congestion_control": "bbr",
+                    "zero_rtt": true
+                }}
             }}]
         }}"#,
         Uuid::new_v4()
@@ -912,7 +946,11 @@ async fn test_17_split_dns_routing_e2e() {
                     }}
                 ]
             }},
-            "inbounds": [{{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }}],
+            "inbounds": [{{
+                "tag": "socks-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "socks" }}
+            }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
         srv_port
@@ -932,8 +970,9 @@ async fn test_18_shadowsocks_aead_replay_defense() {
     let cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "shadowsocks", "tag": "in", "listen": "127.0.0.1", "listen_port": {},
-                "password": "{}"
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "shadowsocks", "password": "{}" }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
@@ -1046,11 +1085,12 @@ async fn test_19_vmess_inbound_server_e2e() {
     let srv_cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "vmess",
                 "tag": "vmess-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "users": [{{"uuid": "{}"}}]
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{
+                    "type": "vmess",
+                    "uuid": "{}"
+                }}
             }}],
             "outbounds": [{{"type": "direct", "tag": "direct"}}]
         }}"#,
@@ -1063,12 +1103,13 @@ async fn test_19_vmess_inbound_server_e2e() {
     let cli_cfg = Config::from_json_str(&format!(
         r#"{{
             "outbounds": [{{
-                "type": "vmess",
                 "tag": "vmess-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "uuid": "{}",
-                "security": "aes-128-gcm"
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "protocol": {{
+                    "type": "vmess",
+                    "uuid": "{}",
+                    "security": "aes-128-gcm"
+                }}
             }}]
         }}"#,
         srv_port, test_uuid_str
@@ -1106,12 +1147,13 @@ async fn test_20_tuic_v5_inbound_server_e2e() {
     let srv_cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "tuic",
                 "tag": "tuic-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "users": [{{"uuid": "{}"}}],
-                "password": "{}"
+                "carrier": {{ "type": "udp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{
+                    "type": "tuic",
+                    "uuid": "{}",
+                    "password": "{}"
+                }}
             }}],
             "outbounds": [{{"type": "direct", "tag": "direct"}}]
         }}"#,
@@ -1124,13 +1166,13 @@ async fn test_20_tuic_v5_inbound_server_e2e() {
     let cli_cfg = Config::from_json_str(&format!(
         r#"{{
             "outbounds": [{{
-                "type": "tuic",
                 "tag": "tuic-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "uuid": "{}",
-                "password": "{}",
-                "tls": {{ "enabled": true, "insecure": true }}
+                "carrier": {{ "type": "udp", "address": "127.0.0.1:{}" }},
+                "protocol": {{
+                    "type": "tuic",
+                    "uuid": "{}",
+                    "password": "{}"
+                }}
             }}]
         }}"#,
         srv_port, test_uuid_str, password
@@ -1167,11 +1209,12 @@ async fn test_21_hysteria2_inbound_server_e2e() {
     let srv_cfg = Config::from_json_str(&format!(
         r#"{{
             "inbounds": [{{
-                "type": "hysteria2",
                 "tag": "hy2-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "password": "{}"
+                "carrier": {{ "type": "udp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{
+                    "type": "hysteria2",
+                    "password": "{}"
+                }}
             }}],
             "outbounds": [{{"type": "direct", "tag": "direct"}}]
         }}"#,
@@ -1184,12 +1227,12 @@ async fn test_21_hysteria2_inbound_server_e2e() {
     let cli_cfg = Config::from_json_str(&format!(
         r#"{{
             "outbounds": [{{
-                "type": "hysteria2",
                 "tag": "hy2-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "password": "{}",
-                "tls": {{ "enabled": true, "insecure": true }}
+                "carrier": {{ "type": "udp", "address": "127.0.0.1:{}" }},
+                "protocol": {{
+                    "type": "hysteria2",
+                    "password": "{}"
+                }}
             }}]
         }}"#,
         srv_port, password

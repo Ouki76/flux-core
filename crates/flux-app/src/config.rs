@@ -142,34 +142,14 @@ pub struct SocksUserConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum TaggedInboundConfig {
-    #[serde(rename = "socks")]
-    Socks {
+pub enum SystemInboundConfig {
+    #[serde(rename = "tun")]
+    Tun {
         tag: String,
-        listen: String,
-        listen_port: u16,
         #[serde(default)]
-        users: Vec<SocksUserConfig>,
+        interface_name: Option<String>,
         #[serde(default)]
-        tls: Option<InboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<InboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "http")]
-    Http {
-        tag: String,
-        listen: String,
-        listen_port: u16,
-        #[serde(default)]
-        users: Vec<SocksUserConfig>,
-        #[serde(default)]
-        tls: Option<InboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<InboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
+        mtu: Option<usize>,
     },
     #[serde(rename = "mixed")]
     Mixed {
@@ -178,59 +158,6 @@ pub enum TaggedInboundConfig {
         listen_port: u16,
         #[serde(default)]
         users: Vec<SocksUserConfig>,
-        #[serde(default)]
-        tls: Option<InboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<InboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "vless")]
-    Vless {
-        tag: String,
-        listen: String,
-        listen_port: u16,
-        #[serde(default)]
-        users: Vec<VlessUserConfig>,
-        tls: Option<InboundTlsConfig>,
-        reality: Option<InboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "tun")]
-    Tun {
-        tag: String,
-        interface_name: Option<String>,
-        mtu: Option<usize>,
-    },
-    #[serde(rename = "trojan")]
-    Trojan {
-        tag: String,
-        listen: String,
-        listen_port: u16,
-        #[serde(default)]
-        password: Vec<String>,
-        #[serde(default)]
-        tls: Option<InboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<InboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "shadowsocks")]
-    Shadowsocks {
-        tag: String,
-        listen: String,
-        listen_port: u16,
-        password: String,
-        #[serde(default)]
-        method: Option<String>,
-        #[serde(default)]
-        tls: Option<InboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<InboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
     },
     #[serde(rename = "redirect")]
     Redirect {
@@ -244,53 +171,15 @@ pub enum TaggedInboundConfig {
         listen: String,
         listen_port: u16,
     },
-    #[serde(rename = "vmess")]
-    Vmess {
-        tag: String,
-        listen: String,
-        listen_port: u16,
-        users: Vec<VlessUserConfig>,
-        #[serde(default)]
-        tls: Option<InboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<InboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "tuic", alias = "tuic5")]
-    Tuic {
-        tag: String,
-        listen: String,
-        listen_port: u16,
-        users: Vec<VlessUserConfig>,
-        password: String,
-        tls: Option<InboundTlsConfig>,
-    },
-    #[serde(rename = "hysteria2", alias = "hy2")]
-    Hysteria2 {
-        tag: String,
-        listen: String,
-        listen_port: u16,
-        password: String,
-        tls: Option<InboundTlsConfig>,
-    },
 }
 
-impl TaggedInboundConfig {
+impl SystemInboundConfig {
     pub fn tag(&self) -> &str {
         match self {
-            Self::Socks { tag, .. }
-            | Self::Http { tag, .. }
+            Self::Tun { tag, .. }
             | Self::Mixed { tag, .. }
-            | Self::Vless { tag, .. }
-            | Self::Tun { tag, .. }
-            | Self::Trojan { tag, .. }
-            | Self::Shadowsocks { tag, .. }
             | Self::Redirect { tag, .. }
-            | Self::Tproxy { tag, .. }
-            | Self::Vmess { tag, .. }
-            | Self::Tuic { tag, .. }
-            | Self::Hysteria2 { tag, .. } => tag,
+            | Self::Tproxy { tag, .. } => tag,
         }
     }
 }
@@ -298,40 +187,17 @@ impl TaggedInboundConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum InboundConfig {
-    Layered(Box<LayeredInboundNode>),
-    Tagged(Box<TaggedInboundConfig>),
+    Node(Box<LayeredInboundNode>),
+    System(SystemInboundConfig),
 }
 
 impl InboundConfig {
     pub fn tag(&self) -> &str {
         match self {
-            Self::Layered(node) => &node.tag,
-            Self::Tagged(tagged) => tagged.tag(),
+            Self::Node(node) => &node.tag,
+            Self::System(sys) => sys.tag(),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VlessUserConfig {
-    pub uuid: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InboundTlsConfig {
-    pub enabled: bool,
-    pub server_name: Option<String>,
-    pub certificate_path: Option<String>,
-    pub key_path: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct InboundRealityConfig {
-    pub enabled: bool,
-    pub server_names: Vec<String>,
-    pub private_key: String,
-    pub short_ids: Vec<String>,
-    #[serde(default)]
-    pub fallback: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -497,6 +363,10 @@ fn default_grpc_service() -> String {
     "GunService".into()
 }
 
+fn default_hy2_mbps() -> u64 {
+    100
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum InboundFramingConfig {
@@ -565,9 +435,9 @@ pub enum ProtocolConfig {
     #[serde(rename = "hysteria2", alias = "hy2")]
     Hysteria2 {
         password: String,
-        #[serde(default = "default_mbps")]
+        #[serde(default = "default_hy2_mbps")]
         up_mbps: u64,
-        #[serde(default = "default_mbps")]
+        #[serde(default = "default_hy2_mbps")]
         down_mbps: u64,
         #[serde(default)]
         hop_interval_secs: Option<u64>,
@@ -628,25 +498,9 @@ pub struct LayeredInboundNode {
     pub framing: Option<FlexibleList<InboundFramingConfig>>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct TransportConfig {
-    #[serde(rename = "type")]
-    pub transport_type: String, // "tcp", "ws", "websocket", "httpupgrade", "h2", "grpc"
-    #[serde(default)]
-    pub path: Option<String>,
-    #[serde(default)]
-    pub service_name: Option<String>,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
-}
-
-fn default_mbps() -> u64 {
-    100
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum TaggedOutboundConfig {
+pub enum OutboundGroupConfig {
     #[serde(rename = "direct")]
     Direct {
         tag: String,
@@ -655,185 +509,51 @@ pub enum TaggedOutboundConfig {
     },
     #[serde(rename = "block")]
     Block { tag: String },
-    #[serde(rename = "socks")]
-    Socks {
-        tag: String,
-        server: String,
-        server_port: u16,
-        #[serde(default)]
-        username: Option<String>,
-        #[serde(default)]
-        password: Option<String>,
-        #[serde(default)]
-        tls: Option<OutboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<OutboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "http")]
-    Http {
-        tag: String,
-        server: String,
-        server_port: u16,
-        #[serde(default)]
-        username: Option<String>,
-        #[serde(default)]
-        password: Option<String>,
-        #[serde(default)]
-        tls: Option<OutboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<OutboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "vless")]
-    Vless {
-        tag: String,
-        server: String,
-        server_port: u16,
-        uuid: String,
-        #[serde(default)]
-        flow: Option<String>,
-        #[serde(default)]
-        tls: Option<OutboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<OutboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "vmess")]
-    Vmess {
-        tag: String,
-        server: String,
-        server_port: u16,
-        uuid: String,
-        #[serde(default)]
-        security: Option<String>,
-        #[serde(default)]
-        tls: Option<OutboundTlsConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "wireguard", alias = "awg")]
-    WireGuard {
-        tag: String,
-        server: String,
-        server_port: u16,
-        private_key: String,
-        peer_public_key: String,
-        #[serde(default)]
-        preshared_key: Option<String>,
-        #[serde(default)]
-        awg: Option<flux_protocol::wireguard::AwgConfig>,
-    },
-    #[serde(rename = "hysteria2", alias = "hy2")]
-    Hysteria2 {
-        tag: String,
-        server: String,
-        #[serde(default)]
-        ports: Vec<u16>,
-        #[serde(default)]
-        server_port: Option<u16>,
-        password: String,
-        #[serde(default = "default_mbps")]
-        up_mbps: u64,
-        #[serde(default = "default_mbps")]
-        down_mbps: u64,
-        #[serde(default)]
-        hop_interval_secs: Option<u64>,
-        #[serde(default)]
-        tls: Option<OutboundTlsConfig>,
-    },
-    #[serde(rename = "tuic", alias = "tuic5")]
-    Tuic {
-        tag: String,
-        server: String,
-        server_port: u16,
-        uuid: String,
-        password: String,
-        #[serde(default)]
-        congestion_control: Option<String>,
-        #[serde(default)]
-        zero_rtt: Option<bool>,
-        #[serde(default)]
-        tls: Option<OutboundTlsConfig>,
-    },
     #[serde(rename = "selector")]
     Selector {
         tag: String,
         outbounds: Vec<String>,
+        #[serde(default)]
         default: Option<String>,
     },
     #[serde(rename = "urltest")]
     UrlTest {
         tag: String,
         outbounds: Vec<String>,
+        #[serde(default)]
         url: Option<String>,
+        #[serde(default)]
         interval: Option<String>,
+        #[serde(default)]
         tolerance: Option<u64>,
     },
     #[serde(rename = "fallback")]
     Fallback {
         tag: String,
         outbounds: Vec<String>,
+        #[serde(default)]
         url: Option<String>,
+        #[serde(default)]
         interval: Option<String>,
     },
     #[serde(rename = "loadbalance")]
     LoadBalance {
         tag: String,
         outbounds: Vec<String>,
+        #[serde(default)]
         strategy: Option<String>,
-    },
-    #[serde(rename = "trojan")]
-    Trojan {
-        tag: String,
-        server: String,
-        server_port: u16,
-        password: String,
-        #[serde(default)]
-        tls: Option<OutboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<OutboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
-    },
-    #[serde(rename = "shadowsocks")]
-    Shadowsocks {
-        tag: String,
-        server: String,
-        server_port: u16,
-        password: String,
-        #[serde(default)]
-        method: Option<String>,
-        #[serde(default)]
-        tls: Option<OutboundTlsConfig>,
-        #[serde(default)]
-        reality: Option<OutboundRealityConfig>,
-        #[serde(default)]
-        transport: Option<TransportConfig>,
     },
 }
 
-impl TaggedOutboundConfig {
+impl OutboundGroupConfig {
     pub fn tag(&self) -> &str {
         match self {
             Self::Direct { tag, .. }
             | Self::Block { tag }
-            | Self::Socks { tag, .. }
-            | Self::Http { tag, .. }
-            | Self::Vless { tag, .. }
-            | Self::Vmess { tag, .. }
-            | Self::WireGuard { tag, .. }
-            | Self::Hysteria2 { tag, .. }
-            | Self::Tuic { tag, .. }
             | Self::Selector { tag, .. }
             | Self::UrlTest { tag, .. }
             | Self::Fallback { tag, .. }
-            | Self::LoadBalance { tag, .. }
-            | Self::Trojan { tag, .. }
-            | Self::Shadowsocks { tag, .. } => tag,
+            | Self::LoadBalance { tag, .. } => tag,
         }
     }
 }
@@ -841,36 +561,17 @@ impl TaggedOutboundConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OutboundConfig {
-    Layered(Box<LayeredOutboundNode>),
-    Tagged(Box<TaggedOutboundConfig>),
+    Node(Box<LayeredOutboundNode>),
+    Group(OutboundGroupConfig),
 }
 
 impl OutboundConfig {
     pub fn tag(&self) -> &str {
         match self {
-            Self::Layered(node) => &node.tag,
-            Self::Tagged(tagged) => tagged.tag(),
+            Self::Node(node) => &node.tag,
+            Self::Group(group) => group.tag(),
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OutboundTlsConfig {
-    pub enabled: bool,
-    pub server_name: Option<String>,
-    #[serde(default)]
-    pub insecure: bool,
-    #[serde(default)]
-    pub alpn: Vec<String>,
-    #[serde(default, alias = "fingerprint")]
-    pub utls: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OutboundRealityConfig {
-    pub enabled: bool,
-    pub public_key: String,
-    pub short_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1376,7 +1077,7 @@ impl Config {
             }
 
             match out_cfg {
-                OutboundConfig::Layered(node) => {
+                OutboundConfig::Node(node) => {
                     match &node.protocol {
                         ProtocolConfig::Vless { uuid, .. } | ProtocolConfig::Vmess { uuid, .. } => {
                             Uuid::parse_str(uuid).map_err(|e| {
@@ -1401,25 +1102,8 @@ impl Config {
                         }
                     }
                 }
-                OutboundConfig::Tagged(tagged) => match &**tagged {
-                    TaggedOutboundConfig::Vless { uuid, reality, .. } => {
-                        Uuid::parse_str(uuid).map_err(|e| {
-                            FluxError::Config(format!(
-                                "outbound '{}': invalid vless uuid: {}",
-                                tag, e
-                            ))
-                        })?;
-                        if let Some(r) = reality
-                            && r.enabled
-                            && decode_key_32bytes(&r.public_key).is_err()
-                        {
-                            return Err(FluxError::Config(format!(
-                                "outbound '{}': reality public_key must be 32 bytes (64 hex characters or Base64)",
-                                tag
-                            )));
-                        }
-                    }
-                    TaggedOutboundConfig::Selector {
+                OutboundConfig::Group(group) => match group {
+                    OutboundGroupConfig::Selector {
                         outbounds, default, ..
                     } => {
                         if outbounds.is_empty() {
@@ -1438,7 +1122,7 @@ impl Config {
                         }
                         group_edges.insert(tag.to_string(), outbounds.clone());
                     }
-                    TaggedOutboundConfig::UrlTest { outbounds, .. } => {
+                    OutboundGroupConfig::UrlTest { outbounds, .. } => {
                         if outbounds.is_empty() {
                             return Err(FluxError::Config(format!(
                                 "urltest '{}' must have at least one outbound candidate",
@@ -1447,7 +1131,7 @@ impl Config {
                         }
                         group_edges.insert(tag.to_string(), outbounds.clone());
                     }
-                    TaggedOutboundConfig::Fallback { outbounds, .. } => {
+                    OutboundGroupConfig::Fallback { outbounds, .. } => {
                         if outbounds.is_empty() {
                             return Err(FluxError::Config(format!(
                                 "fallback '{}' must have at least one outbound candidate",
@@ -1456,7 +1140,7 @@ impl Config {
                         }
                         group_edges.insert(tag.to_string(), outbounds.clone());
                     }
-                    TaggedOutboundConfig::LoadBalance { outbounds, .. } => {
+                    OutboundGroupConfig::LoadBalance { outbounds, .. } => {
                         if outbounds.is_empty() {
                             return Err(FluxError::Config(format!(
                                 "loadbalance '{}' must have at least one outbound candidate",
@@ -1624,10 +1308,9 @@ mod tests {
             /* Inbound listeners */
             "inbounds": [
                 {
-                    "type": "socks",
                     "tag": "socks-in",
-                    "listen": "127.0.0.1",
-                    "listen_port": 10808 // standard port
+                    "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": 10808 },
+                    "protocol": { "type": "socks" }
                 }
             ],
             "outbounds": [

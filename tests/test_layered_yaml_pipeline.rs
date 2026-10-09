@@ -374,10 +374,7 @@ outbounds:
         Err(e) => e,
         Ok(_) => panic!("expected Instance::new to fail for UDP + VLESS"),
     };
-    assert!(
-        err.to_string()
-            .contains("carrier UDP currently supports shadowsocks")
-    );
+    assert!(err.to_string().contains("carrier UDP currently supports"));
 
     let in_yaml = r#"
 inbounds:
@@ -401,7 +398,7 @@ outbounds:
     assert!(
         err_in
             .to_string()
-            .contains("carrier UDP currently supports shadowsocks")
+            .contains("carrier UDP currently supports")
     );
 }
 

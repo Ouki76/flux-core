@@ -17,10 +17,18 @@ async fn test_fallback_outbound_failover() {
     let cfg_json = format!(
         r#"{{
             "inbounds": [
-                {{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }}
+                {{
+                    "tag": "socks-in",
+                    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                    "protocol": {{ "type": "socks" }}
+                }}
             ],
             "outbounds": [
-                {{ "type": "socks", "tag": "dead-node", "server": "127.0.0.1", "server_port": {} }},
+                {{
+                    "tag": "dead-node",
+                    "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                    "protocol": {{ "type": "socks" }}
+                }},
                 {{ "type": "direct", "tag": "working-node" }},
                 {{
                     "type": "fallback",
@@ -72,7 +80,11 @@ async fn test_loadbalance_outbound_distribution() {
     let cfg_json = format!(
         r#"{{
             "inbounds": [
-                {{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }}
+                {{
+                    "tag": "socks-in",
+                    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                    "protocol": {{ "type": "socks" }}
+                }}
             ],
             "outbounds": [
                 {{ "type": "direct", "tag": "node-1" }},

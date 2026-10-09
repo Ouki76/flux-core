@@ -246,14 +246,15 @@ async fn test_vless_websocket_pipeline_e2e() {
     let server_cfg = format!(
         r#"{{
             "inbounds": [{{
-                "type": "vless",
                 "tag": "vless-ws-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "users": [{{"uuid": "{}"}}],
-                "transport": {{
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "framing": {{
                     "type": "ws",
                     "path": "/vless-ws-path"
+                }},
+                "protocol": {{
+                    "type": "vless",
+                    "uuid": "{}"
                 }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
@@ -267,14 +268,15 @@ async fn test_vless_websocket_pipeline_e2e() {
     let client_cfg = format!(
         r#"{{
             "outbounds": [{{
-                "type": "vless",
                 "tag": "vless-ws-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "uuid": "{}",
-                "transport": {{
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "framing": {{
                     "type": "ws",
                     "path": "/vless-ws-path"
+                }},
+                "protocol": {{
+                    "type": "vless",
+                    "uuid": "{}"
                 }}
             }},
             {{ "type": "direct", "tag": "direct" }}]
@@ -313,15 +315,16 @@ async fn test_shadowsocks_websocket_pipeline_e2e() {
     let server_cfg = format!(
         r#"{{
             "inbounds": [{{
-                "type": "shadowsocks",
                 "tag": "ss-ws-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "password": "{}",
-                "method": "chacha20-ietf-poly1305",
-                "transport": {{
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "framing": {{
                     "type": "ws",
                     "path": "/ss-ws-tunnel"
+                }},
+                "protocol": {{
+                    "type": "shadowsocks",
+                    "password": "{}",
+                    "method": "chacha20-ietf-poly1305"
                 }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
@@ -335,15 +338,16 @@ async fn test_shadowsocks_websocket_pipeline_e2e() {
     let client_cfg = format!(
         r#"{{
             "outbounds": [{{
-                "type": "shadowsocks",
                 "tag": "ss-ws-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "password": "{}",
-                "method": "chacha20-ietf-poly1305",
-                "transport": {{
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "framing": {{
                     "type": "ws",
                     "path": "/ss-ws-tunnel"
+                }},
+                "protocol": {{
+                    "type": "shadowsocks",
+                    "password": "{}",
+                    "method": "chacha20-ietf-poly1305"
                 }}
             }},
             {{ "type": "direct", "tag": "direct" }}]
@@ -383,15 +387,15 @@ async fn test_trojan_websocket_pipeline_e2e() {
     let server_cfg = format!(
         r#"{{
             "inbounds": [{{
-                "type": "trojan",
                 "tag": "trojan-ws-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "password": ["{}"],
-                "tls": {{ "enabled": false }},
-                "transport": {{
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "framing": {{
                     "type": "ws",
                     "path": "/trojan-ws"
+                }},
+                "protocol": {{
+                    "type": "trojan",
+                    "password": "{}"
                 }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
@@ -405,14 +409,15 @@ async fn test_trojan_websocket_pipeline_e2e() {
     let client_cfg = format!(
         r#"{{
             "outbounds": [{{
-                "type": "trojan",
                 "tag": "trojan-ws-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "password": "{}",
-                "transport": {{
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "framing": {{
                     "type": "ws",
                     "path": "/trojan-ws"
+                }},
+                "protocol": {{
+                    "type": "trojan",
+                    "password": "{}"
                 }}
             }},
             {{ "type": "direct", "tag": "direct" }}]
@@ -451,14 +456,15 @@ async fn test_vmess_websocket_pipeline_e2e() {
     let server_cfg = format!(
         r#"{{
             "inbounds": [{{
-                "type": "vmess",
                 "tag": "vmess-ws-in",
-                "listen": "127.0.0.1",
-                "listen_port": {},
-                "users": [{{"uuid": "{}"}}],
-                "transport": {{
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "framing": {{
                     "type": "ws",
                     "path": "/vmess-ws"
+                }},
+                "protocol": {{
+                    "type": "vmess",
+                    "uuid": "{}"
                 }}
             }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
@@ -472,14 +478,16 @@ async fn test_vmess_websocket_pipeline_e2e() {
     let client_cfg = format!(
         r#"{{
             "outbounds": [{{
-                "type": "vmess",
                 "tag": "vmess-ws-out",
-                "server": "127.0.0.1",
-                "server_port": {},
-                "uuid": "{}",
-                "transport": {{
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "framing": {{
                     "type": "ws",
                     "path": "/vmess-ws"
+                }},
+                "protocol": {{
+                    "type": "vmess",
+                    "uuid": "{}",
+                    "security": "aes-128-gcm"
                 }}
             }},
             {{ "type": "direct", "tag": "direct" }}]

@@ -58,17 +58,18 @@ async fn test_layered_websocket_framing() {
         r#"{{
             "outbounds": [
                 {{
-                    "type": "vless",
                     "tag": "vless-ws-node",
-                    "server": "127.0.0.1",
-                    "server_port": {},
-                    "uuid": "{}",
-                    "transport": {{
+                    "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                    "framing": {{
                         "type": "ws",
                         "path": "/my-ws-tunnel",
                         "headers": {{
                             "Host": "custom-cdn.example.com"
                         }}
+                    }},
+                    "protocol": {{
+                        "type": "vless",
+                        "uuid": "{}"
                     }}
                 }},
                 {{ "type": "direct", "tag": "direct" }}

@@ -18,7 +18,11 @@ async fn test_perf_memory_concurrency_and_leak() {
     let config_json = format!(
         r#"{{
             "inbounds": [
-                {{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }}
+                {{
+                    "tag": "socks-in",
+                    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                    "protocol": {{ "type": "socks" }}
+                }}
             ],
             "outbounds": [
                 {{ "type": "direct", "tag": "direct" }}
@@ -76,7 +80,11 @@ async fn test_perf_throughput_speed() {
     let config_json = format!(
         r#"{{
             "inbounds": [
-                {{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }}
+                {{
+                    "tag": "socks-in",
+                    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                    "protocol": {{ "type": "socks" }}
+                }}
             ],
             "outbounds": [
                 {{ "type": "direct", "tag": "direct" }}

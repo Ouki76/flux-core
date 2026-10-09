@@ -52,7 +52,11 @@ route:
                 "rules/routing.yaml"
             ],
             "inbounds": [
-                { "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": 10888 }
+                {
+                    "tag": "socks-in",
+                    "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": 10888 },
+                    "protocol": { "type": "socks" }
+                }
             ],
             "outbounds": [
                 { "type": "direct", "tag": "direct" },
@@ -97,7 +101,11 @@ fn test_config_env_var_substitution() {
 
     let raw = r#"{
         "inbounds": [
-            { "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": ${FLUX_TEST_INBOUND_PORT} }
+            {
+                "tag": "socks-in",
+                "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": ${FLUX_TEST_INBOUND_PORT} },
+                "protocol": { "type": "socks" }
+            }
         ],
         "outbounds": [
             { "type": "direct", "tag": "direct" }
@@ -111,13 +119,16 @@ fn test_config_env_var_substitution() {
     let cfg = Config::from_json_str(raw).unwrap();
     let inb = &cfg.inbounds[0];
     match inb {
-        flux_app::InboundConfig::Tagged(tagged) => match &**tagged {
-            flux_app::TaggedInboundConfig::Socks { listen_port, .. } => {
-                assert_eq!(*listen_port, 19999);
+        flux_app::InboundConfig::Node(node) => {
+            assert_eq!(node.tag, "socks-in");
+            match &node.carrier {
+                flux_app::InboundCarrierConfig::Tcp { listen_port, .. } => {
+                    assert_eq!(*listen_port, Some(19999));
+                }
+                _ => panic!("expected tcp carrier"),
             }
-            _ => panic!("expected socks inbound"),
-        },
-        _ => panic!("expected tagged socks inbound"),
+        }
+        _ => panic!("expected node inbound"),
     }
 
     let api_cfg = cfg.api.unwrap();
