@@ -698,6 +698,7 @@ struct TunTcpSession {
     server_seq: AtomicU32,
     payload_tx: tokio::sync::mpsc::Sender<Bytes>,
     last_activity: parking_lot::Mutex<std::time::Instant>,
+    ooo_buffer: parking_lot::Mutex<std::collections::BTreeMap<u32, Bytes>>,
 }
 
 #[cfg(target_os = "linux")]
@@ -986,6 +987,9 @@ impl Inbound for TunInbound {
                                         last_activity: parking_lot::Mutex::new(
                                             std::time::Instant::now(),
                                         ),
+                                        ooo_buffer: parking_lot::Mutex::new(
+                                            std::collections::BTreeMap::new(),
+                                        ),
                                     });
                                     sessions.insert(key, session.clone());
 
@@ -1127,9 +1131,6 @@ impl Inbound for TunInbound {
                                                 Ok(()) => {
                                                     expected_seq =
                                                         expected_seq.wrapping_add(payload_len);
-                                                    session
-                                                        .client_seq
-                                                        .store(expected_seq, Ordering::SeqCst);
                                                 }
                                                 Err(
                                                     tokio::sync::mpsc::error::TrySendError::Full(_),
@@ -1140,6 +1141,26 @@ impl Inbound for TunInbound {
                                                     );
                                                 }
                                                 Err(_) => {}
+                                            }
+
+                                            // Drain contiguous out-of-order segments
+                                            let mut ooo = session.ooo_buffer.lock();
+                                            while let Some(entry) = ooo.first_entry() {
+                                                if *entry.key() == expected_seq {
+                                                    let next_chunk = entry.remove();
+                                                    let next_len = next_chunk.len() as u32;
+                                                    let _ = session.payload_tx.try_send(next_chunk);
+                                                    expected_seq = expected_seq.wrapping_add(next_len);
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                            session.client_seq.store(expected_seq, Ordering::SeqCst);
+                                        } else if parsed.tcp_seq > expected_seq {
+                                            // Buffer out-of-order packet (up to 32 segments) to prevent packet loss
+                                            let mut ooo = session.ooo_buffer.lock();
+                                            if ooo.len() < 32 {
+                                                ooo.insert(parsed.tcp_seq, parsed.payload);
                                             }
                                         }
 

@@ -92,7 +92,7 @@ impl Outbound for ShadowsocksOutbound {
 
         // 1. Generate client salt
         let mut salt = [0u8; SALT_LEN];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rngs::OsRng.fill_bytes(&mut salt);
         stream.write_all(&salt).await.map_err(FluxError::Io)?;
 
         // 2. Derive subkey and cipher
@@ -173,7 +173,7 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
                 cipher_kind,
             } => {
                 let mut salt = [0u8; SALT_LEN];
-                rand::thread_rng().fill_bytes(&mut salt);
+                rand::rngs::OsRng.fill_bytes(&mut salt);
                 let subkey = derive_subkey(master_key, &salt);
                 let mut cipher = ShadowsocksCipher::with_kind(*cipher_kind, &subkey);
 

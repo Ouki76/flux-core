@@ -35,11 +35,12 @@ pub struct RealityClientConfig {
     pub short_id: Vec<u8>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RealityServerConfig {
     pub server_names: Vec<String>,
     pub private_key: [u8; 32],
     pub short_ids: Vec<Vec<u8>>,
+    pub fallback: Option<String>,
 }
 
 pub struct RealityHandshake;
@@ -92,7 +93,7 @@ impl RealityHandshake {
 
         // 3. Random: 32 bytes
         let mut client_random = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut client_random);
+        rand::rngs::OsRng.fill_bytes(&mut client_random);
         client_hello.extend_from_slice(&client_random);
 
         // 4. Session ID: 32 bytes -> Contains client_pub!
@@ -181,7 +182,7 @@ impl RealityHandshake {
     }
 
     /// Server-side: authenticate incoming REALITY client from TLS 1.3 ClientHello camouflage.
-    pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin + 'static>(
+    pub async fn server_handshake<S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static>(
         mut stream: S,
         cfg: &RealityServerConfig,
     ) -> FluxResult<RealityStream<S>> {
@@ -271,40 +272,57 @@ impl RealityHandshake {
             pos += ext_len;
         }
 
-        let ciphertext = auth_ciphertext.ok_or_else(|| {
-            FluxError::AuthFailed("missing reality auth ticket extension in TLS ClientHello".into())
-        })?;
+        let auth_res: Result<(ChaCha20Poly1305, ChaCha20Poly1305), FluxError> = (|| {
+            let ciphertext = auth_ciphertext.ok_or_else(|| {
+                FluxError::AuthFailed("missing reality auth ticket extension in TLS ClientHello".into())
+            })?;
 
-        // Cryptographic verification
-        let client_pub = X25519PublicKey::from(client_pub_bytes);
-        let shared_secret = server_secret.diffie_hellman(&client_pub);
+            // Cryptographic verification
+            let client_pub = X25519PublicKey::from(client_pub_bytes);
+            let shared_secret = server_secret.diffie_hellman(&client_pub);
 
-        let hk = Hkdf::<Sha256>::new(Some(client_pub.as_bytes()), shared_secret.as_bytes());
-        let mut okm = [0u8; 64];
-        hk.expand(REALITY_INFO, &mut okm)
-            .map_err(|_| FluxError::Crypto("HKDF expansion failed in Reality server".into()))?;
+            let hk = Hkdf::<Sha256>::new(Some(client_pub.as_bytes()), shared_secret.as_bytes());
+            let mut okm = [0u8; 64];
+            hk.expand(REALITY_INFO, &mut okm)
+                .map_err(|_| FluxError::Crypto("HKDF expansion failed in Reality server".into()))?;
 
-        let mut client_key = [0u8; 32];
-        let mut server_key = [0u8; 32];
-        client_key.copy_from_slice(&okm[0..32]);
-        server_key.copy_from_slice(&okm[32..64]);
+            let mut client_key = [0u8; 32];
+            let mut server_key = [0u8; 32];
+            client_key.copy_from_slice(&okm[0..32]);
+            server_key.copy_from_slice(&okm[32..64]);
 
-        let client_cipher = ChaCha20Poly1305::new_from_slice(&client_key).map_err(|e| {
-            FluxError::Crypto(format!("failed to init client cipher on server: {}", e))
-        })?;
-        let server_cipher = ChaCha20Poly1305::new_from_slice(&server_key).map_err(|e| {
-            FluxError::Crypto(format!("failed to init server cipher on server: {}", e))
-        })?;
+            let client_cipher = ChaCha20Poly1305::new_from_slice(&client_key).map_err(|e| {
+                FluxError::Crypto(format!("failed to init client cipher on server: {}", e))
+            })?;
+            let server_cipher = ChaCha20Poly1305::new_from_slice(&server_key).map_err(|e| {
+                FluxError::Crypto(format!("failed to init server cipher on server: {}", e))
+            })?;
 
-        let nonce = Nonce::from([0u8; 12]);
-        let decrypted_short_id = client_cipher
-            .decrypt(&nonce, ciphertext.as_slice())
-            .map_err(|_| FluxError::AuthFailed("reality auth tag decryption failed".into()))?;
+            let nonce = Nonce::from([0u8; 12]);
+            let decrypted_short_id = client_cipher
+                .decrypt(&nonce, ciphertext.as_slice())
+                .map_err(|_| FluxError::AuthFailed("reality auth tag decryption failed".into()))?;
 
-        // Check if decrypted short_id is permitted
-        if !cfg.short_ids.is_empty() && !cfg.short_ids.iter().any(|id| id == &decrypted_short_id) {
-            return Err(FluxError::AuthFailed("invalid reality short_id".into()));
-        }
+            // Check if decrypted short_id is permitted
+            if !cfg.short_ids.is_empty() && !cfg.short_ids.iter().any(|id| id == &decrypted_short_id) {
+                return Err(FluxError::AuthFailed("invalid reality short_id".into()));
+            }
+
+            Ok((client_cipher, server_cipher))
+        })();
+
+        let (client_cipher, server_cipher) = match auth_res {
+            Ok(ciphers) => ciphers,
+            Err(e) => {
+                if let Some(ref fb) = cfg.fallback {
+                    let _ = relay_to_fallback(stream, &header, &record_buf, fb).await;
+                    return Err(FluxError::AuthFailed(
+                        "reality probe redirected to decoy fallback server".into(),
+                    ));
+                }
+                return Err(e);
+            }
+        };
 
         // Format and send authentic TLS 1.3 ServerHello
         let mut server_hello = Vec::with_capacity(128);
@@ -313,7 +331,7 @@ impl RealityHandshake {
         server_hello.extend_from_slice(&TLS_VERSION_1_2);
 
         let mut server_random = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut server_random);
+        rand::rngs::OsRng.fill_bytes(&mut server_random);
         server_hello.extend_from_slice(&server_random);
 
         // Echo Session ID
@@ -350,6 +368,52 @@ impl RealityHandshake {
         // Server writes with server_cipher, reads with client_cipher
         Ok(RealityStream::new(stream, server_cipher, client_cipher))
     }
+}
+
+async fn relay_to_fallback<S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static>(
+    client_stream: S,
+    record_hdr: &[u8],
+    record_buf: &[u8],
+    fallback: &str,
+) -> FluxResult<()> {
+    let fallback_addr = if let Ok(sa) = fallback.parse::<std::net::SocketAddr>() {
+        sa
+    } else {
+        let addr_str = if fallback.contains(':') {
+            fallback.to_string()
+        } else {
+            format!("{}:443", fallback)
+        };
+        tokio::net::lookup_host(&addr_str)
+            .await
+            .map_err(FluxError::Io)?
+            .next()
+            .ok_or_else(|| {
+                FluxError::Dns(format!("cannot resolve fallback domain '{}'", fallback))
+            })?
+    };
+
+    let mut dest_stream = crate::tcp::TcpTransport::connect(
+        fallback_addr,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    dest_stream
+        .write_all(record_hdr)
+        .await
+        .map_err(FluxError::Io)?;
+    dest_stream
+        .write_all(record_buf)
+        .await
+        .map_err(FluxError::Io)?;
+    let _ = dest_stream.flush().await;
+
+    let mut cs: flux_types::BoxedStream = Box::new(client_stream);
+    let mut ds: flux_types::BoxedStream = Box::new(dest_stream);
+    tokio::spawn(async move {
+        let _ = flux_common::copy_bidirectional(&mut cs, &mut ds).await;
+    });
+    Ok(())
 }
 
 /// A fully encrypted, authenticated bidirectional stream wrapper for REALITY.
@@ -677,6 +741,7 @@ mod tests {
             server_names: vec!["www.microsoft.com".into()],
             private_key: server_secret.to_bytes(),
             short_ids: vec![vec![0x01, 0x02, 0x03, 0x04]],
+            fallback: None,
         };
 
         let client_cfg = RealityClientConfig {
@@ -711,5 +776,45 @@ mod tests {
 
         srv.await.unwrap();
         cli.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_reality_probe_fallback_redirection() {
+        let decoy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy_listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = decoy_listener.accept().await {
+                let mut buf = vec![0u8; 128];
+                let n = sock.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                let _ = sock.write_all(b"DECOY_RESPONSE").await;
+            }
+        });
+
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_cfg = RealityServerConfig {
+            server_names: vec!["www.microsoft.com".into()],
+            private_key: server_secret.to_bytes(),
+            short_ids: vec![vec![0x01, 0x02, 0x03, 0x04]],
+            fallback: Some(decoy_addr.to_string()),
+        };
+
+        // Create unauthenticated probe ClientHello
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let srv = tokio::spawn(async move {
+            let res = RealityHandshake::server_handshake(server_io, &server_cfg).await;
+            assert!(res.is_err(), "probe must fail reality auth");
+        });
+
+        let mut fake_probe = client_io;
+        // Send pseudo ClientHello
+        let mut fake_ch = vec![0x16, 0x03, 0x01, 0x00, 0x10, 0x01, 0x00, 0x00, 0x0c];
+        fake_ch.extend_from_slice(&[0u8; 12]);
+        fake_probe.write_all(&fake_ch).await.unwrap();
+        fake_probe.flush().await.unwrap();
+
+        let _ = srv.await;
     }
 }

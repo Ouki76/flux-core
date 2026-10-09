@@ -101,8 +101,8 @@ impl VmessProtocol {
         // 2. Generate random 16-byte session key & 16-byte session IV
         let mut session_key = [0u8; 16];
         let mut session_iv = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut session_key);
-        rand::thread_rng().fill_bytes(&mut session_iv);
+        rand::rngs::OsRng.fill_bytes(&mut session_key);
+        rand::rngs::OsRng.fill_bytes(&mut session_iv);
 
         // 3. Build plain header body
         let mut body = Vec::with_capacity(64);

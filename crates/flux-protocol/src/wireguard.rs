@@ -60,6 +60,51 @@ pub struct WireGuardConfig {
     pub awg: Option<AwgConfig>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AntiReplayWindow {
+    last_counter: u64,
+    bitmap: u64,
+}
+
+impl AntiReplayWindow {
+    pub fn new() -> Self {
+        Self {
+            last_counter: 0,
+            bitmap: 0,
+        }
+    }
+
+    pub fn check_and_update(&mut self, counter: u64) -> bool {
+        if self.bitmap == 0 && self.last_counter == 0 {
+            self.last_counter = counter;
+            self.bitmap = 1;
+            return true;
+        }
+
+        if counter > self.last_counter {
+            let diff = counter - self.last_counter;
+            if diff < 64 {
+                self.bitmap <<= diff;
+                self.bitmap |= 1;
+            } else {
+                self.bitmap = 1;
+            }
+            self.last_counter = counter;
+            true
+        } else {
+            let diff = self.last_counter - counter;
+            if diff >= 64 {
+                return false;
+            }
+            if (self.bitmap & (1 << diff)) != 0 {
+                return false;
+            }
+            self.bitmap |= 1 << diff;
+            true
+        }
+    }
+}
+
 pub struct WireGuardSession {
     pub send_cipher: ChaCha20Poly1305,
     pub recv_cipher: ChaCha20Poly1305,
@@ -68,6 +113,7 @@ pub struct WireGuardSession {
     pub sender_index: u32,
     pub receiver_index: u32,
     pub awg: AwgConfig,
+    pub replay_window: AntiReplayWindow,
 }
 
 impl WireGuardSession {
@@ -86,6 +132,7 @@ impl WireGuardSession {
             sender_index,
             receiver_index,
             awg: awg.unwrap_or_default(),
+            replay_window: AntiReplayWindow::new(),
         }
     }
 
@@ -133,6 +180,12 @@ impl WireGuardSession {
         let mut counter_bytes = [0u8; 8];
         counter_bytes.copy_from_slice(&packet[8..16]);
         let counter = u64::from_le_bytes(counter_bytes);
+
+        if !self.replay_window.check_and_update(counter) {
+            return Err(FluxError::AuthFailed(
+                "wireguard packet rejected by anti-replay sliding window".into(),
+            ));
+        }
 
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
@@ -295,5 +348,30 @@ mod tests {
         let mut recv_session = WireGuardSession::new(recv_k, send_k, 7331, 1337, Some(awg));
         let decrypted = recv_session.decrypt_data_packet(&data_pkt).unwrap();
         assert_eq!(&decrypted, payload);
+
+        // Replay attack test: second decryption of the exact same packet MUST FAIL!
+        let replay_res = recv_session.decrypt_data_packet(&data_pkt);
+        assert!(replay_res.is_err(), "Replayed WireGuard packet must be rejected");
+    }
+
+    #[test]
+    fn test_wireguard_anti_replay_window_logic() {
+        let mut window = AntiReplayWindow::new();
+        assert!(window.check_and_update(0));
+        assert!(!window.check_and_update(0), "replaying 0 must fail");
+
+        assert!(window.check_and_update(1));
+        assert!(window.check_and_update(2));
+        assert!(!window.check_and_update(1), "replaying 1 must fail");
+        assert!(!window.check_and_update(2), "replaying 2 must fail");
+
+        // Jump forward
+        assert!(window.check_and_update(10));
+        assert!(window.check_and_update(5)); // in window (< 64), not seen yet
+        assert!(!window.check_and_update(5), "replaying 5 must fail");
+
+        // Jump 100 packets forward
+        assert!(window.check_and_update(120));
+        assert!(!window.check_and_update(10), "packet 10 is now older than window (>64 diff) and must fail");
     }
 }

@@ -420,7 +420,7 @@ pub struct Ss2022UdpPacketCipher {
 impl Ss2022UdpPacketCipher {
     pub fn new(method: Ss2022CipherMethod, psk: &[u8]) -> Self {
         let mut session_id = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut session_id);
+        rand::rngs::OsRng.fill_bytes(&mut session_id);
         let subkey = derive_2022_subkey(psk, &session_id, method.key_len());
         let aead = Ss2022Aead::new(method, &subkey);
         Self {
@@ -539,7 +539,7 @@ impl Ss2022Protocol {
     ) -> FluxResult<Ss2022Stream<S>> {
         let salt_len = method.salt_len();
         let mut client_salt = vec![0u8; salt_len];
-        rand::thread_rng().fill_bytes(&mut client_salt);
+        rand::rngs::OsRng.fill_bytes(&mut client_salt);
 
         stream
             .write_all(&client_salt)
@@ -692,7 +692,7 @@ impl Ss2022Protocol {
 
         // Generate server salt and response
         let mut server_salt = vec![0u8; salt_len];
-        rand::thread_rng().fill_bytes(&mut server_salt);
+        rand::rngs::OsRng.fill_bytes(&mut server_salt);
         stream
             .write_all(&server_salt)
             .await

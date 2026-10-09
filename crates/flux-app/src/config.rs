@@ -330,6 +330,8 @@ pub struct InboundRealityConfig {
     pub server_names: Vec<String>,
     pub private_key: String,
     pub short_ids: Vec<String>,
+    #[serde(default)]
+    pub fallback: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -444,6 +446,8 @@ pub enum InboundSecurityConfig {
         server_names: Vec<String>,
         private_key: String,
         short_ids: Vec<String>,
+        #[serde(default)]
+        fallback: Option<String>,
     },
     #[serde(rename = "shadowtls")]
     ShadowTls {

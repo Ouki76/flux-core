@@ -251,7 +251,7 @@ impl Inbound for ShadowsocksInbound {
 
                     // Generate server salt and prepare server encoder
                     let mut server_salt = [0u8; SALT_LEN];
-                    rand::thread_rng().fill_bytes(&mut server_salt);
+                    rand::rngs::OsRng.fill_bytes(&mut server_salt);
                     if stream.write_all(&server_salt).await.is_err() {
                         return;
                     }

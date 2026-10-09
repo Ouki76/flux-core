@@ -1054,6 +1054,7 @@ fn build_server_pipeline(
                 server_names: r.server_names,
                 private_key: pk_bytes,
                 short_ids,
+                fallback: r.fallback,
             })
         } else {
             None
@@ -1495,6 +1496,7 @@ fn compile_server_securities(
                 server_names,
                 private_key,
                 short_ids,
+                fallback,
             } => {
                 let pk_bytes = crate::config::decode_key_32bytes(&private_key)?;
                 let sids = short_ids
@@ -1506,6 +1508,7 @@ fn compile_server_securities(
                         server_names,
                         private_key: pk_bytes,
                         short_ids: sids,
+                        fallback,
                     },
                 ));
             }

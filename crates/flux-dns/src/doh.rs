@@ -8,6 +8,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+const DOH_POOL_SIZE: usize = 4;
+
 #[derive(Clone)]
 pub struct DohClient {
     pub server_ip: String,
@@ -15,7 +17,8 @@ pub struct DohClient {
     pub host_header: String,
     pub path: String,
     pub is_tls: bool,
-    stream: Arc<Mutex<Option<BoxedStream>>>,
+    streams: Arc<[Mutex<Option<BoxedStream>>]>,
+    counter: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for DohClient {
@@ -47,13 +50,18 @@ impl DohClient {
             (host_port.to_string(), default_port)
         };
 
+        let streams: Vec<Mutex<Option<BoxedStream>>> = (0..DOH_POOL_SIZE)
+            .map(|_| Mutex::new(None))
+            .collect();
+
         Self {
             server_ip: host.clone(),
             server_port: port,
             host_header: host,
             path: format!("/{}", path),
             is_tls,
-            stream: Arc::new(Mutex::new(None)),
+            streams: streams.into(),
+            counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -95,7 +103,8 @@ impl DohClient {
             query_wire.len()
         );
 
-        let mut guard = self.stream.lock().await;
+        let idx = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % DOH_POOL_SIZE;
+        let mut guard = self.streams[idx].lock().await;
 
         for attempt in 0..2 {
             if guard.is_none() {
