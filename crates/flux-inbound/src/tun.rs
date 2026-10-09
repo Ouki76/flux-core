@@ -1145,20 +1145,17 @@ impl Inbound for TunInbound {
 
                                             // Drain contiguous out-of-order segments
                                             let mut ooo = session.ooo_buffer.lock();
-                                            while let Some(entry) = ooo.first_entry() {
-                                                if *entry.key() == expected_seq {
-                                                    // Peek before removing to prevent silent drop if channel is full
-                                                    if session.payload_tx.capacity() == 0 {
-                                                        break;
-                                                    }
-                                                    let next_chunk = entry.remove();
-                                                    let next_len = next_chunk.len() as u32;
-                                                    let _ = session.payload_tx.try_send(next_chunk);
-                                                    expected_seq =
-                                                        expected_seq.wrapping_add(next_len);
-                                                } else {
+                                            while let std::collections::btree_map::Entry::Occupied(
+                                                entry,
+                                            ) = ooo.entry(expected_seq)
+                                            {
+                                                if session.payload_tx.capacity() == 0 {
                                                     break;
                                                 }
+                                                let next_chunk = entry.remove();
+                                                let next_len = next_chunk.len() as u32;
+                                                let _ = session.payload_tx.try_send(next_chunk);
+                                                expected_seq = expected_seq.wrapping_add(next_len);
                                             }
                                             session
                                                 .client_seq
@@ -1386,15 +1383,11 @@ mod tests {
 
         // Drain contiguous segments
         let mut ooo = session.ooo_buffer.lock();
-        while let Some(entry) = ooo.first_entry() {
-            if *entry.key() == curr_expected {
-                let next_chunk = entry.remove();
-                let next_len = next_chunk.len() as u32;
-                session.payload_tx.try_send(next_chunk).unwrap();
-                curr_expected = curr_expected.wrapping_add(next_len);
-            } else {
-                break;
-            }
+        while let std::collections::btree_map::Entry::Occupied(entry) = ooo.entry(curr_expected) {
+            let next_chunk = entry.remove();
+            let next_len = next_chunk.len() as u32;
+            session.payload_tx.try_send(next_chunk).unwrap();
+            curr_expected = curr_expected.wrapping_add(next_len);
         }
         drop(ooo);
         session.client_seq.store(curr_expected, Ordering::SeqCst);
@@ -1407,5 +1400,70 @@ mod tests {
         assert_eq!(&p1[..], b"HELLO_1234");
         let p2 = rx.try_recv().unwrap();
         assert_eq!(&p2[..], b"WORLD_1234");
+    }
+
+    #[test]
+    fn test_tun_tcp_out_of_order_reassembly_u32_wraparound() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+        let session = TunTcpSession {
+            client_seq: AtomicU32::new(u32::MAX - 19),
+            server_seq: AtomicU32::new(500),
+            payload_tx: tx,
+            last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
+            ooo_buffer: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+        };
+
+        // Scenario: Sequence numbers cross 32-bit integer boundary (u32::MAX)
+        // Expected packets:
+        // P1: seq = u32::MAX - 19, len = 10 -> advances expected to u32::MAX - 9
+        // P2: seq = u32::MAX - 9,  len = 10 -> advances expected to 1 (wraparound!)
+        // P3: seq = 1,             len = 10 -> advances expected to 11
+        let chunk1_in_order = Bytes::from_static(b"PKT1_START");
+        let chunk2_ooo = Bytes::from_static(b"PKT2_WRAP-");
+        let chunk3_ooo = Bytes::from_static(b"PKT3_AFTER");
+
+        let seq_pkt2 = u32::MAX - 9;
+        let seq_pkt3 = 0u32;
+
+        let expected_seq = session.client_seq.load(Ordering::Relaxed);
+        // Both P2 and P3 arrive out-of-order before P1
+        assert!((seq_pkt2.wrapping_sub(expected_seq) as i32) > 0);
+        assert!((seq_pkt3.wrapping_sub(expected_seq) as i32) > 0);
+        session.ooo_buffer.lock().insert(seq_pkt2, chunk2_ooo);
+        session.ooo_buffer.lock().insert(seq_pkt3, chunk3_ooo);
+
+        // Buffer has 2 out-of-order segments
+        assert_eq!(session.ooo_buffer.lock().len(), 2);
+
+        // Now in-order P1 arrives
+        let seq_pkt1 = u32::MAX - 19;
+        let mut curr_expected = session.client_seq.load(Ordering::Relaxed);
+        assert_eq!(seq_pkt1, curr_expected);
+
+        session.payload_tx.try_send(chunk1_in_order).unwrap();
+        curr_expected = curr_expected.wrapping_add(10);
+
+        // Drain contiguous segments across u32::MAX wraparound
+        let mut ooo = session.ooo_buffer.lock();
+        while let std::collections::btree_map::Entry::Occupied(entry) = ooo.entry(curr_expected) {
+            let next_chunk = entry.remove();
+            let next_len = next_chunk.len() as u32;
+            session.payload_tx.try_send(next_chunk).unwrap();
+            curr_expected = curr_expected.wrapping_add(next_len);
+        }
+        drop(ooo);
+        session.client_seq.store(curr_expected, Ordering::SeqCst);
+
+        // Verify client_seq properly advanced across wraparound boundary to 11
+        assert_eq!(session.client_seq.load(Ordering::Relaxed), 10);
+
+        // Verify all 3 segments delivered in strictly ordered sequence
+        let r1 = rx.try_recv().unwrap();
+        assert_eq!(&r1[..], b"PKT1_START");
+        let r2 = rx.try_recv().unwrap();
+        assert_eq!(&r2[..], b"PKT2_WRAP-");
+        let r3 = rx.try_recv().unwrap();
+        assert_eq!(&r3[..], b"PKT3_AFTER");
+        assert!(rx.try_recv().is_err());
     }
 }
