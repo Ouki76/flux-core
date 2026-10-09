@@ -351,4 +351,41 @@ mod tests {
         let recovered = obfs.deobfuscate(&scrambled).unwrap();
         assert_eq!(&recovered, plain);
     }
+
+    #[test]
+    fn test_salamander_obfs_edge_cases() {
+        let obfs = SalamanderObfs::new("my-salamander-secret");
+
+        // 1. Truncated packet less than 16 bytes returns None
+        assert_eq!(obfs.deobfuscate(&[]), None);
+        assert_eq!(obfs.deobfuscate(&[1, 2, 3, 4, 5]), None);
+        assert_eq!(obfs.deobfuscate(&[0u8; 15]), None);
+
+        // 2. Empty payload (length 16 bytes: exactly salt)
+        let empty_scrambled = obfs.obfuscate(&[]);
+        assert_eq!(empty_scrambled.len(), 16);
+        let recovered_empty = obfs.deobfuscate(&empty_scrambled).unwrap();
+        assert!(recovered_empty.is_empty());
+
+        // 3. Different calls produce distinct salts / ciphertexts
+        let plain = b"Sensitive QUIC Frame Data";
+        let c1 = obfs.obfuscate(plain);
+        let c2 = obfs.obfuscate(plain);
+        assert_ne!(c1, c2);
+        assert_ne!(&c1[..16], &c2[..16]);
+        assert_eq!(obfs.deobfuscate(&c1).unwrap(), plain);
+        assert_eq!(obfs.deobfuscate(&c2).unwrap(), plain);
+
+        // 4. Large payload (64 KB)
+        let large_plain = vec![0x42u8; 65536];
+        let large_scrambled = obfs.obfuscate(&large_plain);
+        assert_eq!(large_scrambled.len(), 16 + 65536);
+        assert_ne!(&large_scrambled[16..], &large_plain[..]);
+        assert_eq!(obfs.deobfuscate(&large_scrambled).unwrap(), large_plain);
+
+        // 5. Wrong key deobfuscation produces garbled data
+        let wrong_obfs = SalamanderObfs::new("wrong-password");
+        let wrong_recovered = wrong_obfs.deobfuscate(&c1).unwrap();
+        assert_ne!(&wrong_recovered, plain);
+    }
 }
