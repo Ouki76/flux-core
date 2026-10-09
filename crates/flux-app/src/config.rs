@@ -142,7 +142,7 @@ pub struct SocksUserConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum InboundConfig {
+pub enum TaggedInboundConfig {
     #[serde(rename = "socks")]
     Socks {
         tag: String,
@@ -276,7 +276,7 @@ pub enum InboundConfig {
     },
 }
 
-impl InboundConfig {
+impl TaggedInboundConfig {
     pub fn tag(&self) -> &str {
         match self {
             Self::Socks { tag, .. }
@@ -291,6 +291,22 @@ impl InboundConfig {
             | Self::Vmess { tag, .. }
             | Self::Tuic { tag, .. }
             | Self::Hysteria2 { tag, .. } => tag,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InboundConfig {
+    Layered(Box<LayeredInboundNode>),
+    Tagged(Box<TaggedInboundConfig>),
+}
+
+impl InboundConfig {
+    pub fn tag(&self) -> &str {
+        match self {
+            Self::Layered(node) => &node.tag,
+            Self::Tagged(tagged) => tagged.tag(),
         }
     }
 }
@@ -316,6 +332,298 @@ pub struct InboundRealityConfig {
     pub short_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum CarrierConfig {
+    #[serde(rename = "tcp")]
+    Tcp {
+        #[serde(default)]
+        address: Option<String>,
+        #[serde(default)]
+        server: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+    },
+    #[serde(rename = "udp")]
+    Udp {
+        #[serde(default)]
+        address: Option<String>,
+        #[serde(default)]
+        server: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum InboundCarrierConfig {
+    #[serde(rename = "tcp")]
+    Tcp {
+        #[serde(default)]
+        listen: Option<String>,
+        #[serde(default)]
+        listen_port: Option<u16>,
+        #[serde(default)]
+        address: Option<String>,
+    },
+    #[serde(rename = "udp")]
+    Udp {
+        #[serde(default)]
+        listen: Option<String>,
+        #[serde(default)]
+        listen_port: Option<u16>,
+        #[serde(default)]
+        address: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SecurityConfig {
+    #[serde(rename = "tls")]
+    Tls {
+        #[serde(default)]
+        sni: Option<String>,
+        #[serde(default)]
+        alpn: Vec<String>,
+        #[serde(default)]
+        insecure: bool,
+        #[serde(default)]
+        utls: Option<String>,
+    },
+    #[serde(rename = "reality")]
+    Reality {
+        #[serde(default)]
+        sni: Option<String>,
+        public_key: String,
+        #[serde(default)]
+        short_id: Option<String>,
+    },
+    #[serde(rename = "shadowtls")]
+    ShadowTls {
+        version: u8,
+        password: String,
+        sni: String,
+    },
+    #[serde(rename = "fragment")]
+    Fragment {
+        #[serde(default = "default_length_min")]
+        length_min: usize,
+        #[serde(default = "default_length_max")]
+        length_max: usize,
+        #[serde(default = "default_interval_ms")]
+        interval_ms: u64,
+    },
+}
+
+fn default_length_min() -> usize {
+    1
+}
+fn default_length_max() -> usize {
+    3
+}
+fn default_interval_ms() -> u64 {
+    10
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum InboundSecurityConfig {
+    #[serde(rename = "tls")]
+    Tls {
+        #[serde(default)]
+        server_name: Option<String>,
+        #[serde(default)]
+        certificate_path: Option<String>,
+        #[serde(default)]
+        key_path: Option<String>,
+    },
+    #[serde(rename = "reality")]
+    Reality {
+        server_names: Vec<String>,
+        private_key: String,
+        short_ids: Vec<String>,
+    },
+    #[serde(rename = "shadowtls")]
+    ShadowTls {
+        version: u8,
+        password: String,
+        fallback: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum FramingConfig {
+    #[serde(rename = "ws", alias = "websocket")]
+    WebSocket {
+        #[serde(default = "default_ws_path")]
+        path: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    #[serde(rename = "httpupgrade", alias = "upgrade")]
+    HttpUpgrade {
+        #[serde(default = "default_ws_path")]
+        path: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    #[serde(rename = "h2", alias = "http2")]
+    Http2 {
+        #[serde(default = "default_ws_path")]
+        path: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+    #[serde(rename = "grpc", alias = "gun")]
+    Grpc {
+        #[serde(default = "default_grpc_service")]
+        service_name: String,
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
+}
+
+fn default_ws_path() -> String {
+    "/".into()
+}
+fn default_grpc_service() -> String {
+    "GunService".into()
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum InboundFramingConfig {
+    #[serde(rename = "ws", alias = "websocket")]
+    WebSocket {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    #[serde(rename = "httpupgrade", alias = "upgrade")]
+    HttpUpgrade {
+        #[serde(default)]
+        path: Option<String>,
+    },
+    #[serde(rename = "h2", alias = "http2")]
+    Http2,
+    #[serde(rename = "grpc", alias = "gun")]
+    Grpc,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ProtocolConfig {
+    #[serde(rename = "vless")]
+    Vless {
+        uuid: String,
+        #[serde(default)]
+        flow: Option<String>,
+    },
+    #[serde(rename = "shadowsocks", alias = "ss")]
+    Shadowsocks {
+        password: String,
+        #[serde(default)]
+        method: Option<String>,
+    },
+    #[serde(rename = "trojan")]
+    Trojan { password: String },
+    #[serde(rename = "vmess")]
+    Vmess {
+        uuid: String,
+        #[serde(default)]
+        security: Option<String>,
+    },
+    #[serde(rename = "socks", alias = "socks5")]
+    Socks {
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+    },
+    #[serde(rename = "http")]
+    Http {
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+    },
+    #[serde(rename = "wireguard", alias = "awg")]
+    WireGuard {
+        private_key: String,
+        peer_public_key: String,
+        #[serde(default)]
+        preshared_key: Option<String>,
+        #[serde(default)]
+        awg: Option<flux_protocol::wireguard::AwgConfig>,
+    },
+    #[serde(rename = "hysteria2", alias = "hy2")]
+    Hysteria2 {
+        password: String,
+        #[serde(default = "default_mbps")]
+        up_mbps: u64,
+        #[serde(default = "default_mbps")]
+        down_mbps: u64,
+        #[serde(default)]
+        hop_interval_secs: Option<u64>,
+    },
+    #[serde(rename = "tuic", alias = "tuic5")]
+    Tuic {
+        uuid: String,
+        password: String,
+        #[serde(default)]
+        congestion_control: Option<String>,
+        #[serde(default)]
+        zero_rtt: Option<bool>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FlexibleList<T> {
+    Single(T),
+    Multiple(Vec<T>),
+}
+
+impl<T> FlexibleList<T> {
+    pub fn into_vec(self) -> Vec<T> {
+        match self {
+            Self::Single(item) => vec![item],
+            Self::Multiple(items) => items,
+        }
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        match self {
+            Self::Single(item) => std::slice::from_ref(item),
+            Self::Multiple(items) => items.as_slice(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LayeredOutboundNode {
+    pub tag: String,
+    pub carrier: CarrierConfig,
+    pub protocol: ProtocolConfig,
+    #[serde(default)]
+    pub security: Option<FlexibleList<SecurityConfig>>,
+    #[serde(default)]
+    pub framing: Option<FlexibleList<FramingConfig>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LayeredInboundNode {
+    pub tag: String,
+    pub carrier: InboundCarrierConfig,
+    pub protocol: ProtocolConfig,
+    #[serde(default)]
+    pub security: Option<FlexibleList<InboundSecurityConfig>>,
+    #[serde(default)]
+    pub framing: Option<FlexibleList<InboundFramingConfig>>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TransportConfig {
     #[serde(rename = "type")]
@@ -334,7 +642,7 @@ fn default_mbps() -> u64 {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-pub enum OutboundConfig {
+pub enum TaggedOutboundConfig {
     #[serde(rename = "direct")]
     Direct {
         tag: String,
@@ -504,7 +812,7 @@ pub enum OutboundConfig {
     },
 }
 
-impl OutboundConfig {
+impl TaggedOutboundConfig {
     pub fn tag(&self) -> &str {
         match self {
             Self::Direct { tag, .. }
@@ -522,6 +830,22 @@ impl OutboundConfig {
             | Self::LoadBalance { tag, .. }
             | Self::Trojan { tag, .. }
             | Self::Shadowsocks { tag, .. } => tag,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OutboundConfig {
+    Layered(Box<LayeredOutboundNode>),
+    Tagged(Box<TaggedOutboundConfig>),
+}
+
+impl OutboundConfig {
+    pub fn tag(&self) -> &str {
+        match self {
+            Self::Layered(node) => &node.tag,
+            Self::Tagged(tagged) => tagged.tag(),
         }
     }
 }
@@ -1048,67 +1372,97 @@ impl Config {
             }
 
             match out_cfg {
-                OutboundConfig::Vless { uuid, reality, .. } => {
-                    Uuid::parse_str(uuid).map_err(|e| {
-                        FluxError::Config(format!("outbound '{}': invalid vless uuid: {}", tag, e))
-                    })?;
-                    if let Some(r) = reality
-                        && r.enabled
-                        && decode_key_32bytes(&r.public_key).is_err()
-                    {
-                        return Err(FluxError::Config(format!(
-                            "outbound '{}': reality public_key must be 32 bytes (64 hex characters or Base64)",
-                            tag
-                        )));
+                OutboundConfig::Layered(node) => {
+                    match &node.protocol {
+                        ProtocolConfig::Vless { uuid, .. } | ProtocolConfig::Vmess { uuid, .. } => {
+                            Uuid::parse_str(uuid).map_err(|e| {
+                                FluxError::Config(format!(
+                                    "outbound '{}': invalid uuid: {}",
+                                    tag, e
+                                ))
+                            })?;
+                        }
+                        _ => {}
+                    }
+                    if let Some(ref sec_list) = node.security {
+                        for sec in sec_list.as_slice() {
+                            if let SecurityConfig::Reality { public_key, .. } = sec
+                                && decode_key_32bytes(public_key).is_err()
+                            {
+                                return Err(FluxError::Config(format!(
+                                    "outbound '{}': reality public_key must be 32 bytes (64 hex characters or Base64)",
+                                    tag
+                                )));
+                            }
+                        }
                     }
                 }
-                OutboundConfig::Selector {
-                    outbounds, default, ..
-                } => {
-                    if outbounds.is_empty() {
-                        return Err(FluxError::Config(format!(
-                            "selector '{}' must have at least one outbound candidate",
-                            tag
-                        )));
+                OutboundConfig::Tagged(tagged) => match &**tagged {
+                    TaggedOutboundConfig::Vless { uuid, reality, .. } => {
+                        Uuid::parse_str(uuid).map_err(|e| {
+                            FluxError::Config(format!(
+                                "outbound '{}': invalid vless uuid: {}",
+                                tag, e
+                            ))
+                        })?;
+                        if let Some(r) = reality
+                            && r.enabled
+                            && decode_key_32bytes(&r.public_key).is_err()
+                        {
+                            return Err(FluxError::Config(format!(
+                                "outbound '{}': reality public_key must be 32 bytes (64 hex characters or Base64)",
+                                tag
+                            )));
+                        }
                     }
-                    if let Some(def) = default
-                        && !outbounds.contains(def)
-                    {
-                        return Err(FluxError::Config(format!(
-                            "selector '{}': default outbound '{}' is not in candidate list",
-                            tag, def
-                        )));
+                    TaggedOutboundConfig::Selector {
+                        outbounds, default, ..
+                    } => {
+                        if outbounds.is_empty() {
+                            return Err(FluxError::Config(format!(
+                                "selector '{}' must have at least one outbound candidate",
+                                tag
+                            )));
+                        }
+                        if let Some(def) = default
+                            && !outbounds.contains(def)
+                        {
+                            return Err(FluxError::Config(format!(
+                                "selector '{}': default outbound '{}' is not in candidate list",
+                                tag, def
+                            )));
+                        }
+                        group_edges.insert(tag.to_string(), outbounds.clone());
                     }
-                    group_edges.insert(tag.to_string(), outbounds.clone());
-                }
-                OutboundConfig::UrlTest { outbounds, .. } => {
-                    if outbounds.is_empty() {
-                        return Err(FluxError::Config(format!(
-                            "urltest '{}' must have at least one outbound candidate",
-                            tag
-                        )));
+                    TaggedOutboundConfig::UrlTest { outbounds, .. } => {
+                        if outbounds.is_empty() {
+                            return Err(FluxError::Config(format!(
+                                "urltest '{}' must have at least one outbound candidate",
+                                tag
+                            )));
+                        }
+                        group_edges.insert(tag.to_string(), outbounds.clone());
                     }
-                    group_edges.insert(tag.to_string(), outbounds.clone());
-                }
-                OutboundConfig::Fallback { outbounds, .. } => {
-                    if outbounds.is_empty() {
-                        return Err(FluxError::Config(format!(
-                            "fallback '{}' must have at least one outbound candidate",
-                            tag
-                        )));
+                    TaggedOutboundConfig::Fallback { outbounds, .. } => {
+                        if outbounds.is_empty() {
+                            return Err(FluxError::Config(format!(
+                                "fallback '{}' must have at least one outbound candidate",
+                                tag
+                            )));
+                        }
+                        group_edges.insert(tag.to_string(), outbounds.clone());
                     }
-                    group_edges.insert(tag.to_string(), outbounds.clone());
-                }
-                OutboundConfig::LoadBalance { outbounds, .. } => {
-                    if outbounds.is_empty() {
-                        return Err(FluxError::Config(format!(
-                            "loadbalance '{}' must have at least one outbound candidate",
-                            tag
-                        )));
+                    TaggedOutboundConfig::LoadBalance { outbounds, .. } => {
+                        if outbounds.is_empty() {
+                            return Err(FluxError::Config(format!(
+                                "loadbalance '{}' must have at least one outbound candidate",
+                                tag
+                            )));
+                        }
+                        group_edges.insert(tag.to_string(), outbounds.clone());
                     }
-                    group_edges.insert(tag.to_string(), outbounds.clone());
-                }
-                _ => {}
+                    _ => {}
+                },
             }
         }
 

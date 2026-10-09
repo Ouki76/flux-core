@@ -1,4 +1,6 @@
-use crate::config::{OutboundConfig, OutboundRealityConfig, OutboundTlsConfig, TransportConfig};
+use crate::config::{
+    OutboundConfig, OutboundRealityConfig, OutboundTlsConfig, TaggedOutboundConfig, TransportConfig,
+};
 use base64::Engine;
 use flux_types::{FluxError, FluxResult};
 use std::collections::HashMap;
@@ -44,96 +46,114 @@ impl ProxySpec {
                 let uuid = self.auth.or(self.password).ok_or_else(|| {
                     FluxError::Config(format!("outbound '{}': missing uuid for vless", self.tag))
                 })?;
-                Ok(OutboundConfig::Vless {
-                    tag: self.tag,
-                    server: self.server,
-                    server_port: self.port,
-                    uuid,
-                    flow: self.flow,
-                    tls: self.tls,
-                    reality: self.reality,
-                    transport: self.transport,
-                })
+                Ok(OutboundConfig::Tagged(Box::new(
+                    TaggedOutboundConfig::Vless {
+                        tag: self.tag,
+                        server: self.server,
+                        server_port: self.port,
+                        uuid,
+                        flow: self.flow,
+                        tls: self.tls,
+                        reality: self.reality,
+                        transport: self.transport,
+                    },
+                )))
             }
             "trojan" => {
                 let password = self.auth.or(self.password).unwrap_or_default();
-                Ok(OutboundConfig::Trojan {
-                    tag: self.tag,
-                    server: self.server,
-                    server_port: self.port,
-                    password,
-                    tls: self.tls,
-                    reality: self.reality,
-                    transport: self.transport,
-                })
+                Ok(OutboundConfig::Tagged(Box::new(
+                    TaggedOutboundConfig::Trojan {
+                        tag: self.tag,
+                        server: self.server,
+                        server_port: self.port,
+                        password,
+                        tls: self.tls,
+                        reality: self.reality,
+                        transport: self.transport,
+                    },
+                )))
             }
             "ss" | "shadowsocks" => {
                 let password = self.auth.or(self.password).unwrap_or_default();
-                Ok(OutboundConfig::Shadowsocks {
+                Ok(OutboundConfig::Tagged(Box::new(
+                    TaggedOutboundConfig::Shadowsocks {
+                        tag: self.tag,
+                        server: self.server,
+                        server_port: self.port,
+                        password,
+                        method: self.method,
+                        tls: self.tls,
+                        reality: self.reality,
+                        transport: self.transport,
+                    },
+                )))
+            }
+            "socks" | "socks5" => Ok(OutboundConfig::Tagged(Box::new(
+                TaggedOutboundConfig::Socks {
                     tag: self.tag,
                     server: self.server,
                     server_port: self.port,
-                    password,
-                    method: self.method,
+                    username: self.username,
+                    password: self.password,
                     tls: self.tls,
                     reality: self.reality,
                     transport: self.transport,
-                })
-            }
-            "socks" | "socks5" => Ok(OutboundConfig::Socks {
-                tag: self.tag,
-                server: self.server,
-                server_port: self.port,
-                username: self.username,
-                password: self.password,
-                tls: self.tls,
-                reality: self.reality,
-                transport: self.transport,
-            }),
-            "http" | "https" => Ok(OutboundConfig::Http {
-                tag: self.tag,
-                server: self.server,
-                server_port: self.port,
-                username: self.username,
-                password: self.password,
-                tls: self.tls,
-                reality: self.reality,
-                transport: self.transport,
-            }),
-            "direct" => Ok(OutboundConfig::Direct {
-                tag: self.tag,
-                tls_fragment: None,
-            }),
-            "block" => Ok(OutboundConfig::Block { tag: self.tag }),
+                },
+            ))),
+            "http" | "https" => Ok(OutboundConfig::Tagged(Box::new(
+                TaggedOutboundConfig::Http {
+                    tag: self.tag,
+                    server: self.server,
+                    server_port: self.port,
+                    username: self.username,
+                    password: self.password,
+                    tls: self.tls,
+                    reality: self.reality,
+                    transport: self.transport,
+                },
+            ))),
+            "direct" => Ok(OutboundConfig::Tagged(Box::new(
+                TaggedOutboundConfig::Direct {
+                    tag: self.tag,
+                    tls_fragment: None,
+                },
+            ))),
+            "block" => Ok(OutboundConfig::Tagged(Box::new(
+                TaggedOutboundConfig::Block { tag: self.tag },
+            ))),
             "tuic" => {
                 let uuid = self.auth.ok_or_else(|| {
                     FluxError::Config(format!("outbound '{}': missing uuid for tuic", self.tag))
                 })?;
                 let password = self.password.unwrap_or_default();
-                Ok(OutboundConfig::Tuic {
-                    tag: self.tag,
-                    server: self.server,
-                    server_port: self.port,
-                    uuid,
-                    password,
-                    congestion_control: None,
-                    zero_rtt: None,
-                    tls: self.tls,
-                })
+                Ok(OutboundConfig::Tagged(Box::new(
+                    TaggedOutboundConfig::Tuic {
+                        tag: self.tag,
+                        server: self.server,
+                        server_port: self.port,
+                        uuid,
+                        password,
+                        congestion_control: None,
+                        zero_rtt: None,
+                        tls: self.tls,
+                    },
+                )))
             }
             "hy2" | "hysteria2" => {
                 let password = self.auth.or(self.password).unwrap_or_default();
-                Ok(OutboundConfig::Hysteria2 {
-                    tag: self.tag,
-                    server: self.server,
-                    server_port: Some(self.port),
-                    ports: vec![self.port],
-                    password,
-                    up_mbps: 100,
-                    down_mbps: 100,
-                    hop_interval_secs: None,
-                    tls: self.tls,
-                })
+                Ok(OutboundConfig::Tagged(Box::new(
+                    TaggedOutboundConfig::Hysteria2 {
+                        tag: self.tag,
+                        server: self.server,
+                        server_port: Some(self.port),
+                        ports: vec![self.port],
+                        password,
+                        up_mbps: 100,
+                        down_mbps: 100,
+                        hop_interval_secs: None,
+                        tls: self.tls,
+                    },
+                )))
             }
             other => {
                 tracing::warn!(
@@ -141,10 +161,12 @@ impl ProxySpec {
                     other,
                     self.tag
                 );
-                Ok(OutboundConfig::Direct {
-                    tag: self.tag,
-                    tls_fragment: None,
-                })
+                Ok(OutboundConfig::Tagged(Box::new(
+                    TaggedOutboundConfig::Direct {
+                        tag: self.tag,
+                        tls_fragment: None,
+                    },
+                )))
             }
         }
     }
@@ -550,25 +572,28 @@ mod tests {
         let out = parse_proxy_uri(uri).unwrap();
         assert_eq!(out.tag(), "My-Reality-Node");
         match out {
-            OutboundConfig::Vless {
-                server,
-                server_port,
-                reality,
-                flow,
-                ..
-            } => {
-                assert_eq!(server, "1.2.3.4");
-                assert_eq!(server_port, 443);
-                assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
-                let r = reality.unwrap();
-                assert!(r.enabled);
-                assert_eq!(
-                    r.public_key,
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                );
-                assert_eq!(r.short_id.as_deref(), Some("0123456789abcdef"));
-            }
-            _ => panic!("expected vless outbound"),
+            OutboundConfig::Tagged(tagged) => match *tagged {
+                TaggedOutboundConfig::Vless {
+                    server,
+                    server_port,
+                    reality,
+                    flow,
+                    ..
+                } => {
+                    assert_eq!(server, "1.2.3.4");
+                    assert_eq!(server_port, 443);
+                    assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
+                    let r = reality.unwrap();
+                    assert!(r.enabled);
+                    assert_eq!(
+                        r.public_key,
+                        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    );
+                    assert_eq!(r.short_id.as_deref(), Some("0123456789abcdef"));
+                }
+                _ => panic!("expected vless outbound"),
+            },
+            _ => panic!("expected tagged outbound"),
         }
     }
 
@@ -578,17 +603,20 @@ mod tests {
         let out = parse_proxy_uri(uri).unwrap();
         assert_eq!(out.tag(), "Trojan-US");
         match out {
-            OutboundConfig::Trojan {
-                server,
-                server_port,
-                password,
-                ..
-            } => {
-                assert_eq!(server, "trojan.example.com");
-                assert_eq!(server_port, 443);
-                assert_eq!(password, "mypassword123");
-            }
-            _ => panic!("expected trojan outbound"),
+            OutboundConfig::Tagged(tagged) => match *tagged {
+                TaggedOutboundConfig::Trojan {
+                    server,
+                    server_port,
+                    password,
+                    ..
+                } => {
+                    assert_eq!(server, "trojan.example.com");
+                    assert_eq!(server_port, 443);
+                    assert_eq!(password, "mypassword123");
+                }
+                _ => panic!("expected trojan outbound"),
+            },
+            _ => panic!("expected tagged outbound"),
         }
     }
 
@@ -598,17 +626,20 @@ mod tests {
         let out = parse_proxy_uri(uri).unwrap();
         assert_eq!(out.tag(), "Hy2-Fast");
         match out {
-            OutboundConfig::Hysteria2 {
-                server,
-                server_port,
-                password,
-                ..
-            } => {
-                assert_eq!(server, "hy2.example.com");
-                assert_eq!(server_port, Some(443));
-                assert_eq!(password, "mypassword");
-            }
-            _ => panic!("expected hysteria2 outbound"),
+            OutboundConfig::Tagged(tagged) => match *tagged {
+                TaggedOutboundConfig::Hysteria2 {
+                    server,
+                    server_port,
+                    password,
+                    ..
+                } => {
+                    assert_eq!(server, "hy2.example.com");
+                    assert_eq!(server_port, Some(443));
+                    assert_eq!(password, "mypassword");
+                }
+                _ => panic!("expected hysteria2 outbound"),
+            },
+            _ => panic!("expected tagged outbound"),
         }
     }
 
@@ -619,19 +650,22 @@ mod tests {
         let out = parse_proxy_uri(uri).unwrap();
         assert_eq!(out.tag(), "TUIC-Node");
         match out {
-            OutboundConfig::Tuic {
-                server,
-                server_port,
-                uuid,
-                password,
-                ..
-            } => {
-                assert_eq!(server, "tuic.example.com");
-                assert_eq!(server_port, 8443);
-                assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
-                assert_eq!(password, "tuicpass");
-            }
-            _ => panic!("expected tuic outbound"),
+            OutboundConfig::Tagged(tagged) => match *tagged {
+                TaggedOutboundConfig::Tuic {
+                    server,
+                    server_port,
+                    uuid,
+                    password,
+                    ..
+                } => {
+                    assert_eq!(server, "tuic.example.com");
+                    assert_eq!(server_port, 8443);
+                    assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
+                    assert_eq!(password, "tuicpass");
+                }
+                _ => panic!("expected tuic outbound"),
+            },
+            _ => panic!("expected tagged outbound"),
         }
     }
 

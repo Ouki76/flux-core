@@ -111,10 +111,13 @@ fn test_config_env_var_substitution() {
     let cfg = Config::from_json_str(raw).unwrap();
     let inb = &cfg.inbounds[0];
     match inb {
-        flux_app::InboundConfig::Socks { listen_port, .. } => {
-            assert_eq!(*listen_port, 19999);
-        }
-        _ => panic!("expected socks inbound"),
+        flux_app::InboundConfig::Tagged(tagged) => match &**tagged {
+            flux_app::TaggedInboundConfig::Socks { listen_port, .. } => {
+                assert_eq!(*listen_port, 19999);
+            }
+            _ => panic!("expected socks inbound"),
+        },
+        _ => panic!("expected tagged socks inbound"),
     }
 
     let api_cfg = cfg.api.unwrap();

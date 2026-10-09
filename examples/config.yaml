@@ -45,20 +45,50 @@ outbounds:
   - type: block
     tag: block
 
-  # VLESS with REALITY security and Vision flow
-  - type: vless
-    tag: vless-reality-node
-    server: 1.2.3.4
-    server_port: 443
-    uuid: a1b2c3d4-e5f6-7890-1234-56789abcdef0
-    flow: xtls-rprx-vision
-    tls:
-      enabled: true
-      server_name: www.microsoft.com
-    reality:
-      enabled: true
-      public_key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+  # Layered Network Stack: Shadowsocks over REALITY + WebSocket (Stealth)
+  - tag: ss-stealth-node
+    carrier:
+      type: tcp
+      address: "1.2.3.4:443"
+    security:
+      type: reality
+      sni: "www.microsoft.com"
+      public_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
       short_id: "0123456789abcdef"
+    framing:
+      type: ws
+      path: "/live-stream"
+      headers:
+        Host: "custom.domain.org"
+    protocol:
+      type: shadowsocks
+      password: "secretpassword"
+      method: "2022-blake3-chacha20-poly1305"
+
+  # Layered Network Stack: Shadowsocks on Pure UDP (Datagrams only, no TCP)
+  - tag: ss-pure-udp
+    carrier:
+      type: udp
+      address: "1.2.3.4:8388"
+    protocol:
+      type: shadowsocks
+      password: "secretpassword"
+      method: "2022-blake3-aes-128-gcm"
+
+  # Layered Network Stack: VLESS with REALITY security and Vision flow
+  - tag: vless-reality-node
+    carrier:
+      type: tcp
+      address: "1.2.3.4:443"
+    security:
+      type: reality
+      sni: "www.microsoft.com"
+      public_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+      short_id: "0123456789abcdef"
+    protocol:
+      type: vless
+      uuid: "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
+      flow: xtls-rprx-vision
 
   # Trojan over TLS
   - type: trojan

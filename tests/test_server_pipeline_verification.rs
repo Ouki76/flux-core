@@ -36,7 +36,7 @@ async fn test_pipeline_raw_roundtrip() {
 #[tokio::test]
 async fn test_pipeline_unwrap_timeout() {
     let (_client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let mut pipeline = ServerTransportPipeline::new(
+    let mut pipeline = ServerTransportPipeline::single(
         ServerSecurityLayer::None,
         ServerFramingLayer::WebSocket {
             path: Some("/ws".into()),
@@ -61,7 +61,7 @@ async fn test_pipeline_unwrap_timeout() {
 #[tokio::test]
 async fn test_pipeline_websocket_framing() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let pipeline = ServerTransportPipeline::new(
+    let pipeline = ServerTransportPipeline::single(
         ServerSecurityLayer::None,
         ServerFramingLayer::WebSocket {
             path: Some("/flux-ws".into()),
@@ -99,7 +99,7 @@ async fn test_pipeline_websocket_framing() {
 #[tokio::test]
 async fn test_pipeline_websocket_path_mismatch_rejected() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let pipeline = ServerTransportPipeline::new(
+    let pipeline = ServerTransportPipeline::single(
         ServerSecurityLayer::None,
         ServerFramingLayer::WebSocket {
             path: Some("/expected-path".into()),
@@ -126,7 +126,7 @@ async fn test_pipeline_websocket_path_mismatch_rejected() {
 #[tokio::test]
 async fn test_pipeline_httpupgrade_framing() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let pipeline = ServerTransportPipeline::new(
+    let pipeline = ServerTransportPipeline::single(
         ServerSecurityLayer::None,
         ServerFramingLayer::HttpUpgrade {
             path: Some("/flux-upgrade".into()),
@@ -165,7 +165,7 @@ async fn test_pipeline_httpupgrade_framing() {
 async fn test_pipeline_http2_framing() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let pipeline =
-        ServerTransportPipeline::new(ServerSecurityLayer::None, ServerFramingLayer::Http2);
+        ServerTransportPipeline::single(ServerSecurityLayer::None, ServerFramingLayer::Http2);
 
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -203,7 +203,7 @@ async fn test_pipeline_http2_framing() {
 async fn test_pipeline_grpc_framing() {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let pipeline =
-        ServerTransportPipeline::new(ServerSecurityLayer::None, ServerFramingLayer::Grpc);
+        ServerTransportPipeline::single(ServerSecurityLayer::None, ServerFramingLayer::Grpc);
 
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
 

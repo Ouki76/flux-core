@@ -10,8 +10,8 @@ use std::time::Duration;
 pub struct LazyPipelineDialer {
     pub server_address: TargetAddress,
     pub resolver: Arc<DnsResolver>,
-    pub security: SecurityLayer,
-    pub framing: FramingLayer,
+    pub securities: Vec<SecurityLayer>,
+    pub framings: Vec<FramingLayer>,
     pub connect_timeout: Duration,
 }
 
@@ -25,8 +25,23 @@ impl LazyPipelineDialer {
         Self {
             server_address,
             resolver,
-            security,
-            framing,
+            securities: vec![security],
+            framings: vec![framing],
+            connect_timeout: Duration::from_secs(10),
+        }
+    }
+
+    pub fn new_multi(
+        server_address: TargetAddress,
+        resolver: Arc<DnsResolver>,
+        securities: Vec<SecurityLayer>,
+        framings: Vec<FramingLayer>,
+    ) -> Self {
+        Self {
+            server_address,
+            resolver,
+            securities,
+            framings,
             connect_timeout: Duration::from_secs(10),
         }
     }
@@ -43,8 +58,8 @@ impl StreamDialer for LazyPipelineDialer {
         let resolved = self.resolver.resolve(&self.server_address).await?;
         let pipeline = LayeredTransportPipeline::new(self.server_address.clone(), resolved)
             .with_timeout(self.connect_timeout)
-            .with_security(self.security.clone())
-            .with_framing(self.framing.clone())
+            .with_securities(self.securities.clone())
+            .with_framings(self.framings.clone())
             .with_host_header(self.server_address.host());
         pipeline.dial().await
     }
