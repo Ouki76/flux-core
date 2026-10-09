@@ -220,7 +220,7 @@ impl VmessProtocol {
             .decrypt(&body_nonce, enc_body.as_slice())
             .map_err(|e| FluxError::Crypto(format!("VMess header body decrypt failed: {}", e)))?;
 
-        if body.len() < 38 {
+        if body.len() < 42 {
             return Err(FluxError::Protocol {
                 protocol: "vmess",
                 message: "VMess header body too short".into(),
@@ -240,7 +240,7 @@ impl VmessProtocol {
 
         let address = match atyp {
             VMESS_ATYP_IPV4 => {
-                if body.len() < 42 + 4 + 4 {
+                if body.len() < 46 {
                     return Err(FluxError::Protocol {
                         protocol: "vmess",
                         message: "truncated vmess ipv4".into(),
@@ -250,6 +250,12 @@ impl VmessProtocol {
                 TargetAddress::Ip(SocketAddr::new(ip.into(), port))
             }
             VMESS_ATYP_DOMAIN => {
+                if body.len() < 43 {
+                    return Err(FluxError::Protocol {
+                        protocol: "vmess",
+                        message: "missing vmess domain length".into(),
+                    });
+                }
                 let dlen = body[42] as usize;
                 if dlen == 0 {
                     return Err(FluxError::Protocol {
@@ -257,7 +263,7 @@ impl VmessProtocol {
                         message: "empty vmess domain length".into(),
                     });
                 }
-                if body.len() < 43 + dlen + 4 {
+                if body.len() < 43 + dlen {
                     return Err(FluxError::Protocol {
                         protocol: "vmess",
                         message: "truncated vmess domain".into(),
@@ -272,7 +278,7 @@ impl VmessProtocol {
                 TargetAddress::Domain(domain, port)
             }
             VMESS_ATYP_IPV6 => {
-                if body.len() < 42 + 16 + 4 {
+                if body.len() < 58 {
                     return Err(FluxError::Protocol {
                         protocol: "vmess",
                         message: "truncated vmess ipv6".into(),
@@ -739,5 +745,47 @@ mod tests {
 
         srv.await.unwrap();
         cli.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_vmess_short_body_boundary_safe() {
+        let test_uuid = Uuid::new_v4();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let auth_id = VmessProtocol::create_auth_id(&test_uuid, now);
+
+        let mut mac = create_hmac(test_uuid.as_bytes());
+        mac.update(&auth_id);
+        let header_key_bytes = hmac::Mac::finalize(mac).into_bytes();
+        let header_aead =
+            <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&header_key_bytes[..16]).unwrap();
+
+        // Test lengths: 0, 16, 38, 41, 42
+        for short_len in [0usize, 16, 38, 41, 42] {
+            let mut body = vec![0u8; short_len];
+            if short_len == 42 {
+                body[41] = VMESS_ATYP_DOMAIN; // triggers domain boundary
+            }
+            let enc_len = header_aead
+                .encrypt(
+                    &AesNonce::from([0u8; 12]),
+                    (short_len as u16).to_be_bytes().as_slice(),
+                )
+                .unwrap();
+            let enc_body = header_aead
+                .encrypt(&AesNonce::from([1u8; 12]), body.as_slice())
+                .unwrap();
+
+            let mut wire = Vec::new();
+            wire.extend_from_slice(&auth_id);
+            wire.extend_from_slice(&enc_len);
+            wire.extend_from_slice(&enc_body);
+
+            let mut cursor = std::io::Cursor::new(wire);
+            let res = VmessProtocol::read_request_header(&mut cursor, &[test_uuid]).await;
+            assert!(res.is_err(), "expected error for short_len {}", short_len);
+        }
     }
 }
