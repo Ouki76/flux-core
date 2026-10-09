@@ -356,3 +356,95 @@ outbounds:
 
     srv_instance.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_layered_yaml_udp_carrier_rejects_non_shadowsocks() {
+    let out_yaml = r#"
+outbounds:
+  - tag: invalid-udp-vless
+    carrier:
+      type: udp
+      address: "127.0.0.1:8080"
+    protocol:
+      type: vless
+      uuid: "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
+"#;
+    let cfg = Config::from_yaml_str(out_yaml).unwrap();
+    let err = match Instance::new(cfg) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Instance::new to fail for UDP + VLESS"),
+    };
+    assert!(
+        err.to_string()
+            .contains("carrier UDP currently supports shadowsocks")
+    );
+
+    let in_yaml = r#"
+inbounds:
+  - tag: invalid-udp-vless-in
+    carrier:
+      type: udp
+      listen: "127.0.0.1"
+      listen_port: 8081
+    protocol:
+      type: vless
+      uuid: "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
+outbounds:
+  - type: direct
+    tag: direct
+"#;
+    let cfg_in = Config::from_yaml_str(in_yaml).unwrap();
+    let err_in = match Instance::new(cfg_in) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Instance::new to fail for inbound UDP + VLESS"),
+    };
+    assert!(
+        err_in
+            .to_string()
+            .contains("carrier UDP currently supports shadowsocks")
+    );
+}
+
+#[tokio::test]
+async fn test_layered_yaml_missing_carrier_address_fails_gracefully() {
+    let bad_carrier_yaml = r#"
+outbounds:
+  - tag: missing-address
+    carrier:
+      type: tcp
+    protocol:
+      type: trojan
+      password: "pass"
+"#;
+    let cfg = Config::from_yaml_str(bad_carrier_yaml).unwrap();
+    let err = match Instance::new(cfg) {
+        Err(e) => e,
+        Ok(_) => panic!("expected Instance::new to fail for missing address"),
+    };
+    assert!(
+        err.to_string()
+            .contains("tcp carrier must specify address or server+port")
+    );
+}
+
+#[tokio::test]
+async fn test_layered_yaml_single_security_and_framing_roundtrip() {
+    let yaml = r#"
+outbounds:
+  - tag: single-sec-ws
+    carrier:
+      type: tcp
+      address: "127.0.0.1:443"
+    security:
+      type: tls
+      sni: "example.com"
+    framing:
+      type: ws
+      path: "/ws-single"
+    protocol:
+      type: trojan
+      password: "pass"
+"#;
+    let cfg = Config::from_yaml_str(yaml).unwrap();
+    assert!(Instance::new(cfg).is_ok());
+}
