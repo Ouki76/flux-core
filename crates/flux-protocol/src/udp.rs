@@ -111,7 +111,7 @@ pub fn decode_socks5_udp(src_addr: TargetAddress, mut data: Bytes) -> FluxResult
     Ok(UdpPacket::new(data, src_addr, destination))
 }
 
-/// Encodes a Trojan UDP packet: [ATYP + Addr + Port] + [Length (2 bytes BE)] + [\r\n] + [Payload].
+/// Encodes a Trojan UDP packet: `[ATYP + Addr + Port] + [Length (2 bytes BE)] + [\r\n] + [Payload]`.
 pub fn encode_trojan_udp(packet: &UdpPacket) -> Bytes {
     let mut buf = BytesMut::with_capacity(32 + packet.payload.len());
     match &packet.destination {
@@ -141,7 +141,7 @@ pub fn encode_trojan_udp(packet: &UdpPacket) -> Bytes {
     buf.freeze()
 }
 
-/// Encodes a VLESS UDP packet: [Length (2 bytes BE)] + [Payload].
+/// Encodes a VLESS UDP packet: `[Length (2 bytes BE)] + [Payload]`.
 pub fn encode_vless_udp(payload: &[u8]) -> Bytes {
     let mut buf = BytesMut::with_capacity(2 + payload.len());
     buf.put_u16(payload.len() as u16);
@@ -149,7 +149,7 @@ pub fn encode_vless_udp(payload: &[u8]) -> Bytes {
     buf.freeze()
 }
 
-/// Encodes a standard VLESS UDP packet: [Address] + [Length (2 bytes BE)] + [Payload].
+/// Encodes a standard VLESS UDP packet: `[Address] + [Length (2 bytes BE)] + [Payload]`.
 pub fn encode_vless_udp_packet(packet: &UdpPacket) -> Bytes {
     let mut buf = BytesMut::with_capacity(32 + packet.payload.len());
     match &packet.destination {
