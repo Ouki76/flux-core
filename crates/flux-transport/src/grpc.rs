@@ -70,7 +70,29 @@ impl AsyncRead for GrpcStream {
                 if this.read_buf.len() >= total_frame_len {
                     // Extract payload
                     let _hdr = this.read_buf.split_to(GRPC_HEADER_LEN);
-                    let payload = this.read_buf.split_to(msg_len).freeze();
+                    let mut body = this.read_buf.split_to(msg_len);
+
+                    // Check for Gun Protobuf field 1 tag (0x0A)
+                    let payload = if !body.is_empty() && body[0] == 0x0A {
+                        let _tag = body.split_to(1);
+                        let mut val = 0u64;
+                        let mut shift = 0;
+                        let mut consumed = 0;
+                        for &b in body.as_ref() {
+                            consumed += 1;
+                            val |= ((b & 0x7f) as u64) << shift;
+                            if b & 0x80 == 0 {
+                                break;
+                            }
+                            shift += 7;
+                        }
+                        let _varint = body.split_to(consumed);
+                        let data_len = (val as usize).min(body.len());
+                        body.split_to(data_len).freeze()
+                    } else {
+                        body.freeze()
+                    };
+
                     let to_copy = payload.len().min(buf.remaining());
                     buf.put_slice(&payload[..to_copy]);
 
@@ -142,11 +164,26 @@ impl AsyncWrite for GrpcStream {
             return Poll::Ready(Ok(0));
         }
 
-        // 2. Prepare next gRPC frame from caller buffer
+        // 2. Prepare next Gun/gRPC frame with Protobuf Hunk encoding
         let chunk_size = buf.len().min(16384);
-        let mut frame = Vec::with_capacity(GRPC_HEADER_LEN + chunk_size);
+        let mut varint = [0u8; 10];
+        let mut vn = 0;
+        let mut val = chunk_size as u64;
+        while val >= 0x80 {
+            varint[vn] = (val as u8 & 0x7f) | 0x80;
+            val >>= 7;
+            vn += 1;
+        }
+        varint[vn] = val as u8;
+        vn += 1;
+        let varint_bytes = &varint[..vn];
+
+        let proto_len = 1 + varint_bytes.len() + chunk_size;
+        let mut frame = Vec::with_capacity(GRPC_HEADER_LEN + proto_len);
         frame.push(0x00); // Uncompressed
-        frame.extend_from_slice(&(chunk_size as u32).to_be_bytes());
+        frame.extend_from_slice(&(proto_len as u32).to_be_bytes());
+        frame.push(0x0A); // Protobuf field 1 length-delimited
+        frame.extend_from_slice(varint_bytes);
         frame.extend_from_slice(&buf[..chunk_size]);
 
         this.write_buf = frame;

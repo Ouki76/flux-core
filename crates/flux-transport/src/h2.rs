@@ -4,15 +4,21 @@ use h2::client::SendRequest;
 use h2::{RecvStream, SendStream};
 use http::{Request, Response, StatusCode};
 use std::collections::HashMap;
+use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+enum H2RecvState {
+    Pending(h2::client::ResponseFuture),
+    Ready(RecvStream),
+}
+
 /// A bidirectional byte stream operating over an HTTP/2 stream.
 pub struct H2Stream {
     send: SendStream<Bytes>,
-    recv: RecvStream,
+    recv: H2RecvState,
     read_buf: Bytes,
     read_pos: usize,
 }
@@ -21,7 +27,19 @@ impl H2Stream {
     pub fn new(send: SendStream<Bytes>, recv: RecvStream) -> Self {
         Self {
             send,
-            recv,
+            recv: H2RecvState::Ready(recv),
+            read_buf: Bytes::new(),
+            read_pos: 0,
+        }
+    }
+
+    pub fn new_client_pending(
+        send: SendStream<Bytes>,
+        response_fut: h2::client::ResponseFuture,
+    ) -> Self {
+        Self {
+            send,
+            recv: H2RecvState::Pending(response_fut),
             read_buf: Bytes::new(),
             read_pos: 0,
         }
@@ -55,22 +73,38 @@ impl AsyncRead for H2Stream {
                 return Poll::Ready(Ok(()));
             }
 
-            match this.recv.poll_data(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    let _ = this.recv.flow_control().release_capacity(bytes.len());
-                    this.read_buf = bytes;
-                    this.read_pos = 0;
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::ConnectionReset,
-                        e.to_string(),
-                    )));
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(Ok(())); // EOF
-                }
-                Poll::Pending => return Poll::Pending,
+            match &mut this.recv {
+                H2RecvState::Pending(fut) => match Pin::new(fut).poll(cx) {
+                    Poll::Ready(Ok(response)) => {
+                        let recv_stream = response.into_body();
+                        this.recv = H2RecvState::Ready(recv_stream);
+                        continue;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            format!("H2 response error: {}", e),
+                        )));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                H2RecvState::Ready(recv) => match recv.poll_data(cx) {
+                    Poll::Ready(Some(Ok(bytes))) => {
+                        let _ = recv.flow_control().release_capacity(bytes.len());
+                        this.read_buf = bytes;
+                        this.read_pos = 0;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::ConnectionReset,
+                            e.to_string(),
+                        )));
+                    }
+                    Poll::Ready(None) => {
+                        return Poll::Ready(Ok(())); // EOF
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
             }
         }
     }
@@ -169,7 +203,7 @@ impl H2Transport {
 
         let mut req_builder = Request::builder()
             .method("POST")
-            .uri(format!("https://{}{}", host, clean_path))
+            .uri(clean_path)
             .header("Host", host)
             .header("User-Agent", "flux-core/h2");
 
@@ -190,13 +224,7 @@ impl H2Transport {
                     message: format!("failed to send H2 request: {}", e),
                 })?;
 
-        let response = response_fut.await.map_err(|e| FluxError::Protocol {
-            protocol: "http2",
-            message: format!("H2 response error: {}", e),
-        })?;
-
-        let recv_stream = response.into_body();
-        Ok(H2Stream::new(send_stream, recv_stream))
+        Ok(H2Stream::new_client_pending(send_stream, response_fut))
     }
 
     /// Server-side HTTP/2 handshake establishing an active stream.

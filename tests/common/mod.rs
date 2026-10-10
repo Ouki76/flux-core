@@ -14,7 +14,10 @@ pub async fn get_free_tcp_port() -> u16 {
             NEXT_TCP_PORT.store(21000, Ordering::Relaxed);
             continue;
         }
-        if let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+        if let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{}", port)).await
+            && let Ok(udp) = std::net::UdpSocket::bind(format!("127.0.0.1:{}", port))
+        {
+            drop(udp);
             drop(listener);
             return port;
         }
@@ -53,10 +56,7 @@ pub async fn start_tcp_echo_server() -> SocketAddr {
 
 #[allow(dead_code)]
 pub async fn start_udp_echo_server() -> SocketAddr {
-    let port = get_free_tcp_port().await;
-    let socket = UdpSocket::bind(format!("127.0.0.1:{}", port))
-        .await
-        .unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
 
     tokio::spawn(async move {

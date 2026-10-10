@@ -1,13 +1,10 @@
 use crate::tcp::TcpTransport;
 use flux_types::{AsyncStream, BoxedStream, FluxError, FluxResult};
-use hmac::{Hmac, Mac};
+use hmac::Mac;
 use rand::RngCore;
-use sha2::Sha256;
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-type HmacSha256 = Hmac<Sha256>;
 
 pub const SHADOWTLS_V3_TAKEOVER: &[u8] = b"SHADOWTLS_V3_PROXY_HANDSHAKE_READY";
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
@@ -46,29 +43,8 @@ impl ShadowTlsHandshake {
         mut stream: S,
         cfg: &ShadowTlsClientConfig,
     ) -> FluxResult<BoxedStream> {
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        // Generate client random (32 bytes)
-        let mut client_random = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut client_random);
-
-        // Compute HMAC challenge: HMAC-SHA256(password, [random (32 bytes) + timestamp (8 bytes)])
-        let mut mac = HmacSha256::new_from_slice(cfg.password.as_bytes())
-            .map_err(|e| FluxError::Crypto(format!("failed to init HMAC: {}", e)))?;
-        mac.update(&client_random);
-        mac.update(&now_sec.to_be_bytes());
-        let hmac_res = mac.finalize().into_bytes();
-
-        let mut session_id = [0u8; 32];
-        session_id[..8].copy_from_slice(&hmac_res[..8]);
-        session_id[8..16].copy_from_slice(&now_sec.to_be_bytes());
-        rand::rngs::OsRng.fill_bytes(&mut session_id[16..]);
-
-        // Build authentic TLS 1.3 ClientHello with HMAC challenge
-        let client_hello = build_tls_client_hello(&cfg.server_name, &client_random, &session_id);
+        // Build authentic TLS 1.3 ClientHello with HMAC challenge matching official ShadowTLS v3 spec
+        let client_hello = build_tls_client_hello(&cfg.server_name, &cfg.password);
         stream
             .write_all(&client_hello)
             .await
@@ -195,15 +171,23 @@ impl ShadowTlsHandshake {
     }
 }
 
-fn build_tls_client_hello(server_name: &str, random: &[u8; 32], session_id: &[u8; 32]) -> Vec<u8> {
+fn build_tls_client_hello(server_name: &str, password: &str) -> Vec<u8> {
+    let mut random = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+
+    let mut session_id = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut session_id[..28]);
+    session_id[28..32].copy_from_slice(&[0, 0, 0, 0]);
+
     let mut hello = Vec::with_capacity(512);
     hello.push(TLS_CLIENT_HELLO);
     hello.extend_from_slice(&[0, 0, 0]); // Length placeholder
     hello.extend_from_slice(&[0x03, 0x03]); // TLS 1.2 legacy version
-    hello.extend_from_slice(random);
+    hello.extend_from_slice(&random);
 
     hello.push(32);
-    hello.extend_from_slice(session_id);
+    let session_id_start = hello.len();
+    hello.extend_from_slice(&session_id);
 
     // Standard modern cipher suites: TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256, TLS_AES_256_GCM_SHA384
     hello.extend_from_slice(&[0x00, 0x06, 0x13, 0x01, 0x13, 0x03, 0x13, 0x02]);
@@ -236,6 +220,17 @@ fn build_tls_client_hello(server_name: &str, random: &[u8; 32], session_id: &[u8
     hello[2] = hs_len_bytes[2];
     hello[3] = hs_len_bytes[3];
 
+    // Compute HMAC-SHA1(password, hello[:session_id_start] + session_id + hello[session_id_start + 32:])
+    type HmacSha1 = hmac::Hmac<sha1::Sha1>;
+    let mut mac = <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).unwrap();
+    mac.update(&hello[..session_id_start]);
+    mac.update(&session_id);
+    mac.update(&hello[session_id_start + 32..]);
+    let hmac_res = mac.finalize().into_bytes();
+
+    // Copy 4-byte HMAC into hello[session_id_start + 28..session_id_start + 32]
+    hello[session_id_start + 28..session_id_start + 32].copy_from_slice(&hmac_res[..4]);
+
     // Wrap in TLS Record Header
     let mut record = Vec::with_capacity(5 + hello.len());
     record.push(TLS_RECORD_HANDSHAKE);
@@ -247,43 +242,35 @@ fn build_tls_client_hello(server_name: &str, random: &[u8; 32], session_id: &[u8
 }
 
 fn verify_shadowtls_session_id(handshake: &[u8], password: &str) -> (bool, Option<String>) {
-    if handshake.len() < 38 || handshake[0] != TLS_CLIENT_HELLO {
+    if handshake.len() < 39 + 32 || handshake[0] != TLS_CLIENT_HELLO {
         return (false, None);
     }
-
-    let mut client_random = [0u8; 32];
-    client_random.copy_from_slice(&handshake[6..38]);
-
     let session_id_len = handshake[38] as usize;
-    if session_id_len != 32 || handshake.len() < 39 + 32 {
+    if session_id_len != 32 {
+        return (false, None);
+    }
+    let session_id_start = 39;
+    let hmac_pos = session_id_start + 28;
+    if hmac_pos + 4 > handshake.len() {
         return (false, None);
     }
 
-    let session_id = &handshake[39..39 + 32];
-    let hmac_claim = &session_id[..8];
-    let mut timestamp_bytes = [0u8; 8];
-    timestamp_bytes.copy_from_slice(&session_id[8..16]);
-    let timestamp = u64::from_be_bytes(timestamp_bytes);
+    let mut expected_session_id = [0u8; 32];
+    expected_session_id.copy_from_slice(&handshake[session_id_start..session_id_start + 32]);
+    expected_session_id[28..32].copy_from_slice(&[0, 0, 0, 0]);
 
-    let now_sec = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // 120s replay window
-    if now_sec.abs_diff(timestamp) > 120 {
-        return (false, None);
-    }
-
-    let mut mac = match HmacSha256::new_from_slice(password.as_bytes()) {
+    type HmacSha1 = hmac::Hmac<sha1::Sha1>;
+    let mut mac = match <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()) {
         Ok(m) => m,
         Err(_) => return (false, None),
     };
-    mac.update(&client_random);
-    mac.update(&timestamp_bytes);
-    let expected = mac.finalize().into_bytes();
+    mac.update(&handshake[..session_id_start]);
+    mac.update(&expected_session_id);
+    mac.update(&handshake[session_id_start + 32..]);
+    let computed_hmac = mac.finalize().into_bytes();
 
-    if hmac_claim == &expected[..8] {
+    let actual_hmac = &handshake[hmac_pos..hmac_pos + 4];
+    if actual_hmac == &computed_hmac[..4] {
         (true, None)
     } else {
         (false, None)
@@ -297,23 +284,7 @@ mod tests {
     #[test]
     fn test_shadowtls_client_hello_hmac() {
         let password = "my_secret_shadowtls_password";
-        let mut random = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut random);
-
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let mut mac = HmacSha256::new_from_slice(password.as_bytes()).unwrap();
-        mac.update(&random);
-        mac.update(&now_sec.to_be_bytes());
-        let hmac_res = mac.finalize().into_bytes();
-
-        let mut session_id = [0u8; 32];
-        session_id[..8].copy_from_slice(&hmac_res[..8]);
-        session_id[8..16].copy_from_slice(&now_sec.to_be_bytes());
-
-        let record = build_tls_client_hello("captive.apple.com", &random, &session_id);
+        let record = build_tls_client_hello("captive.apple.com", password);
         assert_eq!(record[0], TLS_RECORD_HANDSHAKE);
 
         let (verified, _) = verify_shadowtls_session_id(&record[5..], password);

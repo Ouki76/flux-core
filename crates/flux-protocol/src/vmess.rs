@@ -3,7 +3,7 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use flux_types::{FluxError, FluxResult, NetworkType, TargetAddress};
 use hmac::{Hmac, Mac as _};
 use rand::RngCore;
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
@@ -11,6 +11,88 @@ use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use uuid::Uuid;
+
+enum VmessHasher {
+    Sha256(Sha256),
+    Hmac {
+        inner: Box<VmessHasher>,
+        outer: Box<VmessHasher>,
+    },
+}
+
+impl VmessHasher {
+    fn new_sha256() -> Self {
+        Self::Sha256(Sha256::new())
+    }
+
+    fn new_hmac(parent_creator: &dyn Fn() -> VmessHasher, key: &[u8]) -> Self {
+        let block_size = 64;
+        let mut k = key.to_vec();
+        if k.len() > block_size {
+            let mut h = parent_creator();
+            h.update(&k);
+            k = h.finalize().to_vec();
+        }
+        k.resize(block_size, 0);
+
+        let mut inner = parent_creator();
+        let mut outer = parent_creator();
+
+        let mut ipad = [0u8; 64];
+        let mut opad = [0u8; 64];
+        for i in 0..64 {
+            ipad[i] = k[i] ^ 0x36;
+            opad[i] = k[i] ^ 0x5c;
+        }
+        inner.update(&ipad);
+        outer.update(&opad);
+
+        Self::Hmac {
+            inner: Box::new(inner),
+            outer: Box::new(outer),
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha256(s) => s.update(data),
+            Self::Hmac { inner, .. } => inner.update(data),
+        }
+    }
+
+    fn finalize(self) -> [u8; 32] {
+        match self {
+            Self::Sha256(s) => s.finalize().into(),
+            Self::Hmac { inner, mut outer } => {
+                let inner_digest = inner.finalize();
+                outer.update(&inner_digest);
+                outer.finalize()
+            }
+        }
+    }
+}
+
+pub fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
+    let mut creator: Box<dyn Fn() -> VmessHasher> =
+        Box::new(|| VmessHasher::new_hmac(&VmessHasher::new_sha256, b"VMess AEAD KDF"));
+
+    for &p in path {
+        let parent = creator;
+        let p_vec = p.to_vec();
+        creator = Box::new(move || VmessHasher::new_hmac(&*parent, &p_vec));
+    }
+
+    let mut h = creator();
+    h.update(key);
+    h.finalize()
+}
+
+pub fn vmess_kdf_16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
+    let full = vmess_kdf(key, path);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
+}
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -745,6 +827,22 @@ mod tests {
 
         srv.await.unwrap();
         cli.await.unwrap();
+    }
+
+    #[test]
+    fn test_vmess_kdf_standard_test_vector() {
+        let key = b"Demo Key for KDF Value Test";
+        let path = [
+            b"Demo Path for KDF Value Test".as_slice(),
+            b"Demo Path for KDF Value Test2".as_slice(),
+            b"Demo Path for KDF Value Test3".as_slice(),
+        ];
+        let val = vmess_kdf(key, &path);
+        let hex = format!("{:x}", bytes::Bytes::copy_from_slice(&val));
+        assert_eq!(
+            hex,
+            "53e9d7e1bd7bd25022b71ead07d8a596efc8a845c7888652fd684b4903dc8892"
+        );
     }
 
     #[tokio::test]
