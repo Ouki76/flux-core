@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use flux_dns::DnsResolver;
 use flux_protocol::shadowsocks::{
-    CipherKind, SALT_LEN, ShadowsocksCipher, ShadowsocksStream, TAG_LEN, derive_master_key,
+    CipherKind, ShadowsocksCipher, ShadowsocksStream, TAG_LEN, derive_master_key_for_kind,
     derive_subkey, encode_ss_address,
 };
 use flux_types::{
@@ -16,7 +16,8 @@ use tokio::net::UdpSocket;
 
 pub struct ShadowsocksOutbound {
     tag: String,
-    master_key: [u8; 32],
+    password: String,
+    master_key: Vec<u8>,
     cipher_kind: CipherKind,
     dialer: Option<Arc<dyn StreamDialer>>,
     server_address: TargetAddress,
@@ -31,10 +32,13 @@ impl ShadowsocksOutbound {
         resolver: Arc<DnsResolver>,
         dialer: Arc<dyn StreamDialer>,
     ) -> Self {
+        let cipher_kind = CipherKind::ChaCha20IetfPoly1305;
+        let master_key = derive_master_key_for_kind(password, cipher_kind);
         Self {
             tag: tag.into(),
-            master_key: derive_master_key(password),
-            cipher_kind: CipherKind::ChaCha20IetfPoly1305,
+            password: password.to_string(),
+            master_key,
+            cipher_kind,
             dialer: Some(dialer),
             server_address,
             resolver,
@@ -47,10 +51,13 @@ impl ShadowsocksOutbound {
         password: &str,
         resolver: Arc<DnsResolver>,
     ) -> Self {
+        let cipher_kind = CipherKind::ChaCha20IetfPoly1305;
+        let master_key = derive_master_key_for_kind(password, cipher_kind);
         Self {
             tag: tag.into(),
-            master_key: derive_master_key(password),
-            cipher_kind: CipherKind::ChaCha20IetfPoly1305,
+            password: password.to_string(),
+            master_key,
+            cipher_kind,
             dialer: None,
             server_address,
             resolver,
@@ -59,6 +66,7 @@ impl ShadowsocksOutbound {
 
     pub fn with_cipher_kind(mut self, kind: CipherKind) -> Self {
         self.cipher_kind = kind;
+        self.master_key = derive_master_key_for_kind(&self.password, kind);
         self
     }
 }
@@ -93,7 +101,8 @@ impl Outbound for ShadowsocksOutbound {
         }
 
         // 1. Generate client salt
-        let mut salt = [0u8; SALT_LEN];
+        let salt_len = self.cipher_kind.salt_len();
+        let mut salt = vec![0u8; salt_len];
         rand::rngs::OsRng.fill_bytes(&mut salt);
         stream.write_all(&salt).await.map_err(FluxError::Io)?;
 
@@ -112,7 +121,7 @@ impl Outbound for ShadowsocksOutbound {
         stream.write_all(&enc_addr).await.map_err(FluxError::Io)?;
         stream.flush().await.map_err(FluxError::Io)?;
 
-        let ss_stream = ShadowsocksStream::new(stream, enc, None, self.master_key);
+        let ss_stream = ShadowsocksStream::new(stream, enc, None, &self.master_key);
         Ok(Box::new(ss_stream))
     }
 
@@ -136,7 +145,7 @@ impl Outbound for ShadowsocksOutbound {
                 ShadowsocksPacketEndpointInner::Ss2022(Arc::new(cipher))
             }
             legacy_kind => ShadowsocksPacketEndpointInner::Legacy {
-                master_key: self.master_key,
+                master_key: self.master_key.clone(),
                 cipher_kind: legacy_kind,
             },
         };
@@ -151,7 +160,7 @@ impl Outbound for ShadowsocksOutbound {
 
 enum ShadowsocksPacketEndpointInner {
     Legacy {
-        master_key: [u8; 32],
+        master_key: Vec<u8>,
         cipher_kind: CipherKind,
     },
     Ss2022(Arc<flux_protocol::shadowsocks2022::Ss2022UdpPacketCipher>),
@@ -174,7 +183,8 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
                 master_key,
                 cipher_kind,
             } => {
-                let mut salt = [0u8; SALT_LEN];
+                let salt_len = cipher_kind.salt_len();
+                let mut salt = vec![0u8; salt_len];
                 rand::rngs::OsRng.fill_bytes(&mut salt);
                 let subkey = derive_subkey(master_key, &salt);
                 let mut cipher = ShadowsocksCipher::with_kind(*cipher_kind, &subkey);
@@ -186,7 +196,7 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
 
                 let ciphertext = cipher.encrypt(&plain)?;
 
-                let mut out = Vec::with_capacity(SALT_LEN + ciphertext.len());
+                let mut out = Vec::with_capacity(salt_len + ciphertext.len());
                 out.extend_from_slice(&salt);
                 out.extend_from_slice(&ciphertext);
                 out
@@ -217,19 +227,19 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
                 master_key,
                 cipher_kind,
             } => {
-                if len < SALT_LEN + TAG_LEN {
+                let salt_len = cipher_kind.salt_len();
+                if len < salt_len + TAG_LEN {
                     return Err(FluxError::Protocol {
                         protocol: "shadowsocks-udp",
                         message: "received packet too short".into(),
                     });
                 }
 
-                let mut salt = [0u8; SALT_LEN];
-                salt.copy_from_slice(&guard[..SALT_LEN]);
-                let subkey = derive_subkey(master_key, &salt);
+                let salt = &guard[..salt_len];
+                let subkey = derive_subkey(master_key, salt);
                 let mut cipher = ShadowsocksCipher::with_kind(*cipher_kind, &subkey);
 
-                let plain = cipher.decrypt(&guard[SALT_LEN..len])?;
+                let plain = cipher.decrypt(&guard[salt_len..len])?;
                 if plain.is_empty() {
                     return Err(FluxError::Protocol {
                         protocol: "shadowsocks-udp",

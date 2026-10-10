@@ -1,5 +1,5 @@
 use crate::socks5::{ATYP_DOMAIN, ATYP_IPV4, ATYP_IPV6};
-use aes_gcm::Aes256Gcm;
+use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, AeadInPlace, KeyInit},
@@ -23,6 +23,7 @@ pub enum CipherKind {
     #[default]
     ChaCha20IetfPoly1305,
     Aes256Gcm,
+    Aes128Gcm,
     Ss2022(crate::shadowsocks2022::Ss2022CipherMethod),
 }
 
@@ -33,6 +34,7 @@ impl CipherKind {
                 Some(Self::ChaCha20IetfPoly1305)
             }
             "aes-256-gcm" | "aes-256" => Some(Self::Aes256Gcm),
+            "aes-128-gcm" | "aes-128" => Some(Self::Aes128Gcm),
             "2022-blake3-aes-128-gcm" => Some(Self::Ss2022(
                 crate::shadowsocks2022::Ss2022CipherMethod::Blake3Aes128Gcm,
             )),
@@ -45,31 +47,47 @@ impl CipherKind {
             _ => None,
         }
     }
+
+    pub fn key_len(&self) -> usize {
+        match self {
+            Self::ChaCha20IetfPoly1305 | Self::Aes256Gcm => 32,
+            Self::Aes128Gcm => 16,
+            Self::Ss2022(m) => m.key_len(),
+        }
+    }
+
+    pub fn salt_len(&self) -> usize {
+        match self {
+            Self::ChaCha20IetfPoly1305 | Self::Aes256Gcm => 32,
+            Self::Aes128Gcm => 16,
+            Self::Ss2022(m) => m.salt_len(),
+        }
+    }
 }
 
-/// Standard Shadowsocks key derivation:
-/// If password is a 32-byte base64 PSK, decodes directly; otherwise uses standard EVP_BytesToKey (MD5).
-pub fn derive_master_key(password: &str) -> [u8; 32] {
+/// Standard Shadowsocks key derivation with specified key length:
+/// If password is a base64 PSK with matching length, decodes directly; otherwise uses standard EVP_BytesToKey (MD5).
+pub fn derive_master_key_for_kind(password: &str, kind: CipherKind) -> Vec<u8> {
+    derive_master_key_len(password, kind.key_len())
+}
+
+pub fn derive_master_key_len(password: &str, key_len: usize) -> Vec<u8> {
     let clean = password.trim();
     use base64::Engine;
     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(clean)
-        && bytes.len() == 32
+        && bytes.len() == key_len
     {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        return out;
+        return bytes;
     }
     if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(clean)
-        && bytes.len() == 32
+        && bytes.len() == key_len
     {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        return out;
+        return bytes;
     }
 
-    let mut key = Vec::with_capacity(32);
+    let mut key = Vec::with_capacity(key_len);
     let mut prev = Vec::new();
-    while key.len() < 32 {
+    while key.len() < key_len {
         let mut hasher = Md5::new();
         hasher.update(&prev);
         hasher.update(password.as_bytes());
@@ -77,15 +95,22 @@ pub fn derive_master_key(password: &str) -> [u8; 32] {
         prev = digest.to_vec();
         key.extend_from_slice(&digest);
     }
+    key.truncate(key_len);
+    key
+}
+
+/// Standard Shadowsocks key derivation (defaults to 32 bytes).
+pub fn derive_master_key(password: &str) -> [u8; 32] {
+    let k = derive_master_key_len(password, 32);
     let mut out = [0u8; 32];
-    out.copy_from_slice(&key[..32]);
+    out.copy_from_slice(&k);
     out
 }
 
 /// Standard Shadowsocks HKDF-SHA1 subkey derivation.
-pub fn derive_subkey(master_key: &[u8; 32], salt: &[u8; 32]) -> [u8; 32] {
+pub fn derive_subkey(master_key: &[u8], salt: &[u8]) -> Vec<u8> {
     let hk = Hkdf::<Sha1>::new(Some(salt), master_key);
-    let mut okm = [0u8; 32];
+    let mut okm = vec![0u8; master_key.len()];
     let _ = hk.expand(SS_SUBKEY_INFO, &mut okm);
     okm
 }
@@ -93,6 +118,7 @@ pub fn derive_subkey(master_key: &[u8; 32], salt: &[u8; 32]) -> [u8; 32] {
 enum CipherInner {
     ChaCha(ChaCha20Poly1305),
     Aes256(Box<Aes256Gcm>),
+    Aes128(Box<Aes128Gcm>),
 }
 
 pub struct ShadowsocksCipher {
@@ -102,19 +128,32 @@ pub struct ShadowsocksCipher {
 }
 
 impl ShadowsocksCipher {
-    pub fn new(subkey: &[u8; 32]) -> Self {
+    pub fn new(subkey: &[u8]) -> Self {
         Self::with_kind(CipherKind::ChaCha20IetfPoly1305, subkey)
     }
 
-    pub fn with_kind(kind: CipherKind, subkey: &[u8; 32]) -> Self {
+    pub fn with_kind(kind: CipherKind, subkey: &[u8]) -> Self {
         let cipher = match kind {
-            CipherKind::ChaCha20IetfPoly1305
-            | CipherKind::Ss2022(
-                crate::shadowsocks2022::Ss2022CipherMethod::Blake3ChaCha20Poly1305,
-            ) => CipherInner::ChaCha(ChaCha20Poly1305::new_from_slice(subkey).unwrap()),
-            CipherKind::Aes256Gcm | CipherKind::Ss2022(_) => {
+            CipherKind::ChaCha20IetfPoly1305 => {
+                CipherInner::ChaCha(ChaCha20Poly1305::new_from_slice(subkey).unwrap())
+            }
+            CipherKind::Aes256Gcm => {
                 CipherInner::Aes256(Box::new(Aes256Gcm::new_from_slice(subkey).unwrap()))
             }
+            CipherKind::Aes128Gcm => {
+                CipherInner::Aes128(Box::new(Aes128Gcm::new_from_slice(subkey).unwrap()))
+            }
+            CipherKind::Ss2022(m) => match m {
+                crate::shadowsocks2022::Ss2022CipherMethod::Blake3Aes128Gcm => {
+                    CipherInner::Aes128(Box::new(Aes128Gcm::new_from_slice(subkey).unwrap()))
+                }
+                crate::shadowsocks2022::Ss2022CipherMethod::Blake3Aes256Gcm => {
+                    CipherInner::Aes256(Box::new(Aes256Gcm::new_from_slice(subkey).unwrap()))
+                }
+                crate::shadowsocks2022::Ss2022CipherMethod::Blake3ChaCha20Poly1305 => {
+                    CipherInner::ChaCha(ChaCha20Poly1305::new_from_slice(subkey).unwrap())
+                }
+            },
         };
         Self {
             cipher,
@@ -144,6 +183,7 @@ impl ShadowsocksCipher {
         match &self.cipher {
             CipherInner::ChaCha(c) => c.encrypt(nonce, plaintext),
             CipherInner::Aes256(c) => c.encrypt(nonce, plaintext),
+            CipherInner::Aes128(c) => c.encrypt(nonce, plaintext),
         }
         .map_err(|e| FluxError::Crypto(format!("shadowsocks encrypt failed: {}", e)))
     }
@@ -154,6 +194,7 @@ impl ShadowsocksCipher {
         match &self.cipher {
             CipherInner::ChaCha(c) => c.decrypt(nonce, ciphertext),
             CipherInner::Aes256(c) => c.decrypt(nonce, ciphertext),
+            CipherInner::Aes128(c) => c.decrypt(nonce, ciphertext),
         }
         .map_err(|e| FluxError::Crypto(format!("shadowsocks decrypt failed: {}", e)))
     }
@@ -164,6 +205,7 @@ impl ShadowsocksCipher {
         match &self.cipher {
             CipherInner::ChaCha(c) => c.encrypt_in_place(nonce, b"", buffer),
             CipherInner::Aes256(c) => c.encrypt_in_place(nonce, b"", buffer),
+            CipherInner::Aes128(c) => c.encrypt_in_place(nonce, b"", buffer),
         }
         .map_err(|e| FluxError::Crypto(format!("shadowsocks encrypt in place failed: {}", e)))
     }
@@ -174,6 +216,7 @@ impl ShadowsocksCipher {
         match &self.cipher {
             CipherInner::ChaCha(c) => c.decrypt_in_place(nonce, b"", buffer),
             CipherInner::Aes256(c) => c.decrypt_in_place(nonce, b"", buffer),
+            CipherInner::Aes128(c) => c.decrypt_in_place(nonce, b"", buffer),
         }
         .map_err(|e| FluxError::Crypto(format!("shadowsocks decrypt in place failed: {}", e)))
     }
@@ -212,8 +255,8 @@ pub struct ShadowsocksStream<S> {
     enc: ShadowsocksCipher,
     dec: Option<ShadowsocksCipher>,
     kind: CipherKind,
-    master_key: [u8; 32],
-    salt_buf: [u8; SALT_LEN],
+    master_key: Vec<u8>,
+    salt_buf: Vec<u8>,
     salt_pos: usize,
     // Reader chunk state
     len_buf: [u8; 2 + TAG_LEN],
@@ -236,7 +279,7 @@ impl<S> ShadowsocksStream<S> {
         inner: S,
         enc: ShadowsocksCipher,
         dec: Option<ShadowsocksCipher>,
-        master_key: [u8; 32],
+        master_key: &[u8],
     ) -> Self {
         Self::new_with_initial_chunk(inner, enc, dec, master_key, vec![])
     }
@@ -245,17 +288,18 @@ impl<S> ShadowsocksStream<S> {
         inner: S,
         enc: ShadowsocksCipher,
         dec: Option<ShadowsocksCipher>,
-        master_key: [u8; 32],
+        master_key: &[u8],
         initial_chunk: Vec<u8>,
     ) -> Self {
         let kind = enc.kind();
+        let salt_len = kind.salt_len();
         Self {
             inner,
             enc,
             dec,
             kind,
-            master_key,
-            salt_buf: [0u8; SALT_LEN],
+            master_key: master_key.to_vec(),
+            salt_buf: vec![0u8; salt_len],
             salt_pos: 0,
             len_buf: [0u8; 2 + TAG_LEN],
             len_pos: 0,
@@ -282,8 +326,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
         // Step 1: If cipher is not yet initialized (waiting for salt from server)
         if self.dec.is_none() {
             let pos = self.salt_pos;
-            let mut tmp = [0u8; SALT_LEN];
-            let mut tmp_buf = ReadBuf::new(&mut tmp[..SALT_LEN - pos]);
+            let salt_len = self.kind.salt_len();
+            let mut tmp = vec![0u8; salt_len - pos];
+            let mut tmp_buf = ReadBuf::new(&mut tmp);
             match Pin::new(&mut self.inner).poll_read(cx, &mut tmp_buf) {
                 Poll::Ready(Ok(())) => {
                     let n = tmp_buf.filled().len();
@@ -292,7 +337,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                     }
                     self.salt_buf[pos..pos + n].copy_from_slice(&tmp[..n]);
                     self.salt_pos += n;
-                    if self.salt_pos == SALT_LEN {
+                    if self.salt_pos == salt_len {
                         let subkey = derive_subkey(&self.master_key, &self.salt_buf);
                         self.dec = Some(ShadowsocksCipher::with_kind(self.kind, &subkey));
                     } else {
@@ -580,8 +625,8 @@ mod tests {
         let srv_dec = ShadowsocksCipher::new(&derive_subkey(&master, &salt1));
 
         let (client_raw, server_raw) = tokio::io::duplex(8192); // constrained pipe to force partial writes
-        let mut client = ShadowsocksStream::new(client_raw, cli_enc, Some(cli_dec), master);
-        let mut server = ShadowsocksStream::new(server_raw, srv_enc, Some(srv_dec), master);
+        let mut client = ShadowsocksStream::new(client_raw, cli_enc, Some(cli_dec), &master);
+        let mut server = ShadowsocksStream::new(server_raw, srv_enc, Some(srv_dec), &master);
 
         let payload_size = 64 * 1024; // 64 KB
         let send_data: Vec<u8> = (0..payload_size).map(|i| (i % 256) as u8).collect();

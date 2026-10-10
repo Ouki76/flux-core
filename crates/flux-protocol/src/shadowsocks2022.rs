@@ -149,12 +149,35 @@ impl Ss2022Aead {
     }
 }
 
+fn increase_nonce(nonce: &mut [u8; 12]) {
+    for b in nonce.iter_mut() {
+        *b = b.wrapping_add(1);
+        if *b != 0 {
+            break;
+        }
+    }
+}
+
 pub struct Ss2022Stream<S> {
     inner: S,
+    method: Ss2022CipherMethod,
+    psk: Vec<u8>,
+    client_salt: Vec<u8>,
     enc: Ss2022Aead,
-    dec: Ss2022Aead,
-    write_seq: u64,
-    read_seq: u64,
+    dec: Option<Ss2022Aead>,
+    enc_nonce: [u8; 12],
+    dec_nonce: [u8; 12],
+    response_read: bool,
+    is_server: bool,
+    server_response_written: bool,
+    resp_salt_buf: Vec<u8>,
+    resp_salt_pos: usize,
+    resp_hdr_buf: Vec<u8>,
+    resp_hdr_pos: usize,
+    resp_payload_len: usize,
+    resp_payload_buf: Vec<u8>,
+    resp_payload_pos: usize,
+
     write_buf: Vec<u8>,
     write_pos: usize,
     writing_plain_len: usize,
@@ -171,13 +194,35 @@ pub struct Ss2022Stream<S> {
 }
 
 impl<S> Ss2022Stream<S> {
-    pub fn new(inner: S, method: Ss2022CipherMethod, enc_subkey: &[u8], dec_subkey: &[u8]) -> Self {
+    pub fn new_client(
+        inner: S,
+        method: Ss2022CipherMethod,
+        psk: &[u8],
+        client_salt: Vec<u8>,
+        enc_subkey: Vec<u8>,
+        enc_nonce: [u8; 12],
+    ) -> Self {
+        let salt_len = method.salt_len();
+        let fixed_resp_len = 1 + 8 + salt_len + 2 + 16;
         Self {
             inner,
-            enc: Ss2022Aead::new(method, enc_subkey),
-            dec: Ss2022Aead::new(method, dec_subkey),
-            write_seq: 0,
-            read_seq: 0,
+            method,
+            psk: psk.to_vec(),
+            client_salt,
+            enc: Ss2022Aead::new(method, &enc_subkey),
+            dec: None,
+            enc_nonce,
+            dec_nonce: [0u8; 12],
+            response_read: false,
+            is_server: false,
+            server_response_written: true,
+            resp_salt_buf: vec![0u8; salt_len],
+            resp_salt_pos: 0,
+            resp_hdr_buf: vec![0u8; fixed_resp_len],
+            resp_hdr_pos: 0,
+            resp_payload_len: 0,
+            resp_payload_buf: Vec::new(),
+            resp_payload_pos: 0,
             write_buf: Vec::with_capacity(16384 + 32),
             write_pos: 0,
             writing_plain_len: 0,
@@ -191,10 +236,45 @@ impl<S> Ss2022Stream<S> {
         }
     }
 
-    fn make_nonce(seq: u64) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        nonce[4..12].copy_from_slice(&seq.to_be_bytes());
-        nonce
+    pub fn new_server(
+        inner: S,
+        method: Ss2022CipherMethod,
+        psk: &[u8],
+        client_salt: Vec<u8>,
+        dec_subkey: &[u8],
+        dec_nonce: [u8; 12],
+        initial_chunk: Vec<u8>,
+    ) -> Self {
+        Self {
+            inner,
+            method,
+            psk: psk.to_vec(),
+            client_salt,
+            enc: Ss2022Aead::new(method, dec_subkey),
+            dec: Some(Ss2022Aead::new(method, dec_subkey)),
+            enc_nonce: [0u8; 12],
+            dec_nonce,
+            response_read: true,
+            is_server: true,
+            server_response_written: false,
+            resp_salt_buf: Vec::new(),
+            resp_salt_pos: 0,
+            resp_hdr_buf: Vec::new(),
+            resp_hdr_pos: 0,
+            resp_payload_len: 0,
+            resp_payload_buf: Vec::new(),
+            resp_payload_pos: 0,
+            write_buf: Vec::with_capacity(16384 + 32),
+            write_pos: 0,
+            writing_plain_len: 0,
+            len_buf: [0u8; 18],
+            len_pos: 0,
+            payload_len: 0,
+            payload_buf: Vec::new(),
+            payload_pos: 0,
+            read_buf: initial_chunk,
+            read_pos: 0,
+        }
     }
 }
 
@@ -205,6 +285,146 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+
+        // Step 0: Lazy response reading for client
+        if !this.response_read {
+            let salt_len = this.method.salt_len();
+            // A. Read server response salt
+            while this.resp_salt_pos < salt_len {
+                let needed = salt_len - this.resp_salt_pos;
+                let mut tmp = [0u8; 32];
+                let mut tmp_buf = ReadBuf::new(&mut tmp[..needed]);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = tmp_buf.filled().len();
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "EOF reading shadowsocks-2022 server response salt",
+                            )));
+                        }
+                        let pos = this.resp_salt_pos;
+                        this.resp_salt_buf[pos..pos + n].copy_from_slice(&tmp[..n]);
+                        this.resp_salt_pos += n;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            if this.dec.is_none() {
+                let dec_subkey =
+                    derive_2022_subkey(&this.psk, &this.resp_salt_buf, this.method.key_len());
+                this.dec = Some(Ss2022Aead::new(this.method, &dec_subkey));
+            }
+
+            // B. Read server fixed header chunk
+            let fixed_resp_len = 1 + 8 + salt_len + 2 + 16;
+            while this.resp_hdr_pos < fixed_resp_len {
+                let needed = fixed_resp_len - this.resp_hdr_pos;
+                let mut tmp = [0u8; 128];
+                let to_read = needed.min(tmp.len());
+                let mut tmp_buf = ReadBuf::new(&mut tmp[..to_read]);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
+                    Poll::Ready(Ok(())) => {
+                        let n = tmp_buf.filled().len();
+                        if n == 0 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "EOF reading shadowsocks-2022 server response header",
+                            )));
+                        }
+                        let pos = this.resp_hdr_pos;
+                        this.resp_hdr_buf[pos..pos + n].copy_from_slice(&tmp[..n]);
+                        this.resp_hdr_pos += n;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            if this.resp_payload_len == 0 && this.resp_payload_buf.is_empty() {
+                let dec = this.dec.as_ref().unwrap();
+                let dec_nonce = this.dec_nonce;
+                increase_nonce(&mut this.dec_nonce);
+                let resp_fixed = match dec.decrypt(&dec_nonce, &this.resp_hdr_buf) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )));
+                    }
+                };
+
+                if resp_fixed[0] != 0x01 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected server header type: {}", resp_fixed[0]),
+                    )));
+                }
+
+                if &resp_fixed[9..9 + salt_len] != this.client_salt.as_slice() {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "mismatched client salt in shadowsocks-2022 response",
+                    )));
+                }
+
+                let p_len =
+                    u16::from_be_bytes([resp_fixed[9 + salt_len], resp_fixed[10 + salt_len]])
+                        as usize;
+                if p_len == 0 {
+                    this.response_read = true;
+                } else {
+                    this.resp_payload_len = p_len;
+                    this.resp_payload_buf.resize(p_len + 16, 0);
+                    this.resp_payload_pos = 0;
+                }
+            }
+
+            if !this.response_read {
+                let target_len = this.resp_payload_len + 16;
+                while this.resp_payload_pos < target_len {
+                    let needed = target_len - this.resp_payload_pos;
+                    let mut tmp = [0u8; 8192];
+                    let to_read = needed.min(tmp.len());
+                    let mut tmp_buf = ReadBuf::new(&mut tmp[..to_read]);
+                    match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
+                        Poll::Ready(Ok(())) => {
+                            let n = tmp_buf.filled().len();
+                            if n == 0 {
+                                return Poll::Ready(Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "EOF reading shadowsocks-2022 initial payload chunk",
+                                )));
+                            }
+                            let pos = this.resp_payload_pos;
+                            this.resp_payload_buf[pos..pos + n].copy_from_slice(&tmp[..n]);
+                            this.resp_payload_pos += n;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+
+                let dec = this.dec.as_ref().unwrap();
+                let dec_nonce = this.dec_nonce;
+                increase_nonce(&mut this.dec_nonce);
+                let initial_data = match dec.decrypt(&dec_nonce, &this.resp_payload_buf) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            e.to_string(),
+                        )));
+                    }
+                };
+                this.read_buf = initial_data;
+                this.read_pos = 0;
+                this.response_read = true;
+            }
+        }
 
         loop {
             // 1. Drain existing decrypted plaintext
@@ -247,8 +467,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                     }
                 }
 
-                let len_nonce = Self::make_nonce(this.read_seq);
-                let plain_len_bytes = match this.dec.decrypt(&len_nonce, &this.len_buf) {
+                let dec = this.dec.as_ref().unwrap();
+                let len_nonce = this.dec_nonce;
+                increase_nonce(&mut this.dec_nonce);
+                let plain_len_bytes = match dec.decrypt(&len_nonce, &this.len_buf) {
                     Ok(b) => b,
                     Err(e) => {
                         return Poll::Ready(Err(io::Error::new(
@@ -257,7 +479,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                         )));
                     }
                 };
-                this.read_seq += 1;
                 this.payload_len =
                     u16::from_be_bytes([plain_len_bytes[0], plain_len_bytes[1]]) as usize;
                 let total_payload_enc = this.payload_len + 16;
@@ -291,8 +512,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                 }
             }
 
-            let payload_nonce = Self::make_nonce(this.read_seq);
-            let decrypted = match this.dec.decrypt(&payload_nonce, &this.payload_buf) {
+            let dec = this.dec.as_ref().unwrap();
+            let payload_nonce = this.dec_nonce;
+            increase_nonce(&mut this.dec_nonce);
+            let decrypted = match dec.decrypt(&payload_nonce, &this.payload_buf) {
                 Ok(b) => b,
                 Err(e) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -301,7 +524,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                     )));
                 }
             };
-            this.read_seq += 1;
 
             this.read_buf = decrypted;
             this.read_pos = 0;
@@ -340,23 +562,89 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Ss2022Stream<S> {
             return Poll::Ready(Ok(0));
         }
 
+        if this.is_server && !this.server_response_written {
+            let salt_len = this.method.salt_len();
+            let mut server_salt = vec![0u8; salt_len];
+            rand::rngs::OsRng.fill_bytes(&mut server_salt);
+
+            let enc_subkey = derive_2022_subkey(&this.psk, &server_salt, this.method.key_len());
+            this.enc = Ss2022Aead::new(this.method, &enc_subkey);
+            this.enc_nonce = [0u8; 12];
+
+            let chunk_size = buf.len().min(16384);
+            let plain = &buf[..chunk_size];
+
+            let now_sec = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let mut resp_fixed = Vec::with_capacity(1 + 8 + salt_len + 2);
+            resp_fixed.push(0x01); // HeaderTypeServer
+            resp_fixed.extend_from_slice(&now_sec.to_be_bytes());
+            resp_fixed.extend_from_slice(&this.client_salt);
+            resp_fixed.extend_from_slice(&(chunk_size as u16).to_be_bytes());
+
+            let fixed_nonce = this.enc_nonce;
+            increase_nonce(&mut this.enc_nonce);
+            let enc_fixed = match this.enc.encrypt(&fixed_nonce, &resp_fixed) {
+                Ok(b) => b,
+                Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+            };
+
+            let payload_nonce = this.enc_nonce;
+            increase_nonce(&mut this.enc_nonce);
+            let enc_payload = match this.enc.encrypt(&payload_nonce, plain) {
+                Ok(b) => b,
+                Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
+            };
+
+            this.write_buf.clear();
+            this.write_buf.extend_from_slice(&server_salt);
+            this.write_buf.extend_from_slice(&enc_fixed);
+            this.write_buf.extend_from_slice(&enc_payload);
+            this.write_pos = 0;
+            this.writing_plain_len = chunk_size;
+            this.server_response_written = true;
+
+            while this.write_pos < this.write_buf.len() {
+                let n = match Pin::new(&mut this.inner)
+                    .poll_write(cx, &this.write_buf[this.write_pos..])
+                {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                };
+                this.write_pos += n;
+                if this.write_pos == this.write_buf.len() {
+                    let plain_n = this.writing_plain_len;
+                    this.write_buf.clear();
+                    this.write_pos = 0;
+                    this.writing_plain_len = 0;
+                    return Poll::Ready(Ok(plain_n));
+                }
+            }
+
+            return Poll::Pending;
+        }
+
         let chunk_size = buf.len().min(16384);
         let plain = &buf[..chunk_size];
 
         let len_bytes = (chunk_size as u16).to_be_bytes();
-        let len_nonce = Self::make_nonce(this.write_seq);
+        let len_nonce = this.enc_nonce;
+        increase_nonce(&mut this.enc_nonce);
         let enc_len = match this.enc.encrypt(&len_nonce, &len_bytes) {
             Ok(b) => b,
             Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
         };
-        this.write_seq += 1;
 
-        let payload_nonce = Self::make_nonce(this.write_seq);
+        let payload_nonce = this.enc_nonce;
+        increase_nonce(&mut this.enc_nonce);
         let enc_payload = match this.enc.encrypt(&payload_nonce, plain) {
             Ok(b) => b,
             Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
         };
-        this.write_seq += 1;
 
         this.write_buf.clear();
         this.write_buf.extend_from_slice(&enc_len);
@@ -541,12 +829,8 @@ impl Ss2022Protocol {
         let mut client_salt = vec![0u8; salt_len];
         rand::rngs::OsRng.fill_bytes(&mut client_salt);
 
-        stream
-            .write_all(&client_salt)
-            .await
-            .map_err(FluxError::Io)?;
-
         let enc_subkey = derive_2022_subkey(psk, &client_salt, method.key_len());
+        let aead = Ss2022Aead::new(method, &enc_subkey);
 
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -554,76 +838,48 @@ impl Ss2022Protocol {
             .unwrap_or(0);
 
         let addr_bytes = crate::shadowsocks::encode_ss_address(destination);
+        // Variable length header: [destination, padding_len (2B), padding]
+        let padding_len: u16 = 16;
+        let mut padding = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut padding);
+        let var_len = addr_bytes.len() + 2 + padding.len();
 
-        let mut first_payload = Vec::with_capacity(8 + addr_bytes.len());
-        first_payload.extend_from_slice(&now_sec.to_be_bytes());
-        first_payload.extend_from_slice(&addr_bytes);
+        // Fixed chunk: [HeaderTypeClient (0x00), timestamp (8B BE), var_len (2B BE)]
+        let mut fixed_chunk = Vec::with_capacity(1 + 8 + 2);
+        fixed_chunk.push(0x00);
+        fixed_chunk.extend_from_slice(&now_sec.to_be_bytes());
+        fixed_chunk.extend_from_slice(&(var_len as u16).to_be_bytes());
 
-        let aead = Ss2022Aead::new(method, &enc_subkey);
+        let mut enc_nonce = [0u8; 12];
+        let enc_fixed = aead.encrypt(&enc_nonce, &fixed_chunk)?;
+        increase_nonce(&mut enc_nonce);
 
-        // Encrypt length
-        let len_bytes = (first_payload.len() as u16).to_be_bytes();
-        let len_nonce = Ss2022Stream::<S>::make_nonce(0);
-        let enc_len = aead.encrypt(&len_nonce, &len_bytes)?;
+        // Variable chunk: [addr_bytes, padding_len, padding]
+        let mut var_chunk = Vec::with_capacity(var_len);
+        var_chunk.extend_from_slice(&addr_bytes);
+        var_chunk.extend_from_slice(&padding_len.to_be_bytes());
+        var_chunk.extend_from_slice(&padding);
 
-        // Encrypt first payload
-        let payload_nonce = Ss2022Stream::<S>::make_nonce(1);
-        let enc_payload = aead.encrypt(&payload_nonce, &first_payload)?;
+        let enc_var = aead.encrypt(&enc_nonce, &var_chunk)?;
+        increase_nonce(&mut enc_nonce);
 
-        stream.write_all(&enc_len).await.map_err(FluxError::Io)?;
-        stream
-            .write_all(&enc_payload)
-            .await
-            .map_err(FluxError::Io)?;
+        // Send salt, fixed chunk, and variable chunk together in one packet
+        let mut req_buf = Vec::with_capacity(client_salt.len() + enc_fixed.len() + enc_var.len());
+        req_buf.extend_from_slice(&client_salt);
+        req_buf.extend_from_slice(&enc_fixed);
+        req_buf.extend_from_slice(&enc_var);
+
+        stream.write_all(&req_buf).await.map_err(FluxError::Io)?;
         stream.flush().await.map_err(FluxError::Io)?;
 
-        // Read server response salt
-        let mut server_salt = vec![0u8; salt_len];
-        stream
-            .read_exact(&mut server_salt)
-            .await
-            .map_err(FluxError::Io)?;
-
-        let dec_subkey = derive_2022_subkey(psk, &server_salt, method.key_len());
-        let server_aead = Ss2022Aead::new(method, &dec_subkey);
-
-        // SIP022: Read and verify server response header (seq 0: length, seq 1: payload)
-        let mut resp_enc_len = [0u8; 18];
-        stream
-            .read_exact(&mut resp_enc_len)
-            .await
-            .map_err(FluxError::Io)?;
-        let resp_len_nonce = Ss2022Stream::<S>::make_nonce(0);
-        let resp_len_bytes = server_aead.decrypt(&resp_len_nonce, &resp_enc_len)?;
-        let resp_payload_len = u16::from_be_bytes([resp_len_bytes[0], resp_len_bytes[1]]) as usize;
-
-        let mut resp_enc_payload = vec![0u8; resp_payload_len + 16];
-        stream
-            .read_exact(&mut resp_enc_payload)
-            .await
-            .map_err(FluxError::Io)?;
-        let resp_payload_nonce = Ss2022Stream::<S>::make_nonce(1);
-        let resp_payload = server_aead.decrypt(&resp_payload_nonce, &resp_enc_payload)?;
-
-        if resp_payload.len() < 8 + salt_len {
-            return Err(FluxError::Protocol {
-                protocol: "shadowsocks-2022",
-                message: "server response header too short".into(),
-            });
-        }
-
-        // Verify echoed client salt
-        if &resp_payload[8..8 + salt_len] != client_salt.as_slice() {
-            return Err(FluxError::AuthFailed(
-                "mismatched client salt in shadowsocks-2022 response".into(),
-            ));
-        }
-
-        // Stream starts with write_seq = 2 and read_seq = 2 (0 and 1 used for handshake and response headers)
-        let mut ss_stream = Ss2022Stream::new(stream, method, &enc_subkey, &dec_subkey);
-        ss_stream.write_seq = 2;
-        ss_stream.read_seq = 2;
-        Ok(ss_stream)
+        Ok(Ss2022Stream::new_client(
+            stream,
+            method,
+            psk,
+            client_salt,
+            enc_subkey,
+            enc_nonce,
+        ))
     }
 
     /// Server-side: authenticate incoming Shadowsocks 2022 client, verify timestamp and replay cache.
@@ -643,94 +899,77 @@ impl Ss2022Protocol {
         let dec_subkey = derive_2022_subkey(psk, &client_salt, method.key_len());
         let aead = Ss2022Aead::new(method, &dec_subkey);
 
-        let mut enc_len = [0u8; 18];
+        // 1. Read fixed chunk (11 bytes + 16 bytes tag = 27 bytes)
+        let mut enc_fixed = [0u8; 11 + 16];
         stream
-            .read_exact(&mut enc_len)
+            .read_exact(&mut enc_fixed)
             .await
             .map_err(FluxError::Io)?;
 
-        let len_nonce = Ss2022Stream::<S>::make_nonce(0);
-        let len_bytes = aead.decrypt(&len_nonce, &enc_len)?;
-        let payload_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        let mut dec_nonce = [0u8; 12];
+        let fixed = aead.decrypt(&dec_nonce, &enc_fixed)?;
+        increase_nonce(&mut dec_nonce);
 
-        let mut enc_payload = vec![0u8; payload_len + 16];
-        stream
-            .read_exact(&mut enc_payload)
-            .await
-            .map_err(FluxError::Io)?;
-
-        let payload_nonce = Ss2022Stream::<S>::make_nonce(1);
-        let payload = aead.decrypt(&payload_nonce, &enc_payload)?;
-
-        if payload.len() < 8 + 1 {
+        if fixed[0] != 0x00 {
             return Err(FluxError::Protocol {
                 protocol: "shadowsocks-2022",
-                message: "payload too short for timestamp and address".into(),
+                message: format!("unexpected client header type: {}", fixed[0]),
             });
         }
 
-        let mut ts_bytes = [0u8; 8];
-        ts_bytes.copy_from_slice(&payload[..8]);
-        let timestamp = u64::from_be_bytes(ts_bytes);
-
+        let timestamp = u64::from_be_bytes(fixed[1..9].try_into().unwrap());
         if !replay.check_and_insert(&client_salt, timestamp) {
             return Err(FluxError::AuthFailed(
                 "shadowsocks-2022 replay check failed".into(),
             ));
         }
 
-        let atyp = payload[8];
-        let mut cursor = io::Cursor::new(&payload[9..]);
-        let target = Socks5Handshake::read_address(&mut cursor, atyp).await?;
-        let consumed = 9 + cursor.position() as usize;
+        let var_len = u16::from_be_bytes(fixed[9..11].try_into().unwrap()) as usize;
+        let mut enc_var = vec![0u8; var_len + 16];
+        stream
+            .read_exact(&mut enc_var)
+            .await
+            .map_err(FluxError::Io)?;
 
-        let extra_data = if consumed < payload.len() {
-            payload[consumed..].to_vec()
+        let var_chunk = aead.decrypt(&dec_nonce, &enc_var)?;
+        increase_nonce(&mut dec_nonce);
+
+        if var_chunk.is_empty() {
+            return Err(FluxError::Protocol {
+                protocol: "shadowsocks-2022",
+                message: "empty address chunk".into(),
+            });
+        }
+
+        let atyp = var_chunk[0];
+        let mut cursor = io::Cursor::new(&var_chunk[1..]);
+        let target = Socks5Handshake::read_address(&mut cursor, atyp).await?;
+        let consumed = 1 + cursor.position() as usize;
+
+        // Skip padding if present
+        let (extra_data, _) = if consumed + 2 <= var_chunk.len() {
+            let pad_len =
+                u16::from_be_bytes([var_chunk[consumed], var_chunk[consumed + 1]]) as usize;
+            let after_pad = consumed + 2 + pad_len;
+            if after_pad < var_chunk.len() {
+                (var_chunk[after_pad..].to_vec(), ())
+            } else {
+                (Vec::new(), ())
+            }
         } else {
-            Vec::new()
+            (Vec::new(), ())
         };
 
-        // Generate server salt and response
-        let mut server_salt = vec![0u8; salt_len];
-        rand::rngs::OsRng.fill_bytes(&mut server_salt);
-        stream
-            .write_all(&server_salt)
-            .await
-            .map_err(FluxError::Io)?;
-
-        let enc_subkey = derive_2022_subkey(psk, &server_salt, method.key_len());
-        let server_enc_aead = Ss2022Aead::new(method, &enc_subkey);
-
-        // SIP022: Format server response header [timestamp 8B + request salt (salt_len)]
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let mut resp_header = Vec::with_capacity(8 + salt_len);
-        resp_header.extend_from_slice(&now_sec.to_be_bytes());
-        resp_header.extend_from_slice(&client_salt);
-
-        let resp_len_bytes = (resp_header.len() as u16).to_be_bytes();
-        let resp_len_nonce = Ss2022Stream::<S>::make_nonce(0);
-        let resp_enc_len = server_enc_aead.encrypt(&resp_len_nonce, &resp_len_bytes)?;
-
-        let resp_payload_nonce = Ss2022Stream::<S>::make_nonce(1);
-        let resp_enc_payload = server_enc_aead.encrypt(&resp_payload_nonce, &resp_header)?;
-
-        stream
-            .write_all(&resp_enc_len)
-            .await
-            .map_err(FluxError::Io)?;
-        stream
-            .write_all(&resp_enc_payload)
-            .await
-            .map_err(FluxError::Io)?;
-        stream.flush().await.map_err(FluxError::Io)?;
-
-        let mut ss_stream = Ss2022Stream::new(stream, method, &enc_subkey, &dec_subkey);
-        ss_stream.read_seq = 2; // 0 and 1 used for client handshake
-        ss_stream.write_seq = 2; // 0 and 1 used for server response header
-        Ok((ss_stream, target, extra_data))
+        let ss_stream = Ss2022Stream::new_server(
+            stream,
+            method,
+            psk,
+            client_salt,
+            &dec_subkey,
+            dec_nonce,
+            extra_data,
+        );
+        Ok((ss_stream, target, Vec::new()))
     }
 }
 

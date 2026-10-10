@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use flux_protocol::shadowsocks::{
-    CipherKind, SALT_LEN, ShadowsocksCipher, ShadowsocksStream, TAG_LEN, derive_master_key,
+    CipherKind, ShadowsocksCipher, ShadowsocksStream, TAG_LEN, derive_master_key_for_kind,
     derive_subkey, encode_ss_address,
 };
 use flux_protocol::socks5::Socks5Handshake;
@@ -18,7 +18,8 @@ use tracing::{debug, info, warn};
 pub struct ShadowsocksInbound {
     tag: String,
     listen_addr: SocketAddr,
-    master_key: [u8; 32],
+    password: String,
+    master_key: Vec<u8>,
     cipher_kind: CipherKind,
     replay_filter: Arc<flux_protocol::shadowsocks2022::ReplayFilter>,
     pipeline: flux_transport::pipeline::ServerTransportPipeline,
@@ -29,11 +30,14 @@ pub struct ShadowsocksInbound {
 impl ShadowsocksInbound {
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr, password: &str) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let cipher_kind = CipherKind::ChaCha20IetfPoly1305;
+        let master_key = derive_master_key_for_kind(password, cipher_kind);
         Self {
             tag: tag.into(),
             listen_addr,
-            master_key: derive_master_key(password),
-            cipher_kind: CipherKind::ChaCha20IetfPoly1305,
+            password: password.to_string(),
+            master_key,
+            cipher_kind,
             replay_filter: Arc::new(flux_protocol::shadowsocks2022::ReplayFilter::new(10000)),
             pipeline: flux_transport::pipeline::ServerTransportPipeline::raw(),
             running: Arc::new(AtomicBool::new(false)),
@@ -43,6 +47,7 @@ impl ShadowsocksInbound {
 
     pub fn with_cipher_kind(mut self, kind: CipherKind) -> Self {
         self.cipher_kind = kind;
+        self.master_key = derive_master_key_for_kind(&self.password, kind);
         self
     }
 
@@ -75,7 +80,7 @@ impl Inbound for ShadowsocksInbound {
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
-        let master_key = self.master_key;
+        let master_key = self.master_key.clone();
         let cipher_kind = self.cipher_kind;
         let replay_filter = self.replay_filter.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -116,6 +121,7 @@ impl Inbound for ShadowsocksInbound {
                 let inbound_tag = tag_tcp.clone();
                 let replay = replay_tcp.clone();
                 let pipe = pipeline_tcp.clone();
+                let master_key = master_key.clone();
 
                 tokio::spawn(async move {
                     let mut stream: flux_types::BoxedStream = match pipe.unwrap(socket).await {
@@ -172,7 +178,8 @@ impl Inbound for ShadowsocksInbound {
                     }
                     let handshake_fut = async {
                         // 1. Read client salt
-                        let mut salt = [0u8; SALT_LEN];
+                        let salt_len = cipher_kind.salt_len();
+                        let mut salt = vec![0u8; salt_len];
                         stream.read_exact(&mut salt).await.map_err(FluxError::Io)?;
 
                         if !replay.check_and_insert_salt(&salt) {
@@ -250,7 +257,8 @@ impl Inbound for ShadowsocksInbound {
                     let meta = SessionMeta::new(client_addr, target, inbound_tag, NetworkType::Tcp);
 
                     // Generate server salt and prepare server encoder
-                    let mut server_salt = [0u8; SALT_LEN];
+                    let salt_len = cipher_kind.salt_len();
+                    let mut server_salt = vec![0u8; salt_len];
                     rand::rngs::OsRng.fill_bytes(&mut server_salt);
                     if stream.write_all(&server_salt).await.is_err() {
                         return;
@@ -262,7 +270,7 @@ impl Inbound for ShadowsocksInbound {
                         stream,
                         server_enc,
                         Some(dec),
-                        master_key,
+                        &master_key,
                         pipelined_data,
                     );
 
@@ -284,6 +292,7 @@ impl Inbound for ShadowsocksInbound {
         let mut shutdown_rx_udp = self.shutdown_tx.subscribe();
         let sessions: Arc<DashMap<SocketAddr, tokio::sync::mpsc::Sender<UdpPacket>>> =
             Arc::new(DashMap::new());
+        let master_key_udp = self.master_key.clone();
 
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
@@ -297,22 +306,22 @@ impl Inbound for ShadowsocksInbound {
                 };
 
                 let decrypted = if let CipherKind::Ss2022(method) = cipher_kind {
-                    let psk = &master_key[..method.key_len()];
+                    let psk = &master_key_udp[..method.key_len()];
                     let cipher =
                         flux_protocol::shadowsocks2022::Ss2022UdpPacketCipher::new(method, psk);
                     cipher.decrypt_packet(&buf[..len]).await.ok()
                 } else {
-                    if len < SALT_LEN + TAG_LEN {
+                    let salt_len = cipher_kind.salt_len();
+                    if len < salt_len + TAG_LEN {
                         continue;
                     }
-                    let mut salt = [0u8; SALT_LEN];
-                    salt.copy_from_slice(&buf[..SALT_LEN]);
-                    if !replay_udp.check_and_insert_salt(&salt) {
+                    let salt = &buf[..salt_len];
+                    if !replay_udp.check_and_insert_salt(salt) {
                         continue;
                     }
-                    let subkey = derive_subkey(&master_key, &salt);
+                    let subkey = derive_subkey(&master_key_udp, salt);
                     let mut cipher = ShadowsocksCipher::with_kind(cipher_kind, &subkey);
-                    let plain = match cipher.decrypt(&buf[SALT_LEN..len]) {
+                    let plain = match cipher.decrypt(&buf[salt_len..len]) {
                         Ok(p) => p,
                         Err(_) => continue,
                     };
@@ -355,6 +364,7 @@ impl Inbound for ShadowsocksInbound {
 
                     let udp_send = udp_sock_recv.clone();
                     let sessions_clean = sessions.clone();
+                    let master_key_send = master_key_udp.clone();
                     tokio::spawn(async move {
                         loop {
                             match tokio::time::timeout(
@@ -365,15 +375,16 @@ impl Inbound for ShadowsocksInbound {
                             {
                                 Ok(Some(reply)) => {
                                     let encoded = if let CipherKind::Ss2022(method) = cipher_kind {
-                                        let psk = &master_key[..method.key_len()];
+                                        let psk = &master_key_send[..method.key_len()];
                                         let cipher = flux_protocol::shadowsocks2022::Ss2022UdpPacketCipher::new(method, psk);
                                         cipher
                                             .encrypt_packet(&reply.destination, &reply.payload)
                                             .ok()
                                     } else {
-                                        let mut salt = [0u8; SALT_LEN];
+                                        let salt_len = cipher_kind.salt_len();
+                                        let mut salt = vec![0u8; salt_len];
                                         rand::rngs::OsRng.fill_bytes(&mut salt);
-                                        let subkey = derive_subkey(&master_key, &salt);
+                                        let subkey = derive_subkey(&master_key_send, &salt);
                                         let mut cipher =
                                             ShadowsocksCipher::with_kind(cipher_kind, &subkey);
                                         let addr_bytes = encode_ss_address(&reply.destination);
@@ -384,7 +395,7 @@ impl Inbound for ShadowsocksInbound {
                                         plain.extend_from_slice(&reply.payload);
                                         if let Ok(ciphertext) = cipher.encrypt(&plain) {
                                             let mut out =
-                                                Vec::with_capacity(SALT_LEN + ciphertext.len());
+                                                Vec::with_capacity(salt_len + ciphertext.len());
                                             out.extend_from_slice(&salt);
                                             out.extend_from_slice(&ciphertext);
                                             Some(out)
