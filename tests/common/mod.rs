@@ -1,12 +1,24 @@
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-/// Returns a unique, non-colliding TCP port assigned by the OS.
+static NEXT_TCP_PORT: AtomicU16 = AtomicU16::new(21000);
+
+/// Returns a unique, non-colliding TCP port.
 #[allow(dead_code)]
 pub async fn get_free_tcp_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    loop {
+        let port = NEXT_TCP_PORT.fetch_add(1, Ordering::Relaxed);
+        if !(21000..=64000).contains(&port) {
+            NEXT_TCP_PORT.store(21000, Ordering::Relaxed);
+            continue;
+        }
+        if let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+            drop(listener);
+            return port;
+        }
+    }
 }
 
 /// Starts an asynchronous TCP echo server on an ephemeral OS-assigned port and returns its SocketAddr.

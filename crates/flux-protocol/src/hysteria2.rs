@@ -41,7 +41,7 @@ impl SalamanderObfs {
     pub fn obfuscate(&self, packet: &[u8]) -> Vec<u8> {
         use rand::RngCore;
         let mut salt = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut salt);
+        rand::rngs::OsRng.fill_bytes(&mut salt);
         let mut hasher = blake3::Hasher::new_keyed(&self.key);
         hasher.update(&salt);
         let mut xof = hasher.finalize_xof();

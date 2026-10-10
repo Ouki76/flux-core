@@ -53,7 +53,7 @@ impl ShadowTlsHandshake {
 
         // Generate client random (32 bytes)
         let mut client_random = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut client_random);
+        rand::rngs::OsRng.fill_bytes(&mut client_random);
 
         // Compute HMAC challenge: HMAC-SHA256(password, [random (32 bytes) + timestamp (8 bytes)])
         let mut mac = HmacSha256::new_from_slice(cfg.password.as_bytes())
@@ -65,7 +65,7 @@ impl ShadowTlsHandshake {
         let mut session_id = [0u8; 32];
         session_id[..8].copy_from_slice(&hmac_res[..8]);
         session_id[8..16].copy_from_slice(&now_sec.to_be_bytes());
-        rand::thread_rng().fill_bytes(&mut session_id[16..]);
+        rand::rngs::OsRng.fill_bytes(&mut session_id[16..]);
 
         // Build authentic TLS 1.3 ClientHello with HMAC challenge
         let client_hello = build_tls_client_hello(&cfg.server_name, &client_random, &session_id);
@@ -298,7 +298,7 @@ mod tests {
     fn test_shadowtls_client_hello_hmac() {
         let password = "my_secret_shadowtls_password";
         let mut random = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut random);
+        rand::rngs::OsRng.fill_bytes(&mut random);
 
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)

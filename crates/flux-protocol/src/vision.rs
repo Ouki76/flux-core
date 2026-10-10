@@ -1,4 +1,4 @@
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -90,7 +90,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionClientStream<S> {
             this.header_written = true;
             if buf.len() >= 3 && buf[0] == 0x16 && buf[1] == 0x03 {
                 // Pad to ~900-1100 bytes to camouflage ClientHello fingerprint against GFW/DPI
-                let target_size = rand::thread_rng().gen_range(900..1100);
+                let target_size = rand::Rng::gen_range(&mut rand::rngs::OsRng, 900..1100);
                 let pad_len = if target_size > buf.len() {
                     (target_size - buf.len()).min(255) as u8
                 } else {
@@ -104,7 +104,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionClientStream<S> {
                 frame.extend_from_slice(buf);
                 if pad_len > 0 {
                     let mut pad = vec![0u8; pad_len as usize];
-                    rand::thread_rng().fill_bytes(&mut pad);
+                    rand::rngs::OsRng.fill_bytes(&mut pad);
                     frame.extend_from_slice(&pad);
                 }
 

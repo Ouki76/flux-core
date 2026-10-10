@@ -10,7 +10,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use flux_types::{FluxError, FluxResult, TargetAddress};
-use rand::{Rng, RngCore};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
@@ -226,12 +226,12 @@ impl WireGuardHandshake {
 
         for _ in 0..cfg.jc {
             let len = if max > min {
-                rand::thread_rng().gen_range(min..=max)
+                rand::Rng::gen_range(&mut rand::rngs::OsRng, min..=max)
             } else {
                 min
             };
             let mut junk = vec![0u8; len];
-            rand::thread_rng().fill_bytes(&mut junk);
+            rand::rngs::OsRng.fill_bytes(&mut junk);
             packets.push(junk);
         }
         packets
@@ -267,7 +267,7 @@ impl WireGuardHandshake {
         // S1 junk prefix
         if awg.s1 > 0 {
             let mut s1_bytes = vec![0u8; awg.s1 as usize];
-            rand::thread_rng().fill_bytes(&mut s1_bytes);
+            rand::rngs::OsRng.fill_bytes(&mut s1_bytes);
             packet.extend_from_slice(&s1_bytes);
         }
 
@@ -306,7 +306,7 @@ impl WireGuardHandshake {
 
         // MAC1 and MAC2 placeholders
         let mut macs = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut macs);
+        rand::rngs::OsRng.fill_bytes(&mut macs);
         packet.extend_from_slice(&macs);
 
         (packet, send_key, recv_key)

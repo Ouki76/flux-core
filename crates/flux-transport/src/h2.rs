@@ -233,7 +233,10 @@ impl H2Transport {
             .status(StatusCode::OK)
             .header("Content-Type", "application/octet-stream")
             .body(())
-            .unwrap();
+            .map_err(|e| FluxError::Protocol {
+                protocol: "http2",
+                message: format!("failed to build H2 response: {}", e),
+            })?;
 
         let send_stream =
             respond
