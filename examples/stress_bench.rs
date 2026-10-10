@@ -8,7 +8,7 @@ use uuid::Uuid;
 use flux_app::{Config, Instance};
 use flux_common::buffer::BufferPool;
 use flux_dns::{DnsResolver, FakeIpPool};
-use flux_outbound::{HttpOutbound, ShadowsocksOutbound, VlessOutbound};
+use flux_outbound::{HttpOutbound, LazyPipelineDialer, ShadowsocksOutbound, VlessOutbound};
 use flux_protocol::socks5::{CMD_CONNECT, Socks5Handshake};
 use flux_router::{DomainMatch, Router, Rule};
 use flux_types::{NetworkType, Outbound, SessionMeta, TargetAddress};
@@ -620,11 +620,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 5.3 HTTP CONNECT
     let resolver = Arc::new(DnsResolver::new(None));
-    let http_out = HttpOutbound::new(
-        "http-bench",
+    let dialer_http = Arc::new(LazyPipelineDialer::new_raw(
         TargetAddress::domain("127.0.0.1", http_port),
         resolver.clone(),
-    );
+    ));
+    let http_out = HttpOutbound::new("http-bench", dialer_http);
     let meta_http = SessionMeta::new(
         "127.0.0.1:50001".parse().unwrap(),
         TargetAddress::Ip(echo_addr),
@@ -646,15 +646,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 5.4 VLESS (plain)
     let vless_uuid_obj = Uuid::parse_str(vless_uuid).unwrap();
-    let vless_out = VlessOutbound::new(
-        "vless-bench",
+    let dialer_vless = Arc::new(LazyPipelineDialer::new_raw(
         TargetAddress::domain("127.0.0.1", vless_port),
-        vless_uuid_obj,
-        None,
         resolver.clone(),
-        None,
-        None,
-    );
+    ));
+    let vless_out = VlessOutbound::new("vless-bench", vless_uuid_obj, None, dialer_vless);
     let meta_vless = SessionMeta::new(
         "127.0.0.1:50002".parse().unwrap(),
         TargetAddress::Ip(echo_addr),
@@ -675,11 +671,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 5.5 Shadowsocks (AEAD ChaCha20-Poly1305)
+    let dialer_ss = Arc::new(LazyPipelineDialer::new_raw(
+        TargetAddress::domain("127.0.0.1", ss_port),
+        resolver.clone(),
+    ));
     let ss_out = ShadowsocksOutbound::new(
         "ss-bench",
         TargetAddress::domain("127.0.0.1", ss_port),
         ss_pass,
         resolver.clone(),
+        dialer_ss,
     );
     let meta_ss = SessionMeta::new(
         "127.0.0.1:50003".parse().unwrap(),

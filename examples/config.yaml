@@ -93,37 +93,43 @@ outbounds:
       flow: xtls-rprx-vision
 
   # Trojan over TLS
-  - type: trojan
-    tag: trojan-node
-    server: trojan.example.com
-    server_port: 443
-    password: my-trojan-password
-    tls:
-      enabled: true
-      server_name: trojan.example.com
+  - tag: trojan-node
+    carrier:
+      type: tcp
+      address: "trojan.example.com:443"
+    security:
+      type: tls
+      sni: "trojan.example.com"
+    protocol:
+      type: trojan
+      password: "my-trojan-password"
 
   # VLESS over TLS + WebSocket framing (Cloudflare CDN-compatible)
-  - type: vless
-    tag: vless-ws-node
-    server: cdn.example.com
-    server_port: 443
-    uuid: a1b2c3d4-e5f6-7890-1234-56789abcdef0
-    tls:
-      enabled: true
-      server_name: cdn.example.com
-    transport:
+  - tag: vless-ws-node
+    carrier:
+      type: tcp
+      address: "cdn.example.com:443"
+    security:
+      type: tls
+      sni: "cdn.example.com"
+    framing:
       type: ws
-      path: /my-secret-tunnel
+      path: "/my-secret-tunnel"
       headers:
-        Host: custom.host.org
+        Host: "custom.host.org"
+    protocol:
+      type: vless
+      uuid: "a1b2c3d4-e5f6-7890-1234-56789abcdef0"
 
   # Shadowsocks AEAD
-  - type: shadowsocks
-    tag: ss-node
-    server: ss.example.com
-    server_port: 8388
-    password: my-ss-password
-    method: 2022-blake3-chacha20-poly1305
+  - tag: ss-node
+    carrier:
+      type: tcp
+      address: "ss.example.com:8388"
+    protocol:
+      type: shadowsocks
+      password: "my-ss-password"
+      method: "2022-blake3-chacha20-poly1305"
 
   # Selector group: manual selection through dashboard
   - type: selector

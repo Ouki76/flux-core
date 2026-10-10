@@ -19,26 +19,11 @@ pub struct SocksOutbound {
     auth: Option<(String, String)>,
     resolver: Arc<DnsResolver>,
     connect_timeout: Duration,
-    dialer: Option<Arc<dyn StreamDialer>>,
+    dialer: Arc<dyn StreamDialer>,
 }
 
 impl SocksOutbound {
     pub fn new(
-        tag: impl Into<String>,
-        server_address: TargetAddress,
-        resolver: Arc<DnsResolver>,
-    ) -> Self {
-        Self {
-            tag: tag.into(),
-            server_address,
-            auth: None,
-            resolver,
-            connect_timeout: Duration::from_secs(10),
-            dialer: None,
-        }
-    }
-
-    pub fn new_with_dialer(
         tag: impl Into<String>,
         server_address: TargetAddress,
         resolver: Arc<DnsResolver>,
@@ -50,7 +35,7 @@ impl SocksOutbound {
             auth: None,
             resolver,
             connect_timeout: Duration::from_secs(10),
-            dialer: Some(dialer),
+            dialer,
         }
     }
 
@@ -71,12 +56,7 @@ impl Outbound for SocksOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let mut stream: BoxedStream = if let Some(ref d) = self.dialer {
-            d.dial().await?
-        } else {
-            let server_addr = self.resolver.resolve(&self.server_address).await?;
-            Box::new(TcpTransport::connect(server_addr, self.connect_timeout).await?)
-        };
+        let mut stream: BoxedStream = self.dialer.dial().await?;
 
         let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         Socks5Handshake::client_handshake_with_auth(

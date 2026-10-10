@@ -1,11 +1,6 @@
-use crate::dialer::LazyPipelineDialer;
 use async_trait::async_trait;
-use flux_dns::DnsResolver;
 use flux_protocol::udp::{decode_vless_udp_packet, encode_vless_udp_packet};
 use flux_protocol::vless::{VLESS_VERSION, VlessProtocol};
-use flux_transport::pipeline::{FramingLayer, SecurityLayer};
-use flux_transport::reality::RealityClientConfig;
-use flux_transport::tls::TlsClientConfig;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, NetworkType, Outbound, PacketEndpoint, SessionMeta,
     StreamDialer, TargetAddress, UdpPacket,
@@ -24,33 +19,6 @@ pub struct VlessOutbound {
 
 impl VlessOutbound {
     pub fn new(
-        tag: impl Into<String>,
-        server_address: TargetAddress,
-        uuid: Uuid,
-        flow: Option<String>,
-        resolver: Arc<DnsResolver>,
-        tls_config: Option<TlsClientConfig>,
-        reality_config: Option<RealityClientConfig>,
-    ) -> Self {
-        let sec = if let Some(r) = reality_config {
-            SecurityLayer::Reality(r)
-        } else if let Some(t) = tls_config {
-            SecurityLayer::Tls(t)
-        } else {
-            SecurityLayer::None
-        };
-
-        let dialer = Arc::new(LazyPipelineDialer::new(
-            server_address,
-            resolver,
-            sec,
-            FramingLayer::Raw,
-        ));
-
-        Self::new_with_dialer(tag, uuid, flow, dialer)
-    }
-
-    pub fn new_with_dialer(
         tag: impl Into<String>,
         uuid: Uuid,
         flow: Option<String>,

@@ -596,7 +596,7 @@ fn build_layered_outbound(
                     .as_deref()
                     .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
                     .unwrap_or_default();
-                let out = flux_outbound::ShadowsocksOutbound::new(
+                let out = flux_outbound::ShadowsocksOutbound::new_datagram(
                     tag.clone(),
                     target,
                     &password,
@@ -694,7 +694,7 @@ fn build_layered_outbound(
         ProtocolConfig::Vless { uuid, flow } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid vless uuid {}: {}", uuid, e)))?;
-            let out = VlessOutbound::new_with_dialer(tag.clone(), parsed_uuid, flow, dialer);
+            let out = VlessOutbound::new(tag.clone(), parsed_uuid, flow, dialer);
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Shadowsocks { password, method } => {
@@ -702,7 +702,7 @@ fn build_layered_outbound(
                 .as_deref()
                 .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
                 .unwrap_or_default();
-            let out = flux_outbound::ShadowsocksOutbound::new_with_dialer(
+            let out = flux_outbound::ShadowsocksOutbound::new(
                 tag.clone(),
                 target,
                 &password,
@@ -713,7 +713,7 @@ fn build_layered_outbound(
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Trojan { password } => {
-            let out = flux_outbound::TrojanOutbound::new_with_dialer(tag.clone(), password, dialer);
+            let out = flux_outbound::TrojanOutbound::new(tag.clone(), password, dialer);
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Vmess { uuid, security } => {
@@ -728,20 +728,14 @@ fn build_layered_outbound(
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Socks { username, password } => {
-            let mut out =
-                SocksOutbound::new_with_dialer(tag.clone(), target, resolver.clone(), dialer);
+            let mut out = SocksOutbound::new(tag.clone(), target, resolver.clone(), dialer);
             if let (Some(u), Some(p)) = (username, password) {
                 out = out.with_auth(u, p);
             }
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Http { username, password } => {
-            let mut out = flux_outbound::HttpOutbound::new_with_dialer(
-                tag.clone(),
-                target,
-                resolver.clone(),
-                dialer,
-            );
+            let mut out = flux_outbound::HttpOutbound::new(tag.clone(), dialer);
             if let (Some(u), Some(p)) = (username, password) {
                 out = out.with_auth(u, p);
             }

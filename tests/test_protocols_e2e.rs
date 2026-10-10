@@ -41,10 +41,15 @@ async fn test_01_socks5_end_to_end() {
     instance.start().await.unwrap();
 
     let resolver = Arc::new(DnsResolver::new(None));
+    let dialer = Arc::new(flux_outbound::LazyPipelineDialer::new_raw(
+        TargetAddress::domain("127.0.0.1", srv_port),
+        resolver.clone(),
+    ));
     let socks_out = SocksOutbound::new(
         "client",
         TargetAddress::domain("127.0.0.1", srv_port),
         resolver,
+        dialer,
     );
     let meta = SessionMeta::new(
         "127.0.0.1:40001".parse().unwrap(),
@@ -88,11 +93,11 @@ async fn test_02_http_connect_end_to_end() {
     instance.start().await.unwrap();
 
     let resolver = Arc::new(DnsResolver::new(None));
-    let http_out = HttpOutbound::new(
-        "client",
+    let dialer = Arc::new(flux_outbound::LazyPipelineDialer::new_raw(
         TargetAddress::domain("127.0.0.1", srv_port),
         resolver,
-    );
+    ));
+    let http_out = HttpOutbound::new("client", dialer);
     let meta = SessionMeta::new(
         "127.0.0.1:40003".parse().unwrap(),
         TargetAddress::Ip(echo_addr),
@@ -137,15 +142,11 @@ async fn test_03_vless_plain_end_to_end() {
     instance.start().await.unwrap();
 
     let resolver = Arc::new(DnsResolver::new(None));
-    let vless_out = VlessOutbound::new(
-        "client",
+    let dialer = Arc::new(flux_outbound::LazyPipelineDialer::new_raw(
         TargetAddress::domain("127.0.0.1", srv_port),
-        uuid,
-        None,
         resolver,
-        None,
-        None,
-    );
+    ));
+    let vless_out = VlessOutbound::new("client", uuid, None, dialer);
     let meta = SessionMeta::new(
         "127.0.0.1:40005".parse().unwrap(),
         TargetAddress::Ip(echo_addr),
@@ -192,15 +193,13 @@ async fn test_04_vless_tls_end_to_end() {
 
     let resolver = Arc::new(DnsResolver::new(None));
     let tls = flux_transport::tls::TlsClientConfig::new("localhost").with_insecure(true);
-    let vless_out = VlessOutbound::new(
-        "client",
+    let dialer = Arc::new(flux_outbound::LazyPipelineDialer::new(
         TargetAddress::domain("127.0.0.1", srv_port),
-        uuid,
-        None,
         resolver,
-        Some(tls),
-        None,
-    );
+        flux_transport::pipeline::SecurityLayer::Tls(tls),
+        flux_transport::pipeline::FramingLayer::Raw,
+    ));
+    let vless_out = VlessOutbound::new("client", uuid, None, dialer);
     let meta = SessionMeta::new(
         "127.0.0.1:40007".parse().unwrap(),
         TargetAddress::Ip(echo_addr),
@@ -246,13 +245,13 @@ async fn test_05_trojan_tls_end_to_end() {
 
     let resolver = Arc::new(DnsResolver::new(None));
     let tls = flux_transport::tls::TlsClientConfig::new("localhost").with_insecure(true);
-    let trojan_out = TrojanOutbound::new(
-        "client",
+    let dialer = Arc::new(flux_outbound::LazyPipelineDialer::new(
         TargetAddress::domain("127.0.0.1", srv_port),
-        password,
         resolver,
-        tls,
-    );
+        flux_transport::pipeline::SecurityLayer::Tls(tls),
+        flux_transport::pipeline::FramingLayer::Raw,
+    ));
+    let trojan_out = TrojanOutbound::new("client", password, dialer);
     let meta = SessionMeta::new(
         "127.0.0.1:40009".parse().unwrap(),
         TargetAddress::Ip(echo_addr),
@@ -296,11 +295,16 @@ async fn test_06_shadowsocks_aead_end_to_end() {
     instance.start().await.unwrap();
 
     let resolver = Arc::new(DnsResolver::new(None));
+    let dialer = Arc::new(flux_outbound::LazyPipelineDialer::new_raw(
+        TargetAddress::domain("127.0.0.1", srv_port),
+        resolver.clone(),
+    ));
     let ss_out = ShadowsocksOutbound::new(
         "client",
         TargetAddress::domain("127.0.0.1", srv_port),
         password,
         resolver,
+        dialer,
     );
     let meta = SessionMeta::new(
         "127.0.0.1:40011".parse().unwrap(),

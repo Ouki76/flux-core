@@ -45,17 +45,25 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 
 ## Architecture
 
-The project is organized as a Cargo workspace with modular crates:
+The project is designed around a strictly decoupled, modular 4-tier network stack:
+1. **L4 Carrier**: Transport delivery (`tcp`, `udp`, `quic`, Unix domain sockets).
+2. **L5 Security**: Encryption & anti-censorship camouflage (`tls`, `reality` with decoy fallback, `shadowtls`, `fragment`, Salamander obfs).
+3. **L6 Framing**: Stream & multiplexing framing (`websocket`, `httpupgrade`, `http2`, `grpc`).
+4. **L7 Protocol**: Application proxy layer (`vless`, `trojan`, `vmess`, `shadowsocks`, `hysteria2`, `tuic`, `wireguard`, `socks5`, `http`).
 
-- `crates/flux-types`: Core types, session metadata, target addresses, and common traits (`Inbound`, `Outbound`, `Dispatcher`).
+Any protocol can be layered arbitrarily over any compatible security or framing mechanism (e.g. Shadowsocks or VLESS over REALITY + WebSocket, or Hysteria 2 / TUIC streamed over TCP + REALITY).
+
+### Workspace Crates
+
+- `crates/flux-types`: Core session abstractions, target addresses, errors, and common traits (`Inbound`, `Outbound`, `StreamDialer`, `PacketEndpoint`, `Dispatcher`).
 - `crates/flux-common`: Memory pool (`BufferPool`), zero-copy socket pipe (`splice`), and bidirectional copying.
-- `crates/flux-router`: Rule evaluation engine, CIDR matching, and rule-set registry.
-- `crates/flux-dns`: Fake-IP engine, DNS wireformat parser (A and AAAA records), and DoH client.
-- `crates/flux-transport`: TLS, TCP, and REALITY transport implementations.
-- `crates/flux-protocol`: SOCKS5, HTTP, VLESS, Trojan, and Shadowsocks protocol implementations.
-- `crates/flux-inbound`: Inbound listener adapters (Mixed, SOCKS, HTTP, VLESS, Trojan, SS, TUN).
+- `crates/flux-transport`: Multi-layer pipeline (`LayeredTransportPipeline`, `ServerTransportPipeline`), TLS (`rustls`), REALITY, ShadowTLS, TLS fragmentation, WebSocket, HTTPUpgrade, HTTP/2, gRPC, and QUIC (`quinn`).
+- `crates/flux-protocol`: Decoupled protocol codecs: VLESS (with Vision flow), Trojan, VMess (AEAD), Shadowsocks (AEAD & SS-2022 Blake3), Hysteria 2 (Salamander obfs & Brutal pacer), TUIC v5, WireGuard / AmneziaWG, SOCKS5, HTTP CONNECT.
+- `crates/flux-router`: Rule evaluation engine, CIDR matching, GeoIP / GeoSite rule-set registry.
+- `crates/flux-dns`: Fake-IP engine, DNS wireformat parser, DoH client with connection pooling, and DoT/DoQ resolvers.
+- `crates/flux-inbound`: Inbound listener adapters (`VlessInbound`, `TrojanInbound`, `VmessInbound`, `ShadowsocksInbound`, `TuicInbound`, `Hysteria2Inbound`, `SocksInbound`, `HttpInbound`, `MixedInbound`, `TunInbound`, `RedirectInbound`, `TproxyInbound`).
 - `crates/flux-outbound`: Outbound connection adapters and group balancers (Selector, UrlTest, Fallback, LoadBalance).
-- `crates/flux-app`: Dispatcher, configuration parser, and runtime lifecycle manager.
+- `crates/flux-app`: Dispatcher, 4-tier configuration parser, link URI importer, and runtime lifecycle manager.
 - `src/main.rs`: Modern CLI entry point with `clap`.
 
 ## Building

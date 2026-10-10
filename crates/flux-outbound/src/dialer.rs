@@ -31,6 +31,16 @@ impl LazyPipelineDialer {
         }
     }
 
+    pub fn new_raw(server_address: TargetAddress, resolver: Arc<DnsResolver>) -> Self {
+        Self {
+            server_address,
+            resolver,
+            securities: Vec::new(),
+            framings: Vec::new(),
+            connect_timeout: Duration::from_secs(10),
+        }
+    }
+
     pub fn new_multi(
         server_address: TargetAddress,
         resolver: Arc<DnsResolver>,

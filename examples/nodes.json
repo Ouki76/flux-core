@@ -2,10 +2,14 @@
   // External nodes included from another file
   "outbounds": [
     {
-      "type": "socks",
       "tag": "external-socks",
-      "server": "127.0.0.1",
-      "server_port": 1080
+      "carrier": {
+        "type": "tcp",
+        "address": "127.0.0.1:1080"
+      },
+      "protocol": {
+        "type": "socks"
+      }
     }
   ]
 }

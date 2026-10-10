@@ -1,11 +1,9 @@
-use crate::dialer::LazyPipelineDialer;
 use async_trait::async_trait;
 use flux_dns::DnsResolver;
 use flux_protocol::shadowsocks::{
     CipherKind, SALT_LEN, ShadowsocksCipher, ShadowsocksStream, TAG_LEN, derive_master_key,
     derive_subkey, encode_ss_address,
 };
-use flux_transport::pipeline::{FramingLayer, SecurityLayer};
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, StreamDialer,
     TargetAddress, UdpPacket,
@@ -20,7 +18,7 @@ pub struct ShadowsocksOutbound {
     tag: String,
     master_key: [u8; 32],
     cipher_kind: CipherKind,
-    dialer: Arc<dyn StreamDialer>,
+    dialer: Option<Arc<dyn StreamDialer>>,
     server_address: TargetAddress,
     resolver: Arc<DnsResolver>,
 }
@@ -31,29 +29,29 @@ impl ShadowsocksOutbound {
         server_address: TargetAddress,
         password: &str,
         resolver: Arc<DnsResolver>,
-    ) -> Self {
-        let dialer = Arc::new(LazyPipelineDialer::new(
-            server_address.clone(),
-            resolver.clone(),
-            SecurityLayer::None,
-            FramingLayer::Raw,
-        ));
-
-        Self::new_with_dialer(tag, server_address, password, resolver, dialer)
-    }
-
-    pub fn new_with_dialer(
-        tag: impl Into<String>,
-        server_address: TargetAddress,
-        password: &str,
-        resolver: Arc<DnsResolver>,
         dialer: Arc<dyn StreamDialer>,
     ) -> Self {
         Self {
             tag: tag.into(),
             master_key: derive_master_key(password),
             cipher_kind: CipherKind::ChaCha20IetfPoly1305,
-            dialer,
+            dialer: Some(dialer),
+            server_address,
+            resolver,
+        }
+    }
+
+    pub fn new_datagram(
+        tag: impl Into<String>,
+        server_address: TargetAddress,
+        password: &str,
+        resolver: Arc<DnsResolver>,
+    ) -> Self {
+        Self {
+            tag: tag.into(),
+            master_key: derive_master_key(password),
+            cipher_kind: CipherKind::ChaCha20IetfPoly1305,
+            dialer: None,
             server_address,
             resolver,
         }
@@ -76,7 +74,11 @@ impl Outbound for ShadowsocksOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let mut stream = self.dialer.dial().await?;
+        let dialer = self.dialer.as_ref().ok_or_else(|| FluxError::Protocol {
+            protocol: "shadowsocks",
+            message: "datagram-only outbound does not support stream dialing".into(),
+        })?;
+        let mut stream = dialer.dial().await?;
 
         if let CipherKind::Ss2022(method) = self.cipher_kind {
             let key_bytes = &self.master_key[..method.key_len()];

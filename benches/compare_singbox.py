@@ -182,10 +182,9 @@ async def main():
 
     flux_cfg = f"""{{
   "inbounds": [{{
-    "type": "socks",
     "tag": "socks-in",
-    "listen": "127.0.0.1",
-    "listen_port": {flux_port}
+    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {flux_port} }},
+    "protocol": {{ "type": "socks" }}
   }}],
   "outbounds": [{{
     "type": "direct",

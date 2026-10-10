@@ -1,11 +1,7 @@
-use crate::dialer::LazyPipelineDialer;
 use async_trait::async_trait;
-use flux_dns::DnsResolver;
 use flux_protocol::socks5::Socks5Handshake;
 use flux_protocol::trojan::TrojanProtocol;
 use flux_protocol::udp::encode_trojan_udp;
-use flux_transport::pipeline::{FramingLayer, SecurityLayer};
-use flux_transport::tls::TlsClientConfig;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, NetworkType, Outbound, PacketEndpoint, SessionMeta,
     StreamDialer, TargetAddress, UdpPacket,
@@ -22,23 +18,6 @@ pub struct TrojanOutbound {
 
 impl TrojanOutbound {
     pub fn new(
-        tag: impl Into<String>,
-        server_address: TargetAddress,
-        password: impl Into<String>,
-        resolver: Arc<DnsResolver>,
-        tls_config: TlsClientConfig,
-    ) -> Self {
-        let dialer = Arc::new(LazyPipelineDialer::new(
-            server_address,
-            resolver,
-            SecurityLayer::Tls(tls_config),
-            FramingLayer::Raw,
-        ));
-
-        Self::new_with_dialer(tag, password, dialer)
-    }
-
-    pub fn new_with_dialer(
         tag: impl Into<String>,
         password: impl Into<String>,
         dialer: Arc<dyn StreamDialer>,
