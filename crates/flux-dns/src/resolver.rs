@@ -288,7 +288,14 @@ impl DnsResolver {
             };
             *guard = Some(socket);
         }
-        let socket = guard.as_ref().expect("socket present");
+        let socket = match guard.as_ref() {
+            Some(s) => s,
+            None => {
+                return Err(FluxError::Dns(
+                    "failed to initialize DNS client UDP socket".into(),
+                ));
+            }
+        };
 
         let tx_id = rand::random::<u16>();
         let query = DnsMessage::build_query_with_ecs_id(domain, QTYPE_A, ecs, tx_id);

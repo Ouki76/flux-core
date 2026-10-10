@@ -82,13 +82,19 @@ pub struct BufferGuard {
 impl Deref for BufferGuard {
     type Target = Vec<u8>;
     fn deref(&self) -> &Self::Target {
-        self.buf.as_ref().expect("buffer present")
+        match &self.buf {
+            Some(b) => b,
+            None => unreachable!("BufferGuard dereferenced after drop"),
+        }
     }
 }
 
 impl DerefMut for BufferGuard {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.buf.as_mut().expect("buffer present")
+        match &mut self.buf {
+            Some(b) => b,
+            None => unreachable!("BufferGuard dereferenced after drop"),
+        }
     }
 }
 

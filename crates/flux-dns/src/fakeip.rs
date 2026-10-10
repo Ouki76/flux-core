@@ -46,21 +46,24 @@ impl FakeIpPool {
     }
 
     pub fn default_pool() -> Self {
-        Self::new("198.18.0.0/15", 10000).unwrap_or_else(|_| {
-            let net = Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15).expect("valid cidr");
-            let start = u32::from(net.network()) + 1;
-            let end = u32::from(net.broadcast()) - 1;
-            Self {
-                network: net,
-                start_ip: start,
-                end_ip: end,
-                current: AtomicU32::new(start),
-                cache: Mutex::new(FakeIpCache {
-                    domain_to_ip: LruCache::new(DEFAULT_CAPACITY),
-                    ip_to_domain: LruCache::new(DEFAULT_CAPACITY),
-                }),
+        match Self::new("198.18.0.0/15", 10000) {
+            Ok(p) => p,
+            Err(_) => {
+                let net = Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15).unwrap_or_default();
+                let start = u32::from(net.network()) + 1;
+                let end = u32::from(net.broadcast()).saturating_sub(1);
+                Self {
+                    network: net,
+                    start_ip: start,
+                    end_ip: end,
+                    current: AtomicU32::new(start),
+                    cache: Mutex::new(FakeIpCache {
+                        domain_to_ip: LruCache::new(DEFAULT_CAPACITY),
+                        ip_to_domain: LruCache::new(DEFAULT_CAPACITY),
+                    }),
+                }
             }
-        })
+        }
     }
 
     pub fn allocate(&self, domain: &str) -> Ipv4Addr {
