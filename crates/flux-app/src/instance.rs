@@ -902,19 +902,23 @@ fn compile_server_securities(
             InboundSecurityConfig::ShadowTls {
                 password, fallback, ..
             } => {
-                let fb_addr = fallback.parse::<SocketAddr>().map_err(|e| {
-                    FluxError::Config(format!(
-                        "invalid shadowtls fallback addr {}: {}",
-                        fallback, e
-                    ))
-                })?;
+                let fb_target = if let Ok(sa) = fallback.parse::<SocketAddr>() {
+                    flux_transport::shadowtls::TargetFallback::Address(sa)
+                } else if let Some((host, port_str)) = fallback.rsplit_once(':')
+                    && let Ok(port) = port_str.parse::<u16>()
+                {
+                    flux_transport::shadowtls::TargetFallback::Domain(host.to_string(), port)
+                } else {
+                    return Err(FluxError::Config(format!(
+                        "invalid shadowtls fallback addr {}: expected host:port or ip:port",
+                        fallback
+                    )));
+                };
                 list.push(flux_transport::pipeline::ServerSecurityLayer::ShadowTls(
                     flux_transport::shadowtls::ShadowTlsServerConfig {
                         server_names: vec![],
                         password,
-                        fallback_address: flux_transport::shadowtls::TargetFallback::Address(
-                            fb_addr,
-                        ),
+                        fallback_address: fb_target,
                     },
                 ));
             }

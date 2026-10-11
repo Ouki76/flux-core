@@ -2980,3 +2980,73 @@ async fn test_interop_vmess_websocket_both_directions() {
 
     flux_server_inst.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_interop_shadowtls_v3_flux_to_singbox() {
+    let echo = start_tcp_echo_server().await;
+    let sbox_port = get_free_tcp_port().await;
+    let password = "stls-secret-pass-999";
+    let raw_key = b"0123456789abcdef";
+    let b64_key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw_key);
+
+    // flux-core client -> sing-box server (ShadowTLS v3 + Shadowsocks 2022)
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [
+                {{
+                    "type": "shadowtls",
+                    "tag": "st-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": {},
+                    "version": 3,
+                    "users": [{{"password": "{}"}}],
+                    "handshake": {{
+                        "server": "gateway.icloud.com",
+                        "server_port": 443
+                    }},
+                    "detour": "ss-in"
+                }},
+                {{
+                    "type": "shadowsocks",
+                    "tag": "ss-in",
+                    "listen": "127.0.0.1",
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": "{}"
+                }}
+            ],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_port, password, b64_key
+    );
+    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "sbox-stls-node",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "security": {{ "type": "shadowtls", "version": 3, "password": "{}", "sni": "gateway.icloud.com" }},
+                "protocol": {{ "type": "shadowsocks", "password": "{}", "method": "2022-blake3-aes-128-gcm" }}
+            }}]
+        }}"#,
+        sbox_port, password, b64_key
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst
+        .registry
+        .get_outbound("sbox-stls-node")
+        .unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = outbound.dial_stream(&meta).await.unwrap();
+    let payload = b"ShadowTLS v3 + Shadowsocks 2022 flux-core -> sing-box verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+}
