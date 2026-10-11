@@ -25,4 +25,10 @@ x25519-dalek = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }
 hmac = { workspace = true }
+quinn = { workspace = true }
+http = "1"
+futures = "0.3"
 sha3 = "0.10.8"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+blake2 = "0.10.6"

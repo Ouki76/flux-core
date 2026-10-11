@@ -20,6 +20,7 @@ pub struct Hysteria2Outbound {
     pacer: Arc<Mutex<BrutalPacer>>,
     endpoint: Arc<Mutex<Option<quinn::Endpoint>>>,
     connection: Arc<Mutex<Option<quinn::Connection>>>,
+    h3_handle: Arc<Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>>,
     dialer: Option<Arc<dyn flux_types::StreamDialer>>,
 }
 
@@ -40,6 +41,7 @@ impl Hysteria2Outbound {
             pacer: Arc::new(Mutex::new(pacer)),
             endpoint: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(None)),
+            h3_handle: Arc::new(Mutex::new(None)),
             dialer: None,
         }
     }
@@ -61,6 +63,7 @@ impl Hysteria2Outbound {
             pacer: Arc::new(Mutex::new(pacer)),
             endpoint: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(None)),
+            h3_handle: Arc::new(Mutex::new(None)),
             dialer: Some(dialer),
         }
     }
@@ -109,6 +112,11 @@ impl Hysteria2Outbound {
             .as_deref()
             .unwrap_or(&self.config.server);
         let conn = QuicTransport::connect(&endpoint, peer_addr, sni).await?;
+        if self.config.h3 {
+            let h3 = Hysteria2Protocol::client_authenticate_h3(conn.clone(), &self.config.password)
+                .await?;
+            *self.h3_handle.lock().await = Some(h3);
+        }
         *conn_guard = Some(conn.clone());
         Ok(conn)
     }
@@ -125,23 +133,34 @@ impl Outbound for Hysteria2Outbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let mut stream: BoxedStream = if let Some(ref d) = self.dialer {
-            d.dial().await?
+        if let Some(ref d) = self.dialer {
+            let mut stream = d.dial().await?;
+            let auth_frame = Hysteria2Protocol::build_auth_frame(&self.config.password);
+            let req_frame =
+                Hysteria2Protocol::build_request_frame(HYSTERIA2_CMD_TCP, &meta.destination);
+
+            stream.write_all(&auth_frame).await.map_err(FluxError::Io)?;
+            stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
+            stream.flush().await.map_err(FluxError::Io)?;
+            Ok(stream)
         } else {
             let conn = self.get_connection().await?;
-            Box::new(QuicTransport::open_bi_stream(&conn).await?)
-        };
-
-        // Send Hysteria 2 Auth + Request frames over the stream
-        let auth_frame = Hysteria2Protocol::build_auth_frame(&self.config.password);
-        let req_frame =
-            Hysteria2Protocol::build_request_frame(HYSTERIA2_CMD_TCP, &meta.destination);
-
-        stream.write_all(&auth_frame).await.map_err(FluxError::Io)?;
-        stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
-        stream.flush().await.map_err(FluxError::Io)?;
-
-        Ok(stream)
+            let mut stream = QuicTransport::open_bi_stream(&conn).await?;
+            if self.config.h3 {
+                let req_frame = Hysteria2Protocol::encode_tcp_request(&meta.destination);
+                stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
+                stream.flush().await.map_err(FluxError::Io)?;
+                Hysteria2Protocol::read_tcp_response(&mut stream).await?;
+            } else {
+                let auth_frame = Hysteria2Protocol::build_auth_frame(&self.config.password);
+                let req_frame =
+                    Hysteria2Protocol::build_request_frame(HYSTERIA2_CMD_TCP, &meta.destination);
+                stream.write_all(&auth_frame).await.map_err(FluxError::Io)?;
+                stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
+                stream.flush().await.map_err(FluxError::Io)?;
+            }
+            Ok(Box::new(stream))
+        }
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
@@ -231,6 +250,7 @@ mod tests {
             insecure: false,
             server_name: None,
             obfs: None,
+            h3: false,
         };
         let resolver = Arc::new(flux_dns::DnsResolver::new(None));
         let outbound = Hysteria2Outbound::new("hy2-out", cfg, resolver);

@@ -421,7 +421,9 @@ impl ShadowTlsHandshake {
             .map_err(FluxError::Io)?;
 
         if resp_body.len() < 38 {
-            return Err(FluxError::Crypto("invalid ServerHello length in ShadowTLS".into()));
+            return Err(FluxError::Crypto(
+                "invalid ServerHello length in ShadowTLS".into(),
+            ));
         }
         let server_random = &resp_body[6..38];
         let stream = ShadowTlsStream::new_client(stream, &cfg.password, server_random);
@@ -577,7 +579,9 @@ fn build_tls_client_hello(server_name: &str, password: &str) -> Vec<u8> {
     extensions.extend_from_slice(&[0x00, 0x0a, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1d, 0x00, 0x17]);
 
     // Signature algorithms (0x000d)
-    extensions.extend_from_slice(&[0x00, 0x0d, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01]);
+    extensions.extend_from_slice(&[
+        0x00, 0x0d, 0x00, 0x08, 0x00, 0x06, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01,
+    ]);
 
     // Key share (0x0033): x25519 with 32 bytes
     let mut key_share_rand = [0u8; 32];

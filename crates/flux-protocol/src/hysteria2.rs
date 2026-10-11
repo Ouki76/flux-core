@@ -23,6 +23,8 @@ pub struct Hysteria2Config {
     pub server_name: Option<String>,
     #[serde(default)]
     pub obfs: Option<String>,
+    #[serde(default)]
+    pub h3: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -173,6 +175,210 @@ fn constant_time_eq_str(a: &str, b: &str) -> bool {
 pub struct Hysteria2Protocol;
 
 impl Hysteria2Protocol {
+    /// Encodes a uint64 into RFC 9000 QUIC variable-length integer format.
+    pub fn put_quic_varint(val: u64, buf: &mut Vec<u8>) {
+        if val <= 63 {
+            buf.push(val as u8);
+        } else if val <= 16383 {
+            let be = (val as u16) | 0x4000;
+            buf.extend_from_slice(&be.to_be_bytes());
+        } else if val <= 1073741823 {
+            let be = (val as u32) | 0x80000000;
+            buf.extend_from_slice(&be.to_be_bytes());
+        } else {
+            let be = val | 0xc000000000000000;
+            buf.extend_from_slice(&be.to_be_bytes());
+        }
+    }
+
+    /// Reads an RFC 9000 QUIC variable-length integer from an asynchronous stream.
+    pub async fn read_quic_varint<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> FluxResult<u64> {
+        use tokio::io::AsyncReadExt;
+        let mut first = [0u8; 1];
+        reader.read_exact(&mut first).await.map_err(FluxError::Io)?;
+        let prefix = first[0] >> 6;
+        let len = match prefix {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+        let mut val = (first[0] & 0x3f) as u64;
+        for _ in 1..len {
+            let mut b = [0u8; 1];
+            reader.read_exact(&mut b).await.map_err(FluxError::Io)?;
+            val = (val << 8) | (b[0] as u64);
+        }
+        Ok(val)
+    }
+
+    /// Encodes a standard Hysteria 2 TCPRequest frame (0x401).
+    pub fn encode_tcp_request(target: &TargetAddress) -> Vec<u8> {
+        let addr_str = match target {
+            TargetAddress::Ip(sa) => sa.to_string(),
+            TargetAddress::Domain(d, p) => format!("{}:{}", d, p),
+        };
+        let mut buf = Vec::with_capacity(32 + addr_str.len());
+        Self::put_quic_varint(0x401, &mut buf);
+        Self::put_quic_varint(addr_str.len() as u64, &mut buf);
+        buf.extend_from_slice(addr_str.as_bytes());
+        Self::put_quic_varint(0, &mut buf); // padding length = 0
+        buf
+    }
+
+    /// Reads and verifies a standard Hysteria 2 TCPResponse frame.
+    pub async fn read_tcp_response<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> FluxResult<()> {
+        use tokio::io::AsyncReadExt;
+        let mut status = [0u8; 1];
+        reader
+            .read_exact(&mut status)
+            .await
+            .map_err(FluxError::Io)?;
+        let msg_len = Self::read_quic_varint(reader).await?;
+        if msg_len > 0 {
+            let mut msg_buf = vec![0u8; msg_len as usize];
+            reader
+                .read_exact(&mut msg_buf)
+                .await
+                .map_err(FluxError::Io)?;
+        }
+        let pad_len = Self::read_quic_varint(reader).await?;
+        if pad_len > 0 {
+            let mut pad_buf = vec![0u8; pad_len as usize];
+            reader
+                .read_exact(&mut pad_buf)
+                .await
+                .map_err(FluxError::Io)?;
+        }
+        if status[0] != 0 {
+            return Err(FluxError::AuthFailed(
+                "Hysteria 2 server rejected TCP request".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reads and parses an incoming standard Hysteria 2 TCPRequest frame (0x401).
+    pub async fn read_tcp_request<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> FluxResult<TargetAddress> {
+        use tokio::io::AsyncReadExt;
+        let frame_type = Self::read_quic_varint(reader).await?;
+        if frame_type != 0x401 {
+            return Err(FluxError::Protocol {
+                protocol: "hysteria2",
+                message: format!("unexpected frame type: {:#x}", frame_type),
+            });
+        }
+        let addr_len = Self::read_quic_varint(reader).await? as usize;
+        let mut addr_buf = vec![0u8; addr_len];
+        reader
+            .read_exact(&mut addr_buf)
+            .await
+            .map_err(FluxError::Io)?;
+        let addr_str = std::str::from_utf8(&addr_buf).map_err(|e| FluxError::Protocol {
+            protocol: "hysteria2",
+            message: e.to_string(),
+        })?;
+        let pad_len = Self::read_quic_varint(reader).await? as usize;
+        if pad_len > 0 {
+            let mut pad_buf = vec![0u8; pad_len];
+            reader
+                .read_exact(&mut pad_buf)
+                .await
+                .map_err(FluxError::Io)?;
+        }
+        if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+            Ok(TargetAddress::Ip(sa))
+        } else if let Some((d, p_str)) = addr_str.rsplit_once(':')
+            && let Ok(p) = p_str.parse::<u16>()
+        {
+            Ok(TargetAddress::domain(d, p))
+        } else {
+            Err(FluxError::Protocol {
+                protocol: "hysteria2",
+                message: format!("invalid target address: {}", addr_str),
+            })
+        }
+    }
+
+    /// Encodes a standard Hysteria 2 TCPResponse frame.
+    pub fn encode_tcp_response(ok: bool, msg: &str) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16 + msg.len());
+        buf.push(if ok { 0 } else { 1 });
+        Self::put_quic_varint(msg.len() as u64, &mut buf);
+        buf.extend_from_slice(msg.as_bytes());
+        Self::put_quic_varint(0, &mut buf); // padding length = 0
+        buf
+    }
+
+    /// Authenticates client with Hysteria 2 server using HTTP/3, returning a keeper that keeps HTTP/3 alive.
+    pub async fn client_authenticate_h3(
+        conn: quinn::Connection,
+        password: &str,
+    ) -> FluxResult<Box<dyn std::any::Any + Send + Sync>> {
+        let auth_fut = async {
+            let h3_conn = h3_quinn::Connection::new(conn);
+            let (driver, mut send_request) =
+                h3::client::new(h3_conn)
+                    .await
+                    .map_err(|e| FluxError::Protocol {
+                        protocol: "hysteria2",
+                        message: format!("HTTP/3 client init failed: {}", e),
+                    })?;
+
+            tokio::spawn(async move {
+                let mut d = driver;
+                let _ = std::future::poll_fn(|cx| d.poll_close(cx)).await;
+            });
+
+            let req = http::Request::builder()
+                .method("POST")
+                .uri("https://hysteria/auth")
+                .header("Hysteria-Auth", password)
+                .header("Hysteria-CC-RX", "0")
+                .body(())
+                .map_err(|e| FluxError::Protocol {
+                    protocol: "hysteria2",
+                    message: e.to_string(),
+                })?;
+
+            let mut stream =
+                send_request
+                    .send_request(req)
+                    .await
+                    .map_err(|e| FluxError::Protocol {
+                        protocol: "hysteria2",
+                        message: format!("HTTP/3 send_request failed: {}", e),
+                    })?;
+
+            let resp = stream
+                .recv_response()
+                .await
+                .map_err(|e| FluxError::Protocol {
+                    protocol: "hysteria2",
+                    message: format!("HTTP/3 auth response failed: {}", e),
+                })?;
+
+            if resp.status().as_u16() != 233 {
+                return Err(FluxError::AuthFailed(format!(
+                    "Hysteria 2 authentication rejected with HTTP status {}",
+                    resp.status()
+                )));
+            }
+
+            Ok(Box::new(send_request) as Box<dyn std::any::Any + Send + Sync>)
+        };
+
+        tokio::time::timeout(Duration::from_millis(500), auth_fut)
+            .await
+            .map_err(|_| FluxError::Timeout("HTTP/3 authentication timed out".into()))?
+    }
+
     /// Formats a client authentication frame for Hysteria 2.
     pub fn build_auth_frame(password: &str) -> Vec<u8> {
         let pw_bytes = password.as_bytes();

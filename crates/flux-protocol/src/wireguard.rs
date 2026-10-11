@@ -5,6 +5,7 @@
 //! and custom message types (`h1`..`h4`). It is experimental and intended for use with AmneziaWG
 //! obfuscating peers.
 
+use blake2::Blake2s256;
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce as ChaChaNonce,
     aead::{Aead, KeyInit},
@@ -13,7 +14,63 @@ use flux_types::{FluxError, FluxResult, TargetAddress};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+fn hmac_blake2s(key: &[u8], data: &[u8]) -> [u8; 32] {
+    use blake2::Digest;
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let hash = Blake2s256::digest(key);
+        k[..32].copy_from_slice(&hash);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0u8; 64];
+    let mut opad = [0u8; 64];
+    for i in 0..64 {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+
+    let mut inner = Blake2s256::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+
+    let mut outer = Blake2s256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    outer.finalize().into()
+}
+
+fn kdf1(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    let t0 = hmac_blake2s(key, data);
+    hmac_blake2s(&t0, &[0x01])
+}
+
+fn kdf2(key: &[u8; 32], data: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let t0 = hmac_blake2s(key, data);
+    let t1 = hmac_blake2s(&t0, &[0x01]);
+    let mut t2_in = [0u8; 33];
+    t2_in[..32].copy_from_slice(&t1);
+    t2_in[32] = 0x02;
+    let t2 = hmac_blake2s(&t0, &t2_in);
+    (t1, t2)
+}
+
+fn kdf3(key: &[u8; 32], data: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
+    let t0 = hmac_blake2s(key, data);
+    let t1 = hmac_blake2s(&t0, &[0x01]);
+    let mut t2_in = [0u8; 33];
+    t2_in[..32].copy_from_slice(&t1);
+    t2_in[32] = 0x02;
+    let t2 = hmac_blake2s(&t0, &t2_in);
+    let mut t3_in = [0u8; 33];
+    t3_in[..32].copy_from_slice(&t2);
+    t3_in[32] = 0x03;
+    let t3 = hmac_blake2s(&t0, &t3_in);
+    (t1, t2, t3)
+}
 
 /// Standard WireGuard default message types
 pub const WG_MSG_INITIATION: u8 = 1;
@@ -215,6 +272,32 @@ impl WireGuardSession {
     }
 }
 
+fn blake2s_hash(data: &[u8]) -> [u8; 32] {
+    use blake2::Digest;
+    let mut hasher = Blake2s256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+fn blake2s_mix_hash(h: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    use blake2::Digest;
+    let mut hasher = Blake2s256::new();
+    hasher.update(h);
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+#[derive(Clone, Debug)]
+pub struct WireGuardHandshakeState {
+    pub c: [u8; 32],
+    pub h: [u8; 32],
+    pub local_static_priv: [u8; 32],
+    pub ephemeral_priv: [u8; 32],
+    pub local_index: u32,
+    pub awg: AwgConfig,
+    pub psk: Option<[u8; 32]>,
+}
+
 pub struct WireGuardHandshake;
 
 impl WireGuardHandshake {
@@ -237,79 +320,336 @@ impl WireGuardHandshake {
         packets
     }
 
-    /// Creates a WireGuard / AmneziaWG handshake initiation packet.
+    /// Creates an authentic WireGuard / AmneziaWG Noise IK handshake initiation packet.
     pub fn create_initiation(
         local_static: &StaticSecret,
         peer_public: &X25519PublicKey,
         sender_index: u32,
         awg: &AwgConfig,
-    ) -> (Vec<u8>, [u8; 32], [u8; 32]) {
-        let ephemeral_secret = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        psk: Option<[u8; 32]>,
+    ) -> (Vec<u8>, WireGuardHandshakeState) {
+        let initial_construction = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+        let initial_identifier = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
+
+        let mut c0 = blake2s_hash(initial_construction);
+        let h0 = blake2s_mix_hash(&c0, initial_identifier);
+        let h1 = blake2s_mix_hash(&h0, peer_public.as_bytes());
+
+        let mut ephemeral_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut ephemeral_bytes);
+        let ephemeral_secret = StaticSecret::from(ephemeral_bytes);
         let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
 
-        let shared_ephemeral = ephemeral_secret.diffie_hellman(peer_public);
-        let shared_static = local_static.diffie_hellman(peer_public);
+        let h2 = blake2s_mix_hash(&h1, ephemeral_public.as_bytes());
+        c0 = kdf1(&c0, ephemeral_public.as_bytes());
 
-        // Derive keying material using SHA256 / HKDF
-        let mut hash = sha2::Sha256::default();
-        use sha2::Digest;
-        hash.update(b"WireGuard v1 zx2c4 Jason@zx2c4.com");
-        let chain_key = hash.finalize();
+        // Diffie-Hellman 1: Ephemeral - Peer Static
+        let ss_es = ephemeral_secret.diffie_hellman(peer_public);
+        let (c1, k_static) = kdf2(&c0, ss_es.as_bytes());
 
-        let mut send_key = [0u8; 32];
-        let mut recv_key = [0u8; 32];
-        send_key.copy_from_slice(shared_ephemeral.as_bytes());
-        recv_key.copy_from_slice(shared_static.as_bytes());
+        // Encrypt local static public key
+        let local_pub = X25519PublicKey::from(local_static);
+        let cipher_static = ChaCha20Poly1305::new_from_slice(&k_static).unwrap();
+        let enc_static = cipher_static
+            .encrypt(
+                &ChaChaNonce::from([0u8; 12]),
+                chacha20poly1305::aead::Payload {
+                    msg: local_pub.as_bytes(),
+                    aad: &h2,
+                },
+            )
+            .unwrap();
+        let h3 = blake2s_mix_hash(&h2, &enc_static);
 
-        // Header: [S1 junk padding] + [H1 message type] + [sender_index (4)] + [unencrypted ephemeral (32)] + [encrypted static (48)] + [timestamp (28)] + [mac1 (16)] + [mac2 (16)]
+        // Diffie-Hellman 2: Static - Peer Static
+        let ss_ss = local_static.diffie_hellman(peer_public);
+        let (c2, k_ts) = kdf2(&c1, ss_ss.as_bytes());
+
+        // TAI64N timestamp (12 bytes)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let tai64_sec = now.as_secs().wrapping_add(0x4000_0000_0000_000a);
+        let tai64_nano = now.subsec_nanos();
+        let mut tai64n = [0u8; 12];
+        tai64n[0..8].copy_from_slice(&tai64_sec.to_be_bytes());
+        tai64n[8..12].copy_from_slice(&tai64_nano.to_be_bytes());
+
+        let cipher_ts = ChaCha20Poly1305::new_from_slice(&k_ts).unwrap();
+        let enc_ts = cipher_ts
+            .encrypt(
+                &ChaChaNonce::from([0u8; 12]),
+                chacha20poly1305::aead::Payload {
+                    msg: &tai64n,
+                    aad: &h3,
+                },
+            )
+            .unwrap();
+        let h4 = blake2s_mix_hash(&h3, &enc_ts);
+
+        // Packet formatting
         let mut packet = Vec::with_capacity(cfg_packet_len(awg));
-
-        // S1 junk prefix
         if awg.s1 > 0 {
             let mut s1_bytes = vec![0u8; awg.s1 as usize];
             rand::rngs::OsRng.fill_bytes(&mut s1_bytes);
             packet.extend_from_slice(&s1_bytes);
         }
-
         packet.extend_from_slice(&awg.h1.to_le_bytes());
         packet.extend_from_slice(&sender_index.to_le_bytes());
         packet.extend_from_slice(ephemeral_public.as_bytes());
-
-        // Encrypt static public key (32 bytes + 16 bytes tag)
-        let local_pub = X25519PublicKey::from(local_static);
-        let aead = match ChaCha20Poly1305::new_from_slice(chain_key.as_slice()) {
-            Ok(a) => a,
-            Err(_) => return (Vec::new(), [0u8; 32], [0u8; 32]),
-        };
-        let enc_static = match aead.encrypt(
-            &ChaChaNonce::from([0u8; 12]),
-            local_pub.as_bytes().as_slice(),
-        ) {
-            Ok(e) => e,
-            Err(_) => return (Vec::new(), [0u8; 32], [0u8; 32]),
-        };
         packet.extend_from_slice(&enc_static);
-
-        // Encrypted timestamp
-        let now_ns = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let enc_ts = match aead.encrypt(
-            &ChaChaNonce::from([1u8; 12]),
-            now_ns.to_be_bytes().as_slice(),
-        ) {
-            Ok(e) => e,
-            Err(_) => return (Vec::new(), [0u8; 32], [0u8; 32]),
-        };
         packet.extend_from_slice(&enc_ts);
 
-        // MAC1 and MAC2 placeholders
-        let mut macs = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut macs);
-        packet.extend_from_slice(&macs);
+        // Mac1 (16 bytes)
+        let mac1_key = blake2s_mix_hash(&blake2s_hash(b"mac1----"), peer_public.as_bytes());
+        let mac1 = hmac_blake2s(&mac1_key, &packet[awg.s1 as usize..]);
+        packet.extend_from_slice(&mac1[..16]);
 
-        (packet, send_key, recv_key)
+        // Mac2 (16 zero bytes)
+        packet.extend_from_slice(&[0u8; 16]);
+
+        let state = WireGuardHandshakeState {
+            c: c2,
+            h: h4,
+            local_static_priv: local_static.to_bytes(),
+            ephemeral_priv: ephemeral_bytes,
+            local_index: sender_index,
+            awg: awg.clone(),
+            psk,
+        };
+
+        (packet, state)
+    }
+
+    /// Consumes and validates a WireGuard / AmneziaWG Handshake Response (Message 2),
+    /// deriving genuine ChaCha20-Poly1305 transport session keys.
+    pub fn consume_response(
+        state: WireGuardHandshakeState,
+        packet: &[u8],
+    ) -> FluxResult<WireGuardSession> {
+        let prefix_len = state.awg.s2 as usize;
+        let expected_msg_len = prefix_len + 4 + 4 + 4 + 32 + 16 + 16 + 16;
+        if packet.len() < expected_msg_len {
+            return Err(FluxError::Protocol {
+                protocol: "wireguard",
+                message: "handshake response packet too short".into(),
+            });
+        }
+
+        let body = &packet[prefix_len..];
+        let msg_type = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        if msg_type != state.awg.h2 {
+            return Err(FluxError::Protocol {
+                protocol: "wireguard",
+                message: format!("unexpected response message type: {}", msg_type),
+            });
+        }
+
+        let server_index = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let receiver_index = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        if receiver_index != state.local_index {
+            return Err(FluxError::AuthFailed(
+                "mismatched receiver index in handshake response".into(),
+            ));
+        }
+
+        let mut server_ephemeral_bytes = [0u8; 32];
+        server_ephemeral_bytes.copy_from_slice(&body[12..44]);
+        let server_ephemeral = X25519PublicKey::from(server_ephemeral_bytes);
+
+        let h5 = blake2s_mix_hash(&state.h, &server_ephemeral_bytes);
+        let c3 = kdf1(&state.c, &server_ephemeral_bytes);
+
+        // DH 3: Ephemeral - Ephemeral
+        let ephemeral_secret = StaticSecret::from(state.ephemeral_priv);
+        let ss_ee = ephemeral_secret.diffie_hellman(&server_ephemeral);
+        let c4 = kdf1(&c3, ss_ee.as_bytes());
+
+        // DH 4: Local Static - Ephemeral
+        let local_static = StaticSecret::from(state.local_static_priv);
+        let ss_se = local_static.diffie_hellman(&server_ephemeral);
+        let c5 = kdf1(&c4, ss_se.as_bytes());
+
+        // PSK mix
+        let psk_bytes = state.psk.unwrap_or([0u8; 32]);
+        let (c6, tau, k_empty) = kdf3(&c5, &psk_bytes);
+        let h6 = blake2s_mix_hash(&h5, &tau);
+
+        // Verify empty payload authentication tag
+        let enc_empty = &body[44..60];
+        let cipher_empty = ChaCha20Poly1305::new_from_slice(&k_empty).unwrap();
+        cipher_empty
+            .decrypt(
+                &ChaChaNonce::from([0u8; 12]),
+                chacha20poly1305::aead::Payload {
+                    msg: enc_empty,
+                    aad: &h6,
+                },
+            )
+            .map_err(|e| {
+                FluxError::AuthFailed(format!("invalid handshake response MAC tag: {}", e))
+            })?;
+
+        // Derive final transport keys
+        let (send_key, recv_key) = kdf2(&c6, b"");
+
+        Ok(WireGuardSession::new(
+            send_key,
+            recv_key,
+            state.local_index,
+            server_index,
+            Some(state.awg),
+        ))
+    }
+
+    /// Server side: processes Handshake Initiation (Message 1) and formats Handshake Response (Message 2),
+    /// deriving genuine ChaCha20-Poly1305 transport session keys.
+    pub fn respond_to_initiation(
+        local_static: &StaticSecret,
+        receiver_index: u32,
+        awg: &AwgConfig,
+        init_pkt: &[u8],
+        psk: Option<[u8; 32]>,
+    ) -> FluxResult<(Vec<u8>, WireGuardSession)> {
+        let prefix_len = awg.s1 as usize;
+        let expected_min_len = prefix_len + 4 + 4 + 32 + 48 + 28 + 32;
+        if init_pkt.len() < expected_min_len {
+            return Err(FluxError::Protocol {
+                protocol: "wireguard",
+                message: "initiation packet too short".into(),
+            });
+        }
+
+        let body = &init_pkt[prefix_len..];
+        let msg_type = u32::from_le_bytes(body[0..4].try_into().unwrap());
+        if msg_type != awg.h1 {
+            return Err(FluxError::Protocol {
+                protocol: "wireguard",
+                message: format!("unexpected initiation message type: {}", msg_type),
+            });
+        }
+
+        let client_index = u32::from_le_bytes(body[4..8].try_into().unwrap());
+        let mut client_ephemeral_bytes = [0u8; 32];
+        client_ephemeral_bytes.copy_from_slice(&body[8..40]);
+        let client_ephemeral = X25519PublicKey::from(client_ephemeral_bytes);
+
+        let initial_construction = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+        let initial_identifier = b"WireGuard v1 zx2c4 Jason@zx2c4.com";
+        let local_pub = X25519PublicKey::from(local_static);
+
+        let c0 = blake2s_hash(initial_construction);
+        let h0 = blake2s_mix_hash(&c0, initial_identifier);
+        let h1 = blake2s_mix_hash(&h0, local_pub.as_bytes());
+        let h2 = blake2s_mix_hash(&h1, &client_ephemeral_bytes);
+        let c0 = kdf1(&c0, &client_ephemeral_bytes);
+
+        // DH 1: Client Ephemeral - Responder Static
+        let ss_es = local_static.diffie_hellman(&client_ephemeral);
+        let (c1, k_static) = kdf2(&c0, ss_es.as_bytes());
+
+        // Decrypt client static public key
+        let enc_static = &body[40..88];
+        let cipher_static = ChaCha20Poly1305::new_from_slice(&k_static).unwrap();
+        let client_pub_bytes = cipher_static
+            .decrypt(
+                &ChaChaNonce::from([0u8; 12]),
+                chacha20poly1305::aead::Payload {
+                    msg: enc_static,
+                    aad: &h2,
+                },
+            )
+            .map_err(|e| {
+                FluxError::AuthFailed(format!("failed to decrypt static pub in initiation: {}", e))
+            })?;
+
+        let h3 = blake2s_mix_hash(&h2, enc_static);
+        let mut client_static_arr = [0u8; 32];
+        client_static_arr.copy_from_slice(&client_pub_bytes);
+        let client_static = X25519PublicKey::from(client_static_arr);
+
+        // DH 2: Client Static - Responder Static
+        let ss_ss = local_static.diffie_hellman(&client_static);
+        let (c2, k_ts) = kdf2(&c1, ss_ss.as_bytes());
+
+        // Decrypt timestamp
+        let enc_ts = &body[88..116];
+        let cipher_ts = ChaCha20Poly1305::new_from_slice(&k_ts).unwrap();
+        let _ts = cipher_ts
+            .decrypt(
+                &ChaChaNonce::from([0u8; 12]),
+                chacha20poly1305::aead::Payload {
+                    msg: enc_ts,
+                    aad: &h3,
+                },
+            )
+            .map_err(|e| {
+                FluxError::AuthFailed(format!("failed to decrypt timestamp in initiation: {}", e))
+            })?;
+        let h4 = blake2s_mix_hash(&h3, enc_ts);
+
+        // Generate responder ephemeral key
+        let mut server_ephemeral_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut server_ephemeral_bytes);
+        let server_ephemeral_secret = StaticSecret::from(server_ephemeral_bytes);
+        let server_ephemeral_pub = X25519PublicKey::from(&server_ephemeral_secret);
+
+        let h5 = blake2s_mix_hash(&h4, server_ephemeral_pub.as_bytes());
+        let c3 = kdf1(&c2, server_ephemeral_pub.as_bytes());
+
+        // DH 3: Server Ephemeral - Client Ephemeral
+        let ss_ee = server_ephemeral_secret.diffie_hellman(&client_ephemeral);
+        let c4 = kdf1(&c3, ss_ee.as_bytes());
+
+        // DH 4: Server Ephemeral - Client Static
+        let ss_se = server_ephemeral_secret.diffie_hellman(&client_static);
+        let c5 = kdf1(&c4, ss_se.as_bytes());
+
+        // PSK mix
+        let psk_bytes = psk.unwrap_or([0u8; 32]);
+        let (c6, tau, k_empty) = kdf3(&c5, &psk_bytes);
+        let h6 = blake2s_mix_hash(&h5, &tau);
+
+        // Encrypt empty payload
+        let cipher_empty = ChaCha20Poly1305::new_from_slice(&k_empty).unwrap();
+        let enc_empty = cipher_empty
+            .encrypt(
+                &ChaChaNonce::from([0u8; 12]),
+                chacha20poly1305::aead::Payload { msg: b"", aad: &h6 },
+            )
+            .unwrap();
+
+        // Response packet format: [S2 prefix] + [H2] + [sender_index (4)] + [receiver_index (4)] + [server_ephemeral (32)] + [enc_empty (16)] + [mac1 (16)] + [mac2 (16)]
+        let mut resp_pkt = Vec::with_capacity(awg.s2 as usize + 4 + 4 + 4 + 32 + 16 + 16 + 16);
+        if awg.s2 > 0 {
+            let mut s2_bytes = vec![0u8; awg.s2 as usize];
+            rand::rngs::OsRng.fill_bytes(&mut s2_bytes);
+            resp_pkt.extend_from_slice(&s2_bytes);
+        }
+        resp_pkt.extend_from_slice(&awg.h2.to_le_bytes());
+        resp_pkt.extend_from_slice(&receiver_index.to_le_bytes());
+        resp_pkt.extend_from_slice(&client_index.to_le_bytes());
+        resp_pkt.extend_from_slice(server_ephemeral_pub.as_bytes());
+        resp_pkt.extend_from_slice(&enc_empty);
+
+        // Mac1 (16 bytes)
+        let mac1_key = blake2s_mix_hash(&blake2s_hash(b"mac1----"), client_static.as_bytes());
+        let mac1 = hmac_blake2s(&mac1_key, &resp_pkt[awg.s2 as usize..]);
+        resp_pkt.extend_from_slice(&mac1[..16]);
+        resp_pkt.extend_from_slice(&[0u8; 16]); // mac2
+
+        let (client_send, client_recv) = kdf2(&c6, b"");
+
+        // Server sends on client_recv and receives on client_send
+        let session = WireGuardSession::new(
+            client_recv,
+            client_send,
+            receiver_index,
+            client_index,
+            Some(awg.clone()),
+        );
+
+        Ok((resp_pkt, session))
     }
 }
 
@@ -347,19 +687,24 @@ mod tests {
         let peer_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
         let peer_pub = X25519PublicKey::from(&peer_secret);
 
-        let (init_pkt, send_k, recv_k) =
-            WireGuardHandshake::create_initiation(&static_secret, &peer_pub, 1337, &awg);
+        let (init_pkt, state) =
+            WireGuardHandshake::create_initiation(&static_secret, &peer_pub, 1337, &awg, None);
         assert!(init_pkt.len() > 140);
         // Verify S1 junk prefix length and H1 message type
         assert_eq!(&init_pkt[16..20], &101u32.to_le_bytes());
 
-        // Session data packet encryption with H4 message type
-        let mut session = WireGuardSession::new(send_k, recv_k, 1337, 7331, Some(awg.clone()));
+        // Responder processes Message 1 and sends Message 2
+        let (resp_pkt, mut recv_session) =
+            WireGuardHandshake::respond_to_initiation(&peer_secret, 7331, &awg, &init_pkt, None)
+                .unwrap();
+
+        // Initiator consumes Message 2 and derives matching session
+        let mut session = WireGuardHandshake::consume_response(state, &resp_pkt).unwrap();
+
         let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let data_pkt = session.encrypt_data_packet(payload).unwrap();
 
         assert_eq!(&data_pkt[0..4], &104u32.to_le_bytes());
-        let mut recv_session = WireGuardSession::new(recv_k, send_k, 7331, 1337, Some(awg));
         let decrypted = recv_session.decrypt_data_packet(&data_pkt).unwrap();
         assert_eq!(&decrypted, payload);
 
@@ -408,11 +753,12 @@ mod tests {
         let peer_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
         let peer_pub = X25519PublicKey::from(&peer_secret);
 
-        let (_init_pkt, send_k, recv_k) =
-            WireGuardHandshake::create_initiation(&static_secret, &peer_pub, 1337, &awg);
-
-        let mut send_session = WireGuardSession::new(send_k, recv_k, 1337, 7331, Some(awg.clone()));
-        let mut recv_session = WireGuardSession::new(recv_k, send_k, 7331, 1337, Some(awg));
+        let (init_pkt, state) =
+            WireGuardHandshake::create_initiation(&static_secret, &peer_pub, 1337, &awg, None);
+        let (resp_pkt, mut recv_session) =
+            WireGuardHandshake::respond_to_initiation(&peer_secret, 7331, &awg, &init_pkt, None)
+                .unwrap();
+        let mut send_session = WireGuardHandshake::consume_response(state, &resp_pkt).unwrap();
 
         // Generate legitimate packet with counter 0
         let legitimate_pkt_0 = send_session

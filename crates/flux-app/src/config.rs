@@ -441,6 +441,8 @@ pub enum ProtocolConfig {
         down_mbps: u64,
         #[serde(default)]
         hop_interval_secs: Option<u64>,
+        #[serde(default)]
+        h3: bool,
     },
     #[serde(rename = "tuic", alias = "tuic5")]
     Tuic {

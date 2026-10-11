@@ -59,12 +59,14 @@ impl WireGuardOutbound {
         // 2. Perform Handshake Initiation
         let local_static = StaticSecret::from(self.config.private_key);
         let peer_pub = X25519PublicKey::from(self.config.peer_public_key);
+        let sender_index = rand::random::<u32>();
 
-        let (init_pkt, send_k, recv_k) = WireGuardHandshake::create_initiation(
+        let (init_pkt, state) = WireGuardHandshake::create_initiation(
             &local_static,
             &peer_pub,
-            rand::random::<u32>(),
+            sender_index,
             &awg,
+            self.config.preshared_key,
         );
 
         socket
@@ -72,7 +74,17 @@ impl WireGuardOutbound {
             .await
             .map_err(FluxError::Io)?;
 
-        let session = WireGuardSession::new(send_k, recv_k, 1, 2, Some(awg));
+        // Receive Handshake Response (Message 2) with 5s timeout
+        let mut resp_buf = vec![0u8; 1024];
+        let (resp_len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            socket.recv_from(&mut resp_buf),
+        )
+        .await
+        .map_err(|_| FluxError::Timeout("WireGuard handshake response timed out".into()))?
+        .map_err(FluxError::Io)?;
+
+        let session = WireGuardHandshake::consume_response(state, &resp_buf[..resp_len])?;
         let session_arc = Arc::new(Mutex::new(session));
         *guard = Some(session_arc.clone());
         Ok(session_arc)

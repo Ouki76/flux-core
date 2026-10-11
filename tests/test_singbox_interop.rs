@@ -3032,10 +3032,7 @@ async fn test_interop_shadowtls_v3_flux_to_singbox() {
         sbox_port, password, b64_key
     );
     let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
-    let outbound = flux_inst
-        .registry
-        .get_outbound("sbox-stls-node")
-        .unwrap();
+    let outbound = flux_inst.registry.get_outbound("sbox-stls-node").unwrap();
 
     let meta = SessionMeta::new(
         "127.0.0.1:0".parse().unwrap(),
@@ -3045,6 +3042,66 @@ async fn test_interop_shadowtls_v3_flux_to_singbox() {
     );
     let mut stream = outbound.dial_stream(&meta).await.unwrap();
     let payload = b"ShadowTLS v3 + Shadowsocks 2022 flux-core -> sing-box verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+}
+
+#[tokio::test]
+async fn test_interop_hysteria2_quic_flux_to_singbox() {
+    let echo = start_tcp_echo_server().await;
+    let sbox_port = get_free_tcp_port().await;
+    let password = "hy2-secret-password-123";
+
+    let temp_dir = TempDir::new().unwrap();
+    let (cert_path, key_path) = generate_self_signed_cert(temp_dir.path());
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "hysteria2",
+                "tag": "hy2-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"password": "{}"}}],
+                "tls": {{
+                    "enabled": true,
+                    "certificate_path": "{}",
+                    "key_path": "{}"
+                }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_port,
+        password,
+        cert_path.display(),
+        key_path.display()
+    );
+    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "sbox-hy2-node",
+                "carrier": {{ "type": "udp", "address": "127.0.0.1:{}" }},
+                "security": {{ "type": "tls", "insecure": true, "sni": "localhost" }},
+                "protocol": {{ "type": "hysteria2", "password": "{}", "h3": true }}
+            }}]
+        }}"#,
+        sbox_port, password
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst.registry.get_outbound("sbox-hy2-node").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = outbound.dial_stream(&meta).await.unwrap();
+    let payload = b"Hysteria 2 QUIC flux-core -> sing-box verified!";
     stream.write_all(payload).await.unwrap();
     let mut buf = vec![0u8; payload.len()];
     stream.read_exact(&mut buf).await.unwrap();

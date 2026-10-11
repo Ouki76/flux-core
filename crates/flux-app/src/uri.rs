@@ -103,6 +103,7 @@ impl ProxySpec {
                     up_mbps: 100,
                     down_mbps: 100,
                     hop_interval_secs: None,
+                    h3: false,
                 }
             }
             "direct" => {

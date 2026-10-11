@@ -632,6 +632,7 @@ fn build_layered_outbound(
                 up_mbps,
                 down_mbps,
                 hop_interval_secs,
+                h3,
             } => {
                 let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
                     server: target.host(),
@@ -643,6 +644,7 @@ fn build_layered_outbound(
                     insecure: true,
                     server_name: None,
                     obfs: None,
+                    h3,
                 };
                 let out =
                     flux_outbound::Hysteria2Outbound::new(tag.clone(), hy2_cfg, resolver.clone());
@@ -680,7 +682,7 @@ fn build_layered_outbound(
         }
     }
 
-    let securities = compile_client_securities(node.security, &target.host())?;
+    let securities = compile_client_securities(node.security.clone(), &target.host())?;
     let framings = compile_client_framings(node.framing)?;
     let dialer: Arc<dyn flux_types::StreamDialer> =
         Arc::new(flux_outbound::LazyPipelineDialer::new_multi(
@@ -765,7 +767,23 @@ fn build_layered_outbound(
             up_mbps,
             down_mbps,
             hop_interval_secs,
+            h3,
         } => {
+            let mut insecure = false;
+            let mut server_name = None;
+            if let Some(ref sec_list) = node.security {
+                for sec in sec_list.as_slice() {
+                    if let SecurityConfig::Tls {
+                        sni, insecure: ins, ..
+                    } = sec
+                    {
+                        if let Some(s) = sni {
+                            server_name = Some(s.clone());
+                        }
+                        insecure = *ins;
+                    }
+                }
+            }
             let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
                 server: target.host(),
                 ports: vec![target.port()],
@@ -773,12 +791,16 @@ fn build_layered_outbound(
                 up_mbps,
                 down_mbps,
                 hop_interval_secs: hop_interval_secs.unwrap_or(30),
-                insecure: false,
-                server_name: None,
+                insecure,
+                server_name,
                 obfs: None,
+                h3,
             };
-            let out =
-                flux_outbound::Hysteria2Outbound::new_with_dialer(tag.clone(), hy2_cfg, dialer);
+            let out = if let CarrierConfig::Udp { .. } = node.carrier {
+                flux_outbound::Hysteria2Outbound::new(tag.clone(), hy2_cfg, resolver.clone())
+            } else {
+                flux_outbound::Hysteria2Outbound::new_with_dialer(tag.clone(), hy2_cfg, dialer)
+            };
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Tuic {
