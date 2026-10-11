@@ -78,13 +78,26 @@ impl AsyncRead for GrpcStream {
                         let mut val = 0u64;
                         let mut shift = 0;
                         let mut consumed = 0;
+                        let mut overflow = false;
+                        let mut terminated = false;
                         for &b in body.as_ref() {
                             consumed += 1;
+                            if shift >= 64 {
+                                overflow = true;
+                                break;
+                            }
                             val |= ((b & 0x7f) as u64) << shift;
                             if b & 0x80 == 0 {
+                                terminated = true;
                                 break;
                             }
                             shift += 7;
+                        }
+                        if overflow || !terminated || consumed > 10 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "malformed or unterminated protobuf varint length",
+                            )));
                         }
                         let _varint = body.split_to(consumed);
                         let data_len = (val as usize).min(body.len());
@@ -403,5 +416,40 @@ mod tests {
 
         cli.await.unwrap();
         srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_grpc_unterminated_protobuf_varint_rejected() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let srv = tokio::spawn(async move {
+            let mut srv_h2 = crate::h2::H2Transport::server_handshake(server_io)
+                .await
+                .unwrap();
+            // Send gRPC frame: 5-byte header indicating 3 bytes of payload
+            // Payload is 0x0A (field 1 tag) followed by unterminated varint [0x80, 0x80]
+            let frame = vec![0x00, 0x00, 0x00, 0x00, 3, 0x0A, 0x80, 0x80];
+            srv_h2.write_all(&frame).await.unwrap();
+            srv_h2.flush().await.unwrap();
+            srv_h2.shutdown().await.unwrap();
+        });
+
+        let cli = tokio::spawn(async move {
+            let mut cli_stream = GrpcTransport::client_handshake(
+                client_io,
+                "grpc.example.com",
+                "MyService",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+            let mut buf = vec![0u8; 64];
+            let err = cli_stream.read(&mut buf).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        });
+
+        srv.await.unwrap();
+        cli.await.unwrap();
     }
 }

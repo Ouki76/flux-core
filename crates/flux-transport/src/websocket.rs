@@ -685,7 +685,43 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = self.as_mut().get_mut();
+        // 1. Drain pending pong if present
+        while this.pending_pong_pos < this.pending_pong.len() {
+            let n = match Pin::new(&mut this.inner)
+                .poll_write(cx, &this.pending_pong[this.pending_pong_pos..])
+            {
+                Poll::Ready(Ok(n)) => n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            };
+            this.pending_pong_pos += n;
+            if this.pending_pong_pos == this.pending_pong.len() {
+                this.pending_pong.clear();
+                this.pending_pong_pos = 0;
+                break;
+            }
+        }
+        // 2. Drain write_buf
+        while this.write_pos < this.write_buf.len() {
+            let n =
+                match Pin::new(&mut this.inner).poll_write(cx, &this.write_buf[this.write_pos..]) {
+                    Poll::Ready(Ok(n)) => n,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                };
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to flush buffered websocket frame during shutdown",
+                )));
+            }
+            this.write_pos += n;
+        }
+        this.write_buf.clear();
+        this.write_pos = 0;
+        this.pending_chunk_len = 0;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -774,6 +810,29 @@ mod tests {
             let mut buf = [0u8; 32];
             let n = ws_client.read(&mut buf).await.unwrap();
             assert_eq!(n, 0); // Clean EOF!
+        });
+
+        server_task.await.unwrap();
+        client_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_websocket_shutdown_drains_buffer() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+
+        let server_task = tokio::spawn(async move {
+            let mut ws_server = server_handshake(server_io, None).await.unwrap();
+            let mut buf = vec![0u8; b"buffered on shutdown".len()];
+            ws_server.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"buffered on shutdown");
+        });
+
+        let client_task = tokio::spawn(async move {
+            let mut ws_client = client_handshake(client_io, "test.local", "/", &HashMap::new())
+                .await
+                .unwrap();
+            ws_client.write_all(b"buffered on shutdown").await.unwrap();
+            ws_client.shutdown().await.unwrap();
         });
 
         server_task.await.unwrap();

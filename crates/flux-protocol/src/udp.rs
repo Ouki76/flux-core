@@ -181,7 +181,7 @@ pub fn encode_vless_udp_packet(packet: &UdpPacket) -> Bytes {
 /// Decodes a standard VLESS UDP packet from an asynchronous stream.
 pub async fn decode_vless_udp_packet<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
-    default_dst: &TargetAddress,
+    _default_dst: &TargetAddress,
 ) -> FluxResult<UdpPacket> {
     use tokio::io::AsyncReadExt;
     let mut atyp_buf = [0u8; 1];
@@ -189,9 +189,7 @@ pub async fn decode_vless_udp_packet<R: tokio::io::AsyncRead + Unpin>(
         .read_exact(&mut atyp_buf)
         .await
         .map_err(FluxError::Io)?;
-    let target = crate::socks5::Socks5Handshake::read_address(reader, atyp_buf[0])
-        .await
-        .unwrap_or_else(|_| default_dst.clone());
+    let target = crate::socks5::Socks5Handshake::read_address(reader, atyp_buf[0]).await?;
 
     let mut len_buf = [0u8; 2];
     reader
@@ -237,5 +235,26 @@ mod tests {
         );
         let encoded = encode_trojan_udp(&packet);
         assert!(encoded.len() > 14);
+    }
+
+    #[tokio::test]
+    async fn test_decode_vless_udp_packet_invalid_atyp_fails() {
+        // Invalid ATYP = 0xFF
+        let data = [0xFFu8, 0x00, 0x05, b'h', b'e', b'l', b'l', b'o'];
+        let mut cursor = std::io::Cursor::new(&data);
+        let default_dst = TargetAddress::domain("example.com", 53);
+        let res = decode_vless_udp_packet(&mut cursor, &default_dst).await;
+        assert!(res.is_err(), "invalid atyp must return error");
+    }
+
+    #[tokio::test]
+    async fn test_decode_vless_udp_packet_truncated_payload_fails() {
+        // Valid ATYP IPv4 (0x01) + 127.0.0.1:53 + length 100 but stream ends early
+        let mut data = vec![0x01, 127, 0, 0, 1, 0, 53, 0, 100];
+        data.extend_from_slice(b"short");
+        let mut cursor = std::io::Cursor::new(&data);
+        let default_dst = TargetAddress::domain("example.com", 53);
+        let res = decode_vless_udp_packet(&mut cursor, &default_dst).await;
+        assert!(res.is_err(), "truncated payload must return error");
     }
 }

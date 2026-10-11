@@ -809,13 +809,22 @@ impl Inbound for TunInbound {
                                         )
                                     };
                                     if res < 0 {
-                                        Err(std::io::Error::last_os_error())
+                                        let err = std::io::Error::last_os_error();
+                                        if err.kind() == std::io::ErrorKind::WouldBlock {
+                                            Err(err)
+                                        } else {
+                                            tracing::warn!(
+                                                "TUN write error: {}, dropping packet",
+                                                err
+                                            );
+                                            Ok(0)
+                                        }
                                     } else {
                                         Ok(res as usize)
                                     }
                                 }) {
                                     Ok(_) => break,
-                                    Err(_would_block) => continue,
+                                    Err(_) => continue,
                                 }
                             }
                         }

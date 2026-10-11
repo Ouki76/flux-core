@@ -324,7 +324,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         // Step 1: If cipher is not yet initialized (waiting for salt from server)
-        if self.dec.is_none() {
+        while self.dec.is_none() {
             let pos = self.salt_pos;
             let salt_len = self.kind.salt_len();
             let mut tmp = vec![0u8; salt_len - pos];
@@ -333,15 +333,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                 Poll::Ready(Ok(())) => {
                     let n = tmp_buf.filled().len();
                     if n == 0 {
-                        return Poll::Ready(Ok(()));
+                        if self.salt_pos == 0 {
+                            return Poll::Ready(Ok(()));
+                        } else {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF reading shadowsocks salt",
+                            )));
+                        }
                     }
                     self.salt_buf[pos..pos + n].copy_from_slice(&tmp[..n]);
                     self.salt_pos += n;
                     if self.salt_pos == salt_len {
                         let subkey = derive_subkey(&self.master_key, &self.salt_buf);
                         self.dec = Some(ShadowsocksCipher::with_kind(self.kind, &subkey));
-                    } else {
-                        return Poll::Pending;
+                        break;
                     }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -374,7 +380,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                     Poll::Ready(Ok(())) => {
                         let n = ltmp_buf.filled().len();
                         if n == 0 {
-                            return Poll::Ready(Ok(())); // Clean EOF
+                            if self.len_pos == 0 {
+                                return Poll::Ready(Ok(())); // Clean EOF
+                            }
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "unexpected EOF reading shadowsocks chunk length",
+                            )));
                         }
                         self.len_buf[lpos..lpos + n].copy_from_slice(&ltmp[..n]);
                         self.len_pos += n;
@@ -658,5 +670,38 @@ mod tests {
 
         srv_task.await.unwrap();
         cli_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_shadowsocks_truncated_salt_returns_unexpected_eof() {
+        let (mut client_raw, server_raw) = tokio::io::duplex(1024);
+        let master = derive_master_key("secret123");
+        let enc = ShadowsocksCipher::new(&derive_subkey(&master, &[0u8; 32]));
+        let mut stream = ShadowsocksStream::new(server_raw, enc, None, &master);
+
+        // Send only 10 bytes of 32-byte salt and close
+        client_raw.write_all(&[0x11; 10]).await.unwrap();
+        drop(client_raw);
+
+        let mut buf = [0u8; 32];
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn test_shadowsocks_truncated_chunk_len_returns_unexpected_eof() {
+        let (mut client_raw, server_raw) = tokio::io::duplex(1024);
+        let master = derive_master_key("secret123");
+        let enc = ShadowsocksCipher::new(&derive_subkey(&master, &[0u8; 32]));
+        let mut stream = ShadowsocksStream::new(server_raw, enc, None, &master);
+
+        // Send full 32-byte salt, followed by only 5 bytes of 18-byte length chunk, then close
+        client_raw.write_all(&[0x11; 32]).await.unwrap();
+        client_raw.write_all(&[0x22; 5]).await.unwrap();
+        drop(client_raw);
+
+        let mut buf = [0u8; 32];
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

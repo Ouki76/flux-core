@@ -135,6 +135,8 @@ impl Inbound for VmessInbound {
                         req.session_key,
                         req.session_iv,
                         req.security,
+                        req.resp_header,
+                        req.option,
                     );
 
                     disp.dispatch_stream(meta, Box::new(vmess_stream)).await;

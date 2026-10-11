@@ -56,7 +56,7 @@ impl Outbound for VmessOutbound {
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
         let mut stream = self.dialer.dial().await?;
 
-        let (key, iv) = VmessProtocol::write_request_header(
+        let (key, iv, resp_header) = VmessProtocol::write_request_header(
             &mut stream,
             &self.uuid,
             NetworkType::Tcp,
@@ -65,14 +65,15 @@ impl Outbound for VmessOutbound {
         )
         .await?;
 
-        let vmess_stream = VmessStream::new(stream, key, iv, self.security);
+        let vmess_stream =
+            VmessStream::new_client(stream, key, iv, self.security, resp_header, 0x05);
         Ok(Box::new(vmess_stream))
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
         let mut stream = self.dialer.dial().await?;
 
-        let (key, iv) = VmessProtocol::write_request_header(
+        let (key, iv, resp_header) = VmessProtocol::write_request_header(
             &mut stream,
             &self.uuid,
             NetworkType::Udp,
@@ -81,7 +82,14 @@ impl Outbound for VmessOutbound {
         )
         .await?;
 
-        let vmess_stream: BoxedStream = Box::new(VmessStream::new(stream, key, iv, self.security));
+        let vmess_stream: BoxedStream = Box::new(VmessStream::new_client(
+            stream,
+            key,
+            iv,
+            self.security,
+            resp_header,
+            0x05,
+        ));
         let (reader, writer) = tokio::io::split(vmess_stream);
 
         Ok(Box::new(VmessPacketEndpoint {

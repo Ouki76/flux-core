@@ -37,8 +37,8 @@ impl SingboxProcess {
             .spawn()
             .expect("failed to spawn sing-box");
 
-        // Give sing-box 100ms to bind ports
-        std::thread::sleep(Duration::from_millis(150));
+        // Give sing-box 300ms to bind ports under parallel test load
+        std::thread::sleep(Duration::from_millis(300));
 
         (Self { child, _dir: dir }, cfg_path)
     }
@@ -2647,6 +2647,336 @@ async fn test_interop_shadowsocks_udp_chacha20_both_directions() {
     )
     .unwrap();
     assert_eq!(&dec2.payload[..], payload2);
+    flux_server_inst.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_interop_vmess_aead_aes128_both_directions() {
+    let echo = start_tcp_echo_server().await;
+    let sbox_port = get_free_tcp_port().await;
+    let flux_port = get_free_tcp_port().await;
+    let uuid = "a1b2c3d4-e5f6-7890-1234-56789abcdef0";
+
+    // 1. flux-core client -> sing-box server (VMess AEAD AES-128-GCM)
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "vmess",
+                "tag": "vmess-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"uuid": "{}"}}]
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_port, uuid
+    );
+    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "sbox-vmess-node",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "protocol": {{ "type": "vmess", "uuid": "{}", "security": "aes-128-gcm" }}
+            }}]
+        }}"#,
+        sbox_port, uuid
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst.registry.get_outbound("sbox-vmess-node").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = outbound.dial_stream(&meta).await.unwrap();
+    let payload = b"VMess AEAD AES-128-GCM flux-core -> sing-box verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    // 2. sing-box client -> flux-core server (VMess AEAD AES-128-GCM)
+    let flux_server_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "tag": "flux-vmess-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "vmess", "uuid": "{}" }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        flux_port, uuid
+    );
+    let flux_server_inst = Instance::new(Config::from_json_str(&flux_server_cfg).unwrap()).unwrap();
+    flux_server_inst.start().await.unwrap();
+
+    let sbox_client_in_port = get_free_tcp_port().await;
+    let sbox_client_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "socks",
+                "tag": "client-in",
+                "listen": "127.0.0.1",
+                "listen_port": {}
+            }}],
+            "outbounds": [{{
+                "type": "vmess",
+                "tag": "flux-vmess-node",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "uuid": "{}",
+                "security": "aes-128-gcm"
+            }}]
+        }}"#,
+        sbox_client_in_port, flux_port, uuid
+    );
+    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+
+    let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
+        .await
+        .unwrap();
+    flux_protocol::socks5::Socks5Handshake::client_handshake(
+        &mut client_conn,
+        flux_protocol::socks5::CMD_CONNECT,
+        &TargetAddress::Ip(echo),
+    )
+    .await
+    .unwrap();
+
+    let payload2 = b"VMess AEAD AES-128-GCM sing-box -> flux-core verified!";
+    client_conn.write_all(payload2).await.unwrap();
+    let mut buf2 = vec![0u8; payload2.len()];
+    client_conn.read_exact(&mut buf2).await.unwrap();
+    assert_eq!(&buf2, payload2);
+
+    flux_server_inst.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_interop_vmess_aead_chacha20_both_directions() {
+    let echo = start_tcp_echo_server().await;
+    let sbox_port = get_free_tcp_port().await;
+    let flux_port = get_free_tcp_port().await;
+    let uuid = "b2c3d4e5-f6a7-8901-2345-6789abcdef01";
+
+    // 1. flux-core client -> sing-box server (VMess ChaCha20-Poly1305)
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "vmess",
+                "tag": "vmess-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"uuid": "{}"}}]
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_port, uuid
+    );
+    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "sbox-vmess-node",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "protocol": {{ "type": "vmess", "uuid": "{}", "security": "chacha20-poly1305" }}
+            }}]
+        }}"#,
+        sbox_port, uuid
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst.registry.get_outbound("sbox-vmess-node").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = outbound.dial_stream(&meta).await.unwrap();
+    let payload = b"VMess ChaCha20 flux-core -> sing-box verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    // 2. sing-box client -> flux-core server (VMess ChaCha20-Poly1305)
+    let flux_server_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "tag": "flux-vmess-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "vmess", "uuid": "{}" }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        flux_port, uuid
+    );
+    let flux_server_inst = Instance::new(Config::from_json_str(&flux_server_cfg).unwrap()).unwrap();
+    flux_server_inst.start().await.unwrap();
+
+    let sbox_client_in_port = get_free_tcp_port().await;
+    let sbox_client_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "socks",
+                "tag": "client-in",
+                "listen": "127.0.0.1",
+                "listen_port": {}
+            }}],
+            "outbounds": [{{
+                "type": "vmess",
+                "tag": "flux-vmess-node",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "uuid": "{}",
+                "security": "chacha20-poly1305"
+            }}]
+        }}"#,
+        sbox_client_in_port, flux_port, uuid
+    );
+    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+
+    let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
+        .await
+        .unwrap();
+    flux_protocol::socks5::Socks5Handshake::client_handshake(
+        &mut client_conn,
+        flux_protocol::socks5::CMD_CONNECT,
+        &TargetAddress::Ip(echo),
+    )
+    .await
+    .unwrap();
+
+    let payload2 = b"VMess ChaCha20 sing-box -> flux-core verified!";
+    client_conn.write_all(payload2).await.unwrap();
+    let mut buf2 = vec![0u8; payload2.len()];
+    client_conn.read_exact(&mut buf2).await.unwrap();
+    assert_eq!(&buf2, payload2);
+
+    flux_server_inst.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_interop_vmess_websocket_both_directions() {
+    let echo = start_tcp_echo_server().await;
+    let sbox_port = get_free_tcp_port().await;
+    let flux_port = get_free_tcp_port().await;
+    let uuid = "c3d4e5f6-a7b8-9012-3456-789abcdef012";
+
+    // 1. flux-core client -> sing-box server (VMess WS)
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "vmess",
+                "tag": "vmess-ws-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"uuid": "{}"}}],
+                "transport": {{
+                    "type": "ws",
+                    "path": "/vmess-ws"
+                }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_port, uuid
+    );
+    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "sbox-vmess-ws-node",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "framing": {{ "type": "websocket", "path": "/vmess-ws", "host": "127.0.0.1" }},
+                "protocol": {{ "type": "vmess", "uuid": "{}" }}
+            }}]
+        }}"#,
+        sbox_port, uuid
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst
+        .registry
+        .get_outbound("sbox-vmess-ws-node")
+        .unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = outbound.dial_stream(&meta).await.unwrap();
+    let payload = b"VMess WebSocket flux-core -> sing-box verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+
+    // 2. sing-box client -> flux-core server (VMess WS)
+    let flux_server_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "tag": "flux-vmess-ws-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "framing": {{ "type": "websocket", "path": "/vmess-ws" }},
+                "protocol": {{ "type": "vmess", "uuid": "{}" }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        flux_port, uuid
+    );
+    let flux_server_inst = Instance::new(Config::from_json_str(&flux_server_cfg).unwrap()).unwrap();
+    flux_server_inst.start().await.unwrap();
+
+    let sbox_client_in_port = get_free_tcp_port().await;
+    let sbox_client_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "socks",
+                "tag": "client-in",
+                "listen": "127.0.0.1",
+                "listen_port": {}
+            }}],
+            "outbounds": [{{
+                "type": "vmess",
+                "tag": "flux-vmess-ws-node",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "uuid": "{}",
+                "security": "aes-128-gcm",
+                "transport": {{
+                    "type": "ws",
+                    "path": "/vmess-ws"
+                }}
+            }}]
+        }}"#,
+        sbox_client_in_port, flux_port, uuid
+    );
+    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+
+    let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
+        .await
+        .unwrap();
+    flux_protocol::socks5::Socks5Handshake::client_handshake(
+        &mut client_conn,
+        flux_protocol::socks5::CMD_CONNECT,
+        &TargetAddress::Ip(echo),
+    )
+    .await
+    .unwrap();
+
+    let payload2 = b"VMess WebSocket sing-box -> flux-core verified!";
+    client_conn.write_all(payload2).await.unwrap();
+    let mut buf2 = vec![0u8; payload2.len()];
+    client_conn.read_exact(&mut buf2).await.unwrap();
+    assert_eq!(&buf2, payload2);
 
     flux_server_inst.stop().await.unwrap();
 }

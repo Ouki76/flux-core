@@ -77,11 +77,18 @@ impl QuicTransport {
         let mut config = crypto;
         config.alpn_protocols = alpn;
 
-        let client_cfg = quinn::ClientConfig::new(Arc::new(
+        let mut transport = quinn::TransportConfig::default();
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
+            transport.max_idle_timeout(Some(idle));
+        }
+
+        let mut client_cfg = quinn::ClientConfig::new(Arc::new(
             quinn::crypto::rustls::QuicClientConfig::try_from(config).map_err(|e| {
                 FluxError::Crypto(format!("failed to configure QUIC TLS 1.3: {}", e))
             })?,
         ));
+        client_cfg.transport_config(Arc::new(transport));
 
         let bind_addr = if is_ipv6 {
             SocketAddr::from(([0; 16], 0))
@@ -109,11 +116,17 @@ impl QuicTransport {
             })?;
         server_crypto.alpn_protocols = alpn;
 
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        let mut transport = quinn::TransportConfig::default();
+        if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
+            transport.max_idle_timeout(Some(idle));
+        }
+
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).map_err(|e| {
                 FluxError::Crypto(format!("failed to create QUIC server config: {}", e))
             })?,
         ));
+        server_config.transport_config(Arc::new(transport));
 
         quinn::Endpoint::server(server_config, listen_addr).map_err(FluxError::Io)
     }
@@ -124,18 +137,23 @@ impl QuicTransport {
         server_addr: SocketAddr,
         server_name: &str,
     ) -> FluxResult<quinn::Connection> {
-        endpoint
+        let conn_connecting = endpoint
             .connect(server_addr, server_name)
-            .map_err(|e| FluxError::Network(format!("QUIC connection setup failed: {}", e)))?
+            .map_err(|e| FluxError::Network(format!("QUIC connection setup failed: {}", e)))?;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), conn_connecting)
             .await
+            .map_err(|_| {
+                FluxError::Timeout(format!("QUIC connection to {} timed out", server_addr))
+            })?
             .map_err(|e| FluxError::Network(format!("QUIC handshake failed: {}", e)))
     }
 
     /// Opens a bidirectional QUIC stream on the connection.
     pub async fn open_bi_stream(conn: &quinn::Connection) -> FluxResult<QuicBiStream> {
-        let (send, recv) = conn
-            .open_bi()
+        let (send, recv) = tokio::time::timeout(std::time::Duration::from_secs(10), conn.open_bi())
             .await
+            .map_err(|_| FluxError::Timeout("opening QUIC stream timed out".into()))?
             .map_err(|e| FluxError::Network(format!("failed to open QUIC stream: {}", e)))?;
         Ok(QuicBiStream::new(send, recv))
     }

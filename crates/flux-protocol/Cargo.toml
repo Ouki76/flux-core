@@ -25,3 +25,4 @@ x25519-dalek = { workspace = true }
 lru = { workspace = true }
 parking_lot = { workspace = true }
 hmac = { workspace = true }
+sha3 = "0.10.8"
