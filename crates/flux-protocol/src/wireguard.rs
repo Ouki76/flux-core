@@ -5,7 +5,9 @@
 //! and custom message types (`h1`..`h4`). It is experimental and intended for use with AmneziaWG
 //! obfuscating peers.
 
-use blake2::Blake2s256;
+use blake2::digest::typenum::U16;
+use blake2::digest::{Digest, Mac};
+use blake2::{Blake2s256, Blake2sMac};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce as ChaChaNonce,
     aead::{Aead, KeyInit},
@@ -15,6 +17,21 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+fn blake2s_hash_concat(label: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut hasher = Blake2s256::new();
+    hasher.update(label);
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+fn blake2s_mac16(key: &[u8], data: &[u8]) -> [u8; 16] {
+    let mut m = <Blake2sMac<U16> as Mac>::new_from_slice(key).expect("Blake2sMac valid key");
+    Mac::update(&mut m, data);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&m.finalize().into_bytes());
+    out
+}
 
 fn hmac_blake2s(key: &[u8], data: &[u8]) -> [u8; 32] {
     use blake2::Digest;
@@ -401,9 +418,9 @@ impl WireGuardHandshake {
         packet.extend_from_slice(&enc_ts);
 
         // Mac1 (16 bytes)
-        let mac1_key = blake2s_mix_hash(&blake2s_hash(b"mac1----"), peer_public.as_bytes());
-        let mac1 = hmac_blake2s(&mac1_key, &packet[awg.s1 as usize..]);
-        packet.extend_from_slice(&mac1[..16]);
+        let mac1_key = blake2s_hash_concat(b"mac1----", peer_public.as_bytes());
+        let mac1 = blake2s_mac16(&mac1_key, &packet[awg.s1 as usize..]);
+        packet.extend_from_slice(&mac1);
 
         // Mac2 (16 zero bytes)
         packet.extend_from_slice(&[0u8; 16]);
@@ -633,9 +650,9 @@ impl WireGuardHandshake {
         resp_pkt.extend_from_slice(&enc_empty);
 
         // Mac1 (16 bytes)
-        let mac1_key = blake2s_mix_hash(&blake2s_hash(b"mac1----"), client_static.as_bytes());
-        let mac1 = hmac_blake2s(&mac1_key, &resp_pkt[awg.s2 as usize..]);
-        resp_pkt.extend_from_slice(&mac1[..16]);
+        let mac1_key = blake2s_hash_concat(b"mac1----", client_static.as_bytes());
+        let mac1 = blake2s_mac16(&mac1_key, &resp_pkt[awg.s2 as usize..]);
+        resp_pkt.extend_from_slice(&mac1);
         resp_pkt.extend_from_slice(&[0u8; 16]); // mac2
 
         let (client_send, client_recv) = kdf2(&c6, b"");

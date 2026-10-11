@@ -1,5 +1,6 @@
 mod common;
 
+use base64::Engine;
 use common::{get_free_tcp_port, start_tcp_echo_server, start_udp_echo_server};
 use flux_app::{Config, Instance};
 use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
@@ -3106,4 +3107,84 @@ async fn test_interop_hysteria2_quic_flux_to_singbox() {
     let mut buf = vec![0u8; payload.len()];
     stream.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, payload);
+}
+
+#[tokio::test]
+async fn test_interop_wireguard_noise_ik_flux_to_singbox() {
+    let sbox_port = get_free_tcp_port().await;
+
+    let sbox_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let sbox_pub = x25519_dalek::PublicKey::from(&sbox_secret);
+
+    let client_secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let client_pub = x25519_dalek::PublicKey::from(&client_secret);
+
+    let b64_engine = base64::engine::general_purpose::STANDARD;
+    let sbox_priv_b64 = b64_engine.encode(sbox_secret.to_bytes());
+    let client_pub_b64 = b64_engine.encode(client_pub.to_bytes());
+
+    let sbox_cfg = format!(
+        r#"{{
+            "endpoints": [{{
+                "type": "wireguard",
+                "tag": "wg-ep",
+                "address": ["10.0.0.1/32"],
+                "private_key": "{}",
+                "listen_port": {},
+                "peers": [{{
+                    "public_key": "{}",
+                    "allowed_ips": ["10.0.0.2/32"]
+                }}]
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_priv_b64, sbox_port, client_pub_b64
+    );
+    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.connect(format!("127.0.0.1:{}", sbox_port))
+        .await
+        .unwrap();
+
+    let awg = flux_protocol::wireguard::AwgConfig {
+        jc: 0,
+        s1: 0,
+        s2: 0,
+        h1: 1,
+        h2: 2,
+        h3: 3,
+        h4: 4,
+        ..Default::default()
+    };
+    let (init_pkt, state) = flux_protocol::wireguard::WireGuardHandshake::create_initiation(
+        &client_secret,
+        &sbox_pub,
+        9999,
+        &awg,
+        None,
+    );
+
+    sock.send(&init_pkt).await.unwrap();
+
+    let mut resp_buf = vec![0u8; 1024];
+    let len = tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut resp_buf))
+        .await
+        .expect("timed out waiting for sing-box WireGuard handshake response")
+        .expect("failed to receive handshake response packet");
+
+    assert_eq!(len, 92);
+    let mut session =
+        flux_protocol::wireguard::WireGuardHandshake::consume_response(state, &resp_buf[..len])
+            .expect("flux-core must successfully consume and verify sing-box WireGuard response");
+
+    // Session is established: encrypt an IPv4 ICMP packet and verify sing-box receives it
+    let ping_ip_pkt = [
+        69, 0, 0, 32, 4, 210, 0, 0, 64, 1, 98, 9, 10, 0, 0, 2, 10, 0, 0, 1, 8, 0, 16, 36, 0, 1, 0,
+        1, 116, 101, 115, 116,
+    ];
+    let data_pkt = session.encrypt_data_packet(&ping_ip_pkt).unwrap();
+    assert_eq!(&data_pkt[0..4], &4u32.to_le_bytes()); // Type 4 = Data packet
+    sock.send(&data_pkt).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
 }
