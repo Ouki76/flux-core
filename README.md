@@ -5,7 +5,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 ## Features
 
 ### Protocols (Server & Client)
-- **VLESS**: REALITY (X25519, ChaCha20-Poly1305), `xtls-rprx-vision` flow, TLS, WebSocket.
+- **VLESS**: REALITY-style camouflage (X25519, ChaCha20-Poly1305, transcript-bound HKDF, replay protection), `xtls-rprx-vision` flow, TLS, WebSocket.
 - **Trojan**: SHA-224 password hashing over TLS (Inbound & Outbound).
 - **VMess**: AEAD header authentication, AES-128-GCM and ChaCha20-Poly1305 ciphers (Inbound & Outbound).
 - **Shadowsocks & Shadowsocks-2022**: AEAD (ChaCha20-Poly1305, AES-256-GCM), 2022 Blake3-ciphers, ReplayFilter defense (Inbound & Outbound).
@@ -14,7 +14,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **SOCKS5**: TCP CONNECT and UDP ASSOCIATE support with user/password authentication (Inbound & Outbound).
 - **HTTP / HTTP CONNECT**: Forward proxy, tunneling, Basic authentication (Inbound & Outbound).
 - **Mixed Inbound**: Auto-detection of SOCKS5 and HTTP protocols on a single port.
-- **Transparent Inbounds**: TUN (userspace TCP stack & UDP relay), REDIRECT (`SO_ORIGINAL_DST`), TPROXY (`IP_TRANSPARENT`).
+- **Transparent Inbounds**: TUN (powered by the `smoltcp` userspace TCP/IP stack — full retransmission, congestion control, out-of-order reassembly & UDP relay), REDIRECT (`SO_ORIGINAL_DST`), TPROXY (`IP_TRANSPARENT`).
 - **WireGuard**: AmneziaWG dialect with junk packet obfuscation (Outbound tunnel).
 
 ### Transport & Performance
@@ -52,6 +52,12 @@ The project is designed around a strictly decoupled, modular 4-tier network stac
 4. **L7 Protocol**: Application proxy layer (`vless`, `trojan`, `vmess`, `shadowsocks`, `hysteria2`, `tuic`, `wireguard`, `socks5`, `http`).
 
 Any protocol can be layered arbitrarily over any compatible security or framing mechanism (e.g. Shadowsocks or VLESS over REALITY + WebSocket, or Hysteria 2 / TUIC streamed over TCP + REALITY).
+
+> **REALITY compatibility note**: the `reality` security layer implements flux-core's own
+> TLS-camouflage handshake (v2: transcript-bound key derivation, server authentication tag,
+> timestamp + replay protection). It is **not** the XTLS REALITY protocol and is **not**
+> wire-compatible with sing-box / Xray REALITY peers. For production anti-censorship
+> REALITY interop, chain flux-core behind an XTLS-compatible endpoint.
 
 ### Workspace Crates
 

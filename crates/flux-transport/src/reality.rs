@@ -13,7 +13,12 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 
-pub const REALITY_INFO: &[u8] = b"REALITY";
+/// HKDF info prefix. v2 binds keys to the full ClientHello transcript.
+pub const REALITY_INFO_V2: &[u8] = b"REALITY-v2";
+/// Auth block version byte inside the encrypted ticket.
+const AUTH_VERSION_V2: u8 = 2;
+/// Accepted handshake timestamp skew (seconds).
+const AUTH_TIMESTAMP_WINDOW_SECS: i64 = 60;
 
 pub const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 pub const TLS_RECORD_APPLICATION_DATA: u8 = 0x17;
@@ -35,12 +40,55 @@ pub struct RealityClientConfig {
     pub short_id: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Default)]
+/// Server-side REALITY-like camouflage configuration.
+///
+/// SECURITY NOTE: this is flux-core's own TLS-camouflage handshake, **not** the
+/// XTLS REALITY protocol and not wire-compatible with it. It provides mutual
+/// authentication via X25519 + short_id, transcript-bound key derivation and
+/// replay protection, but does not borrow a real TLS server's identity.
+#[derive(Clone)]
 pub struct RealityServerConfig {
     pub server_names: Vec<String>,
     pub private_key: [u8; 32],
     pub short_ids: Vec<Vec<u8>>,
     pub fallback: Option<String>,
+    /// Handshake replay cache (client_pub || timestamp → seen). Shared across connections.
+    pub replay_cache: std::sync::Arc<parking_lot::Mutex<lru::LruCache<[u8; 32], ()>>>,
+}
+
+impl Default for RealityServerConfig {
+    fn default() -> Self {
+        Self::new(vec![], [0u8; 32], vec![], None)
+    }
+}
+
+impl std::fmt::Debug for RealityServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RealityServerConfig")
+            .field("server_names", &self.server_names)
+            .field("short_ids", &self.short_ids)
+            .field("fallback", &self.fallback)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RealityServerConfig {
+    pub fn new(
+        server_names: Vec<String>,
+        private_key: [u8; 32],
+        short_ids: Vec<Vec<u8>>,
+        fallback: Option<String>,
+    ) -> Self {
+        Self {
+            server_names,
+            private_key,
+            short_ids,
+            fallback,
+            replay_cache: std::sync::Arc::new(parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(65536).unwrap(),
+            ))),
+        }
+    }
 }
 
 pub struct RealityHandshake;
@@ -59,10 +107,15 @@ impl RealityHandshake {
 
         let shared_secret = client_secret.diffie_hellman(&server_pub);
 
-        // Derive client and server AEAD keys (64 bytes OKM) using HKDF-SHA256
+        // Derive client and server AEAD keys (64 bytes OKM) using HKDF-SHA256.
+        // v2: info binds the keys to the client ephemeral AND the target SNI,
+        // preventing cross-destination handshake replays.
         let hk = Hkdf::<Sha256>::new(Some(client_pub.as_bytes()), shared_secret.as_bytes());
+        let mut info = Vec::with_capacity(REALITY_INFO_V2.len() + cfg.server_name.len());
+        info.extend_from_slice(REALITY_INFO_V2);
+        info.extend_from_slice(cfg.server_name.as_bytes());
         let mut okm = [0u8; 64];
-        hk.expand(REALITY_INFO, &mut okm)
+        hk.expand(&info, &mut okm)
             .map_err(|_| FluxError::Crypto("HKDF expansion failed in Reality".into()))?;
 
         let mut client_key = [0u8; 32];
@@ -75,10 +128,19 @@ impl RealityHandshake {
         let server_cipher = ChaCha20Poly1305::new_from_slice(&server_key)
             .map_err(|e| FluxError::Crypto(format!("failed to init server cipher: {}", e)))?;
 
-        // Encrypt auth block: short_id (variable len)
+        // v2 auth block: [version(1)][unix timestamp(8 BE)][short_id..]
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut auth_plain = Vec::with_capacity(9 + cfg.short_id.len());
+        auth_plain.push(AUTH_VERSION_V2);
+        auth_plain.extend_from_slice(&now_secs.to_be_bytes());
+        auth_plain.extend_from_slice(&cfg.short_id);
+
         let nonce = Nonce::from([0u8; 12]);
         let ciphertext = client_cipher
-            .encrypt(&nonce, cfg.short_id.as_slice())
+            .encrypt(&nonce, auth_plain.as_slice())
             .map_err(|e| FluxError::Crypto(format!("failed to encrypt reality auth: {}", e)))?;
 
         // Format as authentic RFC 8446 TLS 1.3 ClientHello
@@ -178,6 +240,34 @@ impl RealityHandshake {
             ));
         }
 
+        // Server authentication: first 16 bytes of ServerHello.random carry an AEAD tag
+        // over the handshake context (client ephemeral || SNI), proving the peer holds
+        // the private key matching the configured public key and this exact handshake.
+        // Layout: [type(1)][len(3)][version(2)][random(32)]...
+        if resp_buf.len() < 1 + 3 + 2 + 32 {
+            return Err(FluxError::Crypto("truncated reality ServerHello".into()));
+        }
+        let tag_start = 1 + 3 + 2;
+        let server_tag = &resp_buf[tag_start..tag_start + 16];
+        let mut aad = Vec::with_capacity(32 + cfg.server_name.len());
+        aad.extend_from_slice(client_pub.as_bytes());
+        aad.extend_from_slice(cfg.server_name.as_bytes());
+        let mut auth_nonce = [0u8; 12];
+        auth_nonce[11] = 1;
+        server_cipher
+            .decrypt(
+                &Nonce::from(auth_nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: server_tag,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                FluxError::AuthFailed(
+                    "reality server authentication failed: invalid ServerHello tag".into(),
+                )
+            })?;
+
         Ok(RealityStream::new(stream, client_cipher, server_cipher))
     }
 
@@ -231,108 +321,166 @@ impl RealityHandshake {
             ));
         }
 
-        let auth_res: Result<(ChaCha20Poly1305, ChaCha20Poly1305, [u8; 32]), FluxError> = (|| {
-            // Parse ClientHello to extract Session ID (which contains client_pub)
-            if record_buf.len() < 4 + 2 + 32 + 1 + 32 {
-                return Err(FluxError::AuthFailed(
-                    "reality ClientHello too short".into(),
-                ));
-            }
-
-            let session_id_len = record_buf[4 + 2 + 32] as usize;
-            if session_id_len != 32 {
-                return Err(FluxError::AuthFailed(
-                    "reality ClientHello invalid session id length".into(),
-                ));
-            }
-
-            let session_id_start = 4 + 2 + 32 + 1;
-            let mut client_pub_bytes = [0u8; 32];
-            client_pub_bytes.copy_from_slice(&record_buf[session_id_start..session_id_start + 32]);
-
-            // Find SessionTicket extension (0x0023) or legacy compat (0xffa1) in extensions
-            let mut pos = session_id_start + 32;
-            if pos + 2 > record_buf.len() {
-                return Err(FluxError::AuthFailed("truncated cipher suites".into()));
-            }
-            let cs_len = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]) as usize;
-            pos += 2 + cs_len;
-            if pos + 1 > record_buf.len() {
-                return Err(FluxError::AuthFailed(
-                    "truncated compression methods".into(),
-                ));
-            }
-            let comp_len = record_buf[pos] as usize;
-            pos += 1 + comp_len;
-
-            if pos + 2 > record_buf.len() {
-                return Err(FluxError::AuthFailed("truncated extensions header".into()));
-            }
-            let ext_total_len = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]) as usize;
-            pos += 2;
-
-            let ext_end = pos + ext_total_len;
-            let mut auth_ciphertext: Option<Vec<u8>> = None;
-
-            while pos + 4 <= ext_end && pos + 4 <= record_buf.len() {
-                let ext_type = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]);
-                let ext_len =
-                    u16::from_be_bytes([record_buf[pos + 2], record_buf[pos + 3]]) as usize;
-                pos += 4;
-                if pos + ext_len > record_buf.len() {
-                    break;
+        let auth_res: Result<(ChaCha20Poly1305, ChaCha20Poly1305, [u8; 32], Vec<u8>), FluxError> =
+            (|| {
+                // Parse ClientHello to extract Session ID (which contains client_pub)
+                if record_buf.len() < 4 + 2 + 32 + 1 + 32 {
+                    return Err(FluxError::AuthFailed(
+                        "reality ClientHello too short".into(),
+                    ));
                 }
-                if ext_type == EXT_SESSION_TICKET || ext_type == EXT_CUSTOM_COMPAT {
-                    auth_ciphertext = Some(record_buf[pos..pos + ext_len].to_vec());
-                    break;
+
+                let session_id_len = record_buf[4 + 2 + 32] as usize;
+                if session_id_len != 32 {
+                    return Err(FluxError::AuthFailed(
+                        "reality ClientHello invalid session id length".into(),
+                    ));
                 }
-                pos += ext_len;
-            }
 
-            let ciphertext = auth_ciphertext.ok_or_else(|| {
-                FluxError::AuthFailed(
-                    "missing reality auth ticket extension in TLS ClientHello".into(),
-                )
-            })?;
+                let session_id_start = 4 + 2 + 32 + 1;
+                let mut client_pub_bytes = [0u8; 32];
+                client_pub_bytes
+                    .copy_from_slice(&record_buf[session_id_start..session_id_start + 32]);
 
-            // Cryptographic verification
-            let client_pub = X25519PublicKey::from(client_pub_bytes);
-            let shared_secret = server_secret.diffie_hellman(&client_pub);
+                // Find SessionTicket extension (0x0023) or legacy compat (0xffa1) in extensions
+                let mut pos = session_id_start + 32;
+                if pos + 2 > record_buf.len() {
+                    return Err(FluxError::AuthFailed("truncated cipher suites".into()));
+                }
+                let cs_len = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]) as usize;
+                pos += 2 + cs_len;
+                if pos + 1 > record_buf.len() {
+                    return Err(FluxError::AuthFailed(
+                        "truncated compression methods".into(),
+                    ));
+                }
+                let comp_len = record_buf[pos] as usize;
+                pos += 1 + comp_len;
 
-            let hk = Hkdf::<Sha256>::new(Some(client_pub.as_bytes()), shared_secret.as_bytes());
-            let mut okm = [0u8; 64];
-            hk.expand(REALITY_INFO, &mut okm)
-                .map_err(|_| FluxError::Crypto("HKDF expansion failed in Reality server".into()))?;
+                if pos + 2 > record_buf.len() {
+                    return Err(FluxError::AuthFailed("truncated extensions header".into()));
+                }
+                let ext_total_len =
+                    u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]) as usize;
+                pos += 2;
 
-            let mut client_key = [0u8; 32];
-            let mut server_key = [0u8; 32];
-            client_key.copy_from_slice(&okm[0..32]);
-            server_key.copy_from_slice(&okm[32..64]);
+                let ext_end = pos + ext_total_len;
+                let mut auth_ciphertext: Option<Vec<u8>> = None;
+                let mut sni: Option<Vec<u8>> = None;
 
-            let client_cipher = ChaCha20Poly1305::new_from_slice(&client_key).map_err(|e| {
-                FluxError::Crypto(format!("failed to init client cipher on server: {}", e))
-            })?;
-            let server_cipher = ChaCha20Poly1305::new_from_slice(&server_key).map_err(|e| {
-                FluxError::Crypto(format!("failed to init server cipher on server: {}", e))
-            })?;
+                while pos + 4 <= ext_end && pos + 4 <= record_buf.len() {
+                    let ext_type = u16::from_be_bytes([record_buf[pos], record_buf[pos + 1]]);
+                    let ext_len =
+                        u16::from_be_bytes([record_buf[pos + 2], record_buf[pos + 3]]) as usize;
+                    pos += 4;
+                    if pos + ext_len > record_buf.len() {
+                        break;
+                    }
+                    if ext_type == EXT_SESSION_TICKET || ext_type == EXT_CUSTOM_COMPAT {
+                        auth_ciphertext = Some(record_buf[pos..pos + ext_len].to_vec());
+                    } else if ext_type == 0x0000 && ext_len >= 5 {
+                        // server_name extension: list_len(2) type(1) name_len(2) name
+                        let name_len =
+                            u16::from_be_bytes([record_buf[pos + 3], record_buf[pos + 4]]) as usize;
+                        if 5 + name_len <= ext_len {
+                            sni = Some(record_buf[pos + 5..pos + 5 + name_len].to_vec());
+                        }
+                    }
+                    pos += ext_len;
+                }
 
-            let nonce = Nonce::from([0u8; 12]);
-            let decrypted_short_id = client_cipher
-                .decrypt(&nonce, ciphertext.as_slice())
-                .map_err(|_| FluxError::AuthFailed("reality auth tag decryption failed".into()))?;
+                let ciphertext = auth_ciphertext.ok_or_else(|| {
+                    FluxError::AuthFailed(
+                        "missing reality auth ticket extension in TLS ClientHello".into(),
+                    )
+                })?;
+                let sni = sni.ok_or_else(|| {
+                    FluxError::AuthFailed("missing SNI in reality TLS ClientHello".into())
+                })?;
 
-            // Check if decrypted short_id is permitted
-            if !cfg.short_ids.is_empty()
-                && !cfg.short_ids.iter().any(|id| id == &decrypted_short_id)
-            {
-                return Err(FluxError::AuthFailed("invalid reality short_id".into()));
-            }
+                // Cryptographic verification
+                let client_pub = X25519PublicKey::from(client_pub_bytes);
+                let shared_secret = server_secret.diffie_hellman(&client_pub);
 
-            Ok((client_cipher, server_cipher, client_pub_bytes))
-        })(
-        );
+                let hk = Hkdf::<Sha256>::new(Some(client_pub.as_bytes()), shared_secret.as_bytes());
+                let mut info = Vec::with_capacity(REALITY_INFO_V2.len() + sni.len());
+                info.extend_from_slice(REALITY_INFO_V2);
+                info.extend_from_slice(&sni);
+                let mut okm = [0u8; 64];
+                hk.expand(&info, &mut okm).map_err(|_| {
+                    FluxError::Crypto("HKDF expansion failed in Reality server".into())
+                })?;
 
-        let (client_cipher, server_cipher, client_pub_bytes) = match auth_res {
+                let mut client_key = [0u8; 32];
+                let mut server_key = [0u8; 32];
+                client_key.copy_from_slice(&okm[0..32]);
+                server_key.copy_from_slice(&okm[32..64]);
+
+                let client_cipher = ChaCha20Poly1305::new_from_slice(&client_key).map_err(|e| {
+                    FluxError::Crypto(format!("failed to init client cipher on server: {}", e))
+                })?;
+                let server_cipher = ChaCha20Poly1305::new_from_slice(&server_key).map_err(|e| {
+                    FluxError::Crypto(format!("failed to init server cipher on server: {}", e))
+                })?;
+
+                let nonce = Nonce::from([0u8; 12]);
+                let auth_plain = client_cipher
+                    .decrypt(&nonce, ciphertext.as_slice())
+                    .map_err(|_| {
+                        FluxError::AuthFailed("reality auth tag decryption failed".into())
+                    })?;
+
+                // v2 auth block: [version(1)][unix timestamp(8 BE)][short_id..]
+                if auth_plain.len() < 9 || auth_plain[0] != AUTH_VERSION_V2 {
+                    return Err(FluxError::AuthFailed(
+                        "unsupported reality auth block version".into(),
+                    ));
+                }
+                let ts = i64::from_be_bytes(auth_plain[1..9].try_into().unwrap());
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if (now - ts).abs() > AUTH_TIMESTAMP_WINDOW_SECS {
+                    return Err(FluxError::AuthFailed(
+                        "reality handshake timestamp outside acceptance window".into(),
+                    ));
+                }
+
+                // Replay protection: reject already-seen (client_pub, timestamp) pairs.
+                let mut replay_key = [0u8; 32];
+                {
+                    use sha2::Digest;
+                    let mut h = sha2::Sha256::new();
+                    h.update(client_pub_bytes);
+                    h.update(&auth_plain[1..9]);
+                    replay_key.copy_from_slice(&h.finalize());
+                }
+                {
+                    let mut cache = cfg.replay_cache.lock();
+                    if cache.contains(&replay_key) {
+                        return Err(FluxError::AuthFailed(
+                            "replayed reality handshake rejected".into(),
+                        ));
+                    }
+                    cache.put(replay_key, ());
+                }
+
+                let decrypted_short_id = &auth_plain[9..];
+                // Check if decrypted short_id is permitted
+                if !cfg.short_ids.is_empty()
+                    && !cfg
+                        .short_ids
+                        .iter()
+                        .any(|id| id.as_slice() == decrypted_short_id)
+                {
+                    return Err(FluxError::AuthFailed("invalid reality short_id".into()));
+                }
+
+                Ok((client_cipher, server_cipher, client_pub_bytes, sni))
+            })();
+
+        let (client_cipher, server_cipher, client_pub_bytes, sni) = match auth_res {
             Ok(ciphers) => ciphers,
             Err(e) => {
                 if let Some(ref fb) = cfg.fallback {
@@ -353,6 +501,23 @@ impl RealityHandshake {
 
         let mut server_random = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut server_random);
+        // Embed server authentication tag into random[0..16]: AEAD over
+        // (client ephemeral || SNI), proving private-key possession for this handshake.
+        let mut aad = Vec::with_capacity(32 + sni.len());
+        aad.extend_from_slice(&client_pub_bytes);
+        aad.extend_from_slice(&sni);
+        let mut auth_nonce = [0u8; 12];
+        auth_nonce[11] = 1;
+        let tag = server_cipher
+            .encrypt(
+                &Nonce::from(auth_nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: b"",
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| FluxError::Crypto(format!("failed to compute server auth tag: {}", e)))?;
+        server_random[..16].copy_from_slice(&tag);
         server_hello.extend_from_slice(&server_random);
 
         // Echo Session ID
@@ -755,12 +920,12 @@ mod tests {
         let server_secret = StaticSecret::random_from_rng(OsRng);
         let server_public = X25519PublicKey::from(&server_secret);
 
-        let server_cfg = RealityServerConfig {
-            server_names: vec!["www.microsoft.com".into()],
-            private_key: server_secret.to_bytes(),
-            short_ids: vec![vec![0x01, 0x02, 0x03, 0x04]],
-            fallback: None,
-        };
+        let server_cfg = RealityServerConfig::new(
+            vec!["www.microsoft.com".into()],
+            server_secret.to_bytes(),
+            vec![vec![0x01, 0x02, 0x03, 0x04]],
+            None,
+        );
 
         let client_cfg = RealityClientConfig {
             server_name: "www.microsoft.com".into(),
@@ -811,12 +976,12 @@ mod tests {
         });
 
         let server_secret = StaticSecret::random_from_rng(OsRng);
-        let server_cfg = RealityServerConfig {
-            server_names: vec!["www.microsoft.com".into()],
-            private_key: server_secret.to_bytes(),
-            short_ids: vec![vec![0x01, 0x02, 0x03, 0x04]],
-            fallback: Some(decoy_addr.to_string()),
-        };
+        let server_cfg = RealityServerConfig::new(
+            vec!["www.microsoft.com".into()],
+            server_secret.to_bytes(),
+            vec![vec![0x01, 0x02, 0x03, 0x04]],
+            Some(decoy_addr.to_string()),
+        );
 
         // Create unauthenticated probe ClientHello
         let (client_io, server_io) = tokio::io::duplex(4096);

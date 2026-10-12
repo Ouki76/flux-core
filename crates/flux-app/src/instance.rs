@@ -923,12 +923,12 @@ fn compile_server_securities(
                     .filter_map(|s| flux_types::decode_hex(&s))
                     .collect();
                 list.push(flux_transport::pipeline::ServerSecurityLayer::Reality(
-                    flux_transport::reality::RealityServerConfig {
+                    flux_transport::reality::RealityServerConfig::new(
                         server_names,
-                        private_key: pk_bytes,
-                        short_ids: sids,
+                        pk_bytes,
+                        sids,
                         fallback,
-                    },
+                    ),
                 ));
             }
             InboundSecurityConfig::ShadowTls {

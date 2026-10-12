@@ -1029,6 +1029,7 @@ mod smol_stack_tests {
     }
 
     /// Builds an IPv4/TCP packet; flags/seq/ack/payload configurable.
+    #[allow(clippy::too_many_arguments)]
     fn tcp_pkt(
         src: [u8; 4],
         sport: u16,
