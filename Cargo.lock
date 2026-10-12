@@ -796,6 +796,7 @@ dependencies = [
 name = "flux-transport"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "async-trait",
  "base64",
  "bytes",
@@ -813,6 +814,7 @@ dependencies = [
  "quinn",
  "rand 0.8.8",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "sha1",

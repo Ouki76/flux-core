@@ -5,7 +5,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 ## Features
 
 ### Protocols (Server & Client)
-- **VLESS**: REALITY-style camouflage (X25519, ChaCha20-Poly1305, transcript-bound HKDF, replay protection), `xtls-rprx-vision` flow, TLS, WebSocket.
+- **VLESS**: REALITY (full XTLS-compatible implementation: X25519 auth via TLS session_id, Ed25519 HMAC-tagged certificate, transparent fallback relay), `xtls-rprx-vision` flow, TLS, WebSocket.
 - **Trojan**: SHA-224 password hashing over TLS (Inbound & Outbound).
 - **VMess**: AEAD header authentication, AES-128-GCM and ChaCha20-Poly1305 ciphers (Inbound & Outbound).
 - **Shadowsocks & Shadowsocks-2022**: AEAD (ChaCha20-Poly1305, AES-256-GCM), 2022 Blake3-ciphers, ReplayFilter defense (Inbound & Outbound).
@@ -53,11 +53,11 @@ The project is designed around a strictly decoupled, modular 4-tier network stac
 
 Any protocol can be layered arbitrarily over any compatible security or framing mechanism (e.g. Shadowsocks or VLESS over REALITY + WebSocket, or Hysteria 2 / TUIC streamed over TCP + REALITY).
 
-> **REALITY compatibility note**: the `reality` security layer implements flux-core's own
-> TLS-camouflage handshake (v2: transcript-bound key derivation, server authentication tag,
-> timestamp + replay protection). It is **not** the XTLS REALITY protocol and is **not**
-> wire-compatible with sing-box / Xray REALITY peers. For production anti-censorship
-> REALITY interop, chain flux-core behind an XTLS-compatible endpoint.
+> **REALITY**: fully XTLS-compatible — interoperates with sing-box / Xray clients and
+> servers (verified by live interop tests in both directions). The server transparently
+> relays non-REALITY clients (browsers, active probers) to the configured `fallback`
+> target. The client ships a minimal purpose-built TLS 1.3 stack (rustls cannot control
+> the ClientHello session_id that REALITY uses for authentication).
 
 ### Workspace Crates
 

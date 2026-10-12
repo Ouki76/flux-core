@@ -31,3 +31,5 @@ hmac = { workspace = true }
 h2 = { workspace = true }
 http = "1.0"
 quinn = { workspace = true }
+ring = { workspace = true }
+aes-gcm = { workspace = true }

@@ -7,6 +7,7 @@ use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
 use flux_types::{NetworkType, SessionMeta, TargetAddress, UdpPacket};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::net::SocketAddr;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -3338,4 +3339,239 @@ async fn test_interop_wireguard_noise_ik_flux_to_singbox() {
     assert_eq!(&data_pkt[0..4], &4u32.to_le_bytes()); // Type 4 = Data packet
     sock.send(&data_pkt).await.unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+// ---------------------------------------------------------------------------
+// N. REALITY (XTLS-compatible) Interoperability
+// ---------------------------------------------------------------------------
+
+fn reality_keypair() -> (String, String) {
+    use base64::Engine;
+    let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let public = x25519_dalek::PublicKey::from(&secret);
+    (
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret.to_bytes()),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.as_bytes()),
+    )
+}
+
+/// Starts a real TLS 1.3 echo server (usable as a REALITY handshake target/decoy).
+async fn start_tls_echo_server() -> SocketAddr {
+    let dir = TempDir::new().expect("tempdir");
+    let (cert_path, key_path) = generate_self_signed_cert(dir.path());
+    let (certs, key) =
+        flux_transport::tls::TlsTransport::load_certs_and_key(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .unwrap();
+    let acceptor =
+        flux_transport::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::mem::forget(dir); // keep cert files alive for the test duration
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(mut tls) = acceptor.accept(stream).await {
+                    let mut buf = vec![0u8; 65536];
+                    while let Ok(n) = tls.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if tls.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// flux-core REALITY client → sing-box REALITY server.
+#[tokio::test]
+async fn test_interop_reality_flux_client_to_singbox_server() {
+    let echo = start_tcp_echo_server().await;
+    let decoy = start_tls_echo_server().await; // REALITY requires a real TLS 1.3 target
+    let sbox_port = get_free_tcp_port().await;
+    let decoy_port = decoy.port();
+    let (priv_b64, pub_b64) = reality_keypair();
+    let uuid = uuid::Uuid::new_v4().to_string();
+
+    let sbox_cfg = format!(
+        r#"{{
+            "log": {{"level": "error"}},
+            "inbounds": [{{
+                "type": "vless",
+                "tag": "in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"uuid": "{}"}}],
+                "tls": {{
+                    "enabled": true,
+                    "server_name": "www.microsoft.com",
+                    "reality": {{
+                        "enabled": true,
+                        "handshake": {{"server": "127.0.0.1", "server_port": {}}},
+                        "private_key": "{}",
+                        "short_id": ["01020304"]
+                    }}
+                }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_port, uuid, decoy_port, priv_b64
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "vless-reality-out",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "security": {{
+                    "type": "reality",
+                    "sni": "www.microsoft.com",
+                    "public_key": "{}",
+                    "short_id": "01020304"
+                }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
+            }}]
+        }}"#,
+        sbox_port, pub_b64, uuid
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst.registry.get_outbound("vless-reality-out").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        outbound.dial_stream(&meta),
+    )
+    .await
+    .expect("flux REALITY client handshake with sing-box timed out")
+    .expect("flux REALITY client must handshake with sing-box server");
+
+    let payload = b"REALITY interop: flux client -> sing-box server";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+}
+
+/// sing-box REALITY client → flux-core REALITY server.
+#[tokio::test]
+async fn test_interop_reality_singbox_client_to_flux_server() {
+    let echo = start_tcp_echo_server().await;
+    let flux_port = get_free_tcp_port().await;
+    let sbox_socks_port = get_free_tcp_port().await;
+    let (priv_b64, pub_b64) = reality_keypair();
+    let uuid = uuid::Uuid::new_v4().to_string();
+
+    // flux-core REALITY server (fallback = echo server, unused by valid clients)
+    let flux_cfg = format!(
+        r#"
+inbounds:
+  - tag: vless-reality-in
+    carrier:
+      type: tcp
+      listen: "127.0.0.1"
+      listen_port: {}
+    security:
+      type: reality
+      server_names: ["www.microsoft.com"]
+      private_key: "{}"
+      short_ids: ["01020304"]
+      fallback: "127.0.0.1:{}"
+    protocol:
+      type: vless
+      uuid: "{}"
+outbounds:
+  - type: direct
+    tag: direct
+"#,
+        flux_port,
+        priv_b64,
+        echo.port(),
+        uuid
+    );
+    let flux_inst = Instance::new(Config::from_yaml_str(&flux_cfg).unwrap()).unwrap();
+    flux_inst.start().await.unwrap();
+
+    let sbox_cfg = format!(
+        r#"{{
+            "log": {{"level": "error"}},
+            "inbounds": [{{
+                "type": "socks",
+                "tag": "in",
+                "listen": "127.0.0.1",
+                "listen_port": {}
+            }}],
+            "outbounds": [{{
+                "type": "vless",
+                "tag": "out",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "uuid": "{}",
+                "tls": {{
+                    "enabled": true,
+                    "server_name": "www.microsoft.com",
+                    "utls": {{"enabled": true, "fingerprint": "chrome"}},
+                    "reality": {{
+                        "enabled": true,
+                        "public_key": "{}",
+                        "short_id": "01020304"
+                    }}
+                }}
+            }}]
+        }}"#,
+        sbox_socks_port, flux_port, uuid, pub_b64
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    // Drive traffic through sing-box socks inbound → flux REALITY server → echo.
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", sbox_socks_port))
+        .await
+        .unwrap();
+    // SOCKS5 handshake: no-auth
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, [0x05, 0x00]);
+    // CONNECT to echo server
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    match echo.ip() {
+        std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
+        _ => panic!("echo server must be IPv4"),
+    }
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+    let mut resp = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut resp))
+        .await
+        .expect("sing-box REALITY client → flux server connect timed out")
+        .unwrap();
+    assert_eq!(resp[0], 0x05);
+    assert_eq!(resp[1], 0x00, "sing-box connect must succeed");
+
+    let payload = b"REALITY interop: sing-box client -> flux server";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
 }
