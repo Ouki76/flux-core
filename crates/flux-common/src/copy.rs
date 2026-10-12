@@ -4,8 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-pub const DEFAULT_COPY_BUFFER_SIZE: usize = 256 * 1024; // 256 KB optimal saturated buffer
-
 /// An AsyncRead + AsyncWrite stream wrapper that updates atomic counters in real time.
 pub struct MeteredStream<S> {
     inner: S,

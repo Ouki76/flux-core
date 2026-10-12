@@ -344,7 +344,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
             }
 
             if this.resp_payload_len == 0 && this.resp_payload_buf.is_empty() {
-                let dec = this.dec.as_ref().unwrap();
+                let dec = match this.dec.as_ref() {
+                    Some(d) => d,
+                    None => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "shadowsocks-2022 decryptor not initialized",
+                        )));
+                    }
+                };
                 let dec_nonce = this.dec_nonce;
                 increase_nonce(&mut this.dec_nonce);
                 let resp_fixed = match dec.decrypt(&dec_nonce, &this.resp_hdr_buf) {
@@ -408,7 +416,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                     }
                 }
 
-                let dec = this.dec.as_ref().unwrap();
+                let dec = match this.dec.as_ref() {
+                    Some(d) => d,
+                    None => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "shadowsocks-2022 decryptor not initialized",
+                        )));
+                    }
+                };
                 let dec_nonce = this.dec_nonce;
                 increase_nonce(&mut this.dec_nonce);
                 let initial_data = match dec.decrypt(&dec_nonce, &this.resp_payload_buf) {
@@ -467,7 +483,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                     }
                 }
 
-                let dec = this.dec.as_ref().unwrap();
+                let dec = match this.dec.as_ref() {
+                    Some(d) => d,
+                    None => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "shadowsocks-2022 decryptor not initialized",
+                        )));
+                    }
+                };
                 let len_nonce = this.dec_nonce;
                 increase_nonce(&mut this.dec_nonce);
                 let plain_len_bytes = match dec.decrypt(&len_nonce, &this.len_buf) {
@@ -512,7 +536,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                 }
             }
 
-            let dec = this.dec.as_ref().unwrap();
+            let dec = match this.dec.as_ref() {
+                Some(d) => d,
+                None => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "shadowsocks-2022 decryptor not initialized",
+                    )));
+                }
+            };
             let payload_nonce = this.dec_nonce;
             increase_nonce(&mut this.dec_nonce);
             let decrypted = match dec.decrypt(&payload_nonce, &this.payload_buf) {

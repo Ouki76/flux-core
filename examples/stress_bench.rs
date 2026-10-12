@@ -15,7 +15,6 @@ use flux_types::{NetworkType, Outbound, SessionMeta, TargetAddress};
 
 // Using system allocator matches flux-core main configuration
 // #[global_allocator]
-// static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -92,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
     println!(r#" |_|    |______\____/ /_/ \_\     \_____\____/|_|  \_\______|"#);
     println!("\x1b[0m");
     println!("  Flux-Core High-Performance Engine Stress & Capacity Benchmark");
-    println!("  Rust Edition 2024 | mimalloc | Linux zero-copy splice(2) | BufferPool");
+    println!("  Rust Edition 2024 | Linux zero-copy splice(2) | BufferPool");
 
     let echo_addr = start_fast_echo_server().await;
 

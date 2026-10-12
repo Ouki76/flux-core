@@ -1,4 +1,4 @@
-use crate::wire::{DnsMessage, QTYPE_A};
+use crate::wire::DnsMessage;
 use flux_transport::tcp::TcpTransport;
 use flux_transport::tls::{TlsClientConfig, TlsTransport};
 use flux_types::{BoxedStream, FluxError, FluxResult};
@@ -73,9 +73,10 @@ impl DotClient {
         &self,
         domain: &str,
         ecs: Option<ipnet::IpNet>,
+        qtype: u16,
     ) -> FluxResult<(IpAddr, u32)> {
         let tx_id = rand::random::<u16>();
-        let query = DnsMessage::build_query_with_ecs_id(domain, QTYPE_A, ecs, tx_id);
+        let query = DnsMessage::build_query_with_ecs_id(domain, qtype, ecs, tx_id);
         let len_bytes = (query.len() as u16).to_be_bytes();
 
         let mut guard = self.stream.lock().await;
@@ -127,7 +128,7 @@ impl DotClient {
             match read_res {
                 Ok(resp_buf) => {
                     DnsMessage::validate_response(&resp_buf, tx_id)?;
-                    return DnsMessage::parse_ip_record_with_ttl(&resp_buf);
+                    return DnsMessage::parse_specific_record_with_ttl(&resp_buf, qtype);
                 }
                 Err(_) => {
                     *guard = None;

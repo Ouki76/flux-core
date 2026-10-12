@@ -1,6 +1,5 @@
 use crate::api::TrafficMeter;
 use async_trait::async_trait;
-use dashmap::DashMap;
 use flux_common::copy::copy_bidirectional;
 use flux_router::Router;
 use flux_types::{
@@ -51,7 +50,12 @@ impl DefaultDispatcher {
         self
     }
 
-    fn resolve_effective_meta(&self, meta: &SessionMeta) -> SessionMeta {
+    /// Returns the effective session metadata after Fake-IP reverse mapping.
+    /// Borrows the original metadata when no remapping applies, avoiding a clone.
+    fn resolve_effective_meta<'m>(
+        &self,
+        meta: &'m SessionMeta,
+    ) -> std::borrow::Cow<'m, SessionMeta> {
         if let flux_types::TargetAddress::Ip(sock) = &meta.destination
             && let Some(r) = &self.resolver
             && let Some(fakeip) = r.fake_ip()
@@ -59,9 +63,9 @@ impl DefaultDispatcher {
         {
             let mut m = meta.clone();
             m.destination = flux_types::TargetAddress::Domain(domain, sock.port());
-            return m;
+            return std::borrow::Cow::Owned(m);
         }
-        meta.clone()
+        std::borrow::Cow::Borrowed(meta)
     }
 
     fn get_outbound(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
@@ -249,41 +253,64 @@ impl Dispatcher for DefaultDispatcher {
         mut packet_rx: mpsc::Receiver<UdpPacket>,
         packet_tx: mpsc::Sender<UdpPacket>,
     ) {
+        const MAX_ROUTE_CACHE_ENTRIES: usize = 4096;
+
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        let endpoints: DashMap<String, Arc<dyn PacketEndpoint>> = DashMap::new();
+        // Endpoints are only accessed from this task; a plain HashMap avoids DashMap sharding overhead.
+        let mut endpoints: std::collections::HashMap<Arc<str>, Arc<dyn PacketEndpoint>> =
+            std::collections::HashMap::new();
+        // Per-destination routing cache: (outbound tag, effective destination after Fake-IP remap).
+        // Avoids re-running the full rule engine for every single packet.
+        let mut route_cache: std::collections::HashMap<
+            flux_types::TargetAddress,
+            (Arc<str>, flux_types::TargetAddress),
+        > = std::collections::HashMap::new();
         let meter = self.meter.clone();
 
         while let Some(packet) = packet_rx.recv().await {
             let bytes_len = packet.payload.len() as u64;
 
-            // Dynamically resolve target outbound for THIS specific packet
-            let mut pkt_meta = meta.clone();
-            pkt_meta.destination = packet.destination.clone();
-            let effective_meta = self.resolve_effective_meta(&pkt_meta);
-            let outbound_tag = self.router.route(&effective_meta);
+            // Resolve routing decision for this destination (cached per unique destination).
+            let (outbound_tag, effective_dest) = match route_cache.get(&packet.destination) {
+                Some((tag, dest)) => (tag.clone(), dest.clone()),
+                None => {
+                    let mut pkt_meta = meta.clone();
+                    pkt_meta.destination = packet.destination.clone();
+                    let effective_meta = self.resolve_effective_meta(&pkt_meta);
+                    let tag: Arc<str> = self.router.route(&effective_meta).into();
+                    let dest = effective_meta.destination.clone();
+                    if route_cache.len() >= MAX_ROUTE_CACHE_ENTRIES {
+                        route_cache.clear();
+                    }
+                    route_cache.insert(packet.destination.clone(), (tag.clone(), dest.clone()));
+                    (tag, dest)
+                }
+            };
 
             // Get or create outbound endpoint
-            let endpoint = if let Some(ep) = endpoints.get(outbound_tag) {
+            let endpoint = if let Some(ep) = endpoints.get(&outbound_tag) {
                 ep.clone()
             } else {
-                let outbound = match self.get_outbound(outbound_tag) {
+                let outbound = match self.get_outbound(&outbound_tag) {
                     Some(o) => o,
                     None => {
                         error!(
                             "outbound '{}' not found for UDP destination {}",
-                            outbound_tag, effective_meta.destination
+                            outbound_tag, effective_dest
                         );
                         continue;
                     }
                 };
 
-                let ep: Arc<dyn PacketEndpoint> = match outbound.dial_packet(&effective_meta).await
-                {
+                let mut dial_meta = meta.clone();
+                dial_meta.destination = effective_dest.clone();
+
+                let ep: Arc<dyn PacketEndpoint> = match outbound.dial_packet(&dial_meta).await {
                     Ok(ep) => Arc::from(ep),
                     Err(e) => {
                         warn!(
                             "failed to dial UDP endpoint [{}] for {}: {}",
-                            outbound_tag, effective_meta.destination, e
+                            outbound_tag, effective_dest, e
                         );
                         continue;
                     }
@@ -314,7 +341,7 @@ impl Dispatcher for DefaultDispatcher {
                     }
                 });
 
-                endpoints.insert(outbound_tag.to_string(), ep.clone());
+                endpoints.insert(outbound_tag.clone(), ep.clone());
                 ep
             };
 

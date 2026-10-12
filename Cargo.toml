@@ -57,7 +57,6 @@ clap = { version = "4.5", features = ["derive"] }
 serde_yaml_ng = "0.10"
 glob = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
-mimalloc = { version = "0.1", default-features = false }
 socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 parking_lot = "0.12"
@@ -72,7 +71,8 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# panic = "unwind" (default): a panic inside a per-connection Tokio task is caught
+# at the task boundary and must never take down the whole proxy process.
 strip = true
 [package]
 name = "flux-core"

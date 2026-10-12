@@ -28,6 +28,9 @@ pub struct RuleSet {
     pub suffix_set: HashSet<String>,
     #[serde(skip)]
     pub keyword_list: Vec<String>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub file_loaded: bool,
 }
 
 impl RuleSet {
@@ -95,9 +98,16 @@ impl RuleSet {
         Ok(())
     }
 
-    pub fn compile(&mut self) {
-        if let Some(p) = &self.path.clone() {
-            let _ = self.load_from_file(p);
+    /// Compiles derived lookup structures. Idempotent: derived sets are rebuilt from scratch,
+    /// and the ruleset file is loaded at most once.
+    pub fn compile(&mut self) -> Result<(), String> {
+        if !self.file_loaded
+            && let Some(p) = self.path.clone()
+        {
+            let tag = self.tag.clone();
+            self.load_from_file(&p)
+                .map_err(|e| format!("failed to load ruleset '{}' from '{}': {}", tag, p, e))?;
+            self.file_loaded = true;
         }
 
         self.parsed_cidrs = self
@@ -132,6 +142,7 @@ impl RuleSet {
             .iter()
             .map(|k| k.trim().to_ascii_lowercase())
             .collect();
+        Ok(())
     }
 
     pub fn matches(&self, meta: &SessionMeta) -> bool {
@@ -193,10 +204,13 @@ impl RuleSetRegistry {
         }
     }
 
-    pub fn insert(&mut self, mut ruleset: RuleSet) {
-        ruleset.compile();
+    /// Compiles and inserts a ruleset. Returns an error if the ruleset file cannot be loaded,
+    /// so a missing file never silently degrades to an empty (never-matching) ruleset.
+    pub fn insert(&mut self, mut ruleset: RuleSet) -> Result<(), String> {
+        ruleset.compile()?;
         self.rule_sets
             .insert(ruleset.tag.clone(), Arc::new(ruleset));
+        Ok(())
     }
 
     pub fn get(&self, tag: &str) -> Option<Arc<RuleSet>> {
@@ -217,7 +231,7 @@ mod tests {
             ip_cidr: vec!["157.240.0.0/16".into()],
             ..Default::default()
         };
-        rs.compile();
+        rs.compile().unwrap();
 
         let meta1 = SessionMeta::new(
             "127.0.0.1:1000".parse().unwrap(),
@@ -256,7 +270,7 @@ mod tests {
             path: Some(file_path.to_str().unwrap().to_string()),
             ..Default::default()
         };
-        rs.compile();
+        rs.compile().unwrap();
 
         let meta = SessionMeta::new(
             "127.0.0.1:1000".parse().unwrap(),
@@ -280,7 +294,7 @@ mod tests {
         rs.parse_rule_line("  - 'DOMAIN-SUFFIX,youtube.com'");
         rs.parse_rule_line("  - 'DOMAIN,netflix.com'");
         rs.parse_rule_line("  - 'IP-CIDR,192.168.1.0/24'");
-        rs.compile();
+        rs.compile().unwrap();
 
         let meta1 = SessionMeta::new(
             "127.0.0.1:0".parse().unwrap(),

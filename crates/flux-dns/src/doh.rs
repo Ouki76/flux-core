@@ -92,8 +92,10 @@ impl DohClient {
     }
 
     /// Connects to the DoH server with connection reuse and resolves domain name to an IP.
-    pub async fn query_doh(&self, domain: &str) -> FluxResult<IpAddr> {
-        let query_wire = DnsMessage::build_query(domain, QTYPE_A);
+    /// Queries the DoH server for the given record type, returning the first
+    /// matching address together with its real TTL from the response.
+    pub async fn query_doh(&self, domain: &str, qtype: u16) -> FluxResult<(IpAddr, u32)> {
+        let query_wire = DnsMessage::build_query(domain, qtype);
 
         let req = format!(
             "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
@@ -191,7 +193,7 @@ impl DohClient {
 
             match query_res {
                 Ok(body) => {
-                    return DnsMessage::parse_ip_record(&body);
+                    return DnsMessage::parse_specific_record_with_ttl(&body, qtype);
                 }
                 Err(_) => {
                     *guard = None;
@@ -207,7 +209,7 @@ impl DohClient {
 
     /// Queries the DoH server and returns IPv4.
     pub async fn resolve_ipv4(&self, domain: &str) -> FluxResult<Ipv4Addr> {
-        match self.query_doh(domain).await? {
+        match self.query_doh(domain, QTYPE_A).await?.0 {
             IpAddr::V4(v4) => Ok(v4),
             IpAddr::V6(_) => Err(FluxError::Dns(
                 "expected IPv4 address from DoH, got IPv6".into(),
@@ -275,10 +277,11 @@ mod tests {
         let doh = DohClient::new(&url);
 
         // Perform multiple parallel queries and verify round-robin rotation
-        let ip1 = doh.query_doh("example.com").await.unwrap();
+        let (ip1, ttl1) = doh.query_doh("example.com", QTYPE_A).await.unwrap();
         assert_eq!(ip1, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(ttl1, 300);
 
-        let ip2 = doh.query_doh("example.com").await.unwrap();
+        let (ip2, _) = doh.query_doh("example.com", QTYPE_A).await.unwrap();
         assert_eq!(ip2, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
 
         assert!(doh.counter.load(Ordering::Relaxed) >= 2);

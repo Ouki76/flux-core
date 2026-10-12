@@ -19,8 +19,10 @@ pub struct SingboxProcess {
 }
 
 impl SingboxProcess {
-    pub fn start(config_json: &str) -> (Self, PathBuf) {
-        let bin = get_singbox_bin().expect("sing-box binary must be present");
+    /// Starts a sing-box process, or returns `None` when the binary is unavailable
+    /// (interop tests degrade to a graceful skip instead of a hard failure).
+    pub fn start(config_json: &str) -> Option<(Self, PathBuf)> {
+        let bin = get_singbox_bin()?;
         let dir = TempDir::new().expect("failed to create tempdir");
         let cfg_path = dir.path().join("config.json");
         fs::write(&cfg_path, config_json).expect("failed to write sing-box config");
@@ -41,7 +43,7 @@ impl SingboxProcess {
         // Give sing-box 300ms to bind ports under parallel test load
         std::thread::sleep(Duration::from_millis(300));
 
-        (Self { child, _dir: dir }, cfg_path)
+        Some((Self { child, _dir: dir }, cfg_path))
     }
 }
 
@@ -58,10 +60,6 @@ pub fn get_singbox_bin() -> Option<PathBuf> {
         if path.exists() {
             return Some(path);
         }
-    }
-    let default_path = PathBuf::from("/home/ouki/.local/bin/sing-box");
-    if default_path.exists() {
-        return Some(default_path);
     }
     which("sing-box")
 }
@@ -112,7 +110,10 @@ async fn test_interop_socks5_plain_flux_to_singbox() {
         }}"#,
         sbox_port
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -178,7 +179,10 @@ async fn test_interop_socks5_plain_singbox_to_flux() {
         }}"#,
         sbox_in_port, flux_port
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_in_port))
         .await
@@ -218,7 +222,10 @@ async fn test_interop_socks5_auth_flux_to_singbox() {
         }}"#,
         sbox_port
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -265,7 +272,10 @@ async fn test_interop_http_connect_flux_to_singbox() {
         }}"#,
         sbox_port
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -316,7 +326,10 @@ async fn test_interop_shadowsocks_aead_chacha20_both_directions() {
         }}"#,
         sbox_port, password
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -387,7 +400,10 @@ async fn test_interop_shadowsocks_aead_chacha20_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -431,7 +447,10 @@ async fn test_interop_shadowsocks_aead_aes256_both_directions() {
         }}"#,
         sbox_port, password
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -502,7 +521,10 @@ async fn test_interop_shadowsocks_aead_aes256_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -546,7 +568,10 @@ async fn test_interop_shadowsocks_aead_aes128_both_directions() {
         }}"#,
         sbox_port, password
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -617,7 +642,10 @@ async fn test_interop_shadowsocks_aead_aes128_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -663,7 +691,10 @@ async fn test_interop_shadowsocks_2022_blake3_aes128_both_directions() {
         }}"#,
         sbox_port, b64_key
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -734,7 +765,10 @@ async fn test_interop_shadowsocks_2022_blake3_aes128_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, b64_key
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -780,7 +814,10 @@ async fn test_interop_shadowsocks_2022_blake3_chacha20_both_directions() {
         }}"#,
         sbox_port, b64_key
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -851,7 +888,10 @@ async fn test_interop_shadowsocks_2022_blake3_chacha20_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, b64_key
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -897,7 +937,10 @@ async fn test_interop_shadowsocks_2022_blake3_aes256_both_directions() {
         }}"#,
         sbox_port, b64_key
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -968,7 +1011,10 @@ async fn test_interop_shadowsocks_2022_blake3_aes256_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, b64_key
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -1011,7 +1057,10 @@ async fn test_interop_vless_plain_both_directions() {
         }}"#,
         sbox_port, uuid
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -1073,7 +1122,10 @@ async fn test_interop_vless_plain_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -1127,7 +1179,10 @@ async fn test_interop_vless_tls_both_directions() {
         cert_path.display(),
         key_path.display()
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -1206,7 +1261,10 @@ async fn test_interop_vless_tls_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -1260,7 +1318,10 @@ async fn test_interop_trojan_tls_both_directions() {
         cert_path.display(),
         key_path.display()
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -1339,7 +1400,10 @@ async fn test_interop_trojan_tls_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -1386,7 +1450,10 @@ async fn test_interop_trojan_websocket_both_directions() {
         }}"#,
         sbox_port, password
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -1457,7 +1524,10 @@ async fn test_interop_trojan_websocket_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -1504,7 +1574,10 @@ async fn test_interop_vless_websocket_both_directions() {
         }}"#,
         sbox_port, uuid
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -1575,7 +1648,10 @@ async fn test_interop_vless_websocket_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -1622,7 +1698,10 @@ async fn test_interop_vless_httpupgrade_both_directions() {
         }}"#,
         sbox_port, uuid
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -1693,7 +1772,10 @@ async fn test_interop_vless_httpupgrade_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -1740,7 +1822,10 @@ async fn test_interop_trojan_httpupgrade_both_directions() {
         }}"#,
         sbox_port, password
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -1811,7 +1896,10 @@ async fn test_interop_trojan_httpupgrade_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -1869,7 +1957,10 @@ async fn test_interop_vless_grpc_both_directions() {
         cert_path.display(),
         key_path.display()
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -1954,7 +2045,10 @@ async fn test_interop_vless_grpc_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -2001,7 +2095,10 @@ async fn test_interop_trojan_grpc_both_directions() {
         }}"#,
         sbox_port, password
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -2072,7 +2169,10 @@ async fn test_interop_trojan_grpc_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -2130,7 +2230,10 @@ async fn test_interop_vless_h2_both_directions() {
         cert_path.display(),
         key_path.display()
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -2215,7 +2318,10 @@ async fn test_interop_vless_h2_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -2273,7 +2379,10 @@ async fn test_interop_trojan_h2_both_directions() {
         cert_path.display(),
         key_path.display()
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -2358,7 +2467,10 @@ async fn test_interop_trojan_h2_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -2399,7 +2511,10 @@ async fn test_interop_socks5_udp_both_directions() {
         }}"#,
         sbox_port
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut tcp_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_port))
         .await
@@ -2470,7 +2585,10 @@ async fn test_interop_socks5_udp_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut sbox_client_tcp = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -2534,7 +2652,10 @@ async fn test_interop_shadowsocks_udp_chacha20_both_directions() {
         }}"#,
         sbox_port, password
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -2610,7 +2731,10 @@ async fn test_interop_shadowsocks_udp_chacha20_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, password
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut sbox_client_tcp = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -2672,7 +2796,10 @@ async fn test_interop_vmess_aead_aes128_both_directions() {
         }}"#,
         sbox_port, uuid
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -2735,7 +2862,10 @@ async fn test_interop_vmess_aead_aes128_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -2778,7 +2908,10 @@ async fn test_interop_vmess_aead_chacha20_both_directions() {
         }}"#,
         sbox_port, uuid
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -2841,7 +2974,10 @@ async fn test_interop_vmess_aead_chacha20_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -2888,7 +3024,10 @@ async fn test_interop_vmess_websocket_both_directions() {
         }}"#,
         sbox_port, uuid
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -2960,7 +3099,10 @@ async fn test_interop_vmess_websocket_both_directions() {
         }}"#,
         sbox_client_in_port, flux_port, uuid
     );
-    let (_sbox_client, _) = SingboxProcess::start(&sbox_client_cfg);
+    let Some((_sbox_client, _)) = SingboxProcess::start(&sbox_client_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let mut client_conn = TcpStream::connect(format!("127.0.0.1:{}", sbox_client_in_port))
         .await
@@ -3019,7 +3161,10 @@ async fn test_interop_shadowtls_v3_flux_to_singbox() {
         }}"#,
         sbox_port, password, b64_key
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -3079,7 +3224,10 @@ async fn test_interop_hysteria2_quic_flux_to_singbox() {
         cert_path.display(),
         key_path.display()
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let flux_cfg = format!(
         r#"{{
@@ -3140,7 +3288,10 @@ async fn test_interop_wireguard_noise_ik_flux_to_singbox() {
         }}"#,
         sbox_priv_b64, sbox_port, client_pub_b64
     );
-    let (_sbox, _) = SingboxProcess::start(&sbox_cfg);
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
 
     let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sock.connect(format!("127.0.0.1:{}", sbox_port))

@@ -242,7 +242,7 @@ impl Instance {
                         domain_keyword: rs_cfg.domain_keyword,
                         ..Default::default()
                     };
-                    reg.insert(rs);
+                    reg.insert(rs).map_err(flux_types::FluxError::Config)?;
                 }
                 let mut r_vec = Vec::new();
                 for r in route_cfg.rules {
@@ -251,7 +251,7 @@ impl Instance {
                 let def = route_cfg.final_outbound.unwrap_or_else(|| "direct".into());
                 let geo = Arc::new(flux_router::GeoIpRegistry::new());
                 if let Some(ref path) = route_cfg.geoip_path {
-                    let _ = geo.load(path);
+                    geo.load(path).map_err(flux_types::FluxError::Config)?;
                 }
                 (r_vec, def, reg, geo)
             } else {

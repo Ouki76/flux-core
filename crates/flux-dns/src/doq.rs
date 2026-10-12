@@ -1,4 +1,4 @@
-use crate::wire::{DnsMessage, QTYPE_A};
+use crate::wire::DnsMessage;
 use flux_types::{FluxError, FluxResult};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -102,6 +102,7 @@ impl DoqClient {
         &self,
         domain: &str,
         ecs: Option<ipnet::IpNet>,
+        qtype: u16,
     ) -> FluxResult<(IpAddr, u32)> {
         let connect_addr: SocketAddr = if let Ok(ip) = self.server_host.parse() {
             SocketAddr::new(ip, self.server_port)
@@ -132,7 +133,7 @@ impl DoqClient {
             }
         };
 
-        let query = DnsMessage::build_query_with_ecs(domain, QTYPE_A, ecs);
+        let query = DnsMessage::build_query_with_ecs(domain, qtype, ecs);
         let len_bytes = (query.len() as u16).to_be_bytes();
 
         send_stream
@@ -166,7 +167,7 @@ impl DoqClient {
             .await
             .map_err(|e| FluxError::Network(e.to_string()))?;
 
-        DnsMessage::parse_ip_record_with_ttl(&resp_buf)
+        DnsMessage::parse_specific_record_with_ttl(&resp_buf, qtype)
     }
 }
 
