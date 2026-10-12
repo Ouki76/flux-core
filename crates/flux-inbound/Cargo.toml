@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+futures-util = { workspace = true }
+futures-channel = "0.3"
 flux-types = { workspace = true }
 flux-common = { workspace = true }
 flux-protocol = { workspace = true }
@@ -22,3 +24,4 @@ parking_lot = { workspace = true }
 quinn = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "auto-icmp-echo-reply"] }

@@ -1,13 +1,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use dashmap::DashMap;
-use flux_types::{
-    Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
-};
+use flux_types::{Dispatcher, FluxResult, Inbound, NetworkType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
 pub const TCP_FIN: u8 = 0x01;
@@ -236,415 +232,6 @@ fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
     }
 }
 
-/// Builds an IPv4 or IPv6 UDP packet with IP checksum.
-pub fn build_ip_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
-    match (src, dst) {
-        (SocketAddr::V4(_), SocketAddr::V4(_)) => build_ipv4_udp_packet(src, dst, payload),
-        (SocketAddr::V6(_), SocketAddr::V6(_)) => build_ipv6_udp_packet(src, dst, payload),
-        _ => None,
-    }
-}
-
-/// Builds an IPv4 UDP packet with IP checksum.
-pub fn build_ipv4_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
-    let (src_ip, dst_ip) = match (src.ip(), dst.ip()) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
-        _ => return None,
-    };
-
-    let total_len = 20 + 8 + payload.len();
-    if total_len > 65535 {
-        return None;
-    }
-
-    let mut buf = vec![0u8; total_len];
-    // IPv4 Header (20 bytes)
-    buf[0] = 0x45; // Version 4, IHL 5
-    buf[1] = 0x00; // DSCP / ECN
-    buf[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    buf[4..6].copy_from_slice(&0u16.to_be_bytes()); // Identification
-    buf[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // Flags: Don't Fragment
-    buf[8] = 64; // TTL
-    buf[9] = 17; // Protocol: UDP
-    buf[12..16].copy_from_slice(&src_ip.octets());
-    buf[16..20].copy_from_slice(&dst_ip.octets());
-
-    // Calculate IPv4 Header Checksum
-    let ip_checksum = calc_checksum(&buf[..20]);
-    buf[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
-    // UDP Header (8 bytes)
-    buf[20..22].copy_from_slice(&src.port().to_be_bytes());
-    buf[22..24].copy_from_slice(&dst.port().to_be_bytes());
-    let udp_len = (8 + payload.len()) as u16;
-    buf[24..26].copy_from_slice(&udp_len.to_be_bytes());
-    buf[26..28].copy_from_slice(&0u16.to_be_bytes()); // Checksum optional for IPv4 UDP
-
-    // Payload
-    buf[28..].copy_from_slice(payload);
-
-    Some(buf)
-}
-
-/// Builds an IPv6 UDP packet.
-pub fn build_ipv6_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Option<Vec<u8>> {
-    let (src_ip, dst_ip) = match (src.ip(), dst.ip()) {
-        (IpAddr::V6(s), IpAddr::V6(d)) => (s, d),
-        _ => return None,
-    };
-
-    let udp_len = 8 + payload.len();
-    let total_len = 40 + udp_len;
-    if total_len > 65535 {
-        return None;
-    }
-
-    let mut buf = vec![0u8; total_len];
-    buf[0] = 0x60;
-    buf[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    buf[6] = 17; // Next Header: UDP
-    buf[7] = 64; // Hop Limit
-
-    buf[8..24].copy_from_slice(&src_ip.octets());
-    buf[24..40].copy_from_slice(&dst_ip.octets());
-
-    buf[40..42].copy_from_slice(&src.port().to_be_bytes());
-    buf[42..44].copy_from_slice(&dst.port().to_be_bytes());
-    buf[44..46].copy_from_slice(&(udp_len as u16).to_be_bytes());
-    buf[46..48].copy_from_slice(&0u16.to_be_bytes());
-
-    buf[48..].copy_from_slice(payload);
-
-    // RFC 8200 §8.1: IPv6 UDP checksum is mandatory
-    calc_udp_checksum_ipv6(src_ip, dst_ip, &mut buf[40..]);
-    Some(buf)
-}
-
-fn calc_udp_checksum_ipv6(src: Ipv6Addr, dst: Ipv6Addr, udp_segment: &mut [u8]) {
-    let mut sum: u32 = 0;
-    for chunk in src.octets().chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    for chunk in dst.octets().chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    sum += (udp_segment.len() as u32) >> 16;
-    sum += (udp_segment.len() as u32) & 0xFFFF;
-    sum += 17u32; // Next Header: UDP
-
-    udp_segment[6] = 0;
-    udp_segment[7] = 0;
-    for chunk in udp_segment.chunks(2) {
-        if chunk.len() == 2 {
-            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-        } else {
-            sum += u16::from_be_bytes([chunk[0], 0]) as u32;
-        }
-    }
-    while (sum >> 16) > 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let csum = !(sum as u16);
-    let final_csum = if csum == 0 { 0xFFFF } else { csum };
-    udp_segment[6..8].copy_from_slice(&final_csum.to_be_bytes());
-}
-
-/// Builds an IPv4 or IPv6 TCP packet with correct IP and TCP checksums.
-pub fn build_ip_tcp_packet(
-    src: SocketAddr,
-    dst: SocketAddr,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    payload: &[u8],
-) -> Option<Vec<u8>> {
-    match (src, dst) {
-        (SocketAddr::V4(_), SocketAddr::V4(_)) => {
-            build_ipv4_tcp_packet(src, dst, seq, ack, flags, payload)
-        }
-        (SocketAddr::V6(_), SocketAddr::V6(_)) => {
-            build_ipv6_tcp_packet(src, dst, seq, ack, flags, payload)
-        }
-        _ => None,
-    }
-}
-
-pub fn build_ipv4_tcp_packet(
-    src: SocketAddr,
-    dst: SocketAddr,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    payload: &[u8],
-) -> Option<Vec<u8>> {
-    let (src_ip, dst_ip) = match (src.ip(), dst.ip()) {
-        (IpAddr::V4(s), IpAddr::V4(d)) => (s, d),
-        _ => return None,
-    };
-
-    let total_len = 20 + 20 + payload.len();
-    if total_len > 65535 {
-        return None;
-    }
-
-    let mut buf = vec![0u8; total_len];
-    // IPv4 Header
-    buf[0] = 0x45;
-    buf[1] = 0x00;
-    buf[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
-    buf[4..6].copy_from_slice(&0u16.to_be_bytes());
-    buf[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
-    buf[8] = 64; // TTL
-    buf[9] = 6; // Protocol: TCP
-    buf[12..16].copy_from_slice(&src_ip.octets());
-    buf[16..20].copy_from_slice(&dst_ip.octets());
-
-    let ip_csum = calc_checksum(&buf[..20]);
-    buf[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    // TCP Header
-    buf[20..22].copy_from_slice(&src.port().to_be_bytes());
-    buf[22..24].copy_from_slice(&dst.port().to_be_bytes());
-    buf[24..28].copy_from_slice(&seq.to_be_bytes());
-    buf[28..32].copy_from_slice(&ack.to_be_bytes());
-    buf[32] = 0x50; // 5 x 4 = 20 bytes data offset
-    buf[33] = flags;
-    buf[34..36].copy_from_slice(&64240u16.to_be_bytes()); // Window Size
-
-    if !payload.is_empty() {
-        buf[40..].copy_from_slice(payload);
-    }
-
-    calc_tcp_checksum_ipv4(src_ip, dst_ip, &mut buf[20..]);
-    Some(buf)
-}
-
-pub fn build_ipv6_tcp_packet(
-    src: SocketAddr,
-    dst: SocketAddr,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    payload: &[u8],
-) -> Option<Vec<u8>> {
-    let (src_ip, dst_ip) = match (src.ip(), dst.ip()) {
-        (IpAddr::V6(s), IpAddr::V6(d)) => (s, d),
-        _ => return None,
-    };
-
-    let tcp_len = 20 + payload.len();
-    let total_len = 40 + tcp_len;
-    if total_len > 65535 {
-        return None;
-    }
-
-    let mut buf = vec![0u8; total_len];
-    buf[0] = 0x60;
-    buf[4..6].copy_from_slice(&(tcp_len as u16).to_be_bytes());
-    buf[6] = 6; // Next Header: TCP
-    buf[7] = 64; // Hop Limit
-
-    buf[8..24].copy_from_slice(&src_ip.octets());
-    buf[24..40].copy_from_slice(&dst_ip.octets());
-
-    // TCP Header
-    buf[40..42].copy_from_slice(&src.port().to_be_bytes());
-    buf[42..44].copy_from_slice(&dst.port().to_be_bytes());
-    buf[44..48].copy_from_slice(&seq.to_be_bytes());
-    buf[48..52].copy_from_slice(&ack.to_be_bytes());
-    buf[52] = 0x50;
-    buf[53] = flags;
-    buf[54..56].copy_from_slice(&64240u16.to_be_bytes());
-
-    if !payload.is_empty() {
-        buf[60..].copy_from_slice(payload);
-    }
-
-    calc_tcp_checksum_ipv6(src_ip, dst_ip, &mut buf[40..]);
-    Some(buf)
-}
-
-fn calc_tcp_checksum_ipv4(src: Ipv4Addr, dst: Ipv4Addr, tcp_segment: &mut [u8]) {
-    let mut sum: u32 = 0;
-    for chunk in src.octets().chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    for chunk in dst.octets().chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    sum += 6u32; // Protocol TCP
-    sum += tcp_segment.len() as u32;
-
-    tcp_segment[16] = 0;
-    tcp_segment[17] = 0;
-    for chunk in tcp_segment.chunks(2) {
-        if chunk.len() == 2 {
-            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-        } else {
-            sum += u16::from_be_bytes([chunk[0], 0]) as u32;
-        }
-    }
-    while (sum >> 16) > 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let csum = !(sum as u16);
-    let final_csum = if csum == 0 { 0xFFFF } else { csum };
-    tcp_segment[16..18].copy_from_slice(&final_csum.to_be_bytes());
-}
-
-fn calc_tcp_checksum_ipv6(src: Ipv6Addr, dst: Ipv6Addr, tcp_segment: &mut [u8]) {
-    let mut sum: u32 = 0;
-    for chunk in src.octets().chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    for chunk in dst.octets().chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    sum += (tcp_segment.len() as u32) >> 16;
-    sum += (tcp_segment.len() as u32) & 0xFFFF;
-    sum += 6u32;
-
-    tcp_segment[16] = 0;
-    tcp_segment[17] = 0;
-    for chunk in tcp_segment.chunks(2) {
-        if chunk.len() == 2 {
-            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-        } else {
-            sum += u16::from_be_bytes([chunk[0], 0]) as u32;
-        }
-    }
-    while (sum >> 16) > 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let csum = !(sum as u16);
-    let final_csum = if csum == 0 { 0xFFFF } else { csum };
-    tcp_segment[16..18].copy_from_slice(&final_csum.to_be_bytes());
-}
-
-fn calc_checksum(header: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    for chunk in header.chunks(2) {
-        if chunk.len() == 2 {
-            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-        } else {
-            sum += u16::from_be_bytes([chunk[0], 0]) as u32;
-        }
-    }
-    while (sum >> 16) > 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-/// Handles ICMP Echo Requests (ping) and generates matching Echo Replies.
-pub fn handle_icmp_packet(packet: &[u8]) -> Option<Vec<u8>> {
-    if packet.is_empty() {
-        return None;
-    }
-    match packet[0] >> 4 {
-        4 => handle_ipv4_icmp(packet),
-        6 => handle_ipv6_icmp(packet),
-        _ => None,
-    }
-}
-
-fn handle_ipv4_icmp(packet: &[u8]) -> Option<Vec<u8>> {
-    if packet.len() < 28 {
-        return None;
-    }
-    let ihl = ((packet[0] & 0x0F) * 4) as usize;
-    if packet.len() < ihl + 8 || packet[9] != 1 {
-        return None;
-    }
-    // Type 8 is Echo Request
-    if packet[ihl] != 8 || packet[ihl + 1] != 0 {
-        return None;
-    }
-
-    let mut reply = packet.to_vec();
-    // Swap IPv4 src and dst
-    let src = [packet[12], packet[13], packet[14], packet[15]];
-    let dst = [packet[16], packet[17], packet[18], packet[19]];
-    reply[12..16].copy_from_slice(&dst);
-    reply[16..20].copy_from_slice(&src);
-    reply[8] = 64; // TTL
-
-    // Recalculate IPv4 header checksum
-    reply[10] = 0;
-    reply[11] = 0;
-    let ip_csum = calc_checksum(&reply[..ihl]);
-    reply[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-
-    // ICMP Echo Reply: Type 0, Code 0
-    reply[ihl] = 0;
-    reply[ihl + 1] = 0;
-    reply[ihl + 2] = 0;
-    reply[ihl + 3] = 0;
-    let icmp_csum = calc_checksum(&reply[ihl..]);
-    reply[ihl + 2..ihl + 4].copy_from_slice(&icmp_csum.to_be_bytes());
-
-    Some(reply)
-}
-
-fn handle_ipv6_icmp(packet: &[u8]) -> Option<Vec<u8>> {
-    if packet.len() < 48 || packet[6] != 58 {
-        return None;
-    }
-    // Type 128 is Echo Request
-    if packet[40] != 128 || packet[41] != 0 {
-        return None;
-    }
-
-    let mut reply = packet.to_vec();
-    // Swap IPv6 src and dst
-    let mut src = [0u8; 16];
-    let mut dst = [0u8; 16];
-    src.copy_from_slice(&packet[8..24]);
-    dst.copy_from_slice(&packet[24..40]);
-    reply[8..24].copy_from_slice(&dst);
-    reply[24..40].copy_from_slice(&src);
-    reply[7] = 64; // Hop limit
-
-    // ICMPv6 Echo Reply: Type 129, Code 0
-    reply[40] = 129;
-    reply[41] = 0;
-
-    let src_ip = Ipv6Addr::from(dst);
-    let dst_ip = Ipv6Addr::from(src);
-
-    calc_icmpv6_checksum(src_ip, dst_ip, &mut reply[40..]);
-    Some(reply)
-}
-
-fn calc_icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, data: &mut [u8]) {
-    data[2] = 0;
-    data[3] = 0;
-    let mut sum: u32 = 0;
-    for chunk in src.octets().chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    for chunk in dst.octets().chunks(2) {
-        sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-    }
-    let len = data.len() as u32;
-    sum += len >> 16;
-    sum += len & 0xFFFF;
-    sum += 58; // Next Header: ICMPv6
-
-    for chunk in data.chunks(2) {
-        if chunk.len() == 2 {
-            sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
-        } else {
-            sum += u16::from_be_bytes([chunk[0], 0]) as u32;
-        }
-    }
-    while (sum >> 16) > 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    let csum = !(sum as u16);
-    data[2..4].copy_from_slice(&csum.to_be_bytes());
-}
-
 #[cfg(target_os = "linux")]
 fn open_tun_device(name: &str) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
@@ -693,33 +280,947 @@ fn open_tun_device(name: &str) -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
-struct TunTcpSession {
-    client_seq: AtomicU32,
-    server_seq: AtomicU32,
-    payload_tx: tokio::sync::mpsc::Sender<Bytes>,
-    last_activity: parking_lot::Mutex<std::time::Instant>,
-    ooo_buffer: parking_lot::Mutex<std::collections::BTreeMap<u32, Bytes>>,
+// ---------------------------------------------------------------------------
+// smoltcp-based userspace TCP/IP stack
+//
+// All TCP state machines (retransmission, congestion control, out-of-order
+// reassembly, window management) are delegated to smoltcp. This module only
+// shuttles frames between the kernel TUN device and the stack, and bridges
+// accepted connections/UDP flows to the dispatcher.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+mod smol_stack {
+    use super::{TCP_SYN, parse_ip_packet};
+    use bytes::Bytes;
+    use flux_types::{BoxedStream, Dispatcher, NetworkType, SessionMeta, TargetAddress, UdpPacket};
+    use futures_util::{Sink, SinkExt, Stream, StreamExt};
+    use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
+    use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+    use smoltcp::socket::{tcp, udp};
+    use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
+    use smoltcp::wire::{
+        HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address, Ipv6Address,
+    };
+    use std::collections::{HashMap, VecDeque};
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+    use tracing::{debug, info};
+
+    const TCP_SOCKET_BUF: usize = 64 * 1024;
+    const UDP_SOCKET_BUF: usize = 256 * 1024;
+    const UDP_SOCKET_MAX_PACKETS: usize = 64;
+    const CONN_CHANNEL_CAP: usize = 128;
+    const CMD_CHANNEL_CAP: usize = 4096;
+    const TUN_OUT_CAP: usize = 2048;
+    const UDP_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Commands from connection tasks to the stack actor.
+    enum StackCmd {
+        TcpData {
+            handle: SocketHandle,
+            data: Bytes,
+        },
+        TcpClose {
+            handle: SocketHandle,
+        },
+        UdpReply {
+            remote: SocketAddr,
+            client: SocketAddr,
+            payload: Bytes,
+        },
+        UdpSessionClose {
+            key: (SocketAddr, SocketAddr),
+        },
+    }
+
+    /// Frame-queue device bridging smoltcp with the async TUN reader/writer tasks.
+    #[derive(Default)]
+    pub struct TunDevice {
+        pub rxq: VecDeque<Vec<u8>>,
+        pub txq: VecDeque<Vec<u8>>,
+        pub mtu: usize,
+    }
+
+    pub struct TunRxToken(Vec<u8>);
+    pub struct TunTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
+
+    impl RxToken for TunRxToken {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
+            f(&self.0)
+        }
+    }
+
+    impl TxToken for TunTxToken<'_> {
+        fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
+            let mut buf = vec![0u8; len];
+            let r = f(&mut buf);
+            self.0.push_back(buf);
+            r
+        }
+    }
+
+    impl Device for TunDevice {
+        type RxToken<'a> = TunRxToken;
+        type TxToken<'a> = TunTxToken<'a>;
+
+        fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+            self.rxq
+                .pop_front()
+                .map(|frame| (TunRxToken(frame), TunTxToken(&mut self.txq)))
+        }
+
+        fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
+            Some(TunTxToken(&mut self.txq))
+        }
+
+        fn capabilities(&self) -> DeviceCapabilities {
+            let mut caps = DeviceCapabilities::default();
+            caps.medium = Medium::Ip;
+            caps.max_transmission_unit = self.mtu;
+            caps
+        }
+    }
+
+    /// AsyncRead/AsyncWrite bridge between a proxy pipeline and a smoltcp TCP socket.
+    struct SmolTcpStream {
+        handle: SocketHandle,
+        cmd_tx: futures_channel::mpsc::Sender<StackCmd>,
+        rx: futures_channel::mpsc::Receiver<Bytes>,
+        leftover: Option<Bytes>,
+        closed: bool,
+    }
+
+    impl tokio::io::AsyncRead for SmolTcpStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if let Some(left) = &mut self.leftover {
+                let n = left.len().min(buf.remaining());
+                buf.put_slice(&left[..n]);
+                if n == left.len() {
+                    self.leftover = None;
+                } else {
+                    *left = left.split_off(n);
+                }
+                return std::task::Poll::Ready(Ok(()));
+            }
+            match std::pin::Pin::new(&mut self.rx).poll_next(cx) {
+                std::task::Poll::Ready(Some(bytes)) => {
+                    let n = bytes.len().min(buf.remaining());
+                    buf.put_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        self.leftover = Some(bytes.slice(n..));
+                    }
+                    std::task::Poll::Ready(Ok(()))
+                }
+                // Channel closed by the stack actor: connection is done → EOF.
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for SmolTcpStream {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.closed {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "smoltcp connection closed",
+                )));
+            }
+            if buf.is_empty() {
+                return std::task::Poll::Ready(Ok(0));
+            }
+            let this = &mut *self;
+            match std::pin::Pin::new(&mut this.cmd_tx).poll_ready(cx) {
+                std::task::Poll::Ready(Ok(())) => {
+                    let item = StackCmd::TcpData {
+                        handle: this.handle,
+                        data: Bytes::copy_from_slice(buf),
+                    };
+                    match std::pin::Pin::new(&mut this.cmd_tx).start_send(item) {
+                        Ok(()) => std::task::Poll::Ready(Ok(buf.len())),
+                        Err(e) => std::task::Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            format!("stack actor gone: {}", e),
+                        ))),
+                    }
+                }
+                std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    format!("stack actor gone: {}", e),
+                ))),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            std::pin::Pin::new(&mut this.cmd_tx)
+                .poll_flush(cx)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if !self.closed {
+                self.closed = true;
+                let handle = self.handle;
+                let _ =
+                    std::pin::Pin::new(&mut self.cmd_tx).start_send(StackCmd::TcpClose { handle });
+            }
+            let this = self.get_mut();
+            std::pin::Pin::new(&mut this.cmd_tx)
+                .poll_flush(cx)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e.to_string()))
+        }
+    }
+
+    impl Drop for SmolTcpStream {
+        fn drop(&mut self) {
+            if !self.closed {
+                let _ = self.cmd_tx.try_send(StackCmd::TcpClose {
+                    handle: self.handle,
+                });
+            }
+        }
+    }
+
+    /// Per-connection state owned by the stack actor.
+    struct TcpConn {
+        to_proxy: futures_channel::mpsc::Sender<Bytes>,
+        /// Chunk read from the socket that did not fit into the channel yet.
+        pending_to_proxy: Option<Bytes>,
+        /// Data received from the proxy but not yet accepted by the socket.
+        pending_from_proxy: VecDeque<Bytes>,
+    }
+
+    fn ip_ep_to_std(ep: IpEndpoint) -> Option<SocketAddr> {
+        // smoltcp with `std` uses core::net address types directly.
+        let ip: IpAddr = ep.addr.into();
+        Some(SocketAddr::new(ip, ep.port))
+    }
+
+    fn std_to_ip_addr(addr: IpAddr) -> IpAddress {
+        addr.into()
+    }
+
+    /// Runs the smoltcp stack actor. Owns the Interface and SocketSet; all socket
+    /// manipulation happens on this single task (no locking required).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn run_stack(
+        afd: Arc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+        mtu: usize,
+        tag: Arc<str>,
+        dispatcher: Arc<dyn Dispatcher>,
+        running: Arc<AtomicBool>,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    ) {
+        let start = Instant::now();
+        let mut device = TunDevice {
+            rxq: VecDeque::with_capacity(64),
+            txq: VecDeque::with_capacity(64),
+            mtu,
+        };
+        let config = Config::new(HardwareAddress::Ip);
+        let mut iface = Interface::new(config, &mut device, SmolInstant::ZERO);
+        // AnyIP: treat every destination address as local (transparent capture).
+        iface.set_any_ip(true);
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(Ipv4Address::new(198, 18, 0, 1).into(), 32));
+            let _ = addrs.push(IpCidr::new(
+                Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).into(),
+                128,
+            ));
+        });
+
+        let mut sockets = SocketSet::new(vec![]);
+
+        // TUN reader task → frames into the actor.
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUN_OUT_CAP);
+        {
+            let afd = afd.clone();
+            let running = running.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; mtu + 64];
+                while running.load(Ordering::Relaxed) {
+                    let mut guard = match afd.readable().await {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    let n = match guard.try_io(|inner| {
+                        use std::os::fd::AsRawFd;
+                        let res = unsafe {
+                            libc::read(
+                                inner.as_raw_fd(),
+                                buf.as_mut_ptr() as *mut libc::c_void,
+                                buf.len(),
+                            )
+                        };
+                        if res < 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(res as usize)
+                        }
+                    }) {
+                        Ok(Ok(n)) => n,
+                        Ok(Err(_)) => continue,
+                        Err(_) => continue, // WouldBlock: spurious readiness
+                    };
+                    if n == 0 || frame_tx.send(buf[..n].to_vec()).await.is_err() {
+                        if n == 0 {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Actor → TUN writer task.
+        let (tun_out_tx, mut tun_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUN_OUT_CAP);
+        {
+            let afd = afd.clone();
+            let running = running.clone();
+            tokio::spawn(async move {
+                while running.load(Ordering::Relaxed) {
+                    let Some(pkt) = tun_out_rx.recv().await else {
+                        break;
+                    };
+                    let mut guard = match afd.writable().await {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    let _ = guard.try_io(|inner| {
+                        use std::os::fd::AsRawFd;
+                        let res = unsafe {
+                            libc::write(
+                                inner.as_raw_fd(),
+                                pkt.as_ptr() as *const libc::c_void,
+                                pkt.len(),
+                            )
+                        };
+                        if res < 0 {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(res as usize)
+                        }
+                    });
+                }
+            });
+        }
+
+        let (cmd_tx, mut cmd_rx) = futures_channel::mpsc::channel::<StackCmd>(CMD_CHANNEL_CAP);
+
+        // port → listening socket
+        let mut tcp_listeners: HashMap<u16, SocketHandle> = HashMap::new();
+        let mut udp_listeners: HashMap<u16, SocketHandle> = HashMap::new();
+        // active connections/flows
+        let mut tcp_conns: HashMap<SocketHandle, TcpConn> = HashMap::new();
+        let mut udp_sessions: HashMap<
+            (SocketAddr, SocketAddr),
+            tokio::sync::mpsc::Sender<UdpPacket>,
+        > = HashMap::new();
+
+        fn new_tcp_socket() -> tcp::Socket<'static> {
+            tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
+                tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
+            )
+        }
+
+        loop {
+            // ---- 1. Feed pending inbound frames into the device queue, pre-creating
+            //         listener sockets for new flows.
+            let mut drained = 0;
+            while drained < 512 {
+                let frame = match frame_rx.try_recv() {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                drained += 1;
+                if let Some(parsed) = parse_ip_packet(&frame) {
+                    match parsed.network {
+                        NetworkType::Tcp
+                            if parsed.tcp_flags & TCP_SYN != 0
+                                && parsed.tcp_flags & 0x10 == 0 // pure SYN, no ACK
+                                && !tcp_listeners.contains_key(&parsed.dst.port()) =>
+                        {
+                            let mut sock = new_tcp_socket();
+                            if sock.listen(parsed.dst.port()).is_ok() {
+                                let h = sockets.add(sock);
+                                tcp_listeners.insert(parsed.dst.port(), h);
+                            }
+                        }
+                        NetworkType::Udp if !udp_listeners.contains_key(&parsed.dst.port()) => {
+                            let mut sock = udp::Socket::new(
+                                udp::PacketBuffer::new(
+                                    vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
+                                    vec![0u8; UDP_SOCKET_BUF],
+                                ),
+                                udp::PacketBuffer::new(
+                                    vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
+                                    vec![0u8; UDP_SOCKET_BUF],
+                                ),
+                            );
+                            if sock
+                                .bind(IpListenEndpoint {
+                                    addr: None,
+                                    port: parsed.dst.port(),
+                                })
+                                .is_ok()
+                            {
+                                let h = sockets.add(sock);
+                                udp_listeners.insert(parsed.dst.port(), h);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                device.rxq.push_back(frame);
+            }
+
+            // ---- 2. Apply pending commands from connection tasks.
+            for _ in 0..512 {
+                let cmd = match cmd_rx.try_recv() {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                match cmd {
+                    StackCmd::TcpData { handle, data } => {
+                        if let Some(conn) = tcp_conns.get_mut(&handle) {
+                            conn.pending_from_proxy.push_back(data);
+                        }
+                    }
+                    StackCmd::TcpClose { handle } => {
+                        if let Some(conn) = tcp_conns.get_mut(&handle) {
+                            conn.pending_from_proxy.clear();
+                            let sock = sockets.get_mut::<tcp::Socket>(handle);
+                            sock.close();
+                        }
+                    }
+                    StackCmd::UdpSessionClose { key } => {
+                        udp_sessions.remove(&key);
+                    }
+                    StackCmd::UdpReply {
+                        remote,
+                        client,
+                        payload,
+                    } => {
+                        if let Some(&handle) = udp_listeners.get(&remote.port()) {
+                            let sock = sockets.get_mut::<udp::Socket>(handle);
+                            let meta = udp::UdpMetadata {
+                                endpoint: IpEndpoint {
+                                    addr: std_to_ip_addr(client.ip()),
+                                    port: client.port(),
+                                },
+                                local_address: Some(std_to_ip_addr(remote.ip())),
+                                meta: smoltcp::phy::PacketMeta::default(),
+                            };
+                            if let Err(e) = sock.send_slice(&payload, meta) {
+                                debug!("[{}] smoltcp udp send failed: {}", tag, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- 2b. Flush proxy→socket pending data into socket buffers.
+            for (handle, conn) in tcp_conns.iter_mut() {
+                let sock = sockets.get_mut::<tcp::Socket>(*handle);
+                while sock.can_send() {
+                    let Some(chunk) = conn.pending_from_proxy.front_mut() else {
+                        break;
+                    };
+                    match sock.send_slice(chunk) {
+                        Ok(n) if n == chunk.len() => {
+                            conn.pending_from_proxy.pop_front();
+                        }
+                        Ok(n) => {
+                            bytes::Buf::advance(chunk, n); // keep remainder
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+
+            // ---- 3. Poll the stack (ingress + egress + timers/retransmits).
+            let now = SmolInstant::from_millis(start.elapsed().as_millis() as i64);
+            iface.poll(now, &mut device, &mut sockets);
+
+            // ---- 4. Emit frames to the TUN writer.
+            while let Some(frame) = device.txq.pop_front() {
+                if tun_out_tx.try_send(frame).is_err() {
+                    break; // writer channel full; try again next iteration
+                }
+            }
+
+            // ---- 5. Post-poll: claim new connections, pump socket→proxy data,
+            //         reap closed sockets, dispatch UDP datagrams.
+            let mut to_claim: Vec<(SocketHandle, SocketAddr, SocketAddr, u16)> = vec![];
+            let mut to_remove: Vec<SocketHandle> = vec![];
+            for (handle, conn) in tcp_conns.iter_mut() {
+                let sock = sockets.get_mut::<tcp::Socket>(*handle);
+                // Flush a chunk that previously didn't fit into the channel.
+                if let Some(chunk) = conn.pending_to_proxy.take() {
+                    match conn.to_proxy.try_send(chunk) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            conn.pending_to_proxy = Some(e.into_inner());
+                        }
+                    }
+                }
+                if conn.pending_to_proxy.is_none() {
+                    let mut tmp = [0u8; 8192];
+                    while sock.can_recv() {
+                        match sock.recv_slice(&mut tmp) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                match conn.to_proxy.try_send(Bytes::copy_from_slice(&tmp[..n])) {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        conn.pending_to_proxy = Some(e.into_inner());
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let dead = !sock.is_active()
+                    && conn.pending_to_proxy.is_none()
+                    && conn.pending_from_proxy.is_empty();
+                let closed_done = matches!(sock.state(), tcp::State::Closed)
+                    || (!sock.may_recv() && !sock.may_send());
+                if dead || closed_done {
+                    to_remove.push(*handle);
+                }
+            }
+            for handle in to_remove {
+                if let Some(conn) = tcp_conns.remove(&handle) {
+                    drop(conn.to_proxy); // EOF for the proxy task
+                }
+                // Only remove sockets that are truly closed; abort half-open corpses.
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+                if !matches!(sock.state(), tcp::State::Listen) {
+                    sock.abort();
+                }
+                sockets.remove(handle);
+            }
+
+            // Discover newly accepted connections (sockets that transitioned out of Listen).
+            for (handle, sock_any) in sockets.iter_mut() {
+                let sock: &mut tcp::Socket = match sock_any {
+                    smoltcp::socket::Socket::Tcp(s) => s,
+                    _ => continue,
+                };
+                if tcp_conns.contains_key(&handle) {
+                    continue;
+                }
+                let (Some(local), Some(remote)) = (sock.local_endpoint(), sock.remote_endpoint())
+                else {
+                    continue; // still listening / not yet accepted
+                };
+                if !matches!(
+                    sock.state(),
+                    tcp::State::Established | tcp::State::SynReceived
+                ) {
+                    continue;
+                }
+                if let (Some(l), Some(r)) = (ip_ep_to_std(local), ip_ep_to_std(remote)) {
+                    to_claim.push((handle, r, l, l.port()));
+                }
+            }
+
+            for (handle, remote, local, port) in to_claim {
+                // The accepting socket no longer listens; replace the port listener.
+                tcp_listeners.remove(&port);
+                let mut sock = new_tcp_socket();
+                if sock.listen(port).is_ok() {
+                    let h = sockets.add(sock);
+                    tcp_listeners.insert(port, h);
+                }
+
+                let (to_proxy_tx, to_proxy_rx) =
+                    futures_channel::mpsc::channel::<Bytes>(CONN_CHANNEL_CAP);
+                tcp_conns.insert(
+                    handle,
+                    TcpConn {
+                        to_proxy: to_proxy_tx,
+                        pending_to_proxy: None,
+                        pending_from_proxy: VecDeque::new(),
+                    },
+                );
+
+                let meta = SessionMeta::new(
+                    remote,
+                    TargetAddress::Ip(local),
+                    tag.clone(),
+                    NetworkType::Tcp,
+                );
+                let stream: BoxedStream = Box::new(SmolTcpStream {
+                    handle,
+                    cmd_tx: cmd_tx.clone(),
+                    rx: to_proxy_rx,
+                    leftover: None,
+                    closed: false,
+                });
+                let disp = dispatcher.clone();
+                tokio::spawn(async move {
+                    disp.dispatch_stream(meta, stream).await;
+                });
+            }
+
+            // UDP datagrams → per-flow dispatcher sessions.
+            let udp_handles: Vec<(u16, SocketHandle)> =
+                udp_listeners.iter().map(|(p, h)| (*p, *h)).collect();
+            for (port, handle) in udp_handles {
+                loop {
+                    let sock = sockets.get_mut::<udp::Socket>(handle);
+                    let (payload, meta) = match sock.recv() {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let Some(local_ip) = meta.local_address else {
+                        break;
+                    };
+                    let remote = match ip_ep_to_std(meta.endpoint) {
+                        Some(r) => r,
+                        None => break,
+                    };
+                    let dst = SocketAddr::new(IpAddr::from(local_ip), port);
+                    let pkt = UdpPacket::new(
+                        Bytes::copy_from_slice(payload),
+                        TargetAddress::Ip(remote),
+                        TargetAddress::Ip(dst),
+                    );
+
+                    let key = (remote, dst);
+                    if let Some(tx) = udp_sessions.get(&key) {
+                        let _ = tx.try_send(pkt);
+                    } else {
+                        let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+                        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+                        let meta_sess = SessionMeta::new(
+                            remote,
+                            TargetAddress::Ip(dst),
+                            tag.clone(),
+                            NetworkType::Udp,
+                        );
+                        let disp = dispatcher.clone();
+                        tokio::spawn(async move {
+                            disp.dispatch_packet(meta_sess, pkt_rx, out_tx).await;
+                        });
+                        let _ = pkt_tx.try_send(pkt);
+                        udp_sessions.insert(key, pkt_tx);
+
+                        // Reply pump: dispatcher replies → stack actor.
+                        let mut cmd_tx_reply = cmd_tx.clone();
+                        // Reply pump: dispatcher replies → stack actor.
+                        // On idle timeout the session is closed and removed from the map.
+                        let mut cmd_tx_close = cmd_tx.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let reply = match tokio::time::timeout(
+                                    UDP_SESSION_IDLE_TIMEOUT,
+                                    out_rx.recv(),
+                                )
+                                .await
+                                {
+                                    Ok(Some(reply)) => reply,
+                                    _ => break,
+                                };
+                                // reply.destination = client, reply.source = remote server
+                                let (client, remote_srv) = match (&reply.destination, &reply.source)
+                                {
+                                    (TargetAddress::Ip(c), TargetAddress::Ip(r)) => (*c, *r),
+                                    _ => continue,
+                                };
+                                if cmd_tx_reply
+                                    .send(StackCmd::UdpReply {
+                                        remote: remote_srv,
+                                        client,
+                                        payload: reply.payload.clone(),
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            let _ = cmd_tx_close.send(StackCmd::UdpSessionClose { key }).await;
+                        });
+                    }
+                }
+            }
+
+            // ---- 6. Sleep until the next stack timer or new input arrives.
+            let now = SmolInstant::from_millis(start.elapsed().as_millis() as i64);
+            let wait = iface
+                .poll_delay(now, &sockets)
+                .unwrap_or(SmolDuration::from_secs(60));
+            let wait_std: std::time::Duration = wait.into();
+
+            tokio::select! {
+                _ = shutdown_rx.recv() => break,
+                _ = frame_rx.recv() => {}   // new frame: loop and process
+                _ = cmd_rx.next() => {}     // new command: loop and process
+                _ = tokio::time::sleep(wait_std) => {}
+            }
+        }
+
+        info!("[{}] smoltcp stack actor stopped", tag);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod smol_stack_tests {
+    //! Drives the smoltcp stack with crafted frames — no root / real TUN device required.
+    use super::smol_stack::*;
+    use smoltcp::iface::{Config, Interface, SocketSet};
+    use smoltcp::phy::Medium;
+    use smoltcp::socket::tcp;
+    use smoltcp::time::Instant as SmolInstant;
+    use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
+
+    fn csum(data: &[u8]) -> u16 {
+        let mut sum: u32 = 0;
+        for chunk in data.chunks(2) {
+            let w = if chunk.len() == 2 {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], 0])
+            };
+            sum += u32::from(w);
+        }
+        while (sum >> 16) != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    fn tcp_checksum(src: [u8; 4], dst: [u8; 4], tcp: &mut [u8]) {
+        tcp[16] = 0;
+        tcp[17] = 0;
+        let mut pseudo = Vec::new();
+        pseudo.extend_from_slice(&src);
+        pseudo.extend_from_slice(&dst);
+        pseudo.extend_from_slice(&[0, 6]);
+        pseudo.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(&*tcp);
+        let c = csum(&pseudo);
+        tcp[16..18].copy_from_slice(&c.to_be_bytes());
+    }
+
+    /// Builds an IPv4/TCP packet; flags/seq/ack/payload configurable.
+    fn tcp_pkt(
+        src: [u8; 4],
+        sport: u16,
+        dst: [u8; 4],
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 20 + 20 + payload.len();
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&dst);
+        let c = csum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+
+        let tcp = &mut pkt[20..];
+        tcp[0..2].copy_from_slice(&sport.to_be_bytes());
+        tcp[2..4].copy_from_slice(&dport.to_be_bytes());
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+        tcp[12] = 5 << 4;
+        tcp[13] = flags;
+        tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
+        tcp[20..].copy_from_slice(payload);
+        tcp_checksum(src, dst, tcp);
+        pkt
+    }
+
+    fn test_device() -> TunDevice {
+        TunDevice {
+            rxq: Default::default(),
+            txq: Default::default(),
+            mtu: 1500,
+        }
+    }
+
+    fn make_iface(device: &mut TunDevice) -> Interface {
+        let config = Config::new(HardwareAddress::Ip);
+        let mut iface = Interface::new(config, device, SmolInstant::ZERO);
+        iface.set_any_ip(true);
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(Ipv4Address::new(198, 18, 0, 1).into(), 32));
+        });
+        iface
+    }
+
+    #[test]
+    fn test_smoltcp_accept_and_echo_roundtrip() {
+        use smoltcp::phy::Device as _;
+        let mut device = test_device();
+        assert_eq!(device.capabilities().medium, Medium::Ip);
+        let mut iface = make_iface(&mut device);
+        let mut sockets = SocketSet::new(vec![]);
+
+        let client = [192, 168, 1, 100];
+        let server = [93, 184, 216, 34]; // arbitrary "remote" captured transparently
+
+        // Listener on port 443, like the stack actor installs on SYN.
+        let mut sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 8192]),
+            tcp::SocketBuffer::new(vec![0u8; 8192]),
+        );
+        sock.listen(443).unwrap();
+        let handle = sockets.add(sock);
+
+        // 1. SYN
+        device
+            .rxq
+            .push_back(tcp_pkt(client, 50000, server, 443, 1000, 0, 0x02, &[]));
+        let now = SmolInstant::from_millis(1);
+        let res = iface.poll(now, &mut device, &mut sockets);
+        assert_ne!(res, smoltcp::iface::PollResult::None);
+
+        // Expect SYN-ACK emitted
+        let out = device.txq.pop_front().expect("stack must emit SYN-ACK");
+        assert_eq!(out[9], 6);
+        assert_eq!(out[20 + 13] & 0x12, 0x12, "expected SYN|ACK flags");
+
+        let sock = sockets.get_mut::<tcp::Socket>(handle);
+        assert!(matches!(sock.state(), tcp::State::SynReceived));
+        // Original dst must be preserved in the socket tuple (transparent proxy key)
+        let local = sock.local_endpoint().unwrap();
+        assert_eq!(local.addr.to_string(), "93.184.216.34");
+        assert_eq!(local.port, 443);
+
+        // 2. ACK completes handshake; then data segment
+        let server_isn = u32::from_be_bytes([out[24], out[25], out[26], out[27]]);
+        device.rxq.push_back(tcp_pkt(
+            client,
+            50000,
+            server,
+            443,
+            1001,
+            server_isn.wrapping_add(1),
+            0x10,
+            &[],
+        ));
+        iface.poll(SmolInstant::from_millis(2), &mut device, &mut sockets);
+        assert!(matches!(
+            sockets.get_mut::<tcp::Socket>(handle).state(),
+            tcp::State::Established
+        ));
+
+        let payload = b"GET / HTTP/1.0\r\n\r\n";
+        device.rxq.push_back(tcp_pkt(
+            client,
+            50000,
+            server,
+            443,
+            1001,
+            server_isn.wrapping_add(1),
+            0x18,
+            payload,
+        ));
+        iface.poll(SmolInstant::from_millis(3), &mut device, &mut sockets);
+
+        let sock = sockets.get_mut::<tcp::Socket>(handle);
+        assert!(sock.can_recv());
+        let mut buf = [0u8; 64];
+        let n = sock.recv_slice(&mut buf).unwrap();
+        assert_eq!(&buf[..n], payload);
+
+        // 3. Stack → client: send reply, frame must appear in txq
+        let sock = sockets.get_mut::<tcp::Socket>(handle);
+        sock.send_slice(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+        iface.poll(SmolInstant::from_millis(4), &mut device, &mut sockets);
+        assert!(device.txq.iter().any(|f| f.len() > 40));
+    }
+
+    #[test]
+    fn test_udp_datagram_dispatch() {
+        use smoltcp::socket::udp;
+        let mut device = test_device();
+        let mut iface = make_iface(&mut device);
+        let mut sockets = SocketSet::new(vec![]);
+
+        let mut usock = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 16384]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 16384]),
+        );
+        usock
+            .bind(smoltcp::wire::IpListenEndpoint {
+                addr: None,
+                port: 53,
+            })
+            .unwrap();
+        let h = sockets.add(usock);
+
+        let client = [10, 8, 0, 5];
+        let dns = [8, 8, 8, 8];
+        // IPv4 UDP packet
+        let udp_len = 8 + 4;
+        let total = 20 + udp_len;
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 17;
+        pkt[12..16].copy_from_slice(&client);
+        pkt[16..20].copy_from_slice(&dns);
+        let c = csum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+        pkt[20..22].copy_from_slice(&5353u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&53u16.to_be_bytes());
+        pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        pkt[28..32].copy_from_slice(b"dns!");
+
+        device.rxq.push_back(pkt);
+        iface.poll(SmolInstant::from_millis(1), &mut device, &mut sockets);
+
+        let sock = sockets.get_mut::<udp::Socket>(h);
+        let (data, meta) = sock.recv().expect("udp socket must receive datagram");
+        assert_eq!(data, b"dns!");
+        assert_eq!(meta.endpoint.port, 5353);
+        // Original destination preserved for transparent routing
+        assert_eq!(meta.local_address.unwrap().to_string(), "8.8.8.8");
+    }
 }
 
 #[cfg(target_os = "linux")]
-fn send_packet_guaranteed(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, pkt: Vec<u8>) {
-    match tx.try_send(pkt) {
-        Ok(()) => {}
-        Err(tokio::sync::mpsc::error::TrySendError::Full(val)) => {
-            let tx_clone = tx.clone();
-            tokio::spawn(async move {
-                let _ = tx_clone.send(val).await;
-            });
-        }
-        Err(_) => {}
-    }
-}
+use smol_stack::run_stack;
 
 pub struct TunInbound {
     tag: String,
     interface_name: String,
     mtu: usize,
-    sessions: Arc<DashMap<(SocketAddr, SocketAddr), Arc<TunTcpSession>>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -735,7 +1236,6 @@ impl TunInbound {
             tag: tag.into(),
             interface_name: interface_name.into(),
             mtu: mtu.unwrap_or(1500),
-            sessions: Arc::new(DashMap::new()),
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -758,449 +1258,37 @@ impl Inbound for TunInbound {
 
     async fn start(&self, dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()> {
         self.running.store(true, Ordering::SeqCst);
-        let tag = self.tag.clone();
-        let mtu = self.mtu;
-        let ifname = self.interface_name.clone();
-        let running = self.running.clone();
-        let sessions = self.sessions.clone();
 
         #[cfg(target_os = "linux")]
         {
-            match open_tun_device(&ifname) {
+            match open_tun_device(&self.interface_name) {
                 Ok(owned_fd) => {
                     info!(
                         "[{}] TUN interface '{}' opened successfully (MTU: {})",
-                        tag, ifname, mtu
+                        self.tag, self.interface_name, self.mtu
                     );
                     let async_fd = match tokio::io::unix::AsyncFd::new(owned_fd) {
                         Ok(afd) => Arc::new(afd),
                         Err(e) => {
-                            tracing::error!("[{}] failed to register TUN AsyncFd: {}", tag, e);
+                            tracing::error!("[{}] failed to register TUN AsyncFd: {}", self.tag, e);
                             return Ok(());
                         }
                     };
-
-                    // Dedicated single writer task to serialize all raw TUN FD writes without race conditions or dropped frames
-                    let (tun_tx, mut tun_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2048);
-                    let afd_writer = async_fd.clone();
-                    let running_writer = running.clone();
-                    let mut shutdown_rx_writer = self.shutdown_tx.subscribe();
-                    tokio::spawn(async move {
-                        while running_writer.load(Ordering::Relaxed) {
-                            let pkt = tokio::select! {
-                                _ = shutdown_rx_writer.recv() => break,
-                                res = tun_rx.recv() => match res {
-                                    Some(p) => p,
-                                    None => break,
-                                },
-                            };
-                            loop {
-                                let mut guard = match afd_writer.writable().await {
-                                    Ok(g) => g,
-                                    Err(_) => break,
-                                };
-                                match guard.try_io(|inner| {
-                                    use std::os::fd::AsRawFd;
-                                    let res = unsafe {
-                                        libc::write(
-                                            inner.as_raw_fd(),
-                                            pkt.as_ptr() as *const libc::c_void,
-                                            pkt.len(),
-                                        )
-                                    };
-                                    if res < 0 {
-                                        let err = std::io::Error::last_os_error();
-                                        if err.kind() == std::io::ErrorKind::WouldBlock {
-                                            Err(err)
-                                        } else {
-                                            tracing::warn!(
-                                                "TUN write error: {}, dropping packet",
-                                                err
-                                            );
-                                            Ok(0)
-                                        }
-                                    } else {
-                                        Ok(res as usize)
-                                    }
-                                }) {
-                                    Ok(_) => break,
-                                    Err(_) => continue,
-                                }
-                            }
-                        }
-                    });
-
-                    // Background TCP session reaper to prevent memory leaks from abandoned half-open connections
-                    let sessions_reaper = sessions.clone();
-                    let running_reaper = running.clone();
-                    let mut shutdown_rx_reaper = self.shutdown_tx.subscribe();
-                    tokio::spawn(async move {
-                        let mut interval =
-                            tokio::time::interval(std::time::Duration::from_secs(30));
-                        while running_reaper.load(Ordering::Relaxed) {
-                            tokio::select! {
-                                _ = shutdown_rx_reaper.recv() => break,
-                                _ = interval.tick() => {}
-                            }
-                            let now = std::time::Instant::now();
-                            sessions_reaper.retain(|_, s| {
-                                now.duration_since(*s.last_activity.lock())
-                                    < std::time::Duration::from_secs(120)
-                            });
-                        }
-                    });
-
-                    let tag_clone: Arc<str> = Arc::from(tag.as_str());
-                    let udp_sessions: Arc<
-                        DashMap<(SocketAddr, SocketAddr), tokio::sync::mpsc::Sender<UdpPacket>>,
-                    > = Arc::new(DashMap::new());
-                    let mut shutdown_rx_reader = self.shutdown_tx.subscribe();
-
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; mtu + 64];
-
-                        while running.load(Ordering::Relaxed) {
-                            let mut guard = tokio::select! {
-                                _ = shutdown_rx_reader.recv() => break,
-                                res = async_fd.readable() => match res {
-                                    Ok(g) => g,
-                                    Err(_) => break,
-                                },
-                            };
-
-                            let n = match guard.try_io(|inner| {
-                                use std::os::fd::AsRawFd;
-                                let res = unsafe {
-                                    libc::read(
-                                        inner.as_raw_fd(),
-                                        buf.as_mut_ptr() as *mut libc::c_void,
-                                        buf.len(),
-                                    )
-                                };
-                                if res < 0 {
-                                    Err(std::io::Error::last_os_error())
-                                } else {
-                                    Ok(res as usize)
-                                }
-                            }) {
-                                Ok(Ok(n)) => n,
-                                Ok(Err(_)) => continue,
-                                Err(_would_block) => continue,
-                            };
-
-                            if let Some(icmp_reply) = handle_icmp_packet(&buf[..n]) {
-                                let _ = tun_tx.try_send(icmp_reply);
-                                continue;
-                            }
-
-                            let Some(parsed) = parse_ip_packet(&buf[..n]) else {
-                                continue;
-                            };
-
-                            if parsed.network == NetworkType::Udp {
-                                let pkt = UdpPacket::new(
-                                    parsed.payload,
-                                    TargetAddress::Ip(parsed.src),
-                                    TargetAddress::Ip(parsed.dst),
-                                );
-
-                                let udp_key = (parsed.src, parsed.dst);
-                                if let Some(tx) = udp_sessions.get(&udp_key) {
-                                    let _ = tx.try_send(pkt);
-                                } else {
-                                    let (pkt_tx, pkt_rx) =
-                                        tokio::sync::mpsc::channel::<UdpPacket>(64);
-                                    let (out_tx, mut out_rx) =
-                                        tokio::sync::mpsc::channel::<UdpPacket>(64);
-                                    let disp = dispatcher.clone();
-                                    let meta = SessionMeta::new(
-                                        parsed.src,
-                                        TargetAddress::Ip(parsed.dst),
-                                        tag_clone.clone(),
-                                        NetworkType::Udp,
-                                    );
-
-                                    tokio::spawn(async move {
-                                        disp.dispatch_packet(meta, pkt_rx, out_tx).await;
-                                    });
-
-                                    let _ = pkt_tx.try_send(pkt);
-                                    udp_sessions.insert(udp_key, pkt_tx.clone());
-
-                                    let tun_tx_udp = tun_tx.clone();
-                                    let udp_sessions_clean = udp_sessions.clone();
-                                    let orig_src = parsed.dst;
-                                    let orig_dst = parsed.src;
-
-                                    tokio::spawn(async move {
-                                        loop {
-                                            match tokio::time::timeout(
-                                                std::time::Duration::from_secs(30),
-                                                out_rx.recv(),
-                                            )
-                                            .await
-                                            {
-                                                Ok(Some(reply)) => {
-                                                    if let Some(ip_pkt) = build_ip_udp_packet(
-                                                        orig_src,
-                                                        orig_dst,
-                                                        &reply.payload,
-                                                    ) {
-                                                        let _ = tun_tx_udp.send(ip_pkt).await;
-                                                    }
-                                                }
-                                                _ => {
-                                                    udp_sessions_clean.remove(&udp_key);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    });
-                                }
-                            } else if parsed.network == NetworkType::Tcp {
-                                let key = (parsed.src, parsed.dst);
-
-                                // Check for SYN (new connection request)
-                                if (parsed.tcp_flags & TCP_SYN != 0)
-                                    && (parsed.tcp_flags & TCP_ACK == 0)
-                                {
-                                    if let Some(existing) = sessions.get(&key) {
-                                        // Duplicate SYN: retransmit SYN-ACK without spawning duplicate sessions
-                                        let s_seq = existing
-                                            .server_seq
-                                            .load(Ordering::Relaxed)
-                                            .wrapping_sub(1);
-                                        let c_ack = existing.client_seq.load(Ordering::Relaxed);
-                                        if let Some(syn_ack) = build_ip_tcp_packet(
-                                            parsed.dst,
-                                            parsed.src,
-                                            s_seq,
-                                            c_ack,
-                                            TCP_SYN | TCP_ACK,
-                                            &[],
-                                        ) {
-                                            send_packet_guaranteed(&tun_tx, syn_ack);
-                                        }
-                                        continue;
-                                    }
-
-                                    let isn_s = rand::random::<u32>();
-                                    let isn_c = parsed.tcp_seq;
-                                    let (tx_payload, mut rx_payload) =
-                                        tokio::sync::mpsc::channel::<Bytes>(128);
-
-                                    let session = Arc::new(TunTcpSession {
-                                        client_seq: AtomicU32::new(isn_c.wrapping_add(1)),
-                                        server_seq: AtomicU32::new(isn_s.wrapping_add(1)),
-                                        payload_tx: tx_payload,
-                                        last_activity: parking_lot::Mutex::new(
-                                            std::time::Instant::now(),
-                                        ),
-                                        ooo_buffer: parking_lot::Mutex::new(
-                                            std::collections::BTreeMap::new(),
-                                        ),
-                                    });
-                                    sessions.insert(key, session.clone());
-
-                                    // Reply with SYN-ACK through serialized writer channel
-                                    if let Some(syn_ack) = build_ip_tcp_packet(
-                                        parsed.dst,
-                                        parsed.src,
-                                        isn_s,
-                                        isn_c.wrapping_add(1),
-                                        TCP_SYN | TCP_ACK,
-                                        &[],
-                                    ) {
-                                        send_packet_guaranteed(&tun_tx, syn_ack);
-                                    }
-
-                                    // Create duplex bridge to Dispatcher
-                                    let (client_io, proxy_io) = tokio::io::duplex(64 * 1024);
-                                    let (mut client_read, mut client_write) =
-                                        tokio::io::split(client_io);
-                                    let meta = SessionMeta::new(
-                                        parsed.src,
-                                        TargetAddress::Ip(parsed.dst),
-                                        tag_clone.clone(),
-                                        NetworkType::Tcp,
-                                    );
-                                    let disp = dispatcher.clone();
-                                    tokio::spawn(async move {
-                                        disp.dispatch_stream(meta, Box::new(proxy_io)).await;
-                                    });
-
-                                    // Forward incoming payload from client to proxy_io
-                                    tokio::spawn(async move {
-                                        while let Some(chunk) = rx_payload.recv().await {
-                                            if client_write.write_all(&chunk).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                    });
-
-                                    // Read reply from proxy_io, segment by MSS, and write via tun_tx
-                                    let tun_tx_tcp = tun_tx.clone();
-                                    let s_clone = session.clone();
-                                    let orig_src = parsed.dst;
-                                    let orig_dst = parsed.src;
-                                    let sessions_cleanup = sessions.clone();
-                                    tokio::spawn(async move {
-                                        let mss = if orig_dst.is_ipv6() {
-                                            mtu.saturating_sub(60).max(512)
-                                        } else {
-                                            mtu.saturating_sub(40).max(512)
-                                        };
-                                        let mut r_guard =
-                                            flux_common::BufferPool::default_pool().acquire_guard();
-                                        let r_buf = &mut *r_guard;
-                                        loop {
-                                            match client_read.read(r_buf).await {
-                                                Ok(0) => {
-                                                    // Send FIN-ACK
-                                                    let s_seq =
-                                                        s_clone.server_seq.load(Ordering::Relaxed);
-                                                    let c_ack =
-                                                        s_clone.client_seq.load(Ordering::Relaxed);
-                                                    if let Some(fin_pkt) = build_ip_tcp_packet(
-                                                        orig_src,
-                                                        orig_dst,
-                                                        s_seq,
-                                                        c_ack,
-                                                        TCP_FIN | TCP_ACK,
-                                                        &[],
-                                                    ) {
-                                                        let _ = tun_tx_tcp.send(fin_pkt).await;
-                                                    }
-                                                    // Retain session briefly (5s TIME_WAIT) to absorb final client ACK/RST
-                                                    tokio::spawn(async move {
-                                                        tokio::time::sleep(
-                                                            std::time::Duration::from_secs(5),
-                                                        )
-                                                        .await;
-                                                        sessions_cleanup.remove(&key);
-                                                    });
-                                                    break;
-                                                }
-                                                Ok(n) => {
-                                                    // Segment by MTU / MSS to prevent EMSGSIZE errors on TUN device
-                                                    for chunk in r_buf[..n].chunks(mss) {
-                                                        let s_seq = s_clone.server_seq.fetch_add(
-                                                            chunk.len() as u32,
-                                                            Ordering::SeqCst,
-                                                        );
-                                                        let c_ack = s_clone
-                                                            .client_seq
-                                                            .load(Ordering::Relaxed);
-                                                        if let Some(tcp_pkt) = build_ip_tcp_packet(
-                                                            orig_src,
-                                                            orig_dst,
-                                                            s_seq,
-                                                            c_ack,
-                                                            TCP_ACK | TCP_PSH,
-                                                            chunk,
-                                                        ) {
-                                                            let _ = tun_tx_tcp.send(tcp_pkt).await;
-                                                        }
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    sessions_cleanup.remove(&key);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    });
-                                } else if let Some(session) = sessions.get(&key) {
-                                    // Established session
-                                    if parsed.tcp_flags & TCP_FIN != 0 {
-                                        let s_seq = session.server_seq.load(Ordering::Relaxed);
-                                        let c_ack = parsed.tcp_seq.wrapping_add(1);
-                                        if let Some(fin_ack) = build_ip_tcp_packet(
-                                            parsed.dst,
-                                            parsed.src,
-                                            s_seq,
-                                            c_ack,
-                                            TCP_FIN | TCP_ACK,
-                                            &[],
-                                        ) {
-                                            send_packet_guaranteed(&tun_tx, fin_ack);
-                                        }
-                                        sessions.remove(&key);
-                                    } else if parsed.tcp_flags & TCP_RST != 0 {
-                                        sessions.remove(&key);
-                                    } else if !parsed.payload.is_empty() {
-                                        *session.last_activity.lock() = std::time::Instant::now();
-                                        let mut expected_seq =
-                                            session.client_seq.load(Ordering::Relaxed);
-                                        let payload_len = parsed.payload.len() as u32;
-                                        let s_seq = session.server_seq.load(Ordering::Relaxed);
-
-                                        if parsed.tcp_seq == expected_seq {
-                                            match session.payload_tx.try_send(parsed.payload) {
-                                                Ok(()) => {
-                                                    expected_seq =
-                                                        expected_seq.wrapping_add(payload_len);
-                                                }
-                                                Err(
-                                                    tokio::sync::mpsc::error::TrySendError::Full(_),
-                                                ) => {
-                                                    tracing::debug!(
-                                                        "TUN TCP session buffer full for {:?}",
-                                                        key
-                                                    );
-                                                }
-                                                Err(_) => {}
-                                            }
-
-                                            // Drain contiguous out-of-order segments
-                                            let mut ooo = session.ooo_buffer.lock();
-                                            while let std::collections::btree_map::Entry::Occupied(
-                                                entry,
-                                            ) = ooo.entry(expected_seq)
-                                            {
-                                                if session.payload_tx.capacity() == 0 {
-                                                    break;
-                                                }
-                                                let next_chunk = entry.remove();
-                                                let next_len = next_chunk.len() as u32;
-                                                let _ = session.payload_tx.try_send(next_chunk);
-                                                expected_seq = expected_seq.wrapping_add(next_len);
-                                            }
-                                            session
-                                                .client_seq
-                                                .store(expected_seq, Ordering::SeqCst);
-                                        } else if (parsed.tcp_seq.wrapping_sub(expected_seq) as i32)
-                                            > 0
-                                        {
-                                            // Buffer out-of-order packet (up to 32 segments) using RFC 793 serial number arithmetic
-                                            let mut ooo = session.ooo_buffer.lock();
-                                            if ooo.len() < 32 {
-                                                ooo.insert(parsed.tcp_seq, parsed.payload);
-                                            }
-                                        }
-
-                                        // Send ACK to client via non-blocking serialized writer channel
-                                        if let Some(ack_pkt) = build_ip_tcp_packet(
-                                            parsed.dst,
-                                            parsed.src,
-                                            s_seq,
-                                            expected_seq,
-                                            TCP_ACK,
-                                            &[],
-                                        ) {
-                                            send_packet_guaranteed(&tun_tx, ack_pkt);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    });
+                    let tag: Arc<str> = Arc::from(self.tag.as_str());
+                    tokio::spawn(run_stack(
+                        async_fd,
+                        self.mtu,
+                        tag,
+                        dispatcher,
+                        self.running.clone(),
+                        self.shutdown_tx.subscribe(),
+                    ));
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "[{}] TUN device '{}' could not be opened (CAP_NET_ADMIN / root required: {}). TUN mode will remain passive.",
-                        tag,
-                        ifname,
+                    tracing::error!(
+                        "[{}] failed to open TUN device '{}': {}. Need root or CAP_NET_ADMIN.",
+                        self.tag,
+                        self.interface_name,
                         e
                     );
                 }
@@ -1209,11 +1297,8 @@ impl Inbound for TunInbound {
 
         #[cfg(not(target_os = "linux"))]
         {
-            tracing::info!(
-                "[{}] TUN interface configured on non-Linux OS: {}",
-                tag,
-                ifname
-            );
+            let _ = dispatcher;
+            tracing::error!("[{}] TUN inbound is only supported on Linux", self.tag);
         }
 
         Ok(())
@@ -1222,257 +1307,6 @@ impl Inbound for TunInbound {
     async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
-        self.sessions.clear();
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_and_build_ipv4_udp() {
-        let src: SocketAddr = "192.168.1.100:12345".parse().unwrap();
-        let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
-        let payload = b"ping dns";
-
-        let raw = build_ipv4_udp_packet(src, dst, payload).unwrap();
-        assert_eq!(raw.len(), 20 + 8 + payload.len());
-
-        let parsed = parse_ip_packet(&raw).unwrap();
-        assert_eq!(parsed.src, src);
-        assert_eq!(parsed.dst, dst);
-        assert_eq!(parsed.network, NetworkType::Udp);
-        assert_eq!(&parsed.payload[..], payload);
-    }
-
-    #[test]
-    fn test_parse_and_build_ipv6_udp() {
-        let src: SocketAddr = "[2001:db8::1]:12345".parse().unwrap();
-        let dst: SocketAddr = "[2606:4700:4700::1111]:53".parse().unwrap();
-        let payload = b"ping ipv6 dns";
-
-        let raw = build_ipv6_udp_packet(src, dst, payload).unwrap();
-        assert_eq!(raw.len(), 40 + 8 + payload.len());
-
-        let parsed = parse_ip_packet(&raw).unwrap();
-        assert_eq!(parsed.src, src);
-        assert_eq!(parsed.dst, dst);
-        assert_eq!(parsed.network, NetworkType::Udp);
-        assert_eq!(&parsed.payload[..], payload);
-    }
-
-    #[test]
-    fn test_parse_and_build_ipv4_tcp() {
-        let src: SocketAddr = "192.168.1.100:54321".parse().unwrap();
-        let dst: SocketAddr = "93.184.216.34:80".parse().unwrap();
-        let payload = b"GET / HTTP/1.1\r\n\r\n";
-
-        let raw = build_ipv4_tcp_packet(src, dst, 1000, 2000, TCP_ACK | TCP_PSH, payload).unwrap();
-        assert_eq!(raw.len(), 20 + 20 + payload.len());
-
-        let parsed = parse_ip_packet(&raw).unwrap();
-        assert_eq!(parsed.src, src);
-        assert_eq!(parsed.dst, dst);
-        assert_eq!(parsed.network, NetworkType::Tcp);
-        assert_eq!(parsed.tcp_seq, 1000);
-        assert_eq!(parsed.tcp_ack, 2000);
-        assert_eq!(parsed.tcp_flags, TCP_ACK | TCP_PSH);
-        assert_eq!(&parsed.payload[..], payload);
-    }
-
-    #[test]
-    fn test_parse_and_build_ipv6_tcp() {
-        let src: SocketAddr = "[2001:db8::1]:54321".parse().unwrap();
-        let dst: SocketAddr = "[2606:2800:220:1:248:1893:25c8:1946]:443".parse().unwrap();
-        let payload = b"ClientHello TLS";
-
-        let raw = build_ipv6_tcp_packet(src, dst, 5000, 6000, TCP_SYN, payload).unwrap();
-        assert_eq!(raw.len(), 40 + 20 + payload.len());
-
-        let parsed = parse_ip_packet(&raw).unwrap();
-        assert_eq!(parsed.src, src);
-        assert_eq!(parsed.dst, dst);
-        assert_eq!(parsed.network, NetworkType::Tcp);
-        assert_eq!(parsed.tcp_seq, 5000);
-        assert_eq!(parsed.tcp_ack, 6000);
-        assert_eq!(parsed.tcp_flags, TCP_SYN);
-        assert_eq!(&parsed.payload[..], payload);
-    }
-
-    #[test]
-    fn test_icmpv4_echo_reply() {
-        // Construct IPv4 ICMP Echo Request (Type 8)
-        let mut req = vec![
-            0x45, 0x00, 0x00, 0x1c, // IPv4 header: len 28
-            0x00, 0x00, 0x40, 0x00, 64, 1, 0x00, 0x00, // TTL 64, Proto 1 (ICMP), csum
-            192, 168, 1, 100, // src: 192.168.1.100
-            8, 8, 8, 8, // dst: 8.8.8.8
-            8, 0, 0x00, 0x00, // ICMP Type 8 (Echo), Code 0, csum
-            0x12, 0x34, 0x00, 0x01, // ID, Seq
-        ];
-        let ip_csum = calc_checksum(&req[..20]);
-        req[10..12].copy_from_slice(&ip_csum.to_be_bytes());
-        let icmp_csum = calc_checksum(&req[20..]);
-        req[22..24].copy_from_slice(&icmp_csum.to_be_bytes());
-
-        let reply = handle_icmp_packet(&req).expect("should handle ICMP echo");
-        // Verify reply is IPv4, length 28
-        assert_eq!(reply.len(), 28);
-        // Verify src and dst are swapped
-        assert_eq!(&reply[12..16], &[8, 8, 8, 8]);
-        assert_eq!(&reply[16..20], &[192, 168, 1, 100]);
-        // Verify ICMP Type 0 (Echo Reply), Code 0
-        assert_eq!(reply[20], 0);
-        assert_eq!(reply[21], 0);
-        // Verify ID and Seq preserved
-        assert_eq!(&reply[24..28], &[0x12, 0x34, 0x00, 0x01]);
-    }
-
-    #[test]
-    fn test_icmpv6_echo_reply() {
-        // Construct IPv6 ICMPv6 Echo Request (Type 128)
-        let mut req = vec![0u8; 48];
-        req[0] = 0x60; // IPv6
-        req[4..6].copy_from_slice(&8u16.to_be_bytes()); // payload len 8
-        req[6] = 58; // Next Header: ICMPv6
-        req[7] = 64; // Hop limit
-        req[8..24].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]); // src
-        req[24..40].copy_from_slice(&[
-            0x26, 0x06, 0x47, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
-        ]); // dst
-        req[40] = 128; // Type 128 Echo Request
-        req[41] = 0; // Code 0
-        req[44..48].copy_from_slice(&[0xaa, 0xbb, 0x00, 0x01]); // ID, Seq
-
-        let reply = handle_icmp_packet(&req).expect("should handle ICMPv6 echo");
-        assert_eq!(reply.len(), 48);
-        assert_eq!(&reply[8..24], &req[24..40]); // src is old dst
-        assert_eq!(&reply[24..40], &req[8..24]); // dst is old src
-        assert_eq!(reply[40], 129); // Type 129 Echo Reply
-        assert_eq!(reply[41], 0);
-        assert_eq!(&reply[44..48], &[0xaa, 0xbb, 0x00, 0x01]);
-    }
-
-    #[test]
-    fn test_tun_tcp_out_of_order_reassembly_and_wrap() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(16);
-        let session = TunTcpSession {
-            client_seq: AtomicU32::new(100),
-            server_seq: AtomicU32::new(500),
-            payload_tx: tx,
-            last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            ooo_buffer: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
-        };
-
-        // Scenario: Packet with seq 110 (len 10) arrives BEFORE packet with seq 100 (len 10)
-        let chunk_ooo = Bytes::from_static(b"WORLD_1234");
-        let chunk_in_order = Bytes::from_static(b"HELLO_1234");
-
-        // 1. Process out-of-order segment 110
-        let expected_seq = session.client_seq.load(Ordering::Relaxed);
-        assert_eq!(expected_seq, 100);
-        let seq_110 = 110u32;
-        if (seq_110.wrapping_sub(expected_seq) as i32) > 0 {
-            session.ooo_buffer.lock().insert(seq_110, chunk_ooo);
-        }
-
-        // Verify buffer has 1 entry and rx hasn't received anything
-        assert_eq!(session.ooo_buffer.lock().len(), 1);
-        assert!(rx.try_recv().is_err());
-
-        // 2. Process in-order segment 100
-        let seq_100 = 100u32;
-        let mut curr_expected = session.client_seq.load(Ordering::Relaxed);
-        assert_eq!(seq_100, curr_expected);
-
-        session.payload_tx.try_send(chunk_in_order).unwrap();
-        curr_expected = curr_expected.wrapping_add(10);
-
-        // Drain contiguous segments
-        let mut ooo = session.ooo_buffer.lock();
-        while let std::collections::btree_map::Entry::Occupied(entry) = ooo.entry(curr_expected) {
-            let next_chunk = entry.remove();
-            let next_len = next_chunk.len() as u32;
-            session.payload_tx.try_send(next_chunk).unwrap();
-            curr_expected = curr_expected.wrapping_add(next_len);
-        }
-        drop(ooo);
-        session.client_seq.store(curr_expected, Ordering::SeqCst);
-
-        // Verify client_seq advanced to 120 (100 + 10 + 10)
-        assert_eq!(session.client_seq.load(Ordering::Relaxed), 120);
-
-        // Verify rx received both segments in strictly correct order: "HELLO_1234" then "WORLD_1234"
-        let p1 = rx.try_recv().unwrap();
-        assert_eq!(&p1[..], b"HELLO_1234");
-        let p2 = rx.try_recv().unwrap();
-        assert_eq!(&p2[..], b"WORLD_1234");
-    }
-
-    #[test]
-    fn test_tun_tcp_out_of_order_reassembly_u32_wraparound() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(16);
-        let session = TunTcpSession {
-            client_seq: AtomicU32::new(u32::MAX - 19),
-            server_seq: AtomicU32::new(500),
-            payload_tx: tx,
-            last_activity: parking_lot::Mutex::new(std::time::Instant::now()),
-            ooo_buffer: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
-        };
-
-        // Scenario: Sequence numbers cross 32-bit integer boundary (u32::MAX)
-        // Expected packets:
-        // P1: seq = u32::MAX - 19, len = 10 -> advances expected to u32::MAX - 9
-        // P2: seq = u32::MAX - 9,  len = 10 -> advances expected to 1 (wraparound!)
-        // P3: seq = 1,             len = 10 -> advances expected to 11
-        let chunk1_in_order = Bytes::from_static(b"PKT1_START");
-        let chunk2_ooo = Bytes::from_static(b"PKT2_WRAP-");
-        let chunk3_ooo = Bytes::from_static(b"PKT3_AFTER");
-
-        let seq_pkt2 = u32::MAX - 9;
-        let seq_pkt3 = 0u32;
-
-        let expected_seq = session.client_seq.load(Ordering::Relaxed);
-        // Both P2 and P3 arrive out-of-order before P1
-        assert!((seq_pkt2.wrapping_sub(expected_seq) as i32) > 0);
-        assert!((seq_pkt3.wrapping_sub(expected_seq) as i32) > 0);
-        session.ooo_buffer.lock().insert(seq_pkt2, chunk2_ooo);
-        session.ooo_buffer.lock().insert(seq_pkt3, chunk3_ooo);
-
-        // Buffer has 2 out-of-order segments
-        assert_eq!(session.ooo_buffer.lock().len(), 2);
-
-        // Now in-order P1 arrives
-        let seq_pkt1 = u32::MAX - 19;
-        let mut curr_expected = session.client_seq.load(Ordering::Relaxed);
-        assert_eq!(seq_pkt1, curr_expected);
-
-        session.payload_tx.try_send(chunk1_in_order).unwrap();
-        curr_expected = curr_expected.wrapping_add(10);
-
-        // Drain contiguous segments across u32::MAX wraparound
-        let mut ooo = session.ooo_buffer.lock();
-        while let std::collections::btree_map::Entry::Occupied(entry) = ooo.entry(curr_expected) {
-            let next_chunk = entry.remove();
-            let next_len = next_chunk.len() as u32;
-            session.payload_tx.try_send(next_chunk).unwrap();
-            curr_expected = curr_expected.wrapping_add(next_len);
-        }
-        drop(ooo);
-        session.client_seq.store(curr_expected, Ordering::SeqCst);
-
-        // Verify client_seq properly advanced across wraparound boundary to 11
-        assert_eq!(session.client_seq.load(Ordering::Relaxed), 10);
-
-        // Verify all 3 segments delivered in strictly ordered sequence
-        let r1 = rx.try_recv().unwrap();
-        assert_eq!(&r1[..], b"PKT1_START");
-        let r2 = rx.try_recv().unwrap();
-        assert_eq!(&r2[..], b"PKT2_WRAP-");
-        let r3 = rx.try_recv().unwrap();
-        assert_eq!(&r3[..], b"PKT3_AFTER");
-        assert!(rx.try_recv().is_err());
     }
 }
