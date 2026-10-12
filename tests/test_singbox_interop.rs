@@ -6,8 +6,8 @@ use flux_app::{Config, Instance};
 use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
 use flux_types::{NetworkType, SessionMeta, TargetAddress, UdpPacket};
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
@@ -3359,12 +3359,11 @@ fn reality_keypair() -> (String, String) {
 async fn start_tls_echo_server() -> SocketAddr {
     let dir = TempDir::new().expect("tempdir");
     let (cert_path, key_path) = generate_self_signed_cert(dir.path());
-    let (certs, key) =
-        flux_transport::tls::TlsTransport::load_certs_and_key(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-        )
-        .unwrap();
+    let (certs, key) = flux_transport::tls::TlsTransport::load_certs_and_key(
+        cert_path.to_str().unwrap(),
+        key_path.to_str().unwrap(),
+    )
+    .unwrap();
     let acceptor =
         flux_transport::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
 
@@ -3448,7 +3447,10 @@ async fn test_interop_reality_flux_client_to_singbox_server() {
         sbox_port, pub_b64, uuid
     );
     let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
-    let outbound = flux_inst.registry.get_outbound("vless-reality-out").unwrap();
+    let outbound = flux_inst
+        .registry
+        .get_outbound("vless-reality-out")
+        .unwrap();
 
     let meta = SessionMeta::new(
         "127.0.0.1:0".parse().unwrap(),
@@ -3456,13 +3458,10 @@ async fn test_interop_reality_flux_client_to_singbox_server() {
         "test",
         NetworkType::Tcp,
     );
-    let mut stream = tokio::time::timeout(
-        Duration::from_secs(10),
-        outbound.dial_stream(&meta),
-    )
-    .await
-    .expect("flux REALITY client handshake with sing-box timed out")
-    .expect("flux REALITY client must handshake with sing-box server");
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), outbound.dial_stream(&meta))
+        .await
+        .expect("flux REALITY client handshake with sing-box timed out")
+        .expect("flux REALITY client must handshake with sing-box server");
 
     let payload = b"REALITY interop: flux client -> sing-box server";
     stream.write_all(payload).await.unwrap();

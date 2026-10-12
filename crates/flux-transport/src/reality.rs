@@ -85,7 +85,13 @@ fn aes256gcm_seal(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]
         Ok(c) => c,
         Err(e) => unreachable!("AES-256-GCM rejects 32-byte key: {}", e),
     };
-    match cipher.encrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: plaintext, aad }) {
+    match cipher.encrypt(
+        aes_gcm::Nonce::from_slice(nonce),
+        Payload {
+            msg: plaintext,
+            aad,
+        },
+    ) {
         Ok(ct) => ct,
         Err(e) => unreachable!("AES-GCM encryption of small block cannot fail: {}", e),
     }
@@ -99,7 +105,13 @@ fn aes256gcm_open(
 ) -> Result<Vec<u8>, ()> {
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| ())?;
     cipher
-        .decrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            aes_gcm::Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| ())
 }
 
@@ -334,8 +346,7 @@ struct RealityCertMaterial {
 
 impl RealityCertMaterial {
     fn get_or_init() -> Arc<Self> {
-        static INSTANCE: std::sync::OnceLock<Arc<RealityCertMaterial>> =
-            std::sync::OnceLock::new();
+        static INSTANCE: std::sync::OnceLock<Arc<RealityCertMaterial>> = std::sync::OnceLock::new();
         INSTANCE
             .get_or_init(|| {
                 let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
@@ -350,9 +361,7 @@ impl RealityCertMaterial {
                     .public_key_raw()
                     .try_into()
                     .expect("ed25519 public key must be 32 bytes");
-                let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(
-                    key_pair.serialize_der(),
-                );
+                let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
                 let inner_key = rustls::crypto::ring::sign::any_eddsa_type(&pkcs8)
                     .expect("failed to build ed25519 signing key");
                 let signing_key: Arc<dyn rustls::sign::SigningKey> =
@@ -369,7 +378,7 @@ impl RealityCertMaterial {
     /// Returns the certificate DER with the signature field replaced by
     /// HMAC-SHA512(auth_key, ed25519_pub) — the REALITY proof of possession.
     fn cert_for(&self, auth_key: &[u8; 32]) -> Vec<u8> {
-        use hmac::{Mac, Hmac};
+        use hmac::{Hmac, Mac};
         let mut mac = <Hmac<sha2::Sha512> as Mac>::new_from_slice(auth_key)
             .expect("HMAC-SHA512 accepts any key length");
         mac.update(&self.ed25519_pub);
@@ -394,7 +403,8 @@ impl rustls::sign::SigningKey for ForcedEd25519SigningKey {
         &self,
         _offered: &[rustls::SignatureScheme],
     ) -> Option<Box<dyn rustls::sign::Signer>> {
-        self.inner.choose_scheme(&[rustls::SignatureScheme::ED25519])
+        self.inner
+            .choose_scheme(&[rustls::SignatureScheme::ED25519])
     }
 
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
@@ -485,9 +495,12 @@ impl RealityHandshake {
         })();
 
         let Some(auth_key) = auth else {
-            return Self::fallback_or_fail(stream, &record, cfg, crypto_err(
-                "reality client authentication failed; relayed to fallback",
-            ))
+            return Self::fallback_or_fail(
+                stream,
+                &record,
+                cfg,
+                crypto_err("reality client authentication failed; relayed to fallback"),
+            )
             .await;
         };
 
@@ -563,10 +576,13 @@ async fn relay_to_fallback<S: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'st
         }
     };
 
-    let dest = match crate::tcp::TcpTransport::connect(fallback_addr, std::time::Duration::from_secs(5)).await {
-        Ok(d) => d,
-        Err(_) => return,
-    };
+    let dest =
+        match crate::tcp::TcpTransport::connect(fallback_addr, std::time::Duration::from_secs(5))
+            .await
+        {
+            Ok(d) => d,
+            Err(_) => return,
+        };
     let mut cs: BoxedStream = Box::new(flux_common::copy::PrefixedStream::new(
         client_stream,
         already_read.to_vec(),
@@ -696,36 +712,84 @@ impl Tls13Suite {
         self.hkdf_expand_label(secret, label, transcript_hash, self.hash_len())
     }
 
-    fn encrypt(&self, key: &[u8], nonce: &[u8; 12], aad: &[u8], plaintext: &[u8]) -> FluxResult<Vec<u8>> {
+    fn encrypt(
+        &self,
+        key: &[u8],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> FluxResult<Vec<u8>> {
         match self {
             Self::Aes128GcmSha256 => Aes128Gcm::new_from_slice(key)
                 .map_err(|e| crypto_err(e.to_string()))?
-                .encrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+                .encrypt(
+                    aes_gcm::Nonce::from_slice(nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad,
+                    },
+                )
                 .map_err(|e| crypto_err(format!("tls13 aes128gcm encrypt: {}", e))),
             Self::Aes256GcmSha384 => Aes256Gcm::new_from_slice(key)
                 .map_err(|e| crypto_err(e.to_string()))?
-                .encrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+                .encrypt(
+                    aes_gcm::Nonce::from_slice(nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad,
+                    },
+                )
                 .map_err(|e| crypto_err(format!("tls13 aes256gcm encrypt: {}", e))),
             Self::Chacha20Poly1305Sha256 => ChaCha20Poly1305::new_from_slice(key)
                 .map_err(|e| crypto_err(e.to_string()))?
-                .encrypt(chacha20poly1305::Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+                .encrypt(
+                    chacha20poly1305::Nonce::from_slice(nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad,
+                    },
+                )
                 .map_err(|e| crypto_err(format!("tls13 chacha encrypt: {}", e))),
         }
     }
 
-    fn decrypt(&self, key: &[u8], nonce: &[u8; 12], aad: &[u8], ciphertext: &[u8]) -> FluxResult<Vec<u8>> {
+    fn decrypt(
+        &self,
+        key: &[u8],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> FluxResult<Vec<u8>> {
         match self {
             Self::Aes128GcmSha256 => Aes128Gcm::new_from_slice(key)
                 .map_err(|e| crypto_err(e.to_string()))?
-                .decrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+                .decrypt(
+                    aes_gcm::Nonce::from_slice(nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad,
+                    },
+                )
                 .map_err(|e| crypto_err(format!("tls13 aes128gcm decrypt: {}", e))),
             Self::Aes256GcmSha384 => Aes256Gcm::new_from_slice(key)
                 .map_err(|e| crypto_err(e.to_string()))?
-                .decrypt(aes_gcm::Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+                .decrypt(
+                    aes_gcm::Nonce::from_slice(nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad,
+                    },
+                )
                 .map_err(|e| crypto_err(format!("tls13 aes256gcm decrypt: {}", e))),
             Self::Chacha20Poly1305Sha256 => ChaCha20Poly1305::new_from_slice(key)
                 .map_err(|e| crypto_err(e.to_string()))?
-                .decrypt(chacha20poly1305::Nonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+                .decrypt(
+                    chacha20poly1305::Nonce::from_slice(nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad,
+                    },
+                )
                 .map_err(|e| crypto_err(format!("tls13 chacha decrypt: {}", e))),
         }
     }
@@ -778,9 +842,7 @@ impl TrafficState {
         record.push(TLS_APPDATA);
         record.extend_from_slice(&[0x03, 0x03]);
         record.extend_from_slice(&(ct_len as u16).to_be_bytes());
-        let ct = self
-            .suite
-            .encrypt(&self.key, &nonce, &record, &inner)?;
+        let ct = self.suite.encrypt(&self.key, &nonce, &record, &inner)?;
         record.extend_from_slice(&ct);
         Ok(record)
     }
@@ -803,9 +865,12 @@ impl TrafficState {
 
     /// RFC 8446 §7.2 traffic key update.
     fn update(&mut self) -> FluxResult<()> {
-        self.secret = self
-            .suite
-            .hkdf_expand_label(&self.secret, "traffic upd", &[], self.suite.hash_len())?;
+        self.secret = self.suite.hkdf_expand_label(
+            &self.secret,
+            "traffic upd",
+            &[],
+            self.suite.hash_len(),
+        )?;
         self.key = self
             .suite
             .hkdf_expand_label(&self.secret, "key", &[], self.suite.key_len())?;
@@ -988,8 +1053,9 @@ impl Tls13Client {
         let suite_id = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
         pos += 2;
         pos += 1; // compression
-        let suite = Tls13Suite::from_id(suite_id)
-            .ok_or_else(|| crypto_err(format!("unsupported TLS 1.3 cipher suite: {:#x}", suite_id)))?;
+        let suite = Tls13Suite::from_id(suite_id).ok_or_else(|| {
+            crypto_err(format!("unsupported TLS 1.3 cipher suite: {:#x}", suite_id))
+        })?;
 
         if pos + 2 > sh.len() {
             return Err(crypto_err("short ServerHello (extensions)"));
@@ -1101,8 +1167,9 @@ impl Tls13Client {
                         if cpos + 3 > msg.len() {
                             return Err(crypto_err("short Certificate entry"));
                         }
-                        let cert_len = u32::from_be_bytes([0, msg[cpos], msg[cpos + 1], msg[cpos + 2]])
-                            as usize;
+                        let cert_len =
+                            u32::from_be_bytes([0, msg[cpos], msg[cpos + 1], msg[cpos + 2]])
+                                as usize;
                         cpos += 3;
                         if cpos + cert_len > msg.len() {
                             return Err(crypto_err("truncated certificate"));
@@ -1129,7 +1196,8 @@ impl Tls13Client {
                         content.push(0);
                         content.extend_from_slice(&transcript_hash);
 
-                        let cert = cert_der.as_ref()
+                        let cert = cert_der
+                            .as_ref()
                             .ok_or_else(|| crypto_err("CertificateVerify before Certificate"))?;
                         let server_pub_key = extract_ed25519_pubkey(cert)
                             .ok_or_else(|| crypto_err("server certificate is not ed25519"))?;
@@ -1143,9 +1211,8 @@ impl Tls13Client {
                             &ring::signature::ED25519,
                             server_pub_key,
                         );
-                        peer.verify(&content, cv_sig).map_err(|_| {
-                            auth_err("reality CertificateVerify signature invalid")
-                        })?;
+                        peer.verify(&content, cv_sig)
+                            .map_err(|_| auth_err("reality CertificateVerify signature invalid"))?;
                         transcript.extend_from_slice(&msg);
                     }
                     HS_FINISHED => {
@@ -1201,8 +1268,7 @@ impl Tls13Client {
         let s_ap = suite.derive_secret(&master_secret, "s ap traffic", &ap_hash)?;
 
         // ---- 9. Send client Finished.
-        let fin_key_c =
-            suite.hkdf_expand_label(&c_hs_secret, "finished", &[], suite.hash_len())?;
+        let fin_key_c = suite.hkdf_expand_label(&c_hs_secret, "finished", &[], suite.hash_len())?;
         let fin_hash = suite.hash(&transcript);
         let verify_data = suite.hmac(&fin_key_c, &fin_hash);
         let mut fin_msg = Vec::with_capacity(4 + verify_data.len());
@@ -1397,16 +1463,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13ClientStream<S> {
                                 break;
                             }
                             if mtype == HS_KEY_UPDATE && mlen >= 1 {
-                                self.read_state
-                                    .update()
-                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                                self.read_state.update().map_err(|e| {
+                                    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                                })?;
                                 if plain[pos + 4] == 1 {
                                     // Queue a key_update response (update_not_requested).
                                     let ku = [HS_KEY_UPDATE, 0, 0, 1, 0];
                                     let rec = self
                                         .write_state
                                         .encrypt_record(TLS_HANDSHAKE, &ku)
-                                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                                        .map_err(|e| {
+                                        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+                                    })?;
                                     self.pending_write.extend_from_slice(&rec);
                                 }
                             }
@@ -1492,9 +1560,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13ClientStream<S> {
         // 1. Flush any pending encrypted data first (preserves record order).
         while self.pending_write_pos < self.pending_write.len() {
             let remaining = self.pending_write.len() - self.pending_write_pos;
-            let chunk: Vec<u8> =
-                self.pending_write[self.pending_write_pos..self.pending_write_pos + remaining.min(65536)]
-                    .to_vec();
+            let chunk: Vec<u8> = self.pending_write
+                [self.pending_write_pos..self.pending_write_pos + remaining.min(65536)]
+                .to_vec();
             match Pin::new(&mut self.inner).poll_write(cx, &chunk) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -1515,7 +1583,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13ClientStream<S> {
         let rec = match self.write_state.encrypt_record(23, &buf[..n]) {
             Ok(r) => r,
             Err(e) => {
-                return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )));
             }
         };
         match Pin::new(&mut self.inner).poll_write(cx, &rec) {
@@ -1535,9 +1606,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13ClientStream<S> {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.pending_write_pos < self.pending_write.len() {
             let remaining = self.pending_write.len() - self.pending_write_pos;
-            let chunk: Vec<u8> =
-                self.pending_write[self.pending_write_pos..self.pending_write_pos + remaining.min(65536)]
-                    .to_vec();
+            let chunk: Vec<u8> = self.pending_write
+                [self.pending_write_pos..self.pending_write_pos + remaining.min(65536)]
+                .to_vec();
             match Pin::new(&mut self.inner).poll_write(cx, &chunk) {
                 Poll::Ready(Ok(0)) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -1601,12 +1672,10 @@ mod tests {
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
 
-        let server = tokio::spawn(async move {
-            RealityHandshake::server_handshake(server_io, &scfg).await
-        });
-        let client = tokio::spawn(async move {
-            RealityHandshake::client_handshake(client_io, &ccfg).await
-        });
+        let server =
+            tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
+        let client =
+            tokio::spawn(async move { RealityHandshake::client_handshake(client_io, &ccfg).await });
 
         let mut server_stream = server.await.unwrap().unwrap();
         let mut client_stream = client.await.unwrap().unwrap();
@@ -1637,12 +1706,10 @@ mod tests {
         };
 
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(async move {
-            RealityHandshake::server_handshake(server_io, &scfg).await
-        });
-        let client = tokio::spawn(async move {
-            RealityHandshake::client_handshake(client_io, &ccfg).await
-        });
+        let server =
+            tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
+        let client =
+            tokio::spawn(async move { RealityHandshake::client_handshake(client_io, &ccfg).await });
 
         // No fallback configured → server errors; client must fail too.
         let s = server.await.unwrap();
@@ -1717,8 +1784,7 @@ mod crypto_reference_tests {
         let hexstr: String = ak.iter().map(|b| format!("{:02x}", b)).collect();
         println!("rust ak: {}", hexstr);
         assert_eq!(
-            hexstr,
-            "4bfc7684145ef433495abcd19d3ea65632bee4e84b0c7aa37930b62f4c875a81",
+            hexstr, "4bfc7684145ef433495abcd19d3ea65632bee4e84b0c7aa37930b62f4c875a81",
             "must match python HKDF reference"
         );
     }
@@ -1738,8 +1804,7 @@ mod gcm_vector_tests {
         let hexstr: String = ct.iter().map(|b| format!("{:02x}", b)).collect();
         println!("rust ct: {}", hexstr);
         assert_eq!(
-            hexstr,
-            "27c6357af4faa968dd06bf5e2bc28cb3b41e80e80a42bf2ce96a430165073ba9",
+            hexstr, "27c6357af4faa968dd06bf5e2bc28cb3b41e80e80a42bf2ce96a430165073ba9",
             "must match python AESGCM reference"
         );
     }
