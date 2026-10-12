@@ -429,6 +429,12 @@ pub enum ProtocolConfig {
         peer_public_key: String,
         #[serde(default)]
         preshared_key: Option<String>,
+        /// Local tunnel IP used as source of encapsulated packets (e.g. "10.0.0.2").
+        #[serde(default)]
+        local_address: Option<String>,
+        /// Persistent NAT keepalive interval in seconds (0 disables). Default: 25.
+        #[serde(default)]
+        keepalive_secs: Option<u64>,
         #[serde(default)]
         awg: Option<flux_protocol::wireguard::AwgConfig>,
     },

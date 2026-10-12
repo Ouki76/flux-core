@@ -131,8 +131,20 @@ pub struct WireGuardConfig {
     pub peer_public_key: [u8; 32],
     pub preshared_key: Option<[u8; 32]>,
     pub server_address: TargetAddress,
+    /// Local tunnel IP address used as the source address of encapsulated IP packets.
+    /// Defaults to 10.0.0.2 (or fd00::2 for IPv6 destinations) when not configured.
+    pub local_address: Option<std::net::IpAddr>,
+    /// Persistent keepalive interval in seconds (WireGuard NAT keepalive). Default: 25.
+    pub keepalive_secs: Option<u64>,
     pub awg: Option<AwgConfig>,
 }
+
+/// Seconds after session establishment when a new handshake is initiated (RFC: REKEY_AFTER_TIME).
+pub const WG_REKEY_AFTER_TIME_SECS: u64 = 120;
+/// Seconds after which a session is considered dead even without traffic (RFC: REJECT_AFTER_TIME).
+pub const WG_REJECT_AFTER_TIME_SECS: u64 = 180;
+/// Default persistent keepalive interval.
+pub const WG_DEFAULT_KEEPALIVE_SECS: u64 = 25;
 
 #[derive(Clone, Debug, Default)]
 pub struct AntiReplayWindow {
@@ -546,6 +558,22 @@ impl WireGuardHandshake {
             });
         }
 
+        // MAC1 DoS-protection check (keyed with our own static public key) before any crypto work.
+        // Layout: [.. 116-byte Noise body ..][mac1 (16)][mac2 (16)]
+        let mac1_offset = prefix_len + 4 + 4 + 32 + 48 + 28;
+        if init_pkt.len() >= mac1_offset + 16 {
+            let local_pub = X25519PublicKey::from(local_static);
+            let mac1_key = blake2s_hash_concat(b"mac1----", local_pub.as_bytes());
+            // AmneziaWG: MAC1 covers the message starting at the type field (junk prefix excluded).
+            let expected_mac1 = blake2s_mac16(&mac1_key, &init_pkt[prefix_len..mac1_offset]);
+            let received_mac1 = &init_pkt[mac1_offset..mac1_offset + 16];
+            if !constant_time_eq(&expected_mac1, received_mac1) {
+                return Err(FluxError::AuthFailed(
+                    "wireguard initiation rejected: invalid mac1".into(),
+                ));
+            }
+        }
+
         let client_index = u32::from_le_bytes(body[4..8].try_into().unwrap());
         let mut client_ephemeral_bytes = [0u8; 32];
         client_ephemeral_bytes.copy_from_slice(&body[8..40]);
@@ -589,10 +617,10 @@ impl WireGuardHandshake {
         let ss_ss = local_static.diffie_hellman(&client_static);
         let (c2, k_ts) = kdf2(&c1, ss_ss.as_bytes());
 
-        // Decrypt timestamp
+        // Decrypt and validate TAI64N timestamp (anti-replay freshness window).
         let enc_ts = &body[88..116];
         let cipher_ts = ChaCha20Poly1305::new_from_slice(&k_ts).unwrap();
-        let _ts = cipher_ts
+        let ts_plain = cipher_ts
             .decrypt(
                 &ChaChaNonce::from([0u8; 12]),
                 chacha20poly1305::aead::Payload {
@@ -603,6 +631,21 @@ impl WireGuardHandshake {
             .map_err(|e| {
                 FluxError::AuthFailed(format!("failed to decrypt timestamp in initiation: {}", e))
             })?;
+        if ts_plain.len() == 12 {
+            let tai64_sec = u64::from_be_bytes(ts_plain[0..8].try_into().unwrap());
+            // TAI64N epoch offset: 2^62 + 10 seconds
+            let unix_sec = tai64_sec.saturating_sub(0x4000_0000_0000_000a);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Reject stale initiations (older than REJECT_AFTER_TIME) or future-dated ones.
+            if unix_sec + WG_REJECT_AFTER_TIME_SECS < now || unix_sec > now + 30 {
+                return Err(FluxError::AuthFailed(
+                    "wireguard initiation rejected: stale or future timestamp".into(),
+                ));
+            }
+        }
         let h4 = blake2s_mix_hash(&h3, enc_ts);
 
         // Generate responder ephemeral key
@@ -672,6 +715,18 @@ impl WireGuardHandshake {
 
 fn cfg_packet_len(awg: &AwgConfig) -> usize {
     awg.s1 as usize + 4 + 4 + 32 + 48 + 28 + 32
+}
+
+/// Constant-time byte-slice equality (used for MAC comparisons).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]

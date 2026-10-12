@@ -610,16 +610,21 @@ fn build_layered_outbound(
                 private_key,
                 peer_public_key,
                 preshared_key,
+                local_address,
+                keepalive_secs,
                 awg,
             } => {
                 let priv_k = crate::config::decode_key_32bytes(&private_key)?;
                 let pub_k = crate::config::decode_key_32bytes(&peer_public_key)?;
                 let psk = preshared_key.and_then(|k| crate::config::decode_key_32bytes(&k).ok());
+                let local_ip = local_address.as_deref().and_then(|a| a.parse().ok());
                 let wg_cfg = flux_protocol::wireguard::WireGuardConfig {
                     private_key: priv_k,
                     peer_public_key: pub_k,
                     preshared_key: psk,
                     server_address: target,
+                    local_address: local_ip,
+                    keepalive_secs,
                     awg,
                 };
                 let out =
@@ -747,16 +752,21 @@ fn build_layered_outbound(
             private_key,
             peer_public_key,
             preshared_key,
+            local_address,
+            keepalive_secs,
             awg,
         } => {
             let priv_k = crate::config::decode_key_32bytes(&private_key)?;
             let pub_k = crate::config::decode_key_32bytes(&peer_public_key)?;
             let psk = preshared_key.and_then(|k| crate::config::decode_key_32bytes(&k).ok());
+            let local_ip = local_address.as_deref().and_then(|a| a.parse().ok());
             let wg_cfg = flux_protocol::wireguard::WireGuardConfig {
                 private_key: priv_k,
                 peer_public_key: pub_k,
                 preshared_key: psk,
                 server_address: target,
+                local_address: local_ip,
+                keepalive_secs,
                 awg,
             };
             let out = flux_outbound::WireGuardOutbound::new(tag.clone(), wg_cfg, resolver.clone());
