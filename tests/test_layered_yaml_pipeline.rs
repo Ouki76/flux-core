@@ -1,7 +1,9 @@
 mod common;
 
 use base64::Engine;
-use common::{get_free_tcp_port, start_tcp_echo_server, start_udp_echo_server};
+use common::{
+    get_free_tcp_port, start_tcp_echo_server, start_tls_echo_server, start_udp_echo_server,
+};
 use flux_app::{Config, Instance};
 use flux_types::{NetworkType, SessionMeta, TargetAddress, UdpPacket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -618,4 +620,71 @@ outbounds:
     assert_eq!(&buf, payload);
 
     srv_instance.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_layered_yaml_shadowsocks2022_shadowtls_v3_e2e() {
+    let echo_addr = start_tcp_echo_server().await;
+    let decoy = start_tls_echo_server().await;
+    let srv_port = get_free_tcp_port().await;
+    let yaml = format!(
+        r#"
+inbounds:
+  - tag: stls-in
+    carrier:
+      type: tcp
+      listen: "127.0.0.1"
+      listen_port: {}
+    security:
+      type: shadowtls
+      version: 3
+      password: "pw123"
+      fallback: "127.0.0.1:{}"
+    protocol:
+      type: shadowsocks
+      method: 2022-blake3-aes-128-gcm
+      password: "MDEyMzQ1Njc4OWFiY2RlZg=="
+outbounds:
+  - type: direct
+    tag: direct
+"#,
+        srv_port,
+        decoy.port()
+    );
+    let srv = Instance::new(Config::from_yaml_str(&yaml).unwrap()).unwrap();
+    srv.start().await.unwrap();
+
+    let cli_yaml = format!(
+        r#"
+outbounds:
+  - tag: out
+    carrier:
+      type: tcp
+      address: "127.0.0.1:{}"
+    security:
+      type: shadowtls
+      version: 3
+      password: "pw123"
+      sni: "localhost"
+    protocol:
+      type: shadowsocks
+      method: 2022-blake3-aes-128-gcm
+      password: "MDEyMzQ1Njc4OWFiY2RlZg=="
+"#,
+        srv_port
+    );
+    let cli = Instance::new(Config::from_yaml_str(&cli_yaml).unwrap()).unwrap();
+    let out = cli.registry.get_outbound("out").unwrap();
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo_addr),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut s = out.dial_stream(&meta).await.unwrap();
+    s.write_all(b"ss2022-over-shadowtls").await.unwrap();
+    s.flush().await.unwrap();
+    let mut buf = vec![0u8; 21];
+    s.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"ss2022-over-shadowtls");
 }

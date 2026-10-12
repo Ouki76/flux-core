@@ -474,6 +474,30 @@ fn parse_outbound_carrier(carrier: &CarrierConfig) -> FluxResult<(TargetAddress,
     }
 }
 
+/// Extracts (sni, insecure, alpn) from the first `tls` security entry of a layered
+/// outbound — used for QUIC-native protocols (hysteria2, tuic) whose TLS lives in
+/// the QUIC handshake rather than the stream pipeline.
+fn extract_quic_tls_params(
+    sec_opt: &Option<FlexibleList<SecurityConfig>>,
+) -> (Option<String>, bool, Option<Vec<String>>) {
+    if let Some(secs) = sec_opt {
+        for sec in secs.clone().into_vec() {
+            if let SecurityConfig::Tls {
+                sni,
+                alpn,
+                insecure,
+                ..
+            } = sec
+            {
+                return (sni, insecure, (!alpn.is_empty()).then_some(alpn));
+            }
+        }
+    }
+    // No TLS security configured: QUIC-native protocols (hy2/tuic) traditionally
+    // use self-signed certs on the server — default to insecure for compatibility.
+    (None, true, None)
+}
+
 fn compile_client_securities(
     sec_opt: Option<FlexibleList<SecurityConfig>>,
     default_sni: &str,
@@ -639,6 +663,7 @@ fn build_layered_outbound(
                 hop_interval_secs,
                 h3,
             } => {
+                let (q_sni, q_insecure, q_alpn) = extract_quic_tls_params(&node.security);
                 let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
                     server: target.host(),
                     ports: vec![target.port()],
@@ -646,9 +671,10 @@ fn build_layered_outbound(
                     up_mbps,
                     down_mbps,
                     hop_interval_secs: hop_interval_secs.unwrap_or(30),
-                    insecure: true,
-                    server_name: None,
+                    insecure: q_insecure,
+                    server_name: q_sni,
                     obfs: None,
+                    alpn: q_alpn,
                     h3,
                 };
                 let out =
@@ -664,6 +690,7 @@ fn build_layered_outbound(
             } => {
                 let parsed_uuid = Uuid::parse_str(&uuid)
                     .map_err(|e| FluxError::Config(format!("invalid tuic uuid {}: {}", uuid, e)))?;
+                let (q_sni, q_insecure, q_alpn) = extract_quic_tls_params(&node.security);
                 let tuic_cfg = flux_protocol::tuic::TuicV5Config {
                     server: target.host(),
                     server_port: target.port(),
@@ -671,8 +698,9 @@ fn build_layered_outbound(
                     password,
                     congestion_control: congestion_control.unwrap_or_else(|| "bbr".into()),
                     zero_rtt: zero_rtt.unwrap_or(true),
-                    insecure: true,
-                    server_name: None,
+                    insecure: q_insecure,
+                    server_name: q_sni,
+                    alpn: q_alpn,
                 };
                 let out = flux_outbound::TuicOutbound::new(tag.clone(), tuic_cfg, resolver.clone());
                 registry.insert(tag, Arc::new(out));
@@ -779,21 +807,7 @@ fn build_layered_outbound(
             hop_interval_secs,
             h3,
         } => {
-            let mut insecure = false;
-            let mut server_name = None;
-            if let Some(ref sec_list) = node.security {
-                for sec in sec_list.as_slice() {
-                    if let SecurityConfig::Tls {
-                        sni, insecure: ins, ..
-                    } = sec
-                    {
-                        if let Some(s) = sni {
-                            server_name = Some(s.clone());
-                        }
-                        insecure = *ins;
-                    }
-                }
-            }
+            let (q_sni, q_insecure, q_alpn) = extract_quic_tls_params(&node.security);
             let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
                 server: target.host(),
                 ports: vec![target.port()],
@@ -801,9 +815,10 @@ fn build_layered_outbound(
                 up_mbps,
                 down_mbps,
                 hop_interval_secs: hop_interval_secs.unwrap_or(30),
-                insecure,
-                server_name,
+                insecure: q_insecure,
+                server_name: q_sni,
                 obfs: None,
+                alpn: q_alpn,
                 h3,
             };
             let out = if let CarrierConfig::Udp { .. } = node.carrier {
@@ -821,6 +836,7 @@ fn build_layered_outbound(
         } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid tuic uuid {}: {}", uuid, e)))?;
+            let (q_sni, q_insecure, q_alpn) = extract_quic_tls_params(&node.security);
             let tuic_cfg = flux_protocol::tuic::TuicV5Config {
                 server: target.host(),
                 server_port: target.port(),
@@ -828,8 +844,9 @@ fn build_layered_outbound(
                 password,
                 congestion_control: congestion_control.unwrap_or_else(|| "bbr".into()),
                 zero_rtt: zero_rtt.unwrap_or(true),
-                insecure: false,
-                server_name: None,
+                insecure: q_insecure,
+                server_name: q_sni,
+                alpn: q_alpn,
             };
             let out = flux_outbound::TuicOutbound::new_with_dialer(tag.clone(), tuic_cfg, dialer);
             registry.insert(tag, Arc::new(out));

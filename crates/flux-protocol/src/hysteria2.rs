@@ -23,6 +23,9 @@ pub struct Hysteria2Config {
     pub server_name: Option<String>,
     #[serde(default)]
     pub obfs: Option<String>,
+    /// ALPN protocols for the QUIC TLS handshake (default: ["h3", "hysteria2"]).
+    #[serde(default)]
+    pub alpn: Option<Vec<String>>,
     #[serde(default)]
     pub h3: bool,
 }
@@ -266,7 +269,6 @@ impl Hysteria2Protocol {
     pub async fn read_tcp_request<R: tokio::io::AsyncRead + Unpin>(
         reader: &mut R,
     ) -> FluxResult<TargetAddress> {
-        use tokio::io::AsyncReadExt;
         let frame_type = Self::read_quic_varint(reader).await?;
         if frame_type != 0x401 {
             return Err(FluxError::Protocol {
@@ -274,6 +276,14 @@ impl Hysteria2Protocol {
                 message: format!("unexpected frame type: {:#x}", frame_type),
             });
         }
+        Self::read_tcp_request_body(reader).await
+    }
+
+    /// Reads a TCPRequest body when the 0x401 frame type was already consumed.
+    pub async fn read_tcp_request_body<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> FluxResult<TargetAddress> {
+        use tokio::io::AsyncReadExt;
         let addr_len = Self::read_quic_varint(reader).await? as usize;
         let mut addr_buf = vec![0u8; addr_len];
         reader

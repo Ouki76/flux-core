@@ -33,3 +33,8 @@ http = "1.0"
 quinn = { workspace = true }
 ring = { workspace = true }
 aes-gcm = { workspace = true }
+
+[dev-dependencies]
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+http = { workspace = true }

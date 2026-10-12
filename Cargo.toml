@@ -65,6 +65,9 @@ pem = "3"
 hmac = "0.12"
 blake3 = "1.8"
 h2 = "0.4"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1"
 maxminddb = "0.32"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "ring"] }
 
@@ -91,6 +94,7 @@ anyhow = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 flux-common = { workspace = true }
 flux-router = { workspace = true }
 flux-dns = { workspace = true }

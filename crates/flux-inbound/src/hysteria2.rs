@@ -1,13 +1,13 @@
 use async_trait::async_trait;
-use flux_protocol::hysteria2::{HYSTERIA2_CMD_TCP, HYSTERIA2_CMD_UDP, Hysteria2Protocol};
+use flux_protocol::hysteria2::{HYSTERIA2_CMD_UDP, Hysteria2Protocol};
 use flux_transport::quic::{QuicBiStream, QuicTransport};
 use flux_types::{
     Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
 };
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{debug, info, warn};
 
@@ -206,7 +206,6 @@ impl Inbound for Hysteria2Inbound {
         )?;
 
         self.running.store(true, Ordering::SeqCst);
-        let _running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let password = Arc::new(self.password.clone());
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -234,166 +233,209 @@ impl Inbound for Hysteria2Inbound {
                     let conn = match incoming.await {
                         Ok(c) => c,
                         Err(e) => {
-                            debug!(
-                                "[{}] Hysteria 2 QUIC connection handshake error: {}",
-                                inbound_tag, e
-                            );
+                            debug!("[{}] Hysteria 2 QUIC handshake error: {}", inbound_tag, e);
                             return;
                         }
                     };
-
                     let client_addr = conn.remote_address();
+                    let h3 = flux_transport::h3_lite::H3LiteServer::new(conn.clone());
+                    let authenticated = Arc::new(AtomicBool::new(false));
 
-                    while let Ok((send, recv)) = conn.accept_bi().await {
-                        let mut stream = QuicBiStream::new(send, recv);
-                        let disp_stream = disp.clone();
-                        let in_tag = inbound_tag.clone();
-                        let pw_sub = pw.clone();
-
+                    // UDP datagram sessions for this connection.
+                    let udp_sessions: Arc<
+                        dashmap::DashMap<u32, tokio::sync::mpsc::Sender<UdpPacket>>,
+                    > = Arc::new(dashmap::DashMap::new());
+                    {
+                        let conn_c = conn.clone();
+                        let tag_c = inbound_tag.clone();
+                        let disp_c = disp.clone();
+                        let auth_c = authenticated.clone();
+                        let sessions_c = udp_sessions.clone();
                         tokio::spawn(async move {
-                            // 1. Read Hysteria 2 auth header: [ver (1 byte: 2) + len (2 bytes BE)]
-                            let mut auth_hdr = [0u8; 3];
-                            if let Err(e) = stream.read_exact(&mut auth_hdr).await {
-                                debug!("[{}] Hysteria 2 auth header read failed: {}", in_tag, e);
-                                return;
-                            }
-
-                            let pw_len = u16::from_be_bytes([auth_hdr[1], auth_hdr[2]]) as usize;
-                            let mut full_auth = vec![0u8; 3 + pw_len];
-                            full_auth[..3].copy_from_slice(&auth_hdr);
-                            if let Err(e) = stream.read_exact(&mut full_auth[3..]).await {
-                                debug!("[{}] Hysteria 2 auth password read failed: {}", in_tag, e);
-                                return;
-                            }
-
-                            if let Err(e) = Hysteria2Protocol::parse_auth_frame(&full_auth, &pw_sub)
-                            {
-                                warn!(
-                                    "[{}] Hysteria 2 auth verification failed from {}: {}",
-                                    in_tag, client_addr, e
-                                );
-                                return;
-                            }
-
-                            // 2. Read request header: [command (1 byte) + port (2 bytes BE) + atyp (1 byte)]
-                            let mut req_hdr = [0u8; 4];
-                            if let Err(e) = stream.read_exact(&mut req_hdr).await {
-                                debug!("[{}] Hysteria 2 request header read failed: {}", in_tag, e);
-                                return;
-                            }
-
-                            let command = req_hdr[0];
-                            let port = u16::from_be_bytes([req_hdr[1], req_hdr[2]]);
-                            let atyp = req_hdr[3];
-
-                            let target_addr = match atyp {
-                                1 => {
-                                    let mut ip_bytes = [0u8; 4];
-                                    if stream.read_exact(&mut ip_bytes).await.is_err() {
-                                        return;
-                                    }
-                                    let ip = Ipv4Addr::from(ip_bytes);
-                                    TargetAddress::Ip(SocketAddr::new(ip.into(), port))
+                            loop {
+                                let dgram = match conn_c.read_datagram().await {
+                                    Ok(d) => d,
+                                    Err(_) => break,
+                                };
+                                if !auth_c.load(Ordering::SeqCst) {
+                                    continue;
                                 }
-                                2 => {
-                                    let mut len_byte = [0u8; 1];
-                                    if stream.read_exact(&mut len_byte).await.is_err() {
-                                        return;
-                                    }
-                                    let dlen = len_byte[0] as usize;
-                                    let mut domain_buf = vec![0u8; dlen];
-                                    if stream.read_exact(&mut domain_buf).await.is_err() {
-                                        return;
-                                    }
-                                    let domain = String::from_utf8_lossy(&domain_buf).to_string();
-                                    TargetAddress::Domain(domain, port)
+                                // hy2 UDP datagram: [sessionID u32][packetID u16][fragID u8][fragTotal u8][vstring dest][data]
+                                if dgram.len() < 9 {
+                                    continue;
                                 }
-                                3 => {
-                                    let mut ip_bytes = [0u8; 16];
-                                    if stream.read_exact(&mut ip_bytes).await.is_err() {
-                                        return;
-                                    }
-                                    let ip = Ipv6Addr::from(ip_bytes);
-                                    TargetAddress::Ip(SocketAddr::new(ip.into(), port))
+                                let session_id =
+                                    u32::from_be_bytes([dgram[0], dgram[1], dgram[2], dgram[3]]);
+                                let frag_id = dgram[6];
+                                let frag_total = dgram[7];
+                                if frag_total > 1 || frag_id != 0 {
+                                    continue; // fragmented UDP not supported
                                 }
-                                _ => return,
-                            };
+                                // vstring dest
+                                let vlen = match dgram[8] {
+                                    v if v < 0x40 => v as usize,
+                                    _ => continue, // only short varints for sanity
+                                };
+                                if dgram.len() < 9 + vlen {
+                                    continue;
+                                }
+                                let dest_str =
+                                    String::from_utf8_lossy(&dgram[9..9 + vlen]).to_string();
+                                let payload = &dgram[9 + vlen..];
+                                let target: TargetAddress = match dest_str.parse() {
+                                    Ok(t) => t,
+                                    Err(_) => continue,
+                                };
 
-                            let meta = SessionMeta::new(
-                                client_addr,
-                                target_addr.clone(),
-                                in_tag.clone(),
-                                if command == HYSTERIA2_CMD_UDP {
-                                    NetworkType::Udp
+                                if let Some(tx) = sessions_c.get(&session_id) {
+                                    let pkt = UdpPacket::new(
+                                        payload.to_vec().into(),
+                                        TargetAddress::Ip(client_addr),
+                                        target,
+                                    );
+                                    let _ = tx.try_send(pkt);
                                 } else {
-                                    NetworkType::Tcp
-                                },
-                            );
+                                    let (pkt_tx, pkt_rx) =
+                                        tokio::sync::mpsc::channel::<UdpPacket>(64);
+                                    let (out_tx, mut out_rx) =
+                                        tokio::sync::mpsc::channel::<UdpPacket>(64);
+                                    let meta = SessionMeta::new(
+                                        client_addr,
+                                        target.clone(),
+                                        tag_c.clone(),
+                                        NetworkType::Udp,
+                                    );
+                                    let disp2 = disp_c.clone();
+                                    tokio::spawn(async move {
+                                        disp2.dispatch_packet(meta, pkt_rx, out_tx).await;
+                                    });
+                                    let pkt = UdpPacket::new(
+                                        payload.to_vec().into(),
+                                        TargetAddress::Ip(client_addr),
+                                        target,
+                                    );
+                                    let _ = pkt_tx.try_send(pkt);
+                                    sessions_c.insert(session_id, pkt_tx);
 
-                            if command == HYSTERIA2_CMD_TCP {
-                                disp_stream.dispatch_stream(meta, Box::new(stream)).await;
-                            } else if command == HYSTERIA2_CMD_UDP {
-                                let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
-                                let (out_tx, mut out_rx) =
-                                    tokio::sync::mpsc::channel::<UdpPacket>(64);
-
-                                let disp_packet = disp_stream.clone();
-                                let meta_packet = meta.clone();
-                                tokio::spawn(async move {
-                                    disp_packet
-                                        .dispatch_packet(meta_packet, pkt_rx, out_tx)
-                                        .await;
-                                });
-
-                                let (mut stream_r, mut stream_w) = tokio::io::split(stream);
-
-                                // Forward client packets to dispatcher
-                                let pkt_send = pkt_tx.clone();
-                                let target_src = target_addr.clone();
-                                let read_task = tokio::spawn(async move {
-                                    let mut len_buf = [0u8; 2];
-                                    loop {
-                                        if stream_r.read_exact(&mut len_buf).await.is_err() {
-                                            break;
+                                    let conn2 = conn_c.clone();
+                                    tokio::spawn(async move {
+                                        let mut pid: u16 = 0;
+                                        while let Some(reply) = out_rx.recv().await {
+                                            let dest_str = reply.source.to_string();
+                                            let mut frame =
+                                                Vec::with_capacity(16 + reply.payload.len());
+                                            frame.extend_from_slice(&session_id.to_be_bytes());
+                                            frame.extend_from_slice(&pid.to_be_bytes());
+                                            frame.push(0); // frag id
+                                            frame.push(1); // frag total
+                                            frame.push(dest_str.len() as u8);
+                                            frame.extend_from_slice(dest_str.as_bytes());
+                                            frame.extend_from_slice(&reply.payload);
+                                            pid = pid.wrapping_add(1);
+                                            if conn2.send_datagram(frame.into()).is_err() {
+                                                break;
+                                            }
                                         }
-                                        let len = u16::from_be_bytes(len_buf) as usize;
-                                        let mut payload = vec![0u8; len];
-                                        if stream_r.read_exact(&mut payload).await.is_err() {
-                                            break;
-                                        }
-                                        let pkt = UdpPacket::new(
-                                            payload.into(),
-                                            TargetAddress::Ip(client_addr),
-                                            target_src.clone(),
-                                        );
-                                        if pkt_send.send(pkt).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-
-                                // Forward outbound replies back to client
-                                let write_task = tokio::spawn(async move {
-                                    while let Some(reply) = out_rx.recv().await {
-                                        let len = reply.payload.len() as u16;
-                                        if stream_w.write_all(&len.to_be_bytes()).await.is_err() {
-                                            break;
-                                        }
-                                        if stream_w.write_all(&reply.payload).await.is_err() {
-                                            break;
-                                        }
-                                        if stream_w.flush().await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-
-                                tokio::select! {
-                                    _ = read_task => {},
-                                    _ = write_task => {},
+                                    });
                                 }
                             }
                         });
+                    }
+
+                    loop {
+                        let ev = match h3.accept().await {
+                            Ok(e) => e,
+                            Err(_) => break,
+                        };
+                        match ev {
+                            flux_transport::h3_lite::H3Event::Request {
+                                headers,
+                                mut send,
+                                recv: _,
+                            } => {
+                                let get = |name: &str| {
+                                    headers
+                                        .iter()
+                                        .find(|(n, _)| n == name)
+                                        .map(|(_, v)| v.as_str())
+                                };
+                                let is_auth = get(":method") == Some("POST")
+                                    && get(":path") == Some("/auth")
+                                    && get(":authority").map(|a| a == "hysteria").unwrap_or(true);
+                                let auth_ok = is_auth
+                                    && get("hysteria-auth")
+                                        .map(|p| p == pw.as_str())
+                                        .unwrap_or(false);
+                                if auth_ok {
+                                    authenticated.store(true, Ordering::SeqCst);
+                                    let fields = vec![
+                                        ("hysteria-udp".to_string(), "true".to_string()),
+                                        ("hysteria-cc-rx".to_string(), "0".to_string()),
+                                    ];
+                                    if flux_transport::h3_lite::write_response_headers(
+                                        &mut send, 233, &fields,
+                                    )
+                                    .await
+                                    .is_ok()
+                                    {
+                                        let _ = send.finish();
+                                    }
+                                    debug!(
+                                        "[{}] Hysteria 2 authenticated client {}",
+                                        inbound_tag, client_addr
+                                    );
+                                } else {
+                                    // Masquerade: plain 404.
+                                    let _ = flux_transport::h3_lite::write_response_headers(
+                                        &mut send,
+                                        404,
+                                        &[],
+                                    )
+                                    .await;
+                                    let _ = send.finish();
+                                }
+                            }
+                            flux_transport::h3_lite::H3Event::RawStream {
+                                frame_type,
+                                send,
+                                mut recv,
+                            } => {
+                                if frame_type != 0x401 || !authenticated.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                let disp_s = disp.clone();
+                                let in_tag = inbound_tag.clone();
+                                tokio::spawn(async move {
+                                    let target =
+                                        match Hysteria2Protocol::read_tcp_request_body(&mut recv)
+                                            .await
+                                        {
+                                            Ok(t) => t,
+                                            Err(e) => {
+                                                debug!(
+                                                    "[{}] hy2 tcp request read failed: {}",
+                                                    in_tag, e
+                                                );
+                                                return;
+                                            }
+                                        };
+                                    let ok_resp =
+                                        Hysteria2Protocol::encode_tcp_response(true, "OK");
+                                    let mut send = send;
+                                    if send.write_all(&ok_resp).await.is_err() {
+                                        return;
+                                    }
+                                    let meta = SessionMeta::new(
+                                        client_addr,
+                                        target,
+                                        in_tag,
+                                        NetworkType::Tcp,
+                                    );
+                                    let stream = QuicBiStream::new(send, recv);
+                                    disp_s.dispatch_stream(meta, Box::new(stream)).await;
+                                });
+                            }
+                        }
                     }
                 });
             }

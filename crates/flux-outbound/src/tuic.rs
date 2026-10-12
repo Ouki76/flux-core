@@ -1,13 +1,22 @@
 use async_trait::async_trait;
-use flux_protocol::tuic::{TUIC_CMD_CONNECT, TUIC_CMD_PACKET, TuicV5Config, TuicV5Protocol};
-use flux_transport::quic::{QuicBiStream, QuicTransport};
+use dashmap::DashMap;
+use flux_protocol::tuic::TuicV5Config;
+use flux_protocol::tuic::TuicV5Protocol;
+use flux_transport::quic::QuicTransport;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
     UdpPacket,
 };
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicU16, Ordering};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, mpsc};
+use tracing::debug;
+
+/// Per-connection UDP-over-datagram demultiplexer state.
+struct DatagramDemux {
+    sessions: DashMap<u16, mpsc::Sender<UdpPacket>>,
+}
 
 pub struct TuicOutbound {
     tag: String,
@@ -15,6 +24,8 @@ pub struct TuicOutbound {
     resolver: Arc<flux_dns::DnsResolver>,
     endpoint: Arc<Mutex<Option<quinn::Endpoint>>>,
     connection: Arc<Mutex<Option<quinn::Connection>>>,
+    demux: Arc<Mutex<Option<Arc<DatagramDemux>>>>,
+    next_session_id: Arc<AtomicU16>,
     dialer: Option<Arc<dyn flux_types::StreamDialer>>,
 }
 
@@ -30,10 +41,14 @@ impl TuicOutbound {
             resolver,
             endpoint: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(None)),
+            demux: Arc::new(Mutex::new(None)),
+            next_session_id: Arc::new(AtomicU16::new(1)),
             dialer: None,
         }
     }
 
+    /// For layered transports (e.g. TUIC over TCP+Reality): delegate stream
+    /// establishment to the underlying dialer instead of raw QUIC.
     pub fn new_with_dialer(
         tag: impl Into<String>,
         config: TuicV5Config,
@@ -46,10 +61,14 @@ impl TuicOutbound {
             resolver,
             endpoint: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(None)),
+            demux: Arc::new(Mutex::new(None)),
+            next_session_id: Arc::new(AtomicU16::new(1)),
             dialer: Some(dialer),
         }
     }
 
+    /// Connects and authenticates (TUIC v5: AUTHENTICATE on a dedicated
+    /// unidirectional stream, token = TLS ExportKeyingMaterial).
     async fn get_connection(&self) -> FluxResult<quinn::Connection> {
         let peer_addr = self
             .resolver
@@ -72,7 +91,12 @@ impl TuicOutbound {
         {
             ep.clone()
         } else {
-            let alpn = vec![b"tuic-v5".to_vec(), b"h3".to_vec()];
+            let alpn: Vec<Vec<u8>> = self
+                .config
+                .alpn
+                .clone()
+                .map(|v| v.into_iter().map(|s| s.into_bytes()).collect())
+                .unwrap_or_else(|| vec![b"tuic".to_vec(), b"tuic-v5".to_vec(), b"h3".to_vec()]);
             let ep = QuicTransport::create_client_endpoint(
                 peer_addr.is_ipv6(),
                 alpn,
@@ -88,6 +112,60 @@ impl TuicOutbound {
             .as_deref()
             .unwrap_or(&self.config.server);
         let conn = QuicTransport::connect(&endpoint, peer_addr, sni).await?;
+
+        // Authenticate: dedicated unidirectional stream with the EKM token.
+        let mut token = [0u8; 32];
+        conn.export_keying_material(
+            &mut token,
+            self.config.uuid.as_bytes(),
+            self.config.password.as_bytes(),
+        )
+        .map_err(|e| {
+            FluxError::Crypto(format!("tuic TLS export_keying_material failed: {:?}", e))
+        })?;
+        let auth_frame = TuicV5Protocol::build_auth_frame(&self.config.uuid, &token);
+        let mut uni = conn.open_uni().await.map_err(|e| {
+            FluxError::Network(format!("tuic failed to open auth uni-stream: {}", e))
+        })?;
+        uni.write_all(&auth_frame)
+            .await
+            .map_err(|e| FluxError::Network(format!("tuic auth write: {}", e)))?;
+        uni.finish()
+            .map_err(|e| FluxError::Network(format!("tuic auth finish: {:?}", e)))?;
+
+        // Fresh connection → fresh datagram demultiplexer.
+        let demux = Arc::new(DatagramDemux {
+            sessions: DashMap::new(),
+        });
+        {
+            let mut d = self.demux.lock().await;
+            *d = Some(demux.clone());
+        }
+        {
+            let conn_c = conn.clone();
+            let demux_c = demux.clone();
+            let tag = self.tag.clone();
+            tokio::spawn(async move {
+                loop {
+                    match conn_c.read_datagram().await {
+                        Ok(dgram) => {
+                            if let Ok((session_id, _pid, addr, payload)) =
+                                TuicV5Protocol::parse_packet_frame(&dgram)
+                                && let Some(tx) = demux_c.sessions.get(&session_id)
+                            {
+                                let pkt = UdpPacket::new(payload.into(), addr.clone(), addr);
+                                let _ = tx.try_send(pkt);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("[{}] tuic datagram reader closed: {}", tag, e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+
         *conn_guard = Some(conn.clone());
         Ok(conn)
     }
@@ -104,87 +182,97 @@ impl Outbound for TuicOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
-        let mut stream: BoxedStream = if let Some(ref d) = self.dialer {
-            d.dial().await?
-        } else {
-            let conn = self.get_connection().await?;
-            Box::new(QuicTransport::open_bi_stream(&conn).await?)
-        };
+        if let Some(ref d) = self.dialer {
+            // Layered mode (TUIC frames over an arbitrary stream transport):
+            // AUTH frame with the legacy HMAC token, then the CONNECT command.
+            let mut stream = d.dial().await?;
+            let token = TuicV5Protocol::legacy_token(&self.config.uuid, &self.config.password);
+            let auth_frame = TuicV5Protocol::build_auth_frame(&self.config.uuid, &token);
+            let cmd_frame = TuicV5Protocol::build_command_frame(
+                flux_protocol::tuic::TUIC_CMD_CONNECT,
+                &meta.destination,
+            );
+            stream.write_all(&auth_frame).await.map_err(FluxError::Io)?;
+            stream.write_all(&cmd_frame).await.map_err(FluxError::Io)?;
+            stream.flush().await.map_err(FluxError::Io)?;
+            return Ok(stream);
+        }
 
-        // Send TUIC v5 Auth frame + Connect command over the encrypted QUIC stream
-        let auth_frame = TuicV5Protocol::build_auth_frame(&self.config.uuid, &self.config.password);
-        let cmd_frame = TuicV5Protocol::build_command_frame(TUIC_CMD_CONNECT, &meta.destination);
-
-        stream.write_all(&auth_frame).await.map_err(FluxError::Io)?;
+        let conn = self.get_connection().await?;
+        let mut stream: BoxedStream = Box::new(QuicTransport::open_bi_stream(&conn).await?);
+        let cmd_frame = TuicV5Protocol::build_connect_frame(&meta.destination);
         stream.write_all(&cmd_frame).await.map_err(FluxError::Io)?;
         stream.flush().await.map_err(FluxError::Io)?;
-
         Ok(stream)
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
         let conn = self.get_connection().await?;
-        let mut stream = QuicTransport::open_bi_stream(&conn).await?;
+        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        let demux = self
+            .demux
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| FluxError::Network("tuic demux not initialized".into()))?;
 
-        let auth_frame = TuicV5Protocol::build_auth_frame(&self.config.uuid, &self.config.password);
-        let cmd_frame = TuicV5Protocol::build_command_frame(TUIC_CMD_PACKET, &meta.destination);
+        let (tx, rx) = mpsc::channel::<UdpPacket>(64);
+        demux.sessions.insert(session_id, tx);
 
-        stream.write_all(&auth_frame).await.map_err(FluxError::Io)?;
-        stream.write_all(&cmd_frame).await.map_err(FluxError::Io)?;
-        stream.flush().await.map_err(FluxError::Io)?;
-
-        let (reader, writer) = tokio::io::split(stream);
-
-        Ok(Box::new(TuicPacketEndpoint {
-            reader: Arc::new(Mutex::new(reader)),
-            writer: Arc::new(Mutex::new(writer)),
+        Ok(Box::new(TuicDatagramEndpoint {
+            conn,
+            session_id,
+            next_packet_id: AtomicU16::new(0),
+            rx: Mutex::new(rx),
             destination: meta.destination.clone(),
+            demux,
         }))
     }
 }
 
-pub struct TuicPacketEndpoint {
-    reader: Arc<Mutex<tokio::io::ReadHalf<QuicBiStream>>>,
-    writer: Arc<Mutex<tokio::io::WriteHalf<QuicBiStream>>>,
+/// TUIC v5 UDP endpoint: QUIC datagrams with PACKET frames.
+pub struct TuicDatagramEndpoint {
+    conn: quinn::Connection,
+    session_id: u16,
+    next_packet_id: AtomicU16,
+    rx: Mutex<mpsc::Receiver<UdpPacket>>,
+    #[allow(dead_code)]
     destination: TargetAddress,
+    demux: Arc<DatagramDemux>,
 }
 
 #[async_trait]
-impl PacketEndpoint for TuicPacketEndpoint {
+impl PacketEndpoint for TuicDatagramEndpoint {
     async fn send_packet(&self, packet: UdpPacket) -> FluxResult<()> {
-        let len = packet.payload.len() as u16;
-        let mut guard = self.writer.lock().await;
-        guard
-            .write_all(&len.to_be_bytes())
-            .await
-            .map_err(FluxError::Io)?;
-        guard
-            .write_all(&packet.payload)
-            .await
-            .map_err(FluxError::Io)?;
-        guard.flush().await.map_err(FluxError::Io)?;
+        let pid = self.next_packet_id.fetch_add(1, Ordering::Relaxed);
+        let frame = TuicV5Protocol::build_packet_frame(
+            self.session_id,
+            pid,
+            &packet.destination,
+            &packet.payload,
+        );
+        self.conn
+            .send_datagram(frame.into())
+            .map_err(|e| FluxError::Network(format!("tuic send_datagram failed: {}", e)))?;
         Ok(())
     }
 
     async fn recv_packet(&self) -> FluxResult<UdpPacket> {
-        let mut guard = self.reader.lock().await;
-        let mut len_buf = [0u8; 2];
+        let mut guard = self.rx.lock().await;
         guard
-            .read_exact(&mut len_buf)
+            .recv()
             .await
-            .map_err(FluxError::Io)?;
-        let len = u16::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; len];
-        guard
-            .read_exact(&mut payload)
-            .await
-            .map_err(FluxError::Io)?;
+            .ok_or_else(|| FluxError::Network("tuic datagram session closed".into()))
+    }
+}
 
-        Ok(UdpPacket::new(
-            payload.into(),
-            self.destination.clone(),
-            self.destination.clone(),
-        ))
+impl Drop for TuicDatagramEndpoint {
+    fn drop(&mut self) {
+        self.demux.sessions.remove(&self.session_id);
+        // Best-effort DISSOCIATE (fire-and-forget).
+        let _ = self
+            .conn
+            .send_datagram(TuicV5Protocol::build_dissociate_frame(self.session_id).into());
     }
 }
 
@@ -204,14 +292,15 @@ mod tests {
             zero_rtt: false,
             insecure: false,
             server_name: None,
+            alpn: None,
         };
         let resolver = Arc::new(flux_dns::DnsResolver::new(None));
         let outbound = TuicOutbound::new("tuic-out", cfg, resolver);
 
+        assert!(outbound.endpoint.lock().await.is_none());
+
         let peer_v4: SocketAddr = "127.0.0.1:8443".parse().unwrap();
         let peer_v6: SocketAddr = "[::1]:8443".parse().unwrap();
-
-        assert!(outbound.endpoint.lock().await.is_none());
 
         {
             let mut ep_guard = outbound.endpoint.lock().await;

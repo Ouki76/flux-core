@@ -58,6 +58,37 @@ impl<S> ShadowTlsStream<S> {
         }
     }
 
+    /// Server-side constructor for the v3 handshake-switch path: the read HMAC
+    /// chain is already advanced past the client's first authenticated data frame,
+    /// and that frame's payload is pre-buffered for reading.
+    pub fn new_server_after_switch(
+        inner: S,
+        password: &str,
+        server_random: &[u8],
+        read_hmac: HmacSha1,
+        first_payload: Vec<u8>,
+    ) -> Self {
+        let mut write_hmac = <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).unwrap();
+        write_hmac.update(server_random);
+        write_hmac.update(b"S");
+
+        Self {
+            inner,
+            write_hmac,
+            read_hmac,
+            write_buf: Vec::with_capacity(16384 + 16),
+            write_pos: 0,
+            writing_plain_len: 0,
+            hdr_buf: [0u8; 9],
+            hdr_pos: 0,
+            payload_len: 0,
+            payload_buf: Vec::new(),
+            payload_pos: 0,
+            read_buf: first_payload,
+            read_pos: 0,
+        }
+    }
+
     pub fn new_server(inner: S, password: &str, server_random: &[u8]) -> Self {
         let mut write_hmac = <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).unwrap();
         write_hmac.update(server_random);
@@ -232,6 +263,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowTlsStream<S> {
             let actual_tag = &this.hdr_buf[5..9];
             if actual_tag != expected_tag {
                 // Decoy application data frame from handshake relay, skip it
+                tracing::debug!(
+                    "shadowtls: tag mismatch, skipping record ({}B)",
+                    this.payload_len
+                );
                 this.payload_len = 0;
                 this.hdr_pos = 0;
                 continue;
@@ -491,38 +526,223 @@ impl ShadowTlsHandshake {
         fallback_stream.flush().await.map_err(FluxError::Io)?;
 
         if is_auth {
-            // Authorized client: read genuine ServerHello from fallback and relay to client
+            // Authorized client (ShadowTLS v3): relay the ENTIRE TLS handshake with the
+            // fallback, watching client→fallback records until the first application-data
+            // record whose 4-byte HMAC tag matches HMAC-SHA1(password | server_random | "C").
+            // Then switch to ShadowTlsStream data mode.
+
+            // 1. Read + relay the fallback's ServerHello, extract server_random.
             let mut srv_hdr = [0u8; 5];
-            let mut s_body = Vec::new();
-            if tokio::time::timeout(
+            tokio::time::timeout(
                 Duration::from_secs(3),
                 fallback_stream.read_exact(&mut srv_hdr),
             )
             .await
-            .is_ok()
-            {
-                let s_len = u16::from_be_bytes([srv_hdr[3], srv_hdr[4]]) as usize;
-                s_body = vec![0u8; s_len];
-                if tokio::time::timeout(
-                    Duration::from_secs(3),
-                    fallback_stream.read_exact(&mut s_body),
+            .map_err(|_| FluxError::Timeout("shadowtls fallback ServerHello timed out".into()))?
+            .map_err(FluxError::Io)?;
+            let s_len = u16::from_be_bytes([srv_hdr[3], srv_hdr[4]]) as usize;
+            if s_len > 16384 {
+                return Err(FluxError::Crypto(
+                    "shadowtls fallback ServerHello too large".into(),
+                ));
+            }
+            let mut s_body = vec![0u8; s_len];
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                fallback_stream.read_exact(&mut s_body),
+            )
+            .await
+            .map_err(|_| {
+                FluxError::Timeout("shadowtls fallback ServerHello body timed out".into())
+            })?
+            .map_err(FluxError::Io)?;
+            client_stream
+                .write_all(&srv_hdr)
+                .await
+                .map_err(FluxError::Io)?;
+            client_stream
+                .write_all(&s_body)
+                .await
+                .map_err(FluxError::Io)?;
+            client_stream.flush().await.map_err(FluxError::Io)?;
+
+            // If the fallback didn't answer with a genuine TLS ServerHello, this is
+            // a layered pipeline (the "fallback" is the next in-process layer, e.g.
+            // REALITY) — degrade to legacy immediate-switch mode using whatever bytes
+            // came back as the pseudo server_random (both flux ends stay consistent).
+            let valid_sh =
+                srv_hdr[0] == TLS_RECORD_HANDSHAKE && s_body.len() >= 38 && s_body[0] == 0x02;
+            let server_random: [u8; 32] = if s_body.len() >= 38 {
+                s_body[6..38]
+                    .try_into()
+                    .map_err(|_| FluxError::Crypto("shadowtls invalid server random".into()))?
+            } else {
+                [0u8; 32]
+            };
+
+            // 2. Relay the rest of the server flight (fallback → client) in a
+            //    background task, while watching client records in the main flow.
+            let (mut client_rd, mut client_wr) = tokio::io::split(client_stream);
+            let (mut fb_rd, mut fb_wr) = tokio::io::split(fallback_stream);
+
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            let relay_task = if valid_sh {
+                let password = cfg.password.clone();
+                tokio::spawn(async move {
+                    // ShadowTLS v3 server→client relay WITH modification:
+                    // the fallback's application-data records are XORed with
+                    // SHA256(password|server_random) and prefixed with a rolling
+                    // HMAC-SHA1(password | server_random) 4-byte tag — this is how the
+                    // client detects a genuine ShadowTLS server (vs. plain relay).
+                    let xor_key: [u8; 32] = {
+                        use sha2::Digest;
+                        let mut h = sha2::Sha256::new();
+                        h.update(password.as_bytes());
+                        h.update(server_random);
+                        h.finalize().into()
+                    };
+                    let mut hmac_write =
+                        <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).expect("hmac");
+                    hmac_write.update(&server_random);
+
+                    let mut hdr = [0u8; 5];
+                    loop {
+                        tokio::select! {
+                            _ = stop_rx.changed() => break,
+                            res = fb_rd.read_exact(&mut hdr) => {
+                                if res.is_err() {
+                                    break;
+                                }
+                                let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+                                if len > 16384 + 256 {
+                                    break;
+                                }
+                                let mut body = vec![0u8; len];
+                                if fb_rd.read_exact(&mut body).await.is_err() {
+                                    break;
+                                }
+                                if hdr[0] == 0x17 {
+                                    // appdata: XOR + rolling HMAC tag
+                                    for (i, b) in body.iter_mut().enumerate() {
+                                        *b ^= xor_key[i % 32];
+                                    }
+                                    hmac_write.update(&body);
+                                    let tag_full = hmac_write.clone().finalize().into_bytes();
+                                    let tag = &tag_full[..4];
+                                    let new_len = (body.len() + 4) as u16;
+                                    let new_hdr = [0x17, 0x03, 0x03,
+                                        (new_len >> 8) as u8, (new_len & 0xff) as u8];
+                                    if client_wr.write_all(&new_hdr).await.is_err()
+                                        || client_wr.write_all(tag).await.is_err()
+                                        || client_wr.write_all(&body).await.is_err()
+                                        || client_wr.flush().await.is_err()
+                                    {
+                                        break;
+                                    }
+                                } else if client_wr.write_all(&hdr).await.is_err()
+                                    || client_wr.write_all(&body).await.is_err()
+                                    || client_wr.flush().await.is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    (fb_rd, client_wr)
+                })
+            } else {
+                // Legacy/layered mode: no fallback flight relay; inert task.
+                tokio::spawn(async move { (fb_rd, client_wr) })
+            };
+
+            // 3. Relay client records to the fallback until the first
+            //    HMAC-authenticated appdata record (start of Shadowsocks data).
+            let mut hmac_verify =
+                <HmacSha1 as hmac::Mac>::new_from_slice(cfg.password.as_bytes()).expect("hmac");
+            hmac_verify.update(&server_random);
+            hmac_verify.update(b"C");
+
+            let mut first_payload: Option<Vec<u8>> = None;
+            let mut hdr = [0u8; 5];
+            while first_payload.is_none() {
+                let rec_hdr = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client_rd.read_exact(&mut hdr),
                 )
                 .await
-                .is_ok()
                 {
-                    let _ = client_stream.write_all(&srv_hdr).await;
-                    let _ = client_stream.write_all(&s_body).await;
-                    let _ = client_stream.flush().await;
+                    Ok(Ok(_)) => hdr,
+                    _ => {
+                        let _ = stop_tx.send(true);
+                        return Err(FluxError::Timeout(
+                            "shadowtls client post-handshake read timed out".into(),
+                        ));
+                    }
+                };
+                let len = u16::from_be_bytes([rec_hdr[3], rec_hdr[4]]) as usize;
+                if len > 16384 + 256 {
+                    let _ = stop_tx.send(true);
+                    return Err(FluxError::Crypto("shadowtls oversized record".into()));
+                }
+                let mut body = vec![0u8; len];
+                if client_rd.read_exact(&mut body).await.is_err() {
+                    let _ = stop_tx.send(true);
+                    return Err(FluxError::Crypto("shadowtls truncated record".into()));
+                }
+
+                if rec_hdr[0] == 0x17 && body.len() > 4 {
+                    let mut mac = hmac_verify.clone();
+                    mac.update(&body[4..]);
+                    let expect = mac.finalize().into_bytes();
+                    if body[..4] == expect[..4] {
+                        hmac_verify.update(&body[4..]);
+                        hmac_verify.update(&body[..4]);
+                        first_payload = Some(body[4..].to_vec());
+                        tracing::debug!(
+                            "shadowtls v3: first authenticated data frame matched ({} bytes)",
+                            len - 4
+                        );
+                        break;
+                    } else {
+                        tracing::debug!(
+                            "shadowtls v3: relaying record type={} len={} (no hmac match)",
+                            rec_hdr[0],
+                            len
+                        );
+                        if rec_hdr[0] == 0x17 && body.len() > 4 {}
+                    }
+                }
+
+                if fb_wr.write_all(&rec_hdr).await.is_err()
+                    || fb_wr.write_all(&body).await.is_err()
+                    || fb_wr.flush().await.is_err()
+                {
+                    let _ = stop_tx.send(true);
+                    return Err(FluxError::Crypto(
+                        "shadowtls fallback relay write failed".into(),
+                    ));
                 }
             }
-            let server_random = if s_body.len() >= 38 {
-                &s_body[6..38]
-            } else {
-                &[0u8; 32]
-            };
-            let stream = ShadowTlsStream::new_server(client_stream, &cfg.password, server_random);
-            Ok(Box::new(stream))
-        } else {
+
+            let _ = stop_tx.send(true);
+            let (fb_rd, client_wr) = relay_task.await.map_err(|e| {
+                FluxError::Network(format!("shadowtls relay task join failed: {}", e))
+            })?;
+            let client_stream = client_rd.unsplit(client_wr);
+            drop(fb_rd);
+            drop(fb_wr);
+
+            let stream = ShadowTlsStream::new_server_after_switch(
+                client_stream,
+                &cfg.password,
+                &server_random,
+                hmac_verify,
+                first_payload.unwrap_or_default(),
+            );
+            return Ok(Box::new(stream));
+        }
+        // Authorized path returned above. Unauthorized probe: relay to the fallback.
+        {
             // Unauthorized probe: bridge transparently to real server
             let mut cs: BoxedStream = Box::new(client_stream);
             let mut fs: BoxedStream = Box::new(fallback_stream);
@@ -659,6 +879,258 @@ fn verify_shadowtls_session_id(handshake: &[u8], password: &str) -> (bool, Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scripted reference ShadowTLS v3 client: real TLS 1.3 handshake with the
+    /// decoy through the server relay (un-XORing modified appdata records),
+    /// then HMAC-tagged data frames — exactly per sing-shadowtls.
+    #[tokio::test]
+    async fn test_shadowtls_v3_server_reference_client_flow() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let password = "test-stls-pass";
+        let payload = b"hello-shadowtls";
+
+        // 1. Real TLS 1.3 decoy: completes handshake, then just holds the conn.
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            cert.cert.der().to_vec(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+        );
+        let acceptor =
+            crate::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
+        let decoy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = decoy_listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(stream).await {
+                        let mut buf = vec![0u8; 4096];
+                        let _ = tls.read(&mut buf).await; // client's Finished + garbage
+                    }
+                });
+            }
+        });
+
+        // 2. flux server
+        let scfg = ShadowTlsServerConfig {
+            server_names: vec!["localhost".into()],
+            password: password.into(),
+            fallback_address: TargetFallback::Address(decoy_addr),
+        };
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_task =
+            tokio::spawn(
+                async move { ShadowTlsHandshake::server_handshake(server_io, &scfg).await },
+            );
+
+        // 3. Scripted client: send CH with HMAC challenge.
+        let ch = build_tls_client_hello("localhost", password);
+        let mut stream = client_io;
+        stream.write_all(&ch).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // 4. Read SH record, extract server_random.
+        let mut hdr = [0u8; 5];
+        stream.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[0], TLS_RECORD_HANDSHAKE);
+        let sh_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+        let mut sh_body = vec![0u8; sh_len];
+        stream.read_exact(&mut sh_body).await.unwrap();
+        let server_random: [u8; 32] = sh_body[6..38].try_into().unwrap();
+
+        // 5. Read the fallback's encrypted flight — records must be XOR+HMAC modified.
+        let xor_key: [u8; 32] = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(password.as_bytes());
+            h.update(server_random);
+            h.finalize().into()
+        };
+        let mut read_hmac = <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).unwrap();
+        read_hmac.update(&server_random);
+
+        let mut saw_modified_appdata = false;
+        for _ in 0..8 {
+            let mut rhdr = [0u8; 5];
+            if stream.read_exact(&mut rhdr).await.is_err() {
+                break;
+            }
+            let rlen = u16::from_be_bytes([rhdr[3], rhdr[4]]) as usize;
+            let mut rbody = vec![0u8; rlen];
+            stream.read_exact(&mut rbody).await.unwrap();
+            if rhdr[0] == 0x17 {
+                // modified appdata: [tag 4][xored body]
+                let tag = &rbody[..4];
+                let xored = &rbody[4..];
+                read_hmac.update(xored);
+                let expect = read_hmac.clone().finalize().into_bytes();
+                if tag != &expect[..4] {
+                    let hexs: String = rbody.iter().map(|b| format!("{:02x}", b)).collect();
+                    let sr_hex: String =
+                        server_random.iter().map(|b| format!("{:02x}", b)).collect();
+                    panic!(
+                        "tag mismatch: tag={:?} expect={:?} random={} body={}",
+                        tag,
+                        &expect[..4],
+                        sr_hex,
+                        hexs
+                    );
+                }
+                // unxor to verify content is recoverable
+                let plain: Vec<u8> = xored
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| b ^ xor_key[i % 32])
+                    .collect();
+                assert!(!plain.is_empty());
+                saw_modified_appdata = true;
+            }
+            if saw_modified_appdata && rhdr[0] == 0x17 {
+                // got at least one modified record
+            }
+            // Heuristic: decoy flight ends quickly; break after we have seen appdata.
+            if saw_modified_appdata {
+                break;
+            }
+        }
+        assert!(
+            saw_modified_appdata,
+            "server must XOR+HMAC-modify fallback appdata records"
+        );
+
+        // 6. Send the first authenticated data frame (tag = HMAC(password|random|"C") chain).
+        let mut write_hmac = <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).unwrap();
+        write_hmac.update(&server_random);
+        write_hmac.update(b"C");
+        write_hmac.update(payload);
+        let tag = write_hmac.clone().finalize().into_bytes();
+        write_hmac.update(&tag[..4]); // advance the rolling chain with the tag (per reference)
+        let mut frame = vec![0x17, 0x03, 0x03];
+        frame.extend_from_slice(&((payload.len() + 4) as u16).to_be_bytes());
+        frame.extend_from_slice(&tag[..4]);
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        // 7. The server must switch into ShadowTlsStream mode and deliver the payload.
+        let mut server_stream = server_task.await.unwrap().unwrap();
+        let mut got = vec![0u8; payload.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            server_stream.read_exact(&mut got),
+        )
+        .await
+        .expect("server must deliver the first payload after switch")
+        .unwrap();
+        assert_eq!(&got, payload);
+
+        // 7b. A second client data frame must be delivered as well (chain advanced).
+        let payload2 = b"second-frame-data";
+        write_hmac.update(payload2);
+        let tag2 = write_hmac.clone().finalize().into_bytes();
+        write_hmac.update(&tag2[..4]); // advance rolling chain with the tag
+        let mut frame2 = vec![0x17, 0x03, 0x03];
+        frame2.extend_from_slice(&((payload2.len() + 4) as u16).to_be_bytes());
+        frame2.extend_from_slice(&tag2[..4]);
+        frame2.extend_from_slice(payload2);
+        stream.write_all(&frame2).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut got2 = vec![0u8; payload2.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            server_stream.read_exact(&mut got2),
+        )
+        .await
+        .expect("server must deliver the second payload")
+        .unwrap();
+        assert_eq!(&got2, payload2);
+
+        // 8. Server→client data must be HMAC-tagged ("S" chain).
+        server_stream.write_all(b"pong").await.unwrap();
+        server_stream.flush().await.unwrap();
+        let mut rhdr = [0u8; 5];
+        stream.read_exact(&mut rhdr).await.unwrap();
+        assert_eq!(rhdr[0], 0x17);
+        let rlen = u16::from_be_bytes([rhdr[3], rhdr[4]]) as usize;
+        let mut rbody = vec![0u8; rlen];
+        stream.read_exact(&mut rbody).await.unwrap();
+        let mut verify_hmac = <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).unwrap();
+        verify_hmac.update(&server_random);
+        verify_hmac.update(b"S");
+        verify_hmac.update(&rbody[4..]);
+        let expect = verify_hmac.finalize().into_bytes();
+        assert_eq!(
+            &rbody[..4],
+            &expect[..4],
+            "server data frame must be HMAC-tagged"
+        );
+        assert_eq!(&rbody[4..], b"pong");
+
+        // 7c. Stress: 200KB across many frames of varying size must arrive intact.
+        // (writer spawned concurrently: the duplex channel is bounded.)
+        let mut big = Vec::new();
+        let mut seed: u64 = 0x12345678;
+        for _ in 0..200 * 1024 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            big.push((seed >> 33) as u8);
+        }
+        let big_len = big.len();
+        let (_rd_half, wr_half) = tokio::io::split(stream);
+        let big_hash: String = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(&big);
+            h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+        };
+        let write_task = tokio::spawn(async move {
+            let mut stream = wr_half;
+            let mut write_hmac = write_hmac;
+            let mut off = 0;
+            let mut frame_count = 0;
+            while off < big.len() {
+                let n = (1 + (big[off] as usize % 4000)).min(big.len() - off);
+                frame_count += 1;
+                let chunk = &big[off..off + n];
+                write_hmac.update(chunk);
+                let t = write_hmac.clone().finalize().into_bytes();
+                write_hmac.update(&t[..4]);
+                let mut f = vec![0x17, 0x03, 0x03];
+                f.extend_from_slice(&((chunk.len() + 4) as u16).to_be_bytes());
+                f.extend_from_slice(&t[..4]);
+                f.extend_from_slice(chunk);
+                stream.write_all(&f).await.unwrap();
+                off += n;
+            }
+            stream.flush().await.unwrap();
+            frame_count
+        });
+
+        let mut got_big = vec![0u8; big_len];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            server_stream.read_exact(&mut got_big),
+        )
+        .await
+        .expect("big transfer timed out")
+        .unwrap();
+        let frame_count = write_task.await.unwrap();
+        let got_hash: String = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(&got_big);
+            h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+        };
+        assert_eq!(
+            got_hash, big_hash,
+            "stream corrupted across {} frames",
+            frame_count
+        );
+    }
 
     #[test]
     fn test_shadowtls_client_hello_hmac() {

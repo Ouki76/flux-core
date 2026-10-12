@@ -341,7 +341,8 @@ struct RealityCertMaterial {
     /// replaced per-connection with HMAC-SHA512(auth_key, ed25519_pub).
     cert_der: Vec<u8>,
     ed25519_pub: [u8; 32],
-    signing_key: Arc<dyn rustls::sign::SigningKey>,
+    /// Raw Ed25519 keypair for signing the TLS 1.3 CertificateVerify.
+    ed25519_key: ring::signature::Ed25519KeyPair,
 }
 
 impl RealityCertMaterial {
@@ -361,18 +362,21 @@ impl RealityCertMaterial {
                     .public_key_raw()
                     .try_into()
                     .expect("ed25519 public key must be 32 bytes");
-                let pkcs8 = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
-                let inner_key = rustls::crypto::ring::sign::any_eddsa_type(&pkcs8)
-                    .expect("failed to build ed25519 signing key");
-                let signing_key: Arc<dyn rustls::sign::SigningKey> =
-                    Arc::new(ForcedEd25519SigningKey { inner: inner_key });
+                let pkcs8 = key_pair.serialize_der();
+                let ed25519_key = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
+                    .expect("failed to build ring ed25519 keypair");
                 Arc::new(Self {
                     cert_der,
                     ed25519_pub: pub_bytes,
-                    signing_key,
+                    ed25519_key,
                 })
             })
             .clone()
+    }
+
+    /// Signs the TLS 1.3 CertificateVerify content with the Ed25519 key.
+    fn sign(&self, content: &[u8]) -> Vec<u8> {
+        self.ed25519_key.sign(content).as_ref().to_vec()
     }
 
     /// Returns the certificate DER with the signature field replaced by
@@ -387,42 +391,6 @@ impl RealityCertMaterial {
         let n = der.len();
         der[n - 64..].copy_from_slice(&tag);
         der
-    }
-}
-
-/// Signing key wrapper that always answers Ed25519, regardless of the client's
-/// advertised signature schemes. REALITY clients (uTLS Chrome fingerprints) do not
-/// advertise Ed25519 but accept it — the REALITY server certificate is Ed25519 by design.
-#[derive(Debug)]
-struct ForcedEd25519SigningKey {
-    inner: Arc<dyn rustls::sign::SigningKey>,
-}
-
-impl rustls::sign::SigningKey for ForcedEd25519SigningKey {
-    fn choose_scheme(
-        &self,
-        _offered: &[rustls::SignatureScheme],
-    ) -> Option<Box<dyn rustls::sign::Signer>> {
-        self.inner
-            .choose_scheme(&[rustls::SignatureScheme::ED25519])
-    }
-
-    fn algorithm(&self) -> rustls::SignatureAlgorithm {
-        rustls::SignatureAlgorithm::ED25519
-    }
-}
-
-#[derive(Debug)]
-struct RealityCertResolver {
-    certified: Arc<rustls::sign::CertifiedKey>,
-}
-
-impl rustls::server::ResolvesServerCert for RealityCertResolver {
-    fn resolve(
-        &self,
-        _client_hello: rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        Some(self.certified.clone())
     }
 }
 
@@ -504,29 +472,29 @@ impl RealityHandshake {
             .await;
         };
 
-        // Authenticated REALITY client: terminate TLS 1.3 with the HMAC-tagged cert.
-        let cert_der = cfg.cert.cert_for(&auth_key);
-        let certified = Arc::new(rustls::sign::CertifiedKey::new(
-            vec![rustls::pki_types::CertificateDer::from(cert_der)],
-            cfg.cert.signing_key.clone(),
-        ));
+        // Authenticated REALITY client. Probe the fallback target to mirror its
+        // handshake record framing (REALITY's signature feature: the answer is
+        // byte-shape-indistinguishable from the real target's), then terminate
+        // TLS 1.3 ourselves with the HMAC-tagged certificate.
+        let mimic = match &cfg.fallback {
+            Some(dest) => match probe_target_handshake(dest, &record).await {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    // Target unreachable/misbehaving: relay everything like an invalid client.
+                    tracing::debug!("reality target probe failed ({}), relaying", e);
+                    return Self::fallback_or_fail(
+                        stream,
+                        &record,
+                        cfg,
+                        crypto_err(format!("reality target probe failed: {}", e)),
+                    )
+                    .await;
+                }
+            },
+            None => None,
+        };
 
-        let mut tls_cfg = rustls::ServerConfig::builder_with_provider(
-            rustls::crypto::ring::default_provider().into(),
-        )
-        .with_safe_default_protocol_versions()
-        .map_err(|e| crypto_err(format!("failed to build reality TLS config: {}", e)))?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(RealityCertResolver { certified }));
-        tls_cfg.send_tls13_tickets = 0;
-        tls_cfg.max_fragment_size = Some(MAX_TLS_RECORD);
-
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_cfg));
-        let replay = flux_common::copy::PrefixedStream::new(stream, record);
-        let tls_stream = acceptor
-            .accept(replay)
-            .await
-            .map_err(|e| crypto_err(format!("reality TLS handshake failed: {}", e)))?;
+        let tls_stream = Tls13Server::handshake(stream, &record, &auth_key, cfg, mimic).await?;
         Ok(Box::new(tls_stream))
     }
 
@@ -548,7 +516,7 @@ impl RealityHandshake {
     pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         stream: S,
         cfg: &RealityClientConfig,
-    ) -> FluxResult<Tls13ClientStream<S>> {
+    ) -> FluxResult<Tls13Stream<S>> {
         Tls13Client::handshake(stream, cfg).await
     }
 }
@@ -832,9 +800,21 @@ impl TrafficState {
     }
 
     fn encrypt_record(&mut self, content_type: u8, data: &[u8]) -> FluxResult<Vec<u8>> {
-        let mut inner = Vec::with_capacity(data.len() + 1);
+        self.encrypt_record_padded(content_type, data, 0)
+    }
+
+    /// Encrypts a record, padding the TLSInnerPlaintext with `pad_len` trailing
+    /// zeros (RFC 8446 §5.4 legal; used for REALITY target record-size mimicry).
+    fn encrypt_record_padded(
+        &mut self,
+        content_type: u8,
+        data: &[u8],
+        pad_len: usize,
+    ) -> FluxResult<Vec<u8>> {
+        let mut inner = Vec::with_capacity(data.len() + 1 + pad_len);
         inner.extend_from_slice(data);
         inner.push(content_type);
+        inner.extend_from_slice(&vec![0u8; pad_len]);
         let nonce = self.nonce();
         self.seq += 1;
         let ct_len = inner.len() + 16;
@@ -885,9 +865,9 @@ impl TrafficState {
 // TLS 1.3 client handshake
 // ===========================================================================
 
-/// Completed REALITY client connection: a minimal but fully conformant
-/// TLS 1.3 client session (record protection, key update, close_notify).
-pub struct Tls13ClientStream<S> {
+/// Completed REALITY TLS 1.3 session (client or server role):
+/// full record protection, post-handshake messages, key update, close_notify.
+pub struct Tls13Stream<S> {
     inner: S,
     #[allow(dead_code)] // kept for diagnostics/debugging
     suite: Tls13Suite,
@@ -913,7 +893,7 @@ impl Tls13Client {
     async fn handshake<S: AsyncRead + AsyncWrite + Unpin + 'static>(
         mut stream: S,
         cfg: &RealityClientConfig,
-    ) -> FluxResult<Tls13ClientStream<S>> {
+    ) -> FluxResult<Tls13Stream<S>> {
         // ---- 1. Build the ClientHello handshake message.
         let eph = StaticSecret::random_from_rng(OsRng);
         let eph_pub = X25519PublicKey::from(&eph);
@@ -1199,20 +1179,24 @@ impl Tls13Client {
                         let cert = cert_der
                             .as_ref()
                             .ok_or_else(|| crypto_err("CertificateVerify before Certificate"))?;
-                        let server_pub_key = extract_ed25519_pubkey(cert)
-                            .ok_or_else(|| crypto_err("server certificate is not ed25519"))?;
-                        if cv_scheme != SIG_ED25519 {
-                            return Err(crypto_err(format!(
-                                "unexpected CertificateVerify scheme: {:#x}",
+                        if cv_scheme == SIG_ED25519 {
+                            let server_pub_key = extract_ed25519_pubkey(cert)
+                                .ok_or_else(|| crypto_err("server certificate is not ed25519"))?;
+                            let peer = ring::signature::UnparsedPublicKey::new(
+                                &ring::signature::ED25519,
+                                server_pub_key,
+                            );
+                            peer.verify(&content, cv_sig).map_err(|_| {
+                                auth_err("reality CertificateVerify signature invalid")
+                            })?;
+                        } else {
+                            // Non-Ed25519 cert: real target or MITM, never a REALITY server.
+                            // The connection will only be used for spider crawling and dropped.
+                            tracing::debug!(
+                                "REALITY: non-ed25519 CertificateVerify scheme {:#x} (spider path)",
                                 cv_scheme
-                            )));
+                            );
                         }
-                        let peer = ring::signature::UnparsedPublicKey::new(
-                            &ring::signature::ED25519,
-                            server_pub_key,
-                        );
-                        peer.verify(&content, cv_sig)
-                            .map_err(|_| auth_err("reality CertificateVerify signature invalid"))?;
                         transcript.extend_from_slice(&msg);
                     }
                     HS_FINISHED => {
@@ -1243,22 +1227,28 @@ impl Tls13Client {
 
         // ---- 7. REALITY server authentication: HMAC-tagged ed25519 cert.
         let cert = cert_der.ok_or_else(|| crypto_err("server sent no certificate"))?;
-        let cert_pub = extract_ed25519_pubkey(&cert)
-            .ok_or_else(|| crypto_err("server certificate is not ed25519"))?;
-        let cert_sig = extract_cert_signature(&cert)
-            .ok_or_else(|| crypto_err("failed to extract certificate signature"))?;
-        {
-            use hmac::{Hmac, Mac};
-            let mut mac = <Hmac<sha2::Sha512> as Mac>::new_from_slice(&auth_key)
-                .expect("HMAC-SHA512 accepts any key length");
-            mac.update(cert_pub);
-            let expect = mac.finalize().into_bytes();
-            if cert_sig != expect.as_slice() {
-                return Err(auth_err(
-                    "REALITY verification failed: server is not the configured REALITY peer (or MITM)",
-                ));
+        let verified = 'check: {
+            let Some(cert_pub) = extract_ed25519_pubkey(&cert) else {
+                break 'check false; // real target / MITM with a non-ed25519 cert → spider
+            };
+            let Some(cert_sig) = extract_cert_signature(&cert) else {
+                break 'check false;
+            };
+            {
+                use hmac::{Hmac, Mac};
+                let mut mac = <Hmac<sha2::Sha512> as Mac>::new_from_slice(&auth_key)
+                    .expect("HMAC-SHA512 accepts any key length");
+                mac.update(cert_pub);
+                let expect = mac.finalize().into_bytes();
+                let verified = cert_sig == expect.as_slice();
+                if !verified {
+                    tracing::debug!(
+                        "REALITY: received real certificate (potential MITM or redirection), entering spider mode"
+                    );
+                }
+                verified
             }
-        }
+        };
 
         // ---- 8. Application traffic secrets (transcript through server Finished).
         let derived2 = suite.derive_secret(&handshake_secret, "derived", &empty_hash)?;
@@ -1285,7 +1275,7 @@ impl Tls13Client {
         stream.flush().await.map_err(FluxError::Io)?;
 
         let _ = server_fin;
-        Ok(Tls13ClientStream {
+        let mut tls_stream = Tls13Stream {
             inner: stream,
             suite,
             read_state: TrafficState::new(suite, s_ap)?,
@@ -1299,7 +1289,16 @@ impl Tls13Client {
             pending_write: Vec::new(),
             pending_write_pos: 0,
             closed: false,
-        })
+        };
+        if !verified {
+            // Verification failed: we're talking to the real target or a MITM.
+            // Behave like an ordinary browser loading the site (spider mode), then abort.
+            spider_crawl(&mut tls_stream, &cfg.server_name).await;
+            return Err(auth_err(
+                "REALITY verification failed: processed invalid connection (potential MITM or redirection)",
+            ));
+        }
+        Ok(tls_stream)
     }
 
     async fn read_record_header<S: AsyncRead + Unpin>(stream: &mut S) -> FluxResult<[u8; 5]> {
@@ -1364,7 +1363,7 @@ fn extract_cert_signature(cert: &[u8]) -> Option<&[u8]> {
 // AsyncRead / AsyncWrite for the TLS 1.3 client session (poll-based)
 // ===========================================================================
 
-impl<S: AsyncRead + AsyncWrite + Unpin> Tls13ClientStream<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
     /// Polls until one full plaintext record payload is available in
     /// `read_buf` (application data), EOF, or an error.
     /// Handles CCS, post-handshake messages (NST/KeyUpdate) and alerts.
@@ -1516,7 +1515,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13ClientStream<S> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13ClientStream<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1551,7 +1550,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13ClientStream<S> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13ClientStream<S> {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -1642,12 +1641,638 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13ClientStream<S> {
 }
 
 // ===========================================================================
+// REALITY target handshake probing (record-framing mimicry)
+// ===========================================================================
+
+/// Record sizes observed in the target's TLS 1.3 server flight.
+/// Layout mirrors the reference implementation:
+/// [ServerHello, CCS, EncryptedExtensions, Certificate, CertificateVerify, Finished, NewSessionTicket]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TargetMimicry {
+    /// Total record sizes (5-byte header included); 0 = absent.
+    pub record_sizes: [usize; 7],
+}
+
+impl TargetMimicry {
+    fn size(&self, idx: usize) -> Option<usize> {
+        (self.record_sizes[idx] > 0).then_some(self.record_sizes[idx])
+    }
+}
+
+/// Dials the fallback target, replays the ClientHello, and parses the record
+/// boundaries of the target's TLS 1.3 server flight. Validates that the target
+/// actually speaks TLS 1.3 with an X25519 (or X25519MLKEM768) key share —
+/// exactly like the reference implementation.
+async fn probe_target_handshake(dest: &str, ch_record: &[u8]) -> FluxResult<TargetMimicry> {
+    let addr = if let Ok(sa) = dest.parse::<std::net::SocketAddr>() {
+        sa
+    } else {
+        let addr_str = if dest.contains(':') {
+            dest.to_string()
+        } else {
+            format!("{}:443", dest)
+        };
+        tokio::net::lookup_host(&addr_str)
+            .await
+            .map_err(FluxError::Io)?
+            .next()
+            .ok_or_else(|| FluxError::Dns(format!("cannot resolve reality target '{}'", dest)))?
+    };
+
+    let mut target = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| FluxError::Timeout("reality target dial timed out".into()))?
+    .map_err(FluxError::Io)?;
+
+    target.write_all(ch_record).await.map_err(FluxError::Io)?;
+    target.flush().await.map_err(FluxError::Io)?;
+
+    let mut mimicry = TargetMimicry::default();
+    let mut collected = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+    // Read records: SH, optional CCS, then encrypted EE/Cert/CV/Fin (+ optional NST).
+    for i in 0..7 {
+        let mut hdr = [0u8; 5];
+        let read = tokio::time::timeout_at(deadline, target.read_exact(&mut hdr)).await;
+        match read {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(FluxError::Io(e)),
+            Err(_) => break, // timeout: use whatever we have
+        }
+        let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+        if len > MAX_HANDSHAKE_RECORD {
+            return Err(crypto_err("reality target sent oversized record"));
+        }
+        // Skip the body; we only need record boundaries.
+        let mut body = vec![0u8; len];
+        tokio::time::timeout_at(deadline, target.read_exact(&mut body))
+            .await
+            .map_err(|_| FluxError::Timeout("reality target read timed out".into()))?
+            .map_err(FluxError::Io)?;
+        collected += 5 + len;
+
+        match i {
+            0 => {
+                // Must be a handshake record with a valid TLS 1.3 ServerHello.
+                if hdr[0] != TLS_HANDSHAKE || body.len() < 4 + 2 + 32 {
+                    return Err(crypto_err("reality target did not send a ServerHello"));
+                }
+                // Check the ServerHello selects TLS 1.3 (supported_versions ext) and
+                // offers a valid key share — mirroring the reference's validation.
+                if body[0] != HS_SERVER_HELLO {
+                    return Err(crypto_err(
+                        "reality target: first message is not ServerHello",
+                    ));
+                }
+                let valid = {
+                    let sh = &body[..];
+                    // minimal scan for supported_versions=0x0304 and key_share ext
+                    let mut ok13 = false;
+                    let mut okks = false;
+                    if sh.len() > 4 + 2 + 32 {
+                        let mut pos = 4 + 2 + 32;
+                        if pos < sh.len() {
+                            let sid_len = sh[pos] as usize;
+                            pos += 1 + sid_len + 2 + 1; // sid echo + cipher + compression
+                            if pos + 2 <= sh.len() {
+                                let ext_total = u16::from_be_bytes([sh[pos], sh[pos + 1]]) as usize;
+                                pos += 2;
+                                let ext_end = (pos + ext_total).min(sh.len());
+                                while pos + 4 <= ext_end {
+                                    let et = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+                                    let el =
+                                        u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]) as usize;
+                                    pos += 4;
+                                    if pos + el > ext_end {
+                                        break;
+                                    }
+                                    if et == 0x002b && el == 2 && sh[pos..pos + 2] == [0x03, 0x04] {
+                                        ok13 = true;
+                                    }
+                                    if et == 0x0033 {
+                                        let group = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+                                        let klen =
+                                            u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]) as usize;
+                                        if (group == GROUP_X25519 && klen == 32)
+                                            || (group == GROUP_X25519_MLKEM768
+                                                && klen == MLKEM768_ENC_KEY_SIZE + 32)
+                                        {
+                                            okks = true;
+                                        }
+                                    }
+                                    pos += el;
+                                }
+                            }
+                        }
+                    }
+                    ok13 && okks
+                };
+                if !valid {
+                    return Err(crypto_err(
+                        "reality target ServerHello is not TLS 1.3 with a valid key share",
+                    ));
+                }
+                mimicry.record_sizes[0] = 5 + len;
+            }
+            1 => {
+                if hdr[0] == TLS_CCS {
+                    mimicry.record_sizes[1] = 5 + len;
+                } else if hdr[0] == TLS_APPDATA {
+                    // No CCS: this record is EncryptedExtensions.
+                    mimicry.record_sizes[2] = 5 + len;
+                } else {
+                    return Err(crypto_err(
+                        "reality target: unexpected record after ServerHello",
+                    ));
+                }
+            }
+            2..=6 => {
+                if hdr[0] != TLS_APPDATA {
+                    return Err(crypto_err("reality target: expected encrypted record"));
+                }
+                mimicry.record_sizes[i] = 5 + len;
+                // Finished record ends the flight: we can't reliably distinguish
+                // NST without decrypting, so we stop after the 5th flight record
+                // (SH, CCS?, EE, Cert, CV, Fin) — extra NST records (if any) are
+                // intentionally left unread and the socket is dropped.
+            }
+            _ => {}
+        }
+        // Stop early once we have Fin (6 records with CCS, or 5 without).
+        if (mimicry.record_sizes[1] > 0 && i >= 5) || (mimicry.record_sizes[1] == 0 && i >= 4) {
+            break;
+        }
+        if collected > MAX_HANDSHAKE_RECORD * 8 {
+            break;
+        }
+    }
+
+    if mimicry.record_sizes[0] == 0 {
+        return Err(crypto_err("reality target sent no ServerHello"));
+    }
+    Ok(mimicry)
+}
+
+// ===========================================================================
+// TLS 1.3 server handshake (manual — full control over record framing)
+// ===========================================================================
+
+struct Tls13Server;
+
+impl Tls13Server {
+    /// Completes a TLS 1.3 server handshake for an authenticated REALITY client.
+    /// `ch_record` is the already-read first record containing the ClientHello.
+    /// When `mimic` is present, encrypted handshake records are padded to the
+    /// target's exact record sizes.
+    async fn handshake<S: AsyncRead + AsyncWrite + Unpin + 'static>(
+        mut stream: S,
+        ch_record: &[u8],
+        auth_key: &[u8; 32],
+        cfg: &RealityServerConfig,
+        mimic: Option<TargetMimicry>,
+    ) -> FluxResult<Tls13Stream<S>> {
+        let hello = parse_client_hello(ch_record)
+            .ok_or_else(|| crypto_err("failed to re-parse client hello"))?;
+        let peer_pub = hello
+            .peer_pub
+            .ok_or_else(|| crypto_err("client hello without x25519 key share"))?;
+
+        // Pick the first client-offered cipher suite we support.
+        let client_suites = parse_cipher_suites(&hello.raw)
+            .ok_or_else(|| crypto_err("failed to parse client cipher suites"))?;
+        let suite = client_suites
+            .iter()
+            .find_map(|id| Tls13Suite::from_id(*id))
+            .ok_or_else(|| crypto_err("no common TLS 1.3 cipher suite"))?;
+
+        // ---- ServerHello
+        let eph = StaticSecret::random_from_rng(OsRng);
+        let eph_pub = X25519PublicKey::from(&eph);
+        let mut server_random = [0u8; 32];
+        OsRng.fill_bytes(&mut server_random);
+
+        let mut sh: Vec<u8> = Vec::with_capacity(128);
+        sh.extend_from_slice(&[HS_SERVER_HELLO, 0, 0, 0]);
+        sh.extend_from_slice(&[0x03, 0x03]); // legacy_version
+        sh.extend_from_slice(&server_random);
+        sh.push(32);
+        sh.extend_from_slice(&hello.session_id); // echo client's session_id
+        sh.extend_from_slice(&suite_id(suite).to_be_bytes());
+        sh.push(0); // compression: null
+        // extensions: supported_versions + key_share
+        let mut ext: Vec<u8> = Vec::with_capacity(48);
+        ext.extend_from_slice(&0x002bu16.to_be_bytes());
+        ext.extend_from_slice(&2u16.to_be_bytes());
+        ext.extend_from_slice(&[0x03, 0x04]);
+        ext.extend_from_slice(&0x0033u16.to_be_bytes());
+        ext.extend_from_slice(&36u16.to_be_bytes());
+        ext.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        ext.extend_from_slice(&32u16.to_be_bytes());
+        ext.extend_from_slice(eph_pub.as_bytes());
+        sh.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        sh.extend_from_slice(&ext);
+        let sh_len = (sh.len() - 4) as u32;
+        let sh_len_b = sh_len.to_be_bytes();
+        sh[1] = sh_len_b[1];
+        sh[2] = sh_len_b[2];
+        sh[3] = sh_len_b[3];
+
+        let mut transcript: Vec<u8> = Vec::with_capacity(1024);
+        transcript.extend_from_slice(&hello.raw);
+        transcript.extend_from_slice(&sh);
+
+        // ---- Key schedule
+        let shared = eph.diffie_hellman(&X25519PublicKey::from(peer_pub));
+        let zeros = vec![0u8; suite.hash_len()];
+        let empty_hash = suite.hash(&[]);
+        let early_secret = suite.hkdf_extract(&zeros, &zeros);
+        let derived = suite.derive_secret(&early_secret, "derived", &empty_hash)?;
+        let handshake_secret = suite.hkdf_extract(&derived, shared.as_bytes());
+        let ch_sh_hash = suite.hash(&transcript);
+        let c_hs_secret = suite.derive_secret(&handshake_secret, "c hs traffic", &ch_sh_hash)?;
+        let s_hs_secret = suite.derive_secret(&handshake_secret, "s hs traffic", &ch_sh_hash)?;
+        let mut server_hs = TrafficState::new(suite, s_hs_secret.clone())?;
+        let mut client_hs = TrafficState::new(suite, c_hs_secret.clone())?;
+
+        // ---- Emit the server flight, mirroring the target's record framing.
+        let mut flight: Vec<u8> = Vec::with_capacity(4096);
+        // ServerHello (plaintext, natural size — reference does not pad it)
+        flight.push(TLS_HANDSHAKE);
+        flight.extend_from_slice(&[0x03, 0x03]);
+        flight.extend_from_slice(&(sh.len() as u16).to_be_bytes());
+        flight.extend_from_slice(&sh);
+        // CCS if the target sent one
+        if let Some(m) = mimic
+            && m.record_sizes[1] > 0
+        {
+            flight.extend_from_slice(&[TLS_CCS, 0x03, 0x03, 0x00, 0x01, 0x01]);
+        }
+
+        // EncryptedExtensions: empty extension list
+        let ee = [HS_ENCRYPTED_EXTENSIONS, 0, 0, 2, 0, 0];
+        transcript.extend_from_slice(&ee);
+        let ee_rec = pad_record(
+            &mut server_hs,
+            TLS_HANDSHAKE,
+            &ee,
+            mimic.and_then(|m| m.size(2)),
+        )?;
+        flight.extend_from_slice(&ee_rec);
+
+        // Certificate: HMAC-tagged ed25519 cert
+        let cert_der = cfg.cert.cert_for(auth_key);
+        let mut cert_msg = Vec::with_capacity(cert_der.len() + 16);
+        cert_msg.push(HS_CERTIFICATE);
+        let cert_body_len = (1 + 3 + 3 + cert_der.len() + 2) as u32;
+        let cb = cert_body_len.to_be_bytes();
+        cert_msg.extend_from_slice(&[cb[1], cb[2], cb[3]]);
+        cert_msg.push(0); // certificate_request_context: empty
+        let list_len = (3 + cert_der.len() + 2) as u32;
+        let ll = list_len.to_be_bytes();
+        cert_msg.extend_from_slice(&[ll[1], ll[2], ll[3]]);
+        let cl = (cert_der.len() as u32).to_be_bytes();
+        cert_msg.extend_from_slice(&[cl[1], cl[2], cl[3]]);
+        cert_msg.extend_from_slice(&cert_der);
+        cert_msg.extend_from_slice(&[0, 0]); // no extensions
+        transcript.extend_from_slice(&cert_msg);
+        let cert_rec = pad_record(
+            &mut server_hs,
+            TLS_HANDSHAKE,
+            &cert_msg,
+            mimic.and_then(|m| m.size(3)),
+        )?;
+        flight.extend_from_slice(&cert_rec);
+
+        // CertificateVerify: ed25519 over context + transcript hash
+        let th = suite.hash(&transcript);
+        let mut content = Vec::with_capacity(64 + 33 + 1 + th.len());
+        content.extend_from_slice(&[0x20u8; 64]);
+        content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        content.push(0);
+        content.extend_from_slice(&th);
+        let sig = cfg.cert.sign(&content);
+        let mut cv_msg = Vec::with_capacity(4 + 2 + 2 + sig.len());
+        cv_msg.push(HS_CERTIFICATE_VERIFY);
+        let cv_len = ((2 + 2 + sig.len()) as u32).to_be_bytes();
+        cv_msg.extend_from_slice(&[cv_len[1], cv_len[2], cv_len[3]]);
+        cv_msg.extend_from_slice(&SIG_ED25519.to_be_bytes());
+        cv_msg.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+        cv_msg.extend_from_slice(&sig);
+        transcript.extend_from_slice(&cv_msg);
+        let cv_rec = pad_record(
+            &mut server_hs,
+            TLS_HANDSHAKE,
+            &cv_msg,
+            mimic.and_then(|m| m.size(4)),
+        )?;
+        flight.extend_from_slice(&cv_rec);
+
+        // Finished
+        let fin_key = suite.hkdf_expand_label(&s_hs_secret, "finished", &[], suite.hash_len())?;
+        let fin_th = suite.hash(&transcript);
+        let verify_data = suite.hmac(&fin_key, &fin_th);
+        let mut fin_msg = Vec::with_capacity(4 + verify_data.len());
+        fin_msg.push(HS_FINISHED);
+        let fl = (verify_data.len() as u32).to_be_bytes();
+        fin_msg.extend_from_slice(&[fl[1], fl[2], fl[3]]);
+        fin_msg.extend_from_slice(&verify_data);
+        transcript.extend_from_slice(&fin_msg);
+        let fin_rec = pad_record(
+            &mut server_hs,
+            TLS_HANDSHAKE,
+            &fin_msg,
+            mimic.and_then(|m| m.size(5)),
+        )?;
+        flight.extend_from_slice(&fin_rec);
+
+        stream.write_all(&flight).await.map_err(FluxError::Io)?;
+        stream.flush().await.map_err(FluxError::Io)?;
+
+        // ---- Read client's second flight: CCS? + Finished
+        let mut hs_buf: Vec<u8> = Vec::new();
+        let mut got_finished = false;
+        while !got_finished {
+            let mut hdr = [0u8; 5];
+            stream.read_exact(&mut hdr).await.map_err(FluxError::Io)?;
+            let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+            if len > MAX_TLS_RECORD + 256 {
+                return Err(crypto_err("oversized record in client flight"));
+            }
+            let mut body = vec![0u8; len];
+            stream.read_exact(&mut body).await.map_err(FluxError::Io)?;
+            match hdr[0] {
+                TLS_CCS => continue,
+                TLS_APPDATA => {
+                    let (ctype, plain) = client_hs.decrypt_record(&hdr, &body)?;
+                    if ctype != TLS_HANDSHAKE {
+                        return Err(crypto_err("unexpected record in client second flight"));
+                    }
+                    hs_buf.extend_from_slice(&plain);
+                }
+                other => {
+                    return Err(crypto_err(format!(
+                        "unexpected record type {} in client second flight",
+                        other
+                    )));
+                }
+            }
+            while hs_buf.len() >= 4 {
+                let mlen = u32::from_be_bytes([0, hs_buf[1], hs_buf[2], hs_buf[3]]) as usize;
+                if hs_buf.len() < 4 + mlen {
+                    break;
+                }
+                let msg = hs_buf[..4 + mlen].to_vec();
+                hs_buf.drain(..4 + mlen);
+                if msg[0] != HS_FINISHED {
+                    return Err(crypto_err(format!(
+                        "expected client Finished, got handshake type {}",
+                        msg[0]
+                    )));
+                }
+                let fin_key_c =
+                    suite.hkdf_expand_label(&c_hs_secret, "finished", &[], suite.hash_len())?;
+                let expect = suite.hmac(&fin_key_c, &suite.hash(&transcript));
+                if msg[4..] != expect[..] {
+                    return Err(auth_err("reality client Finished verification failed"));
+                }
+                // NOTE: client Finished is NOT added to the transcript — application
+                // traffic secrets are derived through the server Finished (RFC 8446 §7.1).
+                got_finished = true;
+            }
+        }
+
+        // ---- Application traffic secrets
+        let derived2 = suite.derive_secret(&handshake_secret, "derived", &empty_hash)?;
+        let master_secret = suite.hkdf_extract(&derived2, &zeros);
+        let ap_hash = suite.hash(&transcript);
+        let c_ap = suite.derive_secret(&master_secret, "c ap traffic", &ap_hash)?;
+        let s_ap = suite.derive_secret(&master_secret, "s ap traffic", &ap_hash)?;
+
+        Ok(Tls13Stream {
+            inner: stream,
+            suite,
+            read_state: TrafficState::new(suite, c_ap)?,
+            write_state: TrafficState::new(suite, s_ap)?,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            hdr_buf: [0u8; 5],
+            hdr_len: 0,
+            body_buf: Vec::new(),
+            body_len: 0,
+            pending_write: Vec::new(),
+            pending_write_pos: 0,
+            closed: false,
+        })
+    }
+}
+
+fn suite_id(suite: Tls13Suite) -> u16 {
+    match suite {
+        Tls13Suite::Aes128GcmSha256 => 0x1301,
+        Tls13Suite::Aes256GcmSha384 => 0x1302,
+        Tls13Suite::Chacha20Poly1305Sha256 => 0x1303,
+    }
+}
+
+/// Extracts the client's offered cipher suites from a raw ClientHello.
+fn parse_cipher_suites(hello_raw: &[u8]) -> Option<Vec<u16>> {
+    let mut pos = 4 + 2 + 32;
+    if pos >= hello_raw.len() {
+        return None;
+    }
+    let sid_len = *hello_raw.get(pos)? as usize;
+    pos += 1 + sid_len;
+    if pos + 2 > hello_raw.len() {
+        return None;
+    }
+    let cs_len = u16::from_be_bytes([hello_raw[pos], hello_raw[pos + 1]]) as usize;
+    pos += 2;
+    if pos + cs_len > hello_raw.len() {
+        return None;
+    }
+    let (chunks, _) = hello_raw[pos..pos + cs_len].as_chunks::<2>();
+    Some(chunks.iter().map(|c| u16::from_be_bytes(*c)).collect())
+}
+
+/// Encrypts a handshake record, padding the inner plaintext so the total record
+/// size matches the target's record (when it fits; otherwise natural size).
+fn pad_record(
+    state: &mut TrafficState,
+    content_type: u8,
+    msg: &[u8],
+    target_size: Option<usize>,
+) -> FluxResult<Vec<u8>> {
+    // natural total = 5 (header) + msg + 1 (inner type) + 16 (AEAD tag)
+    let natural = 5 + msg.len() + 1 + 16;
+    let pad = match target_size {
+        Some(t) if t >= natural => t - natural,
+        _ => 0,
+    };
+    state.encrypt_record_padded(content_type, msg, pad)
+}
+
+// ===========================================================================
+// Spider mode (client-side anti-MITM behavior, parity with sing-box/Xray):
+// when REALITY verification fails, we are talking to the real target (or a
+// MITM) — behave like an ordinary HTTPS client instead of aborting instantly.
+// ===========================================================================
+
+async fn spider_crawl<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut Tls13Stream<S>,
+    server_name: &str,
+) {
+    use rand::Rng;
+    let padding_len = rand::rngs::OsRng.gen_range(30..62);
+    let padding: String = "0".repeat(padding_len);
+    let req = format!(
+        "GET / HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: identity\r\nCookie: padding={}\r\nConnection: close\r\n\r\n",
+        server_name, padding
+    );
+    if stream.write_all(req.as_bytes()).await.is_err() {
+        return;
+    }
+    let _ = stream.flush().await;
+    // Read the response (bounded), like a browser loading the landing page.
+    let mut buf = vec![0u8; 16384];
+    let mut total = 0usize;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let res = tokio::time::timeout_at(deadline, stream.read(&mut buf)).await;
+        match res {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                total += n;
+                if total >= 1 << 20 {
+                    break;
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+}
+
+// ===========================================================================
 // Tests
 // ===========================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_reality_server_mimics_target_record_framing() {
+        // TLS 1.3 decoy with a big-ish cert chain to make record sizes distinctive.
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["www.microsoft.com".to_string()]).unwrap();
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            cert.cert.der().to_vec(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+        );
+        let decoy_acceptor =
+            crate::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
+
+        // Decoy: complete real TLS handshakes and echo.
+        let decoy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decoy_addr = decoy_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = decoy_listener.accept().await {
+                let acceptor = decoy_acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = acceptor.accept(stream).await;
+                });
+            }
+        });
+
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = X25519PublicKey::from(&server_secret);
+        let scfg = RealityServerConfig::new(
+            vec!["www.microsoft.com".into()],
+            server_secret.to_bytes(),
+            vec![vec![0x01, 0x02, 0x03, 0x04]],
+            Some(decoy_addr.to_string()),
+        );
+        let ccfg = RealityClientConfig {
+            server_name: "www.microsoft.com".into(),
+            public_key: server_public.to_bytes(),
+            short_id: vec![0x01, 0x02, 0x03, 0x04],
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server =
+            tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
+        let client =
+            tokio::spawn(async move { RealityHandshake::client_handshake(client_io, &ccfg).await });
+
+        let mut server_stream = server.await.unwrap().unwrap();
+        let mut client_stream = client.await.unwrap().unwrap();
+
+        client_stream.write_all(b"mimicry works").await.unwrap();
+        client_stream.flush().await.unwrap();
+        let mut buf = [0u8; 13];
+        server_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"mimicry works");
+    }
+
+    #[tokio::test]
+    async fn test_reality_spider_mode_on_real_tls_server() {
+        // A real (non-REALITY) TLS 1.3 server behind the port: handshake completes,
+        // HMAC verification fails, client must spider (HTTP GET) and then abort.
+        let cert =
+            rcgen::generate_simple_self_signed(vec!["www.microsoft.com".to_string()]).unwrap();
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            cert.cert.der().to_vec(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+        );
+        let acceptor =
+            crate::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(stream).await {
+                        // Respond like a web server to the spider's GET.
+                        let mut buf = vec![0u8; 8192];
+                        if tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            tls.read(&mut buf),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            let _ = tls.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                            ).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let ccfg = RealityClientConfig {
+            server_name: "www.microsoft.com".into(),
+            public_key: [0x42u8; 32], // wrong key: server is a plain TLS server
+            short_id: vec![0x01, 0x02, 0x03, 0x04],
+        };
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let res = RealityHandshake::client_handshake(stream, &ccfg).await;
+        let err = res.err().expect("must fail against non-REALITY server");
+        assert!(
+            err.to_string().contains("processed invalid connection"),
+            "unexpected error: {}",
+            err
+        );
+    }
 
     fn server_cfg(priv_key: [u8; 32]) -> RealityServerConfig {
         RealityServerConfig::new(

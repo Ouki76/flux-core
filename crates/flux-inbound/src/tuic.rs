@@ -1,5 +1,6 @@
 use async_trait::async_trait;
-use flux_protocol::tuic::{TUIC_CMD_CONNECT, TUIC_CMD_PACKET, TuicV5Protocol};
+use dashmap::DashMap;
+use flux_protocol::tuic::{TUIC_AUTH_LEN, TUIC_CMD_CONNECT, TUIC_VERSION, TuicV5Protocol};
 use flux_transport::quic::{QuicBiStream, QuicTransport};
 use flux_types::{
     Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
@@ -7,11 +8,12 @@ use flux_types::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// TUIC v5 inbound (QUIC-native, spec-compatible with sing-box).
 pub struct TuicInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -67,6 +69,17 @@ impl TuicInbound {
             shutdown_tx,
         }
     }
+
+    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut diff = 0u8;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            diff |= x ^ y;
+        }
+        diff == 0
+    }
 }
 
 #[async_trait]
@@ -84,6 +97,7 @@ impl Inbound for TuicInbound {
     }
 
     async fn start(&self, dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()> {
+        // ---- Layered mode (TUIC frames over an arbitrary stream transport)
         if let Some(pipe) = self.pipeline.clone() {
             let listener = crate::create_reuse_port_listener(self.listen_addr)?;
             self.running.store(true, Ordering::SeqCst);
@@ -125,71 +139,81 @@ impl Inbound for TuicInbound {
                             }
                         };
 
-                        let mut auth_buf = [0u8; 57];
+                        // Layered mode: AUTH frame (legacy HMAC token) then CONNECT frame.
+                        let mut auth_buf = [0u8; TUIC_AUTH_LEN];
                         if stream.read_exact(&mut auth_buf).await.is_err() {
                             return;
                         }
+                        let uuid = match TuicV5Protocol::parse_auth_frame(&auth_buf) {
+                            Ok((u, token)) => {
+                                if !user_list.is_empty() && !user_list.contains(&u) {
+                                    return;
+                                }
+                                let expected = TuicV5Protocol::legacy_token(&u, &pw);
+                                if !Self::constant_time_eq(&token, &expected) {
+                                    return;
+                                }
+                                u
+                            }
+                            Err(_) => return,
+                        };
 
-                        let uuid =
-                            match TuicV5Protocol::verify_auth_frame(&auth_buf, &pw, &user_list) {
-                                Ok(u) => u,
-                                Err(_) => return,
-                            };
-
-                        let mut cmd_hdr = [0u8; 4];
-                        if stream.read_exact(&mut cmd_hdr).await.is_err() {
+                        // Read CONNECT header: [5, 0x01, addr...]
+                        let mut hdr = [0u8; 2];
+                        if stream.read_exact(&mut hdr).await.is_err() {
                             return;
                         }
-
-                        let atyp = cmd_hdr[3];
-                        let mut full_cmd = cmd_hdr.to_vec();
-
-                        match atyp {
-                            1 => {
-                                let mut ip_bytes = [0u8; 4];
-                                if stream.read_exact(&mut ip_bytes).await.is_err() {
+                        if hdr[0] != TUIC_VERSION || hdr[1] != TUIC_CMD_CONNECT {
+                            return;
+                        }
+                        // Peek the address: read ATYP byte first
+                        let mut atyp = [0u8; 1];
+                        if stream.read_exact(&mut atyp).await.is_err() {
+                            return;
+                        }
+                        let mut addr_buf = atyp.to_vec();
+                        let more = match atyp[0] {
+                            0x00 => {
+                                let mut lb = [0u8; 1];
+                                if stream.read_exact(&mut lb).await.is_err() {
                                     return;
                                 }
-                                full_cmd.extend_from_slice(&ip_bytes);
+                                let mut rest = vec![0u8; lb[0] as usize + 2];
+                                if stream.read_exact(&mut rest).await.is_err() {
+                                    return;
+                                }
+                                let mut v = lb.to_vec();
+                                v.extend_from_slice(&rest);
+                                v
                             }
-                            3 => {
-                                let mut len_byte = [0u8; 1];
-                                if stream.read_exact(&mut len_byte).await.is_err() {
+                            0x01 => {
+                                let mut rest = [0u8; 4 + 2];
+                                if stream.read_exact(&mut rest).await.is_err() {
                                     return;
                                 }
-                                let dlen = len_byte[0] as usize;
-                                let mut domain_buf = vec![0u8; dlen];
-                                if stream.read_exact(&mut domain_buf).await.is_err() {
-                                    return;
-                                }
-                                full_cmd.push(len_byte[0]);
-                                full_cmd.extend_from_slice(&domain_buf);
+                                rest.to_vec()
                             }
-                            4 => {
-                                let mut ip_bytes = [0u8; 16];
-                                if stream.read_exact(&mut ip_bytes).await.is_err() {
+                            0x02 => {
+                                let mut rest = vec![0u8; 16 + 2];
+                                if stream.read_exact(&mut rest).await.is_err() {
                                     return;
                                 }
-                                full_cmd.extend_from_slice(&ip_bytes);
+                                rest.to_vec()
                             }
                             _ => return,
-                        }
+                        };
+                        addr_buf.extend_from_slice(&more);
 
-                        let (cmd, target_addr) =
-                            match TuicV5Protocol::parse_command_frame(&full_cmd) {
-                                Ok(res) => res,
-                                Err(_) => return,
-                            };
+                        let (target_addr, _) = match TuicV5Protocol::decode_address(&addr_buf) {
+                            Ok(r) => r,
+                            Err(_) => return,
+                        };
 
                         let meta = SessionMeta::new(
                             client_addr,
                             target_addr,
                             inbound_tag,
-                            if cmd == TUIC_CMD_PACKET {
-                                NetworkType::Udp
-                            } else {
-                                NetworkType::Tcp
-                            },
+                            NetworkType::Tcp,
                         )
                         .with_user(uuid.to_string());
 
@@ -201,7 +225,8 @@ impl Inbound for TuicInbound {
             return Ok(());
         }
 
-        let alpn = vec![b"tuic-v5".to_vec(), b"h3".to_vec()];
+        // ---- Native QUIC mode (spec TUIC v5)
+        let alpn = vec![b"tuic".to_vec(), b"tuic-v5".to_vec(), b"h3".to_vec()];
         let endpoint = QuicTransport::create_server_endpoint(
             self.listen_addr,
             self.certs.clone(),
@@ -210,7 +235,6 @@ impl Inbound for TuicInbound {
         )?;
 
         self.running.store(true, Ordering::SeqCst);
-        let _running = self.running.clone();
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let users = Arc::new(self.users.clone());
         let password = Arc::new(self.password.clone());
@@ -247,165 +271,256 @@ impl Inbound for TuicInbound {
                             return;
                         }
                     };
-
                     let client_addr = conn.remote_address();
+                    let authenticated = Arc::new(AtomicBool::new(false));
 
-                    while let Ok((send, recv)) = conn.accept_bi().await {
-                        let mut stream = QuicBiStream::new(send, recv);
-                        let disp_stream = disp.clone();
-                        let in_tag = inbound_tag.clone();
-                        let users_sub = user_list.clone();
-                        let pw_sub = pw.clone();
+                    // UDP sessions: session_id → dispatcher packet channel
+                    let udp_sessions: Arc<DashMap<u16, tokio::sync::mpsc::Sender<UdpPacket>>> =
+                        Arc::new(DashMap::new());
 
+                    // Task 1: unidirectional streams (AUTHENTICATE, DISSOCIATE)
+                    {
+                        let conn_c = conn.clone();
+                        let tag_c = inbound_tag.clone();
+                        let users_c = user_list.clone();
+                        let pw_c = pw.clone();
+                        let auth_c = authenticated.clone();
+                        let sessions_c = udp_sessions.clone();
                         tokio::spawn(async move {
-                            // 1. Read TUIC v5 auth frame: 57 bytes
-                            let mut auth_buf = [0u8; 57];
-                            if let Err(e) = stream.read_exact(&mut auth_buf).await {
-                                debug!(
-                                    "[{}] TUIC auth read failed from {}: {}",
-                                    in_tag, client_addr, e
-                                );
-                                return;
+                            loop {
+                                let mut recv = match conn_c.accept_uni().await {
+                                    Ok(r) => r,
+                                    Err(_) => break,
+                                };
+                                let tag2 = tag_c.clone();
+                                let users2 = users_c.clone();
+                                let pw2 = pw_c.clone();
+                                let auth2 = auth_c.clone();
+                                let sessions2 = sessions_c.clone();
+                                let conn2 = conn_c.clone();
+                                tokio::spawn(async move {
+                                    let mut hdr = [0u8; 2];
+                                    if recv.read_exact(&mut hdr).await.is_err() {
+                                        return;
+                                    }
+                                    if hdr[0] != TUIC_VERSION {
+                                        return;
+                                    }
+                                    match hdr[1] {
+                                        flux_protocol::tuic::TUIC_CMD_AUTHENTICATE => {
+                                            let mut rest = [0u8; 16 + 32];
+                                            if recv.read_exact(&mut rest).await.is_err() {
+                                                return;
+                                            }
+                                            let mut frame = Vec::with_capacity(TUIC_AUTH_LEN);
+                                            frame.extend_from_slice(&hdr);
+                                            frame.extend_from_slice(&rest);
+                                            let (uuid, token) =
+                                                match TuicV5Protocol::parse_auth_frame(&frame) {
+                                                    Ok(v) => v,
+                                                    Err(_) => return,
+                                                };
+                                            if !users2.is_empty() && !users2.contains(&uuid) {
+                                                warn!(
+                                                    "[{}] TUIC unknown uuid from {}",
+                                                    tag2,
+                                                    conn2.remote_address()
+                                                );
+                                                return;
+                                            }
+                                            let mut expected = [0u8; 32];
+                                            if conn2
+                                                .export_keying_material(
+                                                    &mut expected,
+                                                    uuid.as_bytes(),
+                                                    pw2.as_bytes(),
+                                                )
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                            if !TuicInbound::constant_time_eq(&token, &expected) {
+                                                warn!(
+                                                    "[{}] TUIC token mismatch from {}",
+                                                    tag2,
+                                                    conn2.remote_address()
+                                                );
+                                                return;
+                                            }
+                                            auth2.store(true, Ordering::SeqCst);
+                                            debug!(
+                                                "[{}] TUIC authenticated {} from {}",
+                                                tag2,
+                                                uuid,
+                                                conn2.remote_address()
+                                            );
+                                        }
+                                        flux_protocol::tuic::TUIC_CMD_DISSOCIATE => {
+                                            let mut sid = [0u8; 2];
+                                            if recv.read_exact(&mut sid).await.is_ok() {
+                                                let session_id = u16::from_be_bytes(sid);
+                                                sessions2.remove(&session_id);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                });
                             }
+                        });
+                    }
 
-                            let uuid = match TuicV5Protocol::verify_auth_frame(
-                                &auth_buf, &pw_sub, &users_sub,
-                            ) {
-                                Ok(u) => u,
-                                Err(e) => {
-                                    warn!(
-                                        "[{}] TUIC auth verification failed from {}: {}",
-                                        in_tag, client_addr, e
+                    // Task 2: QUIC datagrams (UDP PACKET frames)
+                    {
+                        let conn_c = conn.clone();
+                        let tag_c = inbound_tag.clone();
+                        let disp_c = disp.clone();
+                        let auth_c = authenticated.clone();
+                        let sessions_c = udp_sessions.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                let dgram = match conn_c.read_datagram().await {
+                                    Ok(d) => d,
+                                    Err(_) => break,
+                                };
+                                if !auth_c.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                let (session_id, _pid, addr, payload) =
+                                    match TuicV5Protocol::parse_packet_frame(&dgram) {
+                                        Ok(v) => v,
+                                        Err(_) => continue,
+                                    };
+                                if let Some(tx) = sessions_c.get(&session_id) {
+                                    let pkt = UdpPacket::new(
+                                        payload.into(),
+                                        TargetAddress::Ip(client_addr),
+                                        addr,
                                     );
-                                    return;
-                                }
-                            };
+                                    let _ = tx.try_send(pkt);
+                                } else {
+                                    // New UDP session over datagrams
+                                    let (pkt_tx, pkt_rx) =
+                                        tokio::sync::mpsc::channel::<UdpPacket>(64);
+                                    let (out_tx, mut out_rx) =
+                                        tokio::sync::mpsc::channel::<UdpPacket>(64);
+                                    let meta = SessionMeta::new(
+                                        client_addr,
+                                        addr.clone(),
+                                        tag_c.clone(),
+                                        NetworkType::Udp,
+                                    );
+                                    let disp2 = disp_c.clone();
+                                    tokio::spawn(async move {
+                                        disp2.dispatch_packet(meta, pkt_rx, out_tx).await;
+                                    });
+                                    let pkt = UdpPacket::new(
+                                        payload.into(),
+                                        TargetAddress::Ip(client_addr),
+                                        addr,
+                                    );
+                                    let _ = pkt_tx.try_send(pkt);
+                                    sessions_c.insert(session_id, pkt_tx);
 
-                            // 2. Read command frame header: [cmd (1 byte) + port (2 bytes) + atyp (1 byte)]
-                            let mut cmd_hdr = [0u8; 4];
-                            if let Err(e) = stream.read_exact(&mut cmd_hdr).await {
-                                debug!("[{}] TUIC command header read failed: {}", in_tag, e);
+                                    // Reply pump: dispatcher replies → datagrams
+                                    let conn2 = conn_c.clone();
+                                    tokio::spawn(async move {
+                                        let mut pid: u16 = 0;
+                                        while let Some(reply) = out_rx.recv().await {
+                                            let frame = TuicV5Protocol::build_packet_frame(
+                                                session_id,
+                                                pid,
+                                                &reply.source,
+                                                &reply.payload,
+                                            );
+                                            pid = pid.wrapping_add(1);
+                                            if conn2.send_datagram(frame.into()).is_err() {
+                                                break;
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        });
+                    }
+
+                    // Task 3: bidirectional streams (CONNECT)
+                    loop {
+                        let (send, recv) = match conn.accept_bi().await {
+                            Ok(v) => v,
+                            Err(_) => break,
+                        };
+                        if !authenticated.load(Ordering::SeqCst) {
+                            // Wait briefly for the auth uni-stream to arrive first.
+                            let mut ok = false;
+                            for _ in 0..20 {
+                                if authenticated.load(Ordering::SeqCst) {
+                                    ok = true;
+                                    break;
+                                }
+                                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                            }
+                            if !ok {
+                                continue;
+                            }
+                        }
+                        let disp_s = disp.clone();
+                        let in_tag = inbound_tag.clone();
+                        tokio::spawn(async move {
+                            let mut stream = QuicBiStream::new(send, recv);
+                            let mut hdr = [0u8; 2];
+                            if stream.read_exact(&mut hdr).await.is_err() {
                                 return;
                             }
-
-                            let atyp = cmd_hdr[3];
-                            let mut full_cmd = cmd_hdr.to_vec();
-
-                            match atyp {
-                                1 => {
-                                    let mut ip_bytes = [0u8; 4];
-                                    if stream.read_exact(&mut ip_bytes).await.is_err() {
+                            if hdr[0] != TUIC_VERSION || hdr[1] != TUIC_CMD_CONNECT {
+                                return;
+                            }
+                            let mut atyp = [0u8; 1];
+                            if stream.read_exact(&mut atyp).await.is_err() {
+                                return;
+                            }
+                            let mut addr_buf = atyp.to_vec();
+                            let more = match atyp[0] {
+                                0x00 => {
+                                    let mut lb = [0u8; 1];
+                                    if stream.read_exact(&mut lb).await.is_err() {
                                         return;
                                     }
-                                    full_cmd.extend_from_slice(&ip_bytes);
+                                    let mut rest = vec![0u8; lb[0] as usize + 2];
+                                    if stream.read_exact(&mut rest).await.is_err() {
+                                        return;
+                                    }
+                                    let mut v = lb.to_vec();
+                                    v.extend_from_slice(&rest);
+                                    v
                                 }
-                                3 => {
-                                    let mut len_byte = [0u8; 1];
-                                    if stream.read_exact(&mut len_byte).await.is_err() {
+                                0x01 => {
+                                    let mut rest = [0u8; 4 + 2];
+                                    if stream.read_exact(&mut rest).await.is_err() {
                                         return;
                                     }
-                                    let dlen = len_byte[0] as usize;
-                                    let mut domain_buf = vec![0u8; dlen];
-                                    if stream.read_exact(&mut domain_buf).await.is_err() {
-                                        return;
-                                    }
-                                    full_cmd.push(len_byte[0]);
-                                    full_cmd.extend_from_slice(&domain_buf);
+                                    rest.to_vec()
                                 }
-                                4 => {
-                                    let mut ip_bytes = [0u8; 16];
-                                    if stream.read_exact(&mut ip_bytes).await.is_err() {
+                                0x02 => {
+                                    let mut rest = vec![0u8; 16 + 2];
+                                    if stream.read_exact(&mut rest).await.is_err() {
                                         return;
                                     }
-                                    full_cmd.extend_from_slice(&ip_bytes);
+                                    rest.to_vec()
                                 }
                                 _ => return,
-                            }
-
-                            let (cmd, target_addr) =
-                                match TuicV5Protocol::parse_command_frame(&full_cmd) {
-                                    Ok(res) => res,
-                                    Err(e) => {
-                                        warn!("[{}] TUIC command parse failed: {}", in_tag, e);
-                                        return;
-                                    }
-                                };
-
+                            };
+                            addr_buf.extend_from_slice(&more);
+                            let (target_addr, _) = match TuicV5Protocol::decode_address(&addr_buf) {
+                                Ok(r) => r,
+                                Err(_) => return,
+                            };
                             let meta = SessionMeta::new(
                                 client_addr,
-                                target_addr.clone(),
-                                in_tag.clone(),
-                                if cmd == TUIC_CMD_PACKET {
-                                    NetworkType::Udp
-                                } else {
-                                    NetworkType::Tcp
-                                },
-                            )
-                            .with_user(uuid.to_string());
-
-                            if cmd == TUIC_CMD_CONNECT {
-                                disp_stream.dispatch_stream(meta, Box::new(stream)).await;
-                            } else if cmd == TUIC_CMD_PACKET {
-                                let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
-                                let (out_tx, mut out_rx) =
-                                    tokio::sync::mpsc::channel::<UdpPacket>(64);
-
-                                let disp_packet = disp_stream.clone();
-                                let meta_packet = meta.clone();
-                                tokio::spawn(async move {
-                                    disp_packet
-                                        .dispatch_packet(meta_packet, pkt_rx, out_tx)
-                                        .await;
-                                });
-
-                                let (mut stream_r, mut stream_w) = tokio::io::split(stream);
-
-                                // Forward client packets to dispatcher
-                                let pkt_send = pkt_tx.clone();
-                                let target_src = target_addr.clone();
-                                let read_task = tokio::spawn(async move {
-                                    let mut len_buf = [0u8; 2];
-                                    loop {
-                                        if stream_r.read_exact(&mut len_buf).await.is_err() {
-                                            break;
-                                        }
-                                        let len = u16::from_be_bytes(len_buf) as usize;
-                                        let mut payload = vec![0u8; len];
-                                        if stream_r.read_exact(&mut payload).await.is_err() {
-                                            break;
-                                        }
-                                        let pkt = UdpPacket::new(
-                                            payload.into(),
-                                            TargetAddress::Ip(client_addr),
-                                            target_src.clone(),
-                                        );
-                                        if pkt_send.send(pkt).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-
-                                // Forward outbound replies back to client
-                                let write_task = tokio::spawn(async move {
-                                    while let Some(reply) = out_rx.recv().await {
-                                        let len = reply.payload.len() as u16;
-                                        if stream_w.write_all(&len.to_be_bytes()).await.is_err() {
-                                            break;
-                                        }
-                                        if stream_w.write_all(&reply.payload).await.is_err() {
-                                            break;
-                                        }
-                                        if stream_w.flush().await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-
-                                tokio::select! {
-                                    _ = read_task => {},
-                                    _ = write_task => {},
-                                }
-                            }
+                                target_addr,
+                                in_tag,
+                                NetworkType::Tcp,
+                            );
+                            disp_s.dispatch_stream(meta, Box::new(stream)).await;
                         });
                     }
                 });

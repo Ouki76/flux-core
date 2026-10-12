@@ -1,16 +1,18 @@
 use async_trait::async_trait;
 use flux_protocol::hysteria2::{
-    BrutalPacer, HYSTERIA2_CMD_TCP, HYSTERIA2_CMD_UDP, Hysteria2Config, Hysteria2Protocol,
-    PortHopper,
+    BrutalPacer, HYSTERIA2_CMD_TCP, Hysteria2Config, Hysteria2Protocol, PortHopper,
 };
-use flux_transport::quic::{QuicBiStream, QuicTransport};
+use flux_transport::quic::QuicTransport;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
     UdpPacket,
 };
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use std::sync::atomic::Ordering;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, mpsc};
+
+type UdpDemuxMap = Arc<dashmap::DashMap<u32, tokio::sync::mpsc::Sender<UdpPacket>>>;
 
 pub struct Hysteria2Outbound {
     tag: String,
@@ -22,6 +24,8 @@ pub struct Hysteria2Outbound {
     connection: Arc<Mutex<Option<quinn::Connection>>>,
     h3_handle: Arc<Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>>,
     dialer: Option<Arc<dyn flux_types::StreamDialer>>,
+    udp_demux: Arc<Mutex<Option<UdpDemuxMap>>>,
+    next_udp_session: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl Hysteria2Outbound {
@@ -43,6 +47,8 @@ impl Hysteria2Outbound {
             connection: Arc::new(Mutex::new(None)),
             h3_handle: Arc::new(Mutex::new(None)),
             dialer: None,
+            udp_demux: Arc::new(Mutex::new(None)),
+            next_udp_session: Arc::new(std::sync::atomic::AtomicU32::new(1)),
         }
     }
 
@@ -65,6 +71,8 @@ impl Hysteria2Outbound {
             connection: Arc::new(Mutex::new(None)),
             h3_handle: Arc::new(Mutex::new(None)),
             dialer: Some(dialer),
+            udp_demux: Arc::new(Mutex::new(None)),
+            next_udp_session: Arc::new(std::sync::atomic::AtomicU32::new(1)),
         }
     }
 
@@ -96,7 +104,12 @@ impl Hysteria2Outbound {
         {
             ep.clone()
         } else {
-            let alpn = vec![b"h3".to_vec(), b"hysteria2".to_vec()];
+            let alpn: Vec<Vec<u8>> = self
+                .config
+                .alpn
+                .clone()
+                .map(|v| v.into_iter().map(|s| s.into_bytes()).collect())
+                .unwrap_or_else(|| vec![b"h3".to_vec(), b"hysteria2".to_vec()]);
             let ep = QuicTransport::create_client_endpoint(
                 peer_addr.is_ipv6(),
                 alpn,
@@ -112,11 +125,9 @@ impl Hysteria2Outbound {
             .as_deref()
             .unwrap_or(&self.config.server);
         let conn = QuicTransport::connect(&endpoint, peer_addr, sni).await?;
-        if self.config.h3 {
-            let h3 = Hysteria2Protocol::client_authenticate_h3(conn.clone(), &self.config.password)
-                .await?;
-            *self.h3_handle.lock().await = Some(h3);
-        }
+        let h3 =
+            Hysteria2Protocol::client_authenticate_h3(conn.clone(), &self.config.password).await?;
+        *self.h3_handle.lock().await = Some(h3);
         *conn_guard = Some(conn.clone());
         Ok(conn)
     }
@@ -146,90 +157,107 @@ impl Outbound for Hysteria2Outbound {
         } else {
             let conn = self.get_connection().await?;
             let mut stream = QuicTransport::open_bi_stream(&conn).await?;
-            if self.config.h3 {
-                let req_frame = Hysteria2Protocol::encode_tcp_request(&meta.destination);
-                stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
-                stream.flush().await.map_err(FluxError::Io)?;
-                Hysteria2Protocol::read_tcp_response(&mut stream).await?;
-            } else {
-                let auth_frame = Hysteria2Protocol::build_auth_frame(&self.config.password);
-                let req_frame =
-                    Hysteria2Protocol::build_request_frame(HYSTERIA2_CMD_TCP, &meta.destination);
-                stream.write_all(&auth_frame).await.map_err(FluxError::Io)?;
-                stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
-                stream.flush().await.map_err(FluxError::Io)?;
-            }
+            let req_frame = Hysteria2Protocol::encode_tcp_request(&meta.destination);
+            stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
+            stream.flush().await.map_err(FluxError::Io)?;
+            Hysteria2Protocol::read_tcp_response(&mut stream).await?;
             Ok(Box::new(stream))
         }
     }
 
-    async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+    async fn dial_packet(&self, _meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
         let conn = self.get_connection().await?;
-        let mut stream = QuicTransport::open_bi_stream(&conn).await?;
+        let session_id = self.next_udp_session.fetch_add(1, Ordering::Relaxed);
 
-        let auth_frame = Hysteria2Protocol::build_auth_frame(&self.config.password);
-        let req_frame =
-            Hysteria2Protocol::build_request_frame(HYSTERIA2_CMD_UDP, &meta.destination);
+        // Register this session in the per-connection datagram demuxer.
+        let (tx, rx) = mpsc::channel::<UdpPacket>(64);
+        {
+            let mut demux = self.udp_demux.lock().await;
+            if demux.is_none() {
+                // Spawn the per-connection datagram reader.
+                let conn_c = conn.clone();
+                let sessions: UdpDemuxMap = Arc::new(dashmap::DashMap::new());
+                let sessions_c = sessions.clone();
+                tokio::spawn(async move {
+                    while let Ok(d) = conn_c.read_datagram().await {
+                        if d.len() < 9 {
+                            continue;
+                        }
+                        let sid = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+                        let vlen = d[8] as usize;
+                        if d.len() < 9 + vlen {
+                            continue;
+                        }
+                        let dest_str = String::from_utf8_lossy(&d[9..9 + vlen]).to_string();
+                        let payload = &d[9 + vlen..];
+                        let target: Result<TargetAddress, _> = dest_str.parse();
+                        if let Ok(t) = target
+                            && let Some(tx) = sessions_c.get(&sid)
+                        {
+                            let pkt = UdpPacket::new(payload.to_vec().into(), t.clone(), t);
+                            let _ = tx.try_send(pkt);
+                        }
+                    }
+                });
+                *demux = Some(sessions);
+            }
+            if let Some(ref d) = *demux {
+                d.insert(session_id, tx);
+            }
+        }
 
-        stream.write_all(&auth_frame).await.map_err(FluxError::Io)?;
-        stream.write_all(&req_frame).await.map_err(FluxError::Io)?;
-        stream.flush().await.map_err(FluxError::Io)?;
-
-        let (reader, writer) = tokio::io::split(stream);
-
-        Ok(Box::new(Hysteria2PacketEndpoint {
-            reader: Arc::new(Mutex::new(reader)),
-            writer: Arc::new(Mutex::new(writer)),
+        Ok(Box::new(Hysteria2DatagramEndpoint {
+            conn,
+            session_id,
+            next_packet_id: std::sync::atomic::AtomicU16::new(0),
+            rx: Mutex::new(rx),
             pacer: self.pacer.clone(),
-            destination: meta.destination.clone(),
         }))
     }
 }
 
-pub struct Hysteria2PacketEndpoint {
-    reader: Arc<Mutex<tokio::io::ReadHalf<QuicBiStream>>>,
-    writer: Arc<Mutex<tokio::io::WriteHalf<QuicBiStream>>>,
+/// Hysteria 2 UDP endpoint over QUIC datagrams:
+/// [sessionID u32 BE][packetID u16 BE][fragID u8][fragTotal u8][vstring dest][data].
+pub struct Hysteria2DatagramEndpoint {
+    conn: quinn::Connection,
+    session_id: u32,
+    next_packet_id: std::sync::atomic::AtomicU16,
+    rx: Mutex<mpsc::Receiver<UdpPacket>>,
     pacer: Arc<Mutex<BrutalPacer>>,
-    destination: TargetAddress,
 }
 
 #[async_trait]
-impl PacketEndpoint for Hysteria2PacketEndpoint {
+impl PacketEndpoint for Hysteria2DatagramEndpoint {
     async fn send_packet(&self, packet: UdpPacket) -> FluxResult<()> {
-        self.pacer.lock().await.pace(packet.payload.len() + 2).await;
-        let len = packet.payload.len() as u16;
-        let mut guard = self.writer.lock().await;
-        guard
-            .write_all(&len.to_be_bytes())
-            .await
-            .map_err(FluxError::Io)?;
-        guard
-            .write_all(&packet.payload)
-            .await
-            .map_err(FluxError::Io)?;
-        guard.flush().await.map_err(FluxError::Io)?;
+        let pid = self
+            .next_packet_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dest_str = packet.destination.to_string();
+
+        let mut frame = Vec::with_capacity(9 + dest_str.len() + packet.payload.len());
+        frame.extend_from_slice(&self.session_id.to_be_bytes());
+        frame.extend_from_slice(&pid.to_be_bytes());
+        frame.push(0); // frag id
+        frame.push(1); // frag total
+        frame.push(dest_str.len() as u8);
+        frame.extend_from_slice(dest_str.as_bytes());
+        frame.extend_from_slice(&packet.payload);
+
+        // Brutal pacing for bandwidth control
+        self.pacer.lock().await.pace(frame.len()).await;
+
+        self.conn
+            .send_datagram(frame.into())
+            .map_err(|e| FluxError::Network(format!("hy2 send_datagram failed: {}", e)))?;
         Ok(())
     }
 
     async fn recv_packet(&self) -> FluxResult<UdpPacket> {
-        let mut guard = self.reader.lock().await;
-        let mut len_buf = [0u8; 2];
+        let mut guard = self.rx.lock().await;
         guard
-            .read_exact(&mut len_buf)
+            .recv()
             .await
-            .map_err(FluxError::Io)?;
-        let len = u16::from_be_bytes(len_buf) as usize;
-        let mut payload = vec![0u8; len];
-        guard
-            .read_exact(&mut payload)
-            .await
-            .map_err(FluxError::Io)?;
-
-        Ok(UdpPacket::new(
-            payload.into(),
-            self.destination.clone(),
-            self.destination.clone(),
-        ))
+            .ok_or_else(|| FluxError::Network("hy2 datagram session closed".into()))
     }
 }
 
@@ -250,6 +278,7 @@ mod tests {
             insecure: false,
             server_name: None,
             obfs: None,
+            alpn: None,
             h3: false,
         };
         let resolver = Arc::new(flux_dns::DnsResolver::new(None));

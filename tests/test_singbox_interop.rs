@@ -1,12 +1,13 @@
 mod common;
 
 use base64::Engine;
-use common::{get_free_tcp_port, start_tcp_echo_server, start_udp_echo_server};
+use common::{
+    get_free_tcp_port, start_tcp_echo_server, start_tls_echo_server, start_udp_echo_server,
+};
 use flux_app::{Config, Instance};
 use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
 use flux_types::{NetworkType, SessionMeta, TargetAddress, UdpPacket};
 use std::fs;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -41,8 +42,41 @@ impl SingboxProcess {
             .spawn()
             .expect("failed to spawn sing-box");
 
-        // Give sing-box 300ms to bind ports under parallel test load
-        std::thread::sleep(Duration::from_millis(300));
+        // Wait until sing-box actually binds its listen ports (fixed sleeps are
+        // flaky under parallel test load). Only TCP-based inbounds are probed;
+        // UDP/QUIC inbounds (hysteria2, tuic, wireguard) cannot be TCP-probed.
+        let udp_types = ["hysteria2", "tuic", "wireguard"];
+        let tcp_ports: Vec<u16> = {
+            let mut v = vec![];
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(config_json)
+                && let Some(inbounds) = json.get("inbounds").and_then(|i| i.as_array())
+            {
+                for ib in inbounds {
+                    let ty = ib.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let port = ib.get("listen_port").and_then(|p| p.as_u64());
+                    if let Some(p) = port
+                        && !udp_types.contains(&ty)
+                    {
+                        v.push(p as u16);
+                    }
+                }
+            }
+            v
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        for port in tcp_ports {
+            loop {
+                if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    panic!("sing-box did not bind port {} within 10s", port);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        // Small grace period for QUIC listeners and internal wiring.
+        std::thread::sleep(Duration::from_millis(200));
 
         Some((Self { child, _dir: dir }, cfg_path))
     }
@@ -3355,42 +3389,6 @@ fn reality_keypair() -> (String, String) {
     )
 }
 
-/// Starts a real TLS 1.3 echo server (usable as a REALITY handshake target/decoy).
-async fn start_tls_echo_server() -> SocketAddr {
-    let dir = TempDir::new().expect("tempdir");
-    let (cert_path, key_path) = generate_self_signed_cert(dir.path());
-    let (certs, key) = flux_transport::tls::TlsTransport::load_certs_and_key(
-        cert_path.to_str().unwrap(),
-        key_path.to_str().unwrap(),
-    )
-    .unwrap();
-    let acceptor =
-        flux_transport::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    std::mem::forget(dir); // keep cert files alive for the test duration
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
-            let acceptor = acceptor.clone();
-            tokio::spawn(async move {
-                if let Ok(mut tls) = acceptor.accept(stream).await {
-                    let mut buf = vec![0u8; 65536];
-                    while let Ok(n) = tls.read(&mut buf).await {
-                        if n == 0 {
-                            break;
-                        }
-                        if tls.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
 /// flux-core REALITY client → sing-box REALITY server.
 #[tokio::test]
 async fn test_interop_reality_flux_client_to_singbox_server() {
@@ -3474,12 +3472,13 @@ async fn test_interop_reality_flux_client_to_singbox_server() {
 #[tokio::test]
 async fn test_interop_reality_singbox_client_to_flux_server() {
     let echo = start_tcp_echo_server().await;
+    let decoy = start_tls_echo_server().await; // REALITY fallback must be a real TLS 1.3 target
     let flux_port = get_free_tcp_port().await;
     let sbox_socks_port = get_free_tcp_port().await;
     let (priv_b64, pub_b64) = reality_keypair();
     let uuid = uuid::Uuid::new_v4().to_string();
 
-    // flux-core REALITY server (fallback = echo server, unused by valid clients)
+    // flux-core REALITY server (fallback = TLS decoy for record-framing mimicry)
     let flux_cfg = format!(
         r#"
 inbounds:
@@ -3503,7 +3502,7 @@ outbounds:
 "#,
         flux_port,
         priv_b64,
-        echo.port(),
+        decoy.port(),
         uuid
     );
     let flux_inst = Instance::new(Config::from_yaml_str(&flux_cfg).unwrap()).unwrap();
@@ -3569,6 +3568,342 @@ outbounds:
     assert_eq!(resp[1], 0x00, "sing-box connect must succeed");
 
     let payload = b"REALITY interop: sing-box client -> flux server";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+}
+
+// ---------------------------------------------------------------------------
+// O. TUIC v5 Interoperability (both directions)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_interop_tuic_flux_to_singbox() {
+    let echo = start_tcp_echo_server().await;
+    let sbox_port = get_free_tcp_port().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let password = "tuic-secret-123";
+
+    let temp_dir = TempDir::new().unwrap();
+    let (cert_path, key_path) = generate_self_signed_cert(temp_dir.path());
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "tuic",
+                "tag": "tuic-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"uuid": "{}", "password": "{}"}}],
+                "tls": {{
+                    "enabled": true,
+                    "alpn": ["tuic"],
+                    "certificate_path": "{}",
+                    "key_path": "{}"
+                }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_port,
+        uuid,
+        password,
+        cert_path.display(),
+        key_path.display()
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "tuic-out",
+                "carrier": {{ "type": "udp", "address": "127.0.0.1:{}" }},
+                "security": {{ "type": "tls", "insecure": true, "sni": "localhost", "alpn": ["tuic"] }},
+                "protocol": {{ "type": "tuic", "uuid": "{}", "password": "{}" }}
+            }}]
+        }}"#,
+        sbox_port, uuid, password
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst.registry.get_outbound("tuic-out").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = tokio::time::timeout(Duration::from_secs(10), outbound.dial_stream(&meta))
+        .await
+        .expect("tuic dial timed out")
+        .expect("flux TUIC client must connect to sing-box");
+    let payload = b"TUIC v5 flux-core -> sing-box verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+}
+
+#[tokio::test]
+async fn test_interop_tuic_singbox_to_flux() {
+    let echo = start_tcp_echo_server().await;
+    let flux_port = get_free_tcp_port().await;
+    let sbox_socks_port = get_free_tcp_port().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let password = "tuic-secret-123";
+
+    let flux_cfg = format!(
+        r#"
+inbounds:
+  - tag: tuic-in
+    carrier:
+      type: udp
+      listen: "127.0.0.1"
+      listen_port: {}
+    protocol:
+      type: tuic
+      uuid: "{}"
+      password: "{}"
+outbounds:
+  - type: direct
+    tag: direct
+"#,
+        flux_port, uuid, password
+    );
+    let flux_inst = Instance::new(Config::from_yaml_str(&flux_cfg).unwrap()).unwrap();
+    flux_inst.start().await.unwrap();
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "socks", "tag": "in",
+                "listen": "127.0.0.1", "listen_port": {}
+            }}],
+            "outbounds": [{{
+                "type": "tuic",
+                "tag": "out",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "uuid": "{}",
+                "password": "{}",
+                "tls": {{"enabled": true, "insecure": true, "server_name": "localhost", "alpn": ["tuic"]}}
+            }}]
+        }}"#,
+        sbox_socks_port, flux_port, uuid, password
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", sbox_socks_port))
+        .await
+        .unwrap();
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, [0x05, 0x00]);
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    match echo.ip() {
+        std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
+        _ => panic!("echo server must be IPv4"),
+    }
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+    let mut resp = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut resp))
+        .await
+        .expect("sing-box TUIC connect to flux timed out")
+        .unwrap();
+    assert_eq!(resp[1], 0x00, "sing-box tuic connect must succeed");
+
+    let payload = b"TUIC v5 sing-box -> flux-core verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+}
+
+// ---------------------------------------------------------------------------
+// P. Hysteria 2 reverse direction (sing-box client → flux server)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_interop_hysteria2_singbox_to_flux() {
+    let echo = start_tcp_echo_server().await;
+    let flux_port = get_free_tcp_port().await;
+    let sbox_socks_port = get_free_tcp_port().await;
+    let password = "hy2-reverse-secret";
+
+    let flux_cfg = format!(
+        r#"
+inbounds:
+  - tag: hy2-in
+    carrier:
+      type: udp
+      listen: "127.0.0.1"
+      listen_port: {}
+    protocol:
+      type: hysteria2
+      password: "{}"
+outbounds:
+  - type: direct
+    tag: direct
+"#,
+        flux_port, password
+    );
+    let flux_inst = Instance::new(Config::from_yaml_str(&flux_cfg).unwrap()).unwrap();
+    flux_inst.start().await.unwrap();
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "socks", "tag": "in",
+                "listen": "127.0.0.1", "listen_port": {}
+            }}],
+            "outbounds": [{{
+                "type": "hysteria2",
+                "tag": "out",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "password": "{}",
+                "tls": {{"enabled": true, "insecure": true, "server_name": "localhost", "alpn": ["tuic"]}}
+            }}]
+        }}"#,
+        sbox_socks_port, flux_port, password
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", sbox_socks_port))
+        .await
+        .unwrap();
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await.unwrap();
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    match echo.ip() {
+        std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
+        _ => panic!("echo server must be IPv4"),
+    }
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+    let mut resp = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut resp))
+        .await
+        .expect("sing-box hy2 connect to flux timed out")
+        .unwrap();
+    assert_eq!(resp[1], 0x00, "sing-box hy2 connect must succeed");
+
+    let payload = b"Hysteria2 sing-box -> flux-core verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut buf = vec![0u8; payload.len()];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, payload);
+}
+
+// ---------------------------------------------------------------------------
+// Q. ShadowTLS v3 reverse direction (sing-box client → flux server)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_interop_shadowtls_singbox_to_flux() {
+    let echo = start_tcp_echo_server().await;
+    let decoy = start_tls_echo_server().await;
+    let flux_port = get_free_tcp_port().await;
+    let sbox_socks_port = get_free_tcp_port().await;
+    let stls_password = "stls-reverse-pass-777";
+    let raw_key = b"0123456789abcdef";
+    let b64_key = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, raw_key);
+
+    let flux_cfg = format!(
+        r#"
+inbounds:
+  - tag: stls-in
+    carrier:
+      type: tcp
+      listen: "127.0.0.1"
+      listen_port: {}
+    security:
+      type: shadowtls
+      version: 3
+      password: "{}"
+      fallback: "127.0.0.1:{}"
+    protocol:
+      type: shadowsocks
+      method: 2022-blake3-aes-128-gcm
+      password: "{}"
+outbounds:
+  - type: direct
+    tag: direct
+"#,
+        flux_port,
+        stls_password,
+        decoy.port(),
+        b64_key
+    );
+    let flux_inst = Instance::new(Config::from_yaml_str(&flux_cfg).unwrap()).unwrap();
+    flux_inst.start().await.unwrap();
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "socks", "tag": "in",
+                "listen": "127.0.0.1", "listen_port": {}
+            }}],
+            "outbounds": [
+                {{
+                    "type": "shadowtls",
+                    "tag": "st-out",
+                    "server": "127.0.0.1",
+                    "server_port": {},
+                    "version": 3,
+                    "password": "{}",
+                    "tls": {{"enabled": true, "server_name": "localhost", "insecure": true}}
+                }},
+                {{
+                    "type": "shadowsocks",
+                    "tag": "ss-out",
+                    "method": "2022-blake3-aes-128-gcm",
+                    "password": "{}",
+                    "detour": "st-out"
+                }}
+            ],
+            "route": {{ "final": "ss-out" }}
+        }}"#,
+        sbox_socks_port, flux_port, stls_password, b64_key
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", sbox_socks_port))
+        .await
+        .unwrap();
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await.unwrap();
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    match echo.ip() {
+        std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
+        _ => panic!("echo server must be IPv4"),
+    }
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+    let mut resp = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut resp))
+        .await
+        .expect("sing-box shadowtls connect to flux timed out")
+        .unwrap();
+    assert_eq!(resp[1], 0x00, "sing-box shadowtls connect must succeed");
+
+    let payload = b"ShadowTLS v3 sing-box -> flux-core verified!";
     stream.write_all(payload).await.unwrap();
     let mut buf = vec![0u8; payload.len()];
     stream.read_exact(&mut buf).await.unwrap();

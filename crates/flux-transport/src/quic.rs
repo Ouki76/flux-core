@@ -79,6 +79,10 @@ impl QuicTransport {
 
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        transport.max_concurrent_bidi_streams(256u32.into());
+        transport.max_concurrent_uni_streams(256u32.into());
+        transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+        transport.datagram_send_buffer_size(4 * 1024 * 1024);
         if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
             transport.max_idle_timeout(Some(idle));
         }
@@ -117,6 +121,10 @@ impl QuicTransport {
         server_crypto.alpn_protocols = alpn;
 
         let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(256u32.into());
+        transport.max_concurrent_uni_streams(256u32.into());
+        transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+        transport.datagram_send_buffer_size(4 * 1024 * 1024);
         if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
             transport.max_idle_timeout(Some(idle));
         }

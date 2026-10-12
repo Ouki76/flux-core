@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, Ordering};
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
@@ -91,4 +92,49 @@ pub fn get_rss_kb() -> usize {
 #[allow(dead_code)]
 pub fn get_rss_mb() -> f64 {
     get_rss_kb() as f64 / 1024.0
+}
+
+/// Starts a real TLS 1.3 echo server (usable as a REALITY handshake target/decoy).
+#[allow(dead_code)] // used by interop tests only
+pub async fn start_tls_echo_server() -> SocketAddr {
+    let dir = TempDir::new().expect("tempdir");
+    let cert = rcgen::generate_simple_self_signed(vec![
+        "localhost".to_string(),
+        "example.com".to_string(),
+    ])
+    .expect("cert generation");
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+    let (certs, key) = flux_transport::tls::TlsTransport::load_certs_and_key(
+        cert_path.to_str().unwrap(),
+        key_path.to_str().unwrap(),
+    )
+    .unwrap();
+    let acceptor =
+        flux_transport::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::mem::forget(dir); // keep cert files alive for the test duration
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(mut tls) = acceptor.accept(stream).await {
+                    let mut buf = vec![0u8; 65536];
+                    while let Ok(n) = tls.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        if tls.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    addr
 }

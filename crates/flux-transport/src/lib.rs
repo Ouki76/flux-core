@@ -2,6 +2,7 @@ pub mod fingerprint;
 pub mod fragment;
 pub mod grpc;
 pub mod h2;
+pub mod h3_lite;
 pub mod httpupgrade;
 pub mod pipeline;
 pub mod quic;
