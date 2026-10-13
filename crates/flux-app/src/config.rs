@@ -4,6 +4,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use uuid::Uuid;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -158,6 +159,8 @@ pub enum SystemInboundConfig {
         listen_port: u16,
         #[serde(default)]
         users: Vec<SocksUserConfig>,
+        #[serde(default)]
+        rate_limit: Option<RateLimitConfig>,
     },
     #[serde(rename = "redirect")]
     Redirect {
@@ -171,6 +174,35 @@ pub enum SystemInboundConfig {
         listen: String,
         listen_port: u16,
     },
+    /// WireGuard / AmneziaWG server-side inbound (L3 tunnel over UDP).
+    #[serde(rename = "wireguard")]
+    WireGuard {
+        tag: String,
+        listen: String,
+        listen_port: u16,
+        /// Server static private key (32-byte hex or base64).
+        private_key: String,
+        /// Authorized peers; at least one is required.
+        peers: Vec<WireGuardPeerConfig>,
+        /// Inner IP MTU (default: 1420).
+        #[serde(default)]
+        mtu: Option<usize>,
+        /// AmneziaWG obfuscation parameters (must match the peer's config).
+        #[serde(default)]
+        awg: Option<flux_protocol::wireguard::AwgConfig>,
+    },
+}
+
+/// An authorized WireGuard peer of a server inbound.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireGuardPeerConfig {
+    /// Peer static public key (32-byte hex or base64).
+    pub public_key: String,
+    #[serde(default)]
+    pub preshared_key: Option<String>,
+    /// Allowed inner source IPs for this peer (CIDR). Empty = allow any.
+    #[serde(default)]
+    pub allowed_ips: Vec<String>,
 }
 
 impl SystemInboundConfig {
@@ -179,7 +211,8 @@ impl SystemInboundConfig {
             Self::Tun { tag, .. }
             | Self::Mixed { tag, .. }
             | Self::Redirect { tag, .. }
-            | Self::Tproxy { tag, .. } => tag,
+            | Self::Tproxy { tag, .. }
+            | Self::WireGuard { tag, .. } => tag,
         }
     }
 }
@@ -504,6 +537,31 @@ pub struct LayeredInboundNode {
     pub security: Option<FlexibleList<InboundSecurityConfig>>,
     #[serde(default)]
     pub framing: Option<FlexibleList<InboundFramingConfig>>,
+    /// Optional connection rate limiting (DoS hardening for public listeners).
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+}
+
+/// Per-inbound connection rate limiting: per-IP token bucket + global cap.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    /// Sustained new connections per second allowed per client IP (0/absent = unlimited).
+    #[serde(default)]
+    pub max_conn_per_ip_per_sec: Option<u32>,
+    /// Burst allowance per client IP (default: max(rate, 1) * 2).
+    #[serde(default)]
+    pub burst: Option<u32>,
+    /// Global concurrent connection cap for this inbound (0/absent = unlimited).
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+}
+
+impl RateLimitConfig {
+    pub fn build(&self) -> Arc<flux_common::RateLimiter> {
+        let rate = self.max_conn_per_ip_per_sec.unwrap_or(0);
+        let burst = self.burst.unwrap_or(rate.max(1) * 2).max(1);
+        flux_common::RateLimiter::new(rate, burst, self.max_concurrent.unwrap_or(0))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -597,10 +655,15 @@ pub struct RouteConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuleSetConfig {
     pub tag: String,
+    /// "local" (default, file at `path`), "inline" (embedded lists) or
+    /// "remote" (http(s) URL at `path`, fetched in the background).
     #[serde(rename = "type")]
     pub set_type: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
+    /// Optional periodic refresh interval for remote rule sets (e.g. "24h", "30m").
+    #[serde(default)]
+    pub update_interval: Option<String>,
     #[serde(default)]
     pub ip_cidr: Vec<String>,
     #[serde(default)]
@@ -1067,6 +1130,50 @@ impl Config {
                     "duplicate inbound tag '{}'",
                     tag
                 )));
+            }
+
+            if let InboundConfig::System(SystemInboundConfig::WireGuard {
+                private_key,
+                peers,
+                ..
+            }) = in_cfg
+            {
+                decode_key_32bytes(private_key).map_err(|e| {
+                    FluxError::Config(format!(
+                        "inbound '{}': invalid wireguard private_key: {}",
+                        tag, e
+                    ))
+                })?;
+                if peers.is_empty() {
+                    return Err(FluxError::Config(format!(
+                        "inbound '{}': wireguard requires at least one peer",
+                        tag
+                    )));
+                }
+                for (i, peer) in peers.iter().enumerate() {
+                    decode_key_32bytes(&peer.public_key).map_err(|e| {
+                        FluxError::Config(format!(
+                            "inbound '{}': invalid wireguard peer[{}] public_key: {}",
+                            tag, i, e
+                        ))
+                    })?;
+                    if let Some(psk) = &peer.preshared_key {
+                        decode_key_32bytes(psk).map_err(|e| {
+                            FluxError::Config(format!(
+                                "inbound '{}': invalid wireguard peer[{}] preshared_key: {}",
+                                tag, i, e
+                            ))
+                        })?;
+                    }
+                    for cidr in &peer.allowed_ips {
+                        cidr.parse::<ipnet::IpNet>().map_err(|e| {
+                            FluxError::Config(format!(
+                                "inbound '{}': invalid wireguard peer[{}] allowed_ip '{}': {}",
+                                tag, i, cidr, e
+                            ))
+                        })?;
+                    }
+                }
             }
         }
 

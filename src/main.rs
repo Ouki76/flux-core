@@ -92,26 +92,37 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(async_main(cli))
 }
 
-async fn async_main(cli: Cli) -> anyhow::Result<()> {
-    let cmd = cli.command.unwrap_or(Commands::Version);
+fn parse_log_level(s: &str) -> Option<Level> {
+    match s.to_ascii_lowercase().as_str() {
+        "trace" => Some(Level::TRACE),
+        "debug" => Some(Level::DEBUG),
+        "info" => Some(Level::INFO),
+        "warn" | "warning" => Some(Level::WARN),
+        "error" => Some(Level::ERROR),
+        _ => None,
+    }
+}
 
-    let level = std::env::var("RUST_LOG")
-        .ok()
-        .and_then(|s| match s.to_ascii_lowercase().as_str() {
-            "trace" => Some(Level::TRACE),
-            "debug" => Some(Level::DEBUG),
-            "info" => Some(Level::INFO),
-            "warn" => Some(Level::WARN),
-            "error" => Some(Level::ERROR),
-            _ => None,
-        })
-        .unwrap_or(Level::INFO);
-
+fn init_tracing(level: Level) {
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(level)
         .compact()
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// Resolves the effective log level: RUST_LOG env wins, then config `log.level`,
+/// then INFO.
+fn resolve_log_level(config_level: Option<&str>) -> Level {
+    std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| parse_log_level(&s))
+        .or_else(|| config_level.and_then(parse_log_level))
+        .unwrap_or(Level::INFO)
+}
+
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
+    let cmd = cli.command.unwrap_or(Commands::Version);
 
     match cmd {
         Commands::Run {
@@ -120,11 +131,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             workers: _,
         } => {
             let fmt: ConfigFormat = format.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
+            let cfg = load_any_config(&config, Some(fmt))?;
+            // Initialize logging AFTER config load so `log.level` from the config applies.
+            init_tracing(resolve_log_level(
+                cfg.log.as_ref().and_then(|l| l.level.as_deref()),
+            ));
             info!(
                 "Starting flux-core with config: {:?} (format: {:?})",
                 config, fmt
             );
-            let cfg = load_any_config(&config, Some(fmt))?;
             let mut current_instance = Arc::new(Instance::new(cfg)?);
             current_instance.start().await?;
 
@@ -149,8 +164,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                             Ok(new_cfg) => {
                                 match Instance::new(new_cfg) {
                                     Ok(new_instance) => {
-                                        let has_tun = new_instance.inbounds.iter().any(|i| i.protocol() == "tun")
-                                            || current_instance.inbounds.iter().any(|i| i.protocol() == "tun");
+                                        // TUN (device FD) and WireGuard (exclusive UDP bind, no
+                                        // SO_REUSEPORT) cannot coexist across old/new instances:
+                                        // the old instance must release the resource first.
+                                        let has_exclusive = new_instance.inbounds.iter().any(|i| {
+                                            matches!(i.protocol(), "tun" | "wireguard")
+                                        }) || current_instance.inbounds.iter().any(|i| {
+                                            matches!(i.protocol(), "tun" | "wireguard")
+                                        });
+                                        let has_tun = has_exclusive;
                                         if has_tun {
                                             // TUN interface FD must be released before new instance can bind to tun0
                                             let _ = current_instance.stop().await;
@@ -192,8 +214,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Check { config, format } => {
             let fmt: ConfigFormat = format.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
+            let cfg = load_any_config(&config, Some(fmt));
+            init_tracing(resolve_log_level(
+                cfg.as_ref()
+                    .ok()
+                    .and_then(|c| c.log.as_ref())
+                    .and_then(|l| l.level.as_deref()),
+            ));
             info!("Validating config: {:?} (format: {:?})", config, fmt);
-            match load_any_config(&config, Some(fmt)) {
+            match cfg {
                 Ok(cfg) => {
                     let _instance = Instance::new(cfg)?;
                     println!("Configuration is valid!");
@@ -213,6 +242,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         } => {
             let fmt: ConfigFormat = format.parse().map_err(|e| anyhow::anyhow!("{}", e))?;
             let cfg = load_any_config(&config, Some(fmt))?;
+            init_tracing(resolve_log_level(
+                cfg.log.as_ref().and_then(|l| l.level.as_deref()),
+            ));
             let instance = Instance::new(cfg)?;
 
             let net = match network.to_ascii_lowercase().as_str() {

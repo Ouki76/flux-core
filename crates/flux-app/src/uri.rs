@@ -118,15 +118,12 @@ impl ProxySpec {
                 }));
             }
             other => {
-                tracing::warn!(
-                    "unsupported protocol '{}' for outbound '{}', falling back to direct",
-                    other,
-                    self.tag
-                );
-                return Ok(OutboundConfig::Group(OutboundGroupConfig::Direct {
-                    tag: self.tag,
-                    tls_fragment: None,
-                }));
+                // Strict: an unknown protocol must never silently degrade into an
+                // unproxied direct connection (traffic leak / misconfiguration risk).
+                return Err(FluxError::Config(format!(
+                    "unsupported protocol '{}' for outbound '{}' (supported: vless, trojan, ss/shadowsocks, socks/socks5, http/https, hy2/hysteria2, tuic, direct, block)",
+                    other, self.tag
+                )));
             }
         };
 

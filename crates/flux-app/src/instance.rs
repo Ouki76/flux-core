@@ -59,6 +59,10 @@ pub struct Instance {
     pub meter: Arc<TrafficMeter>,
     pub api_server: Option<Arc<ApiServer>>,
     pub resolver: Arc<DnsResolver>,
+    /// Remote rule sets to fetch in the background: (ruleset, url, refresh interval).
+    remote_rulesets: Vec<(Arc<flux_router::RuleSet>, String, Option<Duration>)>,
+    /// Cancel handle for background fetch loops (SIGHUP reload / shutdown safe).
+    fetch_cancel: tokio_util::sync::CancellationToken,
 }
 
 impl Instance {
@@ -229,39 +233,105 @@ impl Instance {
         }
 
         // 3. Router
-        let (rules, default_outbound, rule_set_registry, geoip_reg) =
-            if let Some(route_cfg) = config.route {
-                let mut reg = flux_router::RuleSetRegistry::new();
-                for rs_cfg in route_cfg.rule_set {
-                    let rs = flux_router::RuleSet {
+        let (rules, default_outbound, rule_set_registry, geoip_reg, remote_rulesets) = if let Some(
+            route_cfg,
+        ) =
+            config.route
+        {
+            let mut reg = flux_router::RuleSetRegistry::new();
+            let mut remote_specs: Vec<(Arc<flux_router::RuleSet>, String, Option<Duration>)> =
+                Vec::new();
+            for rs_cfg in route_cfg.rule_set {
+                // Auto-detect remote rule sets: explicit type=remote or an http(s) URL path.
+                let is_remote = rs_cfg.set_type.as_deref() == Some("remote")
+                    || rs_cfg
+                        .path
+                        .as_deref()
+                        .map(|p| p.starts_with("http://") || p.starts_with("https://"))
+                        .unwrap_or(false);
+                match rs_cfg.set_type.as_deref() {
+                    None | Some("local") | Some("inline") | Some("remote") => {}
+                    Some(other) => {
+                        return Err(FluxError::Config(format!(
+                            "rule_set '{}': unsupported type '{}' (supported: 'local', 'inline', 'remote')",
+                            rs_cfg.tag, other
+                        )));
+                    }
+                }
+                if is_remote {
+                    let url = rs_cfg.path.clone().ok_or_else(|| {
+                        FluxError::Config(format!(
+                            "rule_set '{}': remote type requires a 'path' with an http(s) URL",
+                            rs_cfg.tag
+                        ))
+                    })?;
+                    if !url.starts_with("http://") && !url.starts_with("https://") {
+                        return Err(FluxError::Config(format!(
+                            "rule_set '{}': remote path must be an http(s) URL, got '{}'",
+                            rs_cfg.tag, url
+                        )));
+                    }
+                    let interval = rs_cfg
+                        .update_interval
+                        .as_deref()
+                        .map(|s| {
+                            parse_duration(s).ok_or_else(|| {
+                                FluxError::Config(format!(
+                                    "rule_set '{}': invalid update_interval '{}'",
+                                    rs_cfg.tag, s
+                                ))
+                            })
+                        })
+                        .transpose()?;
+                    let rs_tag = rs_cfg.tag.clone();
+                    let mut rs = flux_router::RuleSet {
                         tag: rs_cfg.tag,
-                        path: rs_cfg.path,
                         ip_cidr: rs_cfg.ip_cidr,
                         domain: rs_cfg.domain,
                         domain_suffix: rs_cfg.domain_suffix,
                         domain_keyword: rs_cfg.domain_keyword,
                         ..Default::default()
                     };
+                    rs.remote_url = Some(url.clone());
+                    rs.update_interval = interval;
+                    // Remote rule sets start empty (never-matching) and are populated
+                    // asynchronously; a failed fetch must not break instance startup.
                     reg.insert(rs).map_err(flux_types::FluxError::Config)?;
+                    if let Some(arc_rs) = reg.get(&rs_tag) {
+                        remote_specs.push((arc_rs, url, interval));
+                    }
+                    continue;
                 }
-                let mut r_vec = Vec::new();
-                for r in route_cfg.rules {
-                    r_vec.push(r.to_rule()?);
-                }
-                let def = route_cfg.final_outbound.unwrap_or_else(|| "direct".into());
-                let geo = Arc::new(flux_router::GeoIpRegistry::new());
-                if let Some(ref path) = route_cfg.geoip_path {
-                    geo.load(path).map_err(flux_types::FluxError::Config)?;
-                }
-                (r_vec, def, reg, geo)
-            } else {
-                (
-                    vec![],
-                    "direct".into(),
-                    flux_router::RuleSetRegistry::new(),
-                    Arc::new(flux_router::GeoIpRegistry::new()),
-                )
-            };
+                let rs = flux_router::RuleSet {
+                    tag: rs_cfg.tag,
+                    path: rs_cfg.path,
+                    ip_cidr: rs_cfg.ip_cidr,
+                    domain: rs_cfg.domain,
+                    domain_suffix: rs_cfg.domain_suffix,
+                    domain_keyword: rs_cfg.domain_keyword,
+                    ..Default::default()
+                };
+                reg.insert(rs).map_err(flux_types::FluxError::Config)?;
+            }
+            let mut r_vec = Vec::new();
+            for r in route_cfg.rules {
+                r_vec.push(r.to_rule()?);
+            }
+            let def = route_cfg.final_outbound.unwrap_or_else(|| "direct".into());
+            let geo = Arc::new(flux_router::GeoIpRegistry::new());
+            if let Some(ref path) = route_cfg.geoip_path {
+                geo.load(path).map_err(flux_types::FluxError::Config)?;
+            }
+            (r_vec, def, reg, geo, remote_specs)
+        } else {
+            (
+                vec![],
+                "direct".into(),
+                flux_router::RuleSetRegistry::new(),
+                Arc::new(flux_router::GeoIpRegistry::new()),
+                Vec::new(),
+            )
+        };
 
         let router = Arc::new(
             Router::new(rules, default_outbound)
@@ -297,6 +367,7 @@ impl Instance {
                         listen,
                         listen_port,
                         users,
+                        rate_limit,
                     } => {
                         let addr_str = format!("{}:{}", listen, listen_port);
                         let addr: SocketAddr = addr_str.parse().map_err(|e| {
@@ -306,9 +377,11 @@ impl Instance {
                             .into_iter()
                             .map(|u| (u.username, u.password))
                             .collect();
-                        inbounds.push(Arc::new(
-                            MixedInbound::new(tag, addr).with_users(user_pairs),
-                        ));
+                        let mut ib = MixedInbound::new(tag, addr).with_users(user_pairs);
+                        if let Some(rl) = rate_limit.as_ref().map(|c| c.build()) {
+                            ib = ib.with_rate_limiter(rl);
+                        }
+                        inbounds.push(Arc::new(ib));
                     }
                     SystemInboundConfig::Redirect {
                         tag,
@@ -320,6 +393,64 @@ impl Instance {
                             FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                         })?;
                         inbounds.push(Arc::new(flux_inbound::RedirectInbound::new(tag, addr)));
+                    }
+                    SystemInboundConfig::WireGuard {
+                        tag,
+                        listen,
+                        listen_port,
+                        private_key,
+                        peers,
+                        mtu,
+                        awg,
+                    } => {
+                        let addr_str = format!("{}:{}", listen, listen_port);
+                        let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                            FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
+                        })?;
+                        let priv_key =
+                            crate::config::decode_key_32bytes(&private_key).map_err(|e| {
+                                FluxError::Config(format!("wireguard inbound '{}': {}", tag, e))
+                            })?;
+                        let mut wg_peers = Vec::with_capacity(peers.len());
+                        for peer in &peers {
+                            let public_key = crate::config::decode_key_32bytes(&peer.public_key)
+                                .map_err(|e| {
+                                    FluxError::Config(format!(
+                                        "wireguard inbound '{}' peer: {}",
+                                        tag, e
+                                    ))
+                                })?;
+                            let preshared_key = peer
+                                .preshared_key
+                                .as_deref()
+                                .map(crate::config::decode_key_32bytes)
+                                .transpose()
+                                .map_err(|e| {
+                                    FluxError::Config(format!(
+                                        "wireguard inbound '{}' peer psk: {}",
+                                        tag, e
+                                    ))
+                                })?;
+                            let allowed_ips = peer
+                                .allowed_ips
+                                .iter()
+                                .map(|c| c.parse::<ipnet::IpNet>())
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(|e| {
+                                    FluxError::Config(format!(
+                                        "wireguard inbound '{}' peer allowed_ips: {}",
+                                        tag, e
+                                    ))
+                                })?;
+                            wg_peers.push(flux_inbound::WireGuardInboundPeer {
+                                public_key,
+                                preshared_key,
+                                allowed_ips,
+                            });
+                        }
+                        inbounds.push(Arc::new(flux_inbound::WireGuardInbound::new(
+                            tag, addr, priv_key, wg_peers, awg, mtu,
+                        )));
                     }
                     SystemInboundConfig::Tproxy {
                         tag,
@@ -364,6 +495,8 @@ impl Instance {
             meter,
             api_server,
             resolver,
+            remote_rulesets,
+            fetch_cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -403,7 +536,58 @@ impl Instance {
         for inbound in &self.inbounds {
             inbound.start(self.dispatcher.clone()).await?;
         }
+        self.spawn_remote_ruleset_fetchers();
         Ok(())
+    }
+
+    /// Spawns background fetch loops for remote (URL-based) rule sets.
+    /// A fetch failure is logged and retried on the next interval (or once,
+    /// when no `update_interval` is configured); it never breaks routing.
+    fn spawn_remote_ruleset_fetchers(&self) {
+        for (rs, url, interval) in &self.remote_rulesets {
+            let rs = rs.clone();
+            let url = url.clone();
+            let interval = *interval;
+            let resolver = self.resolver.clone();
+            let cancel = self.fetch_cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    let fetch = crate::ruleset_fetch::fetch_remote_ruleset(&url, &resolver);
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        r = fetch => r,
+                    };
+                    match result {
+                        Ok(content) => {
+                            rs.apply_content(&content);
+                            tracing::info!(
+                                "remote rule set '{}' loaded from {} ({} bytes)",
+                                rs.tag,
+                                url,
+                                content.len()
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "remote rule set '{}' fetch from {} failed: {}",
+                                rs.tag,
+                                url,
+                                e
+                            );
+                        }
+                    }
+                    match interval {
+                        Some(d) => {
+                            tokio::select! {
+                                _ = cancel.cancelled() => break,
+                                _ = tokio::time::sleep(d) => {}
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            });
+        }
     }
 
     pub async fn stop(&self) -> FluxResult<()> {
@@ -416,6 +600,7 @@ impl Instance {
         for entry in self.registry.map.iter() {
             entry.value().stop();
         }
+        self.fetch_cancel.cancel();
         Ok(())
     }
 }
@@ -1062,72 +1247,76 @@ fn build_layered_inbound(
     let securities = compile_server_securities(node.security)?;
     let framings = compile_server_framings(node.framing)?;
     let pipeline = flux_transport::pipeline::ServerTransportPipeline::new(securities, framings);
+    let rate_limiter = node.rate_limit.as_ref().map(|c| c.build());
 
     match node.protocol {
         ProtocolConfig::Vless { uuid, .. } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid vless uuid {}: {}", uuid, e)))?;
-            inbounds.push(Arc::new(flux_inbound::VlessInbound::new(
-                tag,
-                addr,
-                vec![parsed_uuid],
-                pipeline,
-            )));
+            let mut ib = flux_inbound::VlessInbound::new(tag, addr, vec![parsed_uuid], pipeline);
+            if let Some(rl) = rate_limiter.clone() {
+                ib = ib.with_rate_limiter(rl);
+            }
+            inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::Shadowsocks { password, method } => {
             let cipher_kind = method
                 .as_deref()
                 .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
                 .unwrap_or_default();
-            inbounds.push(Arc::new(
-                flux_inbound::ShadowsocksInbound::new(tag, addr, &password)
-                    .with_cipher_kind(cipher_kind)
-                    .with_pipeline(pipeline),
-            ));
+            let mut ib = flux_inbound::ShadowsocksInbound::new(tag, addr, &password)
+                .with_cipher_kind(cipher_kind)
+                .with_pipeline(pipeline);
+            if let Some(rl) = rate_limiter.clone() {
+                ib = ib.with_rate_limiter(rl);
+            }
+            inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::Trojan { password } => {
-            inbounds.push(Arc::new(flux_inbound::TrojanInbound::new(
-                tag,
-                addr,
-                vec![password],
-                pipeline,
-            )));
+            let mut ib = flux_inbound::TrojanInbound::new(tag, addr, vec![password], pipeline);
+            if let Some(rl) = rate_limiter.clone() {
+                ib = ib.with_rate_limiter(rl);
+            }
+            inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::Vmess { uuid, .. } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid vmess uuid {}: {}", uuid, e)))?;
-            inbounds.push(Arc::new(flux_inbound::VmessInbound::new(
-                tag,
-                addr,
-                vec![parsed_uuid],
-                pipeline,
-            )));
+            let mut ib = flux_inbound::VmessInbound::new(tag, addr, vec![parsed_uuid], pipeline);
+            if let Some(rl) = rate_limiter.clone() {
+                ib = ib.with_rate_limiter(rl);
+            }
+            inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::Socks { username, password } => {
             let users = match (username, password) {
                 (Some(u), Some(p)) => vec![(u, p)],
                 _ => vec![],
             };
-            inbounds.push(Arc::new(
-                flux_inbound::SocksInbound::new(tag, addr)
-                    .with_users(users)
-                    .with_pipeline(pipeline),
-            ));
+            let mut ib = flux_inbound::SocksInbound::new(tag, addr)
+                .with_users(users)
+                .with_pipeline(pipeline);
+            if let Some(rl) = rate_limiter.clone() {
+                ib = ib.with_rate_limiter(rl);
+            }
+            inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::Http { username, password } => {
             let users = match (username, password) {
                 (Some(u), Some(p)) => vec![(u, p)],
                 _ => vec![],
             };
-            inbounds.push(Arc::new(
-                flux_inbound::HttpInbound::new(tag, addr)
-                    .with_users(users)
-                    .with_pipeline(pipeline),
-            ));
+            let mut ib = flux_inbound::HttpInbound::new(tag, addr)
+                .with_users(users)
+                .with_pipeline(pipeline);
+            if let Some(rl) = rate_limiter.clone() {
+                ib = ib.with_rate_limiter(rl);
+            }
+            inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::WireGuard { .. } => {
             return Err(FluxError::Config(
-                "wireguard server inbound not supported".to_string(),
+                "wireguard is an L3 UDP tunnel and cannot be a layered inbound; use a system inbound instead: { \"type\": \"wireguard\", \"listen\": ..., \"private_key\": ..., \"peers\": [...] }".to_string(),
             ));
         }
         ProtocolConfig::Hysteria2 { password, .. } => {

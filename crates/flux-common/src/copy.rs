@@ -92,13 +92,45 @@ where
     tokio::io::copy_bidirectional(&mut a, &mut b).await
 }
 
-/// Bidirectional stream copy between two mutable stream references without mutual deadlock.
+/// One-way copy reading into a pooled 16KB buffer (reused across connections).
+/// On EOF or error the write half is shut down to propagate half-close semantics.
+async fn copy_one_way_pooled<R, W>(
+    r: &mut R,
+    w: &mut W,
+    pool: &'static crate::buffer::BufferPool,
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut guard = pool.acquire_guard();
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut guard[..]).await?;
+        if n == 0 {
+            break;
+        }
+        w.write_all(&guard[..n]).await?;
+        total += n as u64;
+    }
+    let _ = w.shutdown().await;
+    Ok(total)
+}
+
+/// Bidirectional stream copy between two mutable stream references without mutual
+/// deadlock, using pooled buffers instead of per-connection heap allocations.
 pub async fn copy_bidirectional_pooled<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
-    tokio::io::copy_bidirectional(a, b).await
+    let pool = crate::buffer::BufferPool::default_pool();
+    let (mut ar, mut aw) = tokio::io::split(a);
+    let (mut br, mut bw) = tokio::io::split(b);
+    let f1 = copy_one_way_pooled(&mut ar, &mut bw, pool);
+    let f2 = copy_one_way_pooled(&mut br, &mut aw, pool);
+    tokio::try_join!(f1, f2)
 }
 
 /// A stream that prepends a prefix byte buffer before delegating to the inner stream.
@@ -161,6 +193,41 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn test_copy_bidirectional_pooled() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let (mut proxy_in, mut proxy_out) = tokio::io::duplex(1024);
+
+        let t1 = tokio::spawn(async move {
+            client.write_all(b"hello pooled").await.unwrap();
+            client.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut client, &mut buf)
+                .await
+                .unwrap();
+            assert_eq!(buf, b"pooled reply");
+        });
+
+        let t2 = tokio::spawn(async move {
+            let mut buf = vec![0u8; 12];
+            tokio::io::AsyncReadExt::read_exact(&mut proxy_out, &mut buf)
+                .await
+                .unwrap();
+            assert_eq!(&buf, b"hello pooled");
+            proxy_out.write_all(b"pooled reply").await.unwrap();
+            proxy_out.shutdown().await.unwrap();
+        });
+
+        let (up, down) = copy_bidirectional_pooled(&mut server, &mut proxy_in)
+            .await
+            .unwrap();
+        assert_eq!(up, 12);
+        assert_eq!(down, 12);
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+    }
 
     #[tokio::test]
     async fn test_copy_bidirectional() {
