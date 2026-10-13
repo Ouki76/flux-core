@@ -2,6 +2,7 @@ pub mod api;
 pub mod config;
 pub mod dispatcher;
 pub mod instance;
+pub mod ruleset_fetch;
 pub mod uri;
 
 pub use api::*;

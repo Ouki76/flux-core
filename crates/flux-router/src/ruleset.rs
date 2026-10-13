@@ -4,6 +4,62 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Compiled O(1)/O(L) lookup structures derived from the raw rule lists.
+/// Lives behind an RwLock so remote (URL-fetched) rule sets can be hot-swapped
+/// without touching the running router.
+#[derive(Clone, Debug, Default)]
+pub struct CompiledRuleSet {
+    pub ip_range_set: crate::ip_range::IpRangeSet,
+    pub exact_set: HashSet<String>,
+    pub suffix_set: HashSet<String>,
+    pub keyword_list: Vec<String>,
+}
+
+impl CompiledRuleSet {
+    fn build(rs: &RuleSet) -> Self {
+        let parsed_cidrs: Vec<IpNet> = rs
+            .ip_cidr
+            .iter()
+            .filter_map(|s| {
+                if s.contains('/') {
+                    s.parse::<IpNet>().ok()
+                } else if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                    IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).ok()
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let ip_range_set = crate::ip_range::IpRangeSet::from_cidrs(&parsed_cidrs);
+
+        let exact_set = rs
+            .domain
+            .iter()
+            .map(|d| d.trim().to_ascii_lowercase())
+            .collect();
+
+        let suffix_set = rs
+            .domain_suffix
+            .iter()
+            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .collect();
+
+        let keyword_list = rs
+            .domain_keyword
+            .iter()
+            .map(|k| k.trim().to_ascii_lowercase())
+            .collect();
+
+        Self {
+            ip_range_set,
+            exact_set,
+            suffix_set,
+            keyword_list,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuleSet {
     pub tag: String,
@@ -18,16 +74,17 @@ pub struct RuleSet {
     #[serde(default)]
     pub domain_keyword: Vec<String>,
 
+    /// Remote URL (http:// or https://) fetched asynchronously in the background.
+    /// The rule set matches nothing until the first successful fetch completes.
     #[serde(skip)]
-    pub parsed_cidrs: Vec<IpNet>,
+    pub remote_url: Option<String>,
+    /// Optional periodic refresh interval for remote rule sets.
     #[serde(skip)]
-    pub ip_range_set: crate::ip_range::IpRangeSet,
+    pub update_interval: Option<std::time::Duration>,
+    /// Hot-swappable compiled matcher state.
+    #[doc(hidden)]
     #[serde(skip)]
-    pub exact_set: HashSet<String>,
-    #[serde(skip)]
-    pub suffix_set: HashSet<String>,
-    #[serde(skip)]
-    pub keyword_list: Vec<String>,
+    pub compiled: Arc<parking_lot::RwLock<CompiledRuleSet>>,
     #[serde(skip)]
     #[doc(hidden)]
     pub file_loaded: bool,
@@ -98,10 +155,27 @@ impl RuleSet {
         Ok(())
     }
 
+    /// Atomically replaces the compiled contents with the given text (used by
+    /// remote rule set fetches). Takes `&self` so it works through shared Arcs.
+    pub fn apply_content(&self, content: &str) {
+        let mut tmp = RuleSet::default();
+        for line in content.lines() {
+            tmp.parse_rule_line(line);
+        }
+        *self.compiled.write() = CompiledRuleSet::build(&tmp);
+    }
+
+    /// Rebuilds the compiled lookup structures from the raw lists and swaps them in.
+    fn rebuild_compiled(&mut self) {
+        let fresh = CompiledRuleSet::build(self);
+        *self.compiled.write() = fresh;
+    }
+
     /// Compiles derived lookup structures. Idempotent: derived sets are rebuilt from scratch,
-    /// and the ruleset file is loaded at most once.
+    /// and the ruleset file is loaded at most once. Remote rule sets skip file loading.
     pub fn compile(&mut self) -> Result<(), String> {
-        if !self.file_loaded
+        if self.remote_url.is_none()
+            && !self.file_loaded
             && let Some(p) = self.path.clone()
         {
             let tag = self.tag.clone();
@@ -110,46 +184,16 @@ impl RuleSet {
             self.file_loaded = true;
         }
 
-        self.parsed_cidrs = self
-            .ip_cidr
-            .iter()
-            .filter_map(|s| {
-                if s.contains('/') {
-                    s.parse::<IpNet>().ok()
-                } else if let Ok(ip) = s.parse::<std::net::IpAddr>() {
-                    IpNet::new(ip, if ip.is_ipv4() { 32 } else { 128 }).ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        self.ip_range_set = crate::ip_range::IpRangeSet::from_cidrs(&self.parsed_cidrs);
-
-        self.exact_set.clear();
-        for d in &self.domain {
-            self.exact_set.insert(d.trim().to_ascii_lowercase());
-        }
-
-        self.suffix_set.clear();
-        for s in &self.domain_suffix {
-            let clean = s.trim().trim_start_matches('.').to_ascii_lowercase();
-            self.suffix_set.insert(clean);
-        }
-
-        self.keyword_list = self
-            .domain_keyword
-            .iter()
-            .map(|k| k.trim().to_ascii_lowercase())
-            .collect();
+        self.rebuild_compiled();
         Ok(())
     }
 
     pub fn matches(&self, meta: &SessionMeta) -> bool {
+        let compiled = self.compiled.read();
         match &meta.destination {
             flux_types::TargetAddress::Ip(sock) => {
                 let ip = sock.ip();
-                self.ip_range_set.contains(&ip)
+                compiled.ip_range_set.contains(&ip)
             }
             flux_types::TargetAddress::Domain(domain, _) => {
                 // O(1) Exact domain lookup with ASCII case-insensitivity
@@ -162,26 +206,26 @@ impl RuleSet {
                     domain_clean
                 };
 
-                if self.exact_set.contains(domain_str) {
+                if compiled.exact_set.contains(domain_str) {
                     return true;
                 }
 
                 // O(L) Suffix lookup
-                if self.suffix_set.contains(domain_str) {
+                if compiled.suffix_set.contains(domain_str) {
                     return true;
                 }
 
                 let mut current = domain_str;
                 while let Some(dot_idx) = current.find('.') {
                     current = &current[dot_idx + 1..];
-                    if self.suffix_set.contains(current) {
+                    if compiled.suffix_set.contains(current) {
                         return true;
                     }
                 }
 
                 // Keyword scan
-                if !self.keyword_list.is_empty()
-                    && self.keyword_list.iter().any(|k| domain_str.contains(k))
+                if !compiled.keyword_list.is_empty()
+                    && compiled.keyword_list.iter().any(|k| domain_str.contains(k))
                 {
                     return true;
                 }
