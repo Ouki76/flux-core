@@ -1,6 +1,6 @@
 use crate::api::TrafficMeter;
 use async_trait::async_trait;
-use flux_common::copy::copy_bidirectional;
+use flux_common::copy::copy_bidirectional_pooled;
 use flux_router::Router;
 use flux_types::{
     BoxedStream, Dispatcher, FluxError, FluxResult, Outbound, OutboundLookup, PacketEndpoint,
@@ -203,7 +203,9 @@ impl Dispatcher for DefaultDispatcher {
                 (inbound_stream, outbound_stream)
             };
 
-            let copy_fut = copy_bidirectional(inbound_stream, outbound_stream);
+            let mut inbound_stream = inbound_stream;
+            let mut outbound_stream = outbound_stream;
+            let copy_fut = copy_bidirectional_pooled(&mut inbound_stream, &mut outbound_stream);
             let _ = if let (Some(c), Some(rx)) = (&conn, &mut cancel_rx) {
                 tokio::select! {
                     res = copy_fut => res,
@@ -280,7 +282,12 @@ impl Dispatcher for DefaultDispatcher {
                     let tag: Arc<str> = self.router.route(&effective_meta).into();
                     let dest = effective_meta.destination.clone();
                     if route_cache.len() >= MAX_ROUTE_CACHE_ENTRIES {
-                        route_cache.clear();
+                        // Evict a single arbitrary entry instead of flushing the whole
+                        // cache: a full clear would re-run the rule engine for every
+                        // known destination on the next packet (thundering herd).
+                        if let Some(key) = route_cache.keys().next().cloned() {
+                            route_cache.remove(&key);
+                        }
                     }
                     route_cache.insert(packet.destination.clone(), (tag.clone(), dest.clone()));
                     (tag, dest)
@@ -321,13 +328,19 @@ impl Dispatcher for DefaultDispatcher {
                 let reply_tx = packet_tx.clone();
                 let meter_recv = meter.clone();
                 let token = cancel_token.clone();
+                let client_addr = flux_types::TargetAddress::Ip(meta.source);
                 tokio::spawn(async move {
                     loop {
                         tokio::select! {
                             _ = token.cancelled() => break,
                             res = ep_recv.recv_packet() => match res {
-                                Ok(reply) => {
+                                Ok(mut reply) => {
                                     let r_len = reply.payload.len() as u64;
+                                    // Normalize reply addressing: some endpoints (e.g. direct)
+                                    // report destination = responder instead of the original
+                                    // client. Transparent inbounds (TUN/TPROXY/WireGuard) need
+                                    // destination = client to route the inner reply packet back.
+                                    reply.destination = client_addr.clone();
                                     if reply_tx.send(reply).await.is_err() {
                                         break;
                                     }

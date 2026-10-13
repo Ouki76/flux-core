@@ -289,7 +289,8 @@ fn open_tun_device(name: &str) -> std::io::Result<std::os::fd::OwnedFd> {
 // accepted connections/UDP flows to the dispatcher.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+// Portable smoltcp userspace stack: the channel-driven core (`run_stack_channels`)
+// works on every platform; only the TUN fd pump (`run_stack`) is Unix-gated.
 mod smol_stack {
     use super::{TCP_SYN, parse_ip_packet};
     use bytes::Bytes;
@@ -519,39 +520,21 @@ mod smol_stack {
         addr.into()
     }
 
-    /// Runs the smoltcp stack actor. Owns the Interface and SocketSet; all socket
-    /// manipulation happens on this single task (no locking required).
-    #[allow(clippy::too_many_arguments)]
+    /// Runs the smoltcp stack actor over the TUN file descriptor.
+    /// Spawns fd reader/writer pump tasks and delegates to the channel-driven core.
+    #[cfg(unix)]
     pub(super) async fn run_stack(
         afd: Arc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
         mtu: usize,
         tag: Arc<str>,
         dispatcher: Arc<dyn Dispatcher>,
         running: Arc<AtomicBool>,
-        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
-        let start = Instant::now();
-        let mut device = TunDevice {
-            rxq: VecDeque::with_capacity(64),
-            txq: VecDeque::with_capacity(64),
-            mtu,
-        };
-        let config = Config::new(HardwareAddress::Ip);
-        let mut iface = Interface::new(config, &mut device, SmolInstant::ZERO);
-        // AnyIP: treat every destination address as local (transparent capture).
-        iface.set_any_ip(true);
-        iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(Ipv4Address::new(198, 18, 0, 1).into(), 32));
-            let _ = addrs.push(IpCidr::new(
-                Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).into(),
-                128,
-            ));
-        });
-
-        let mut sockets = SocketSet::new(vec![]);
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUN_OUT_CAP);
+        let (tun_out_tx, tun_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUN_OUT_CAP);
 
         // TUN reader task → frames into the actor.
-        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUN_OUT_CAP);
         {
             let afd = afd.clone();
             let running = running.clone();
@@ -592,11 +575,11 @@ mod smol_stack {
         }
 
         // Actor → TUN writer task.
-        let (tun_out_tx, mut tun_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUN_OUT_CAP);
         {
             let afd = afd.clone();
             let running = running.clone();
             tokio::spawn(async move {
+                let mut tun_out_rx = tun_out_rx;
                 while running.load(Ordering::Relaxed) {
                     let Some(pkt) = tun_out_rx.recv().await else {
                         break;
@@ -624,6 +607,42 @@ mod smol_stack {
             });
         }
 
+        run_stack_channels(mtu, tag, dispatcher, shutdown_rx, frame_rx, tun_out_tx).await;
+    }
+
+    /// Channel-driven smoltcp stack actor core. Owns the Interface and SocketSet;
+    /// all socket manipulation happens on this single task (no locking required).
+    ///
+    /// Transport-agnostic: consumed both by the TUN inbound (via fd pump tasks) and
+    /// by the WireGuard inbound (via encrypted tunnel packets).
+    pub(crate) async fn run_stack_channels(
+        mtu: usize,
+        tag: Arc<str>,
+        dispatcher: Arc<dyn Dispatcher>,
+        mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        mut frame_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        stack_out_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
+        let start = Instant::now();
+        let mut device = TunDevice {
+            rxq: VecDeque::with_capacity(64),
+            txq: VecDeque::with_capacity(64),
+            mtu,
+        };
+        let config = Config::new(HardwareAddress::Ip);
+        let mut iface = Interface::new(config, &mut device, SmolInstant::ZERO);
+        // AnyIP: treat every destination address as local (transparent capture).
+        iface.set_any_ip(true);
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(Ipv4Address::new(198, 18, 0, 1).into(), 32));
+            let _ = addrs.push(IpCidr::new(
+                Ipv6Address::new(0xfd00, 0, 0, 0, 0, 0, 0, 1).into(),
+                128,
+            ));
+        });
+
+        let mut sockets = SocketSet::new(vec![]);
+
         let (cmd_tx, mut cmd_rx) = futures_channel::mpsc::channel::<StackCmd>(CMD_CHANNEL_CAP);
 
         // port → listening socket
@@ -643,10 +662,57 @@ mod smol_stack {
             )
         }
 
+        // Frame/command captured by the idle select arms; must be fed into the
+        // stack on the next iteration instead of being silently dropped.
+        let mut pending_frame: Option<Vec<u8>> = None;
+        let mut pending_cmd: Option<StackCmd> = None;
+
         loop {
             // ---- 1. Feed pending inbound frames into the device queue, pre-creating
             //         listener sockets for new flows.
             let mut drained = 0;
+            if let Some(frame) = pending_frame.take() {
+                drained += 1;
+                if let Some(parsed) = parse_ip_packet(&frame) {
+                    match parsed.network {
+                        NetworkType::Tcp
+                            if parsed.tcp_flags & TCP_SYN != 0
+                                && parsed.tcp_flags & 0x10 == 0 // pure SYN, no ACK
+                                && !tcp_listeners.contains_key(&parsed.dst.port()) =>
+                        {
+                            let mut sock = new_tcp_socket();
+                            if sock.listen(parsed.dst.port()).is_ok() {
+                                let h = sockets.add(sock);
+                                tcp_listeners.insert(parsed.dst.port(), h);
+                            }
+                        }
+                        NetworkType::Udp if !udp_listeners.contains_key(&parsed.dst.port()) => {
+                            let mut sock = udp::Socket::new(
+                                udp::PacketBuffer::new(
+                                    vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
+                                    vec![0u8; UDP_SOCKET_BUF],
+                                ),
+                                udp::PacketBuffer::new(
+                                    vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
+                                    vec![0u8; UDP_SOCKET_BUF],
+                                ),
+                            );
+                            if sock
+                                .bind(IpListenEndpoint {
+                                    addr: None,
+                                    port: parsed.dst.port(),
+                                })
+                                .is_ok()
+                            {
+                                let h = sockets.add(sock);
+                                udp_listeners.insert(parsed.dst.port(), h);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                device.rxq.push_back(frame);
+            }
             while drained < 512 {
                 let frame = match frame_rx.try_recv() {
                     Ok(f) => f,
@@ -695,11 +761,15 @@ mod smol_stack {
             }
 
             // ---- 2. Apply pending commands from connection tasks.
-            for _ in 0..512 {
-                let cmd = match cmd_rx.try_recv() {
-                    Ok(c) => c,
-                    Err(_) => break,
+            let mut cmds_processed = 0;
+            loop {
+                let cmd = match pending_cmd.take() {
+                    Some(c) => Some(c),
+                    None if cmds_processed < 512 => cmd_rx.try_recv().ok(),
+                    None => None,
                 };
+                let Some(cmd) = cmd else { break };
+                cmds_processed += 1;
                 match cmd {
                     StackCmd::TcpData { handle, data } => {
                         if let Some(conn) = tcp_conns.get_mut(&handle) {
@@ -763,9 +833,9 @@ mod smol_stack {
             let now = SmolInstant::from_millis(start.elapsed().as_millis() as i64);
             iface.poll(now, &mut device, &mut sockets);
 
-            // ---- 4. Emit frames to the TUN writer.
+            // ---- 4. Emit frames to the transport writer.
             while let Some(frame) = device.txq.pop_front() {
-                if tun_out_tx.try_send(frame).is_err() {
+                if stack_out_tx.try_send(frame).is_err() {
                     break; // writer channel full; try again next iteration
                 }
             }
@@ -979,8 +1049,9 @@ mod smol_stack {
 
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
-                _ = frame_rx.recv() => {}   // new frame: loop and process
-                _ = cmd_rx.next() => {}     // new command: loop and process
+                // Capture the frame so it is processed next iteration instead of dropped.
+                f = frame_rx.recv() => { pending_frame = f; }
+                c = cmd_rx.next() => { pending_cmd = c; } // keep the command for step 2
                 _ = tokio::time::sleep(wait_std) => {}
             }
         }
@@ -1217,6 +1288,9 @@ mod smol_stack_tests {
 
 #[cfg(target_os = "linux")]
 use smol_stack::run_stack;
+
+// Re-export the channel-driven stack core for the WireGuard inbound.
+pub(crate) use smol_stack::run_stack_channels;
 
 pub struct TunInbound {
     tag: String,
