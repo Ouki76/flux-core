@@ -30,8 +30,12 @@ impl FakeIpPool {
         let network: Ipv4Net = cidr.parse()?;
         let cap = NonZeroUsize::new(capacity).unwrap_or(DEFAULT_CAPACITY);
 
-        let start_ip = u32::from(network.network()) + 1;
-        let end_ip = u32::from(network.broadcast()) - 1;
+        // saturating ops guard against degenerate prefixes (/31, /32, 0.0.0.0/32)
+        // where broadcast() - 1 or network() + 1 would otherwise underflow/overflow.
+        let start_ip = u32::from(network.network()).saturating_add(1);
+        let end_ip = u32::from(network.broadcast())
+            .saturating_sub(1)
+            .max(start_ip);
 
         Ok(Self {
             network,
@@ -50,8 +54,8 @@ impl FakeIpPool {
             Ok(p) => p,
             Err(_) => {
                 let net = Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15).unwrap_or_default();
-                let start = u32::from(net.network()) + 1;
-                let end = u32::from(net.broadcast()).saturating_sub(1);
+                let start = u32::from(net.network()).saturating_add(1);
+                let end = u32::from(net.broadcast()).saturating_sub(1).max(start);
                 Self {
                     network: net,
                     start_ip: start,
@@ -100,13 +104,19 @@ impl FakeIpPool {
             guard.domain_to_ip.pop(&old_domain);
         }
 
-        // Atomically insert into both LRU caches, synchronizing evictions to prevent orphaned mappings
-        if let Some((_evicted_ip, evicted_domain)) =
+        // Atomically insert into both LRU caches, synchronizing evictions to prevent
+        // orphaned mappings. Each eviction is cross-checked: the reverse mapping is only
+        // removed when it still points at the evicted counterpart (the IP may have been
+        // re-allocated to another domain after a pool wrap-around in between).
+        if let Some((evicted_ip, evicted_domain)) =
             guard.ip_to_domain.push(ip, domain_lower.clone())
+            && guard.domain_to_ip.get(&evicted_domain) == Some(&evicted_ip)
         {
             guard.domain_to_ip.pop(&evicted_domain);
         }
-        if let Some((_evicted_domain, evicted_ip)) = guard.domain_to_ip.push(domain_lower, ip) {
+        if let Some((evicted_domain, evicted_ip)) = guard.domain_to_ip.push(domain_lower, ip)
+            && guard.ip_to_domain.get(&evicted_ip) == Some(&evicted_domain)
+        {
             guard.ip_to_domain.pop(&evicted_ip);
         }
 
@@ -161,6 +171,22 @@ mod tests {
 
         // Unknown IP returns None
         assert_eq!(pool.lookup_domain(&"1.2.3.4".parse().unwrap()), None);
+    }
+
+    #[test]
+    fn test_fakeip_degenerate_cidr_no_panic() {
+        // /32: broadcast == network, naive `broadcast - 1` would underflow.
+        // Allocation must not panic and forward/reverse maps must stay consistent.
+        let pool = FakeIpPool::new("10.9.8.7/32", 4).unwrap();
+        let ip = pool.allocate("a.example");
+        assert_eq!(
+            pool.lookup_domain(&IpAddr::V4(ip)),
+            Some("a.example".into())
+        );
+
+        // /31 must not panic either.
+        let pool31 = FakeIpPool::new("192.0.2.0/31", 4).unwrap();
+        let _ = pool31.allocate("b.example");
     }
 
     #[test]

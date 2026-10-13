@@ -241,7 +241,16 @@ impl Hysteria2Protocol {
             .read_exact(&mut status)
             .await
             .map_err(FluxError::Io)?;
+        // Cap network-controlled varint lengths to prevent remote memory exhaustion (DoS).
+        const MAX_HY2_MSG_LEN: u64 = 4096;
+        const MAX_HY2_PAD_LEN: u64 = 4096;
         let msg_len = Self::read_quic_varint(reader).await?;
+        if msg_len > MAX_HY2_MSG_LEN {
+            return Err(FluxError::Protocol {
+                protocol: "hysteria2",
+                message: format!("TCPResponse message length {} exceeds limit", msg_len),
+            });
+        }
         if msg_len > 0 {
             let mut msg_buf = vec![0u8; msg_len as usize];
             reader
@@ -250,6 +259,12 @@ impl Hysteria2Protocol {
                 .map_err(FluxError::Io)?;
         }
         let pad_len = Self::read_quic_varint(reader).await?;
+        if pad_len > MAX_HY2_PAD_LEN {
+            return Err(FluxError::Protocol {
+                protocol: "hysteria2",
+                message: format!("TCPResponse padding length {} exceeds limit", pad_len),
+            });
+        }
         if pad_len > 0 {
             let mut pad_buf = vec![0u8; pad_len as usize];
             reader
@@ -284,8 +299,17 @@ impl Hysteria2Protocol {
         reader: &mut R,
     ) -> FluxResult<TargetAddress> {
         use tokio::io::AsyncReadExt;
-        let addr_len = Self::read_quic_varint(reader).await? as usize;
-        let mut addr_buf = vec![0u8; addr_len];
+        // Cap network-controlled varint lengths to prevent remote memory exhaustion (DoS).
+        const MAX_HY2_ADDR_LEN: u64 = 2048;
+        const MAX_HY2_PAD_LEN: u64 = 4096;
+        let addr_len = Self::read_quic_varint(reader).await?;
+        if addr_len == 0 || addr_len > MAX_HY2_ADDR_LEN {
+            return Err(FluxError::Protocol {
+                protocol: "hysteria2",
+                message: format!("TCPRequest address length {} out of bounds", addr_len),
+            });
+        }
+        let mut addr_buf = vec![0u8; addr_len as usize];
         reader
             .read_exact(&mut addr_buf)
             .await
@@ -294,9 +318,15 @@ impl Hysteria2Protocol {
             protocol: "hysteria2",
             message: e.to_string(),
         })?;
-        let pad_len = Self::read_quic_varint(reader).await? as usize;
+        let pad_len = Self::read_quic_varint(reader).await?;
+        if pad_len > MAX_HY2_PAD_LEN {
+            return Err(FluxError::Protocol {
+                protocol: "hysteria2",
+                message: format!("TCPRequest padding length {} exceeds limit", pad_len),
+            });
+        }
         if pad_len > 0 {
-            let mut pad_buf = vec![0u8; pad_len];
+            let mut pad_buf = vec![0u8; pad_len as usize];
             reader
                 .read_exact(&mut pad_buf)
                 .await
@@ -547,6 +577,24 @@ mod tests {
         let (parsed_cmd, parsed_dst) = Hysteria2Protocol::parse_request_frame(&req).unwrap();
         assert_eq!(parsed_cmd, HYSTERIA2_CMD_TCP);
         assert_eq!(parsed_dst, target);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_response_oversized_msg_len_rejected() {
+        // status=0, then a 4-byte QUIC varint encoding 8192 (> MAX_HY2_MSG_LEN=4096)
+        let data = [0x00u8, 0x80, 0x00, 0x20, 0x00];
+        let mut cursor = std::io::Cursor::new(data.to_vec());
+        let res = Hysteria2Protocol::read_tcp_response(&mut cursor).await;
+        assert!(res.is_err(), "oversized message length must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_request_oversized_addr_len_rejected() {
+        // frame type 0x401 (2-byte varint: 0x40|0x04, 0x01), then addr_len varint = 8192
+        let data = [0x44u8, 0x01, 0x80, 0x00, 0x20, 0x00];
+        let mut cursor = std::io::Cursor::new(data.to_vec());
+        let res = Hysteria2Protocol::read_tcp_request(&mut cursor).await;
+        assert!(res.is_err(), "oversized address length must be rejected");
     }
 
     #[test]

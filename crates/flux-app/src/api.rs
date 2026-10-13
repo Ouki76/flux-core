@@ -439,6 +439,38 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         }
     }
 
+    // Detect cross-origin requests BEFORE any state-changing dispatch.
+    let mut has_external_origin = false;
+    for line in &lines {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("origin")
+        {
+            let orig = v.trim();
+            if !orig.starts_with("http://127.0.0.1")
+                && !orig.starts_with("http://localhost")
+                && !orig.starts_with("https://localhost")
+            {
+                has_external_origin = true;
+            }
+            break;
+        }
+    }
+
+    // CSRF & Cross-Origin protection: reject cross-origin requests from external websites if no secret is configured
+    // or if attempting query-string authentication from an untrusted origin.
+    // This MUST run before dispatch: state-changing endpoints (DELETE connections, outbound select,
+    // delay probes) would otherwise execute even though the response is rejected afterwards.
+    if (sec.is_none() || (!query_str.is_empty() && query_str.contains("token=")))
+        && has_external_origin
+        && method != "OPTIONS"
+    {
+        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"cross-origin access without Authorization header is forbidden\"}";
+        let _ = socket.write_all(resp.as_bytes()).await;
+        let _ = socket.flush().await;
+        let _ = socket.shutdown().await;
+        return;
+    }
+
     let (status, body) = if method == "OPTIONS" {
         ("200 OK", String::new())
     } else if !is_authorized {
@@ -687,7 +719,7 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                         }
                     }
                 }
-                let (target_addr, host_header, req_path, _is_tls) =
+                let (target_addr, host_header, req_path, is_tls) =
                     flux_types::parse_probe_url(&test_url);
                 let is_forbidden = match &target_addr {
                     TargetAddress::Ip(addr) => is_private_or_restricted_ip(addr.ip()),
@@ -728,39 +760,24 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                         json!({ "error": "forbidden probe destination" }).to_string(),
                     )
                 } else {
-                    let dummy_src = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
-                    let meta =
-                        SessionMeta::new(dummy_src, target_addr, "delay-test", NetworkType::Tcp);
-                    let start = Instant::now();
-                    let dial_fut = out.dial_stream(&meta);
-                    let probe_res = match tokio::time::timeout(
+                    // Reuse the shared probe implementation: it performs a real TLS
+                    // handshake for https:// URLs, matching UrlTest group behavior.
+                    let probe_res = flux_outbound::probe::probe_outbound(
+                        &out,
+                        &target_addr,
+                        &host_header,
+                        &req_path,
+                        is_tls,
+                        "api-delay-test",
                         Duration::from_millis(timeout_ms),
-                        dial_fut,
                     )
-                    .await
-                    {
-                        Ok(Ok(mut stream)) => {
-                            let req = format!(
-                                "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: flux-core-probe\r\nConnection: close\r\n\r\n",
-                                req_path, host_header
-                            );
-                            let ping_fut = async {
-                                stream.write_all(req.as_bytes()).await?;
-                                let mut b = [0u8; 16];
-                                stream.read(&mut b).await
-                            };
-                            match tokio::time::timeout(Duration::from_millis(timeout_ms), ping_fut)
-                                .await
-                            {
-                                Ok(Ok(n)) if n > 0 => Ok(start.elapsed().as_millis() as u64),
-                                _ => Err("read timeout"),
-                            }
-                        }
-                        _ => Err("dial timeout"),
-                    };
+                    .await;
                     match probe_res {
-                        Ok(delay) => ("200 OK", json!({ "delay": delay }).to_string()),
-                        Err(_) => (
+                        Some(delay) => (
+                            "200 OK",
+                            json!({ "delay": delay.as_millis() as u64 }).to_string(),
+                        ),
+                        None => (
                             "504 Gateway Timeout",
                             json!({ "error": "timeout" }).to_string(),
                         ),
@@ -867,34 +884,6 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     } else {
         ("404 Not Found", json!({"error": "not found"}).to_string())
     };
-
-    let mut has_external_origin = false;
-    for line in &lines {
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("origin")
-        {
-            let orig = v.trim();
-            if !orig.starts_with("http://127.0.0.1")
-                && !orig.starts_with("http://localhost")
-                && !orig.starts_with("https://localhost")
-            {
-                has_external_origin = true;
-            }
-            break;
-        }
-    }
-
-    // CSRF & Cross-Origin protection: reject cross-origin requests from external websites if no secret is configured
-    // or if attempting query-string authentication from an untrusted origin
-    if (sec.is_none() || (!query_str.is_empty() && query_str.contains("token=")))
-        && has_external_origin
-    {
-        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"cross-origin access without Authorization header is forbidden\"}";
-        let _ = socket.write_all(resp.as_bytes()).await;
-        let _ = socket.flush().await;
-        let _ = socket.shutdown().await;
-        return;
-    }
 
     let cors_header = if has_external_origin {
         ""

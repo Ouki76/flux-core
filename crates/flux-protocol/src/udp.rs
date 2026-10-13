@@ -141,14 +141,6 @@ pub fn encode_trojan_udp(packet: &UdpPacket) -> Bytes {
     buf.freeze()
 }
 
-/// Encodes a VLESS UDP packet: `[Length (2 bytes BE)] + [Payload]`.
-pub fn encode_vless_udp(payload: &[u8]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(2 + payload.len());
-    buf.put_u16(payload.len() as u16);
-    buf.put_slice(payload);
-    buf.freeze()
-}
-
 /// Encodes a standard VLESS UDP packet: `[Address] + [Length (2 bytes BE)] + [Payload]`.
 pub fn encode_vless_udp_packet(packet: &UdpPacket) -> Bytes {
     let mut buf = BytesMut::with_capacity(32 + packet.payload.len());

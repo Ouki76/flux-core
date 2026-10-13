@@ -239,7 +239,8 @@ impl DnsResolver {
         };
 
         let result = shared.await;
-        // The query future already wrote the cache on success; drop the inflight entry.
+        // Drop the inflight entry so future lookups start a fresh upstream query
+        // (the cache below absorbs the thundering herd after success).
         self.inner.inflight.remove(&domain_lower);
 
         let (ip, ttl) = result.map_err(|arc_err| match Arc::try_unwrap(arc_err) {
@@ -361,10 +362,26 @@ impl DnsResolver {
             doq.query_doq(domain, ecs, qtype).await
         } else {
             let default_dns = SocketAddr::from(([1, 1, 1, 1], 53));
-            let srv_addr: SocketAddr = if server.contains(':') {
-                server.parse().unwrap_or(default_dns)
+            let parsed: Option<SocketAddr> = if server.contains(':') {
+                server.parse().ok()
             } else {
-                format!("{}:53", server).parse().unwrap_or(default_dns)
+                format!("{}:53", server).parse().ok()
+            };
+            let srv_addr = match parsed {
+                Some(a) => a,
+                None => {
+                    // Never silently reroute DNS to a hardcoded resolver: misconfiguration
+                    // must be visible instead of leaking queries to an unexpected upstream.
+                    tracing::error!(
+                        "invalid upstream DNS server address '{}'; refusing silent fallback to {}",
+                        server,
+                        default_dns
+                    );
+                    return Err(FluxError::Config(format!(
+                        "invalid upstream DNS server address: '{}'",
+                        server
+                    )));
+                }
             };
             self.query_upstream_udp(srv_addr, domain, ecs, qtype).await
         }
@@ -511,6 +528,15 @@ mod tests {
         assert!(resolver.inner.rules[0].matches("internal.corp"));
         assert!(!resolver.inner.rules[0].matches("notinternal.corp"));
         assert!(!resolver.inner.rules[0].matches("internal.corp.evil.com"));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_upstream_server_errors_instead_of_silent_fallback() {
+        // A malformed server address must produce an explicit error rather than
+        // silently rerouting DNS queries to a hardcoded 1.1.1.1 upstream.
+        let resolver = DnsResolver::new(None).with_servers(vec!["not a valid addr".into()]);
+        let res = resolver.resolve_domain("example.com", 80).await;
+        assert!(res.is_err());
     }
 
     #[test]
