@@ -502,6 +502,54 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             "inbounds_count": inbs.len()
         });
         ("200 OK", data.to_string())
+    } else if path_clean == "/api/v1/metrics" && method == "GET" {
+        // Prometheus text exposition format (v0.0.4).
+        let up_total = met.upload_total.load(Ordering::Relaxed);
+        let down_total = met.download_total.load(Ordering::Relaxed);
+        let up_speed = met.upload_speed.load(Ordering::Relaxed);
+        let down_speed = met.download_speed.load(Ordering::Relaxed);
+        let active = met.connections.len();
+        let body = format!(
+            "# HELP flux_uptime_seconds Process uptime in seconds.\n\
+             # TYPE flux_uptime_seconds gauge\n\
+             flux_uptime_seconds {}\n\
+             # HELP flux_active_connections Currently tracked active connections.\n\
+             # TYPE flux_active_connections gauge\n\
+             flux_active_connections {}\n\
+             # HELP flux_upload_bytes_total Total bytes uploaded since start.\n\
+             # TYPE flux_upload_bytes_total counter\n\
+             flux_upload_bytes_total {}\n\
+             # HELP flux_download_bytes_total Total bytes downloaded since start.\n\
+             # TYPE flux_download_bytes_total counter\n\
+             flux_download_bytes_total {}\n\
+             # HELP flux_upload_speed_bps Current upload throughput in bytes/sec.\n\
+             # TYPE flux_upload_speed_bps gauge\n\
+             flux_upload_speed_bps {}\n\
+             # HELP flux_download_speed_bps Current download throughput in bytes/sec.\n\
+             # TYPE flux_download_speed_bps gauge\n\
+             flux_download_speed_bps {}\n\
+             # HELP flux_outbounds_configured Configured outbound count.\n\
+             # TYPE flux_outbounds_configured gauge\n\
+             flux_outbounds_configured {}\n\
+             # HELP flux_inbounds_active Running inbound listener count.\n\
+             # TYPE flux_inbounds_active gauge\n\
+             flux_inbounds_active {}\n\
+             # HELP flux_build_info Build and version metadata.\n\
+             # TYPE flux_build_info gauge\n\
+             flux_build_info{{version=\"{}\", target=\"{}\", os=\"{}\"}} 1\n",
+            start_time.elapsed().as_secs(),
+            active,
+            up_total,
+            down_total,
+            up_speed,
+            down_speed,
+            reg.map.len(),
+            inbs.len(),
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+        );
+        ("200 OK", body)
     } else if path_clean == "/api/v1/traffic" && method == "GET" {
         // Flux Core Traffic API
         let data = json!({
@@ -891,9 +939,15 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, PUT, POST, DELETE, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n"
     };
 
+    let content_type = if path_clean == "/api/v1/metrics" {
+        "text/plain; version=0.0.4; charset=utf-8"
+    } else {
+        "application/json"
+    };
     let response = format!(
-        "HTTP/1.1 {}\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
         status,
+        content_type,
         cors_header,
         body.len(),
         body

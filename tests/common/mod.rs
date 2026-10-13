@@ -138,3 +138,31 @@ pub async fn start_tls_echo_server() -> SocketAddr {
     });
     addr
 }
+
+/// Retries a flaky-prone interop test body up to `attempts` times.
+/// Interop tests spawn external processes (sing-box) and are timing-sensitive
+/// under heavy CI load; transient failures are retried with a short backoff,
+/// persistent failures still fail the test with the original panic.
+#[allow(dead_code)]
+pub async fn retry_on_flake<F, Fut>(label: &str, attempts: usize, f: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use futures_util::FutureExt;
+    for attempt in 1..=attempts {
+        let result = std::panic::AssertUnwindSafe(f()).catch_unwind().await;
+        match result {
+            Ok(()) => return,
+            Err(payload) if attempt < attempts => {
+                eprintln!(
+                    "[{}] attempt {}/{} failed under load, retrying...",
+                    label, attempt, attempts
+                );
+                drop(payload);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+}

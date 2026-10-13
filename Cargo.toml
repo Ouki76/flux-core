@@ -112,6 +112,7 @@ x25519-dalek = { workspace = true }
 rand = { workspace = true }
 criterion = { workspace = true }
 rcgen = { workspace = true }
+futures-util = { workspace = true }
 
 [[bench]]
 name = "throughput"

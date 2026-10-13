@@ -478,3 +478,40 @@ async fn test_api_csrf_rejected_before_dispatch() {
 
     instance.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_api_prometheus_metrics() {
+    let api_port = get_free_tcp_port().await;
+    let raw_config = format!(
+        r#"{{
+            "api": {{ "listen": "127.0.0.1:{}", "secret": "metrics-secret" }},
+            "outbounds": [{{ "type": "direct", "tag": "direct" }}]
+        }}"#,
+        api_port
+    );
+    let cfg = Config::from_json_str(&raw_config).unwrap();
+    let instance = Instance::new(cfg).unwrap();
+    instance.start().await.unwrap();
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", api_port))
+        .await
+        .unwrap();
+    stream
+        .write_all(b"GET /api/v1/metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer metrics-secret\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 8192];
+    let n = stream.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    assert!(resp.contains("200 OK"));
+    assert!(resp.contains("text/plain; version=0.0.4"));
+    assert!(resp.contains("flux_uptime_seconds"));
+    assert!(resp.contains("flux_active_connections"));
+    assert!(resp.contains("flux_upload_bytes_total"));
+    assert!(resp.contains("flux_download_bytes_total"));
+    assert!(resp.contains("flux_build_info{"));
+    assert!(resp.contains("flux_outbounds_configured 1"));
+
+    instance.stop().await.unwrap();
+}

@@ -664,6 +664,11 @@ pub struct RuleSetConfig {
     /// Optional periodic refresh interval for remote rule sets (e.g. "24h", "30m").
     #[serde(default)]
     pub update_interval: Option<String>,
+    /// Optional disk cache file for remote rule sets: the last successfully
+    /// fetched content is applied instantly at startup, before any network
+    /// fetch completes. Default: $XDG_CACHE_HOME/flux-core/rulesets/<tag>-<urlhash>.txt
+    #[serde(default)]
+    pub cache_path: Option<String>,
     #[serde(default)]
     pub ip_cidr: Vec<String>,
     #[serde(default)]

@@ -149,3 +149,88 @@ async fn test_remote_ruleset_fetch_failure_is_non_fatal() {
 
     instance.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_remote_ruleset_disk_cache_survives_restart() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("rs-cache.txt");
+    let rs_port = start_ruleset_http_server("DOMAIN-SUFFIX,cached-domain.com\n").await;
+
+    let make_config = |port: u16| {
+        format!(
+            r#"{{
+                "outbounds": [
+                    {{ "type": "direct", "tag": "direct" }},
+                    {{ "type": "block", "tag": "block" }}
+                ],
+                "route": {{
+                    "rule_set": [
+                        {{
+                            "tag": "cached-rs",
+                            "type": "remote",
+                            "path": "http://127.0.0.1:{}/rules.txt",
+                            "cache_path": "{}"
+                        }}
+                    ],
+                    "rules": [
+                        {{ "rule_set": ["cached-rs"], "outbound": "block" }}
+                    ],
+                    "final": "direct"
+                }}
+            }}"#,
+            port,
+            cache_path.display()
+        )
+    };
+
+    // Phase 1: live server — fetch populates the cache file.
+    {
+        let cfg = Config::from_json_str(&make_config(rs_port)).unwrap();
+        let instance = Instance::new(cfg).unwrap();
+        instance.start().await.unwrap();
+
+        let meta = SessionMeta::new(
+            "127.0.0.1:1000".parse().unwrap(),
+            TargetAddress::domain("www.cached-domain.com", 443),
+            "test",
+            NetworkType::Tcp,
+        );
+        let mut ok = false;
+        for _ in 0..100 {
+            if instance.router.route(&meta) == "block" {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(ok, "remote ruleset must load from the live server");
+        instance.stop().await.unwrap();
+    }
+
+    assert!(
+        std::fs::metadata(&cache_path).is_ok(),
+        "cache file must be written after a successful fetch"
+    );
+
+    // Phase 2: server down (bind a port and immediately drop it) — the
+    // ruleset must match instantly from the disk cache at startup.
+    let dead_port = get_free_tcp_port().await;
+    {
+        let cfg = Config::from_json_str(&make_config(dead_port)).unwrap();
+        let instance = Instance::new(cfg).unwrap();
+        // NO start() fetch needed: cache is applied in Instance::new.
+        let meta = SessionMeta::new(
+            "127.0.0.1:1000".parse().unwrap(),
+            TargetAddress::domain("www.cached-domain.com", 443),
+            "test",
+            NetworkType::Tcp,
+        );
+        assert_eq!(
+            instance.router.route(&meta),
+            "block",
+            "ruleset must match from disk cache without network"
+        );
+        instance.start().await.unwrap();
+        instance.stop().await.unwrap();
+    }
+}

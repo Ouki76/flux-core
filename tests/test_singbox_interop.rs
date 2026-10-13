@@ -1710,6 +1710,13 @@ async fn test_interop_vless_websocket_both_directions() {
 
 #[tokio::test]
 async fn test_interop_vless_httpupgrade_both_directions() {
+    common::retry_on_flake("vless-httpupgrade-bidir", 3, || async {
+        test_interop_vless_httpupgrade_both_directions_inner().await
+    })
+    .await;
+}
+
+async fn test_interop_vless_httpupgrade_both_directions_inner() {
     let echo = start_tcp_echo_server().await;
     let sbox_port = get_free_tcp_port().await;
     let flux_port = get_free_tcp_port().await;

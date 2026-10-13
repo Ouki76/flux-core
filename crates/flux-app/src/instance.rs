@@ -51,6 +51,14 @@ impl OutboundLookup for OutboundRegistry {
     }
 }
 
+/// A remote (URL-fetched) rule set registered for background fetching.
+struct RemoteRuleSetSpec {
+    ruleset: Arc<flux_router::RuleSet>,
+    url: String,
+    interval: Option<Duration>,
+    cache_path: Option<std::path::PathBuf>,
+}
+
 pub struct Instance {
     pub inbounds: Vec<Arc<dyn Inbound>>,
     pub registry: Arc<OutboundRegistry>,
@@ -59,8 +67,8 @@ pub struct Instance {
     pub meter: Arc<TrafficMeter>,
     pub api_server: Option<Arc<ApiServer>>,
     pub resolver: Arc<DnsResolver>,
-    /// Remote rule sets to fetch in the background: (ruleset, url, refresh interval).
-    remote_rulesets: Vec<(Arc<flux_router::RuleSet>, String, Option<Duration>)>,
+    /// Remote rule sets to fetch in the background.
+    remote_rulesets: Vec<RemoteRuleSetSpec>,
     /// Cancel handle for background fetch loops (SIGHUP reload / shutdown safe).
     fetch_cancel: tokio_util::sync::CancellationToken,
 }
@@ -239,8 +247,7 @@ impl Instance {
             config.route
         {
             let mut reg = flux_router::RuleSetRegistry::new();
-            let mut remote_specs: Vec<(Arc<flux_router::RuleSet>, String, Option<Duration>)> =
-                Vec::new();
+            let mut remote_specs: Vec<RemoteRuleSetSpec> = Vec::new();
             for rs_cfg in route_cfg.rule_set {
                 // Auto-detect remote rule sets: explicit type=remote or an http(s) URL path.
                 let is_remote = rs_cfg.set_type.as_deref() == Some("remote")
@@ -297,8 +304,32 @@ impl Instance {
                     // Remote rule sets start empty (never-matching) and are populated
                     // asynchronously; a failed fetch must not break instance startup.
                     reg.insert(rs).map_err(flux_types::FluxError::Config)?;
+                    // Disk cache: apply the last successfully fetched content
+                    // immediately, before any network round-trip.
+                    let cache_path = rs_cfg
+                        .cache_path
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| Some(default_ruleset_cache_path(&rs_tag, &url)));
+                    if let Some(cp) = &cache_path
+                        && let Ok(cached) = std::fs::read_to_string(cp)
+                        && let Some(arc_rs) = reg.get(&rs_tag)
+                    {
+                        arc_rs.apply_content(&cached);
+                        tracing::info!(
+                            "remote rule set '{}' restored from cache {} ({} bytes)",
+                            rs_tag,
+                            cp.display(),
+                            cached.len()
+                        );
+                    }
                     if let Some(arc_rs) = reg.get(&rs_tag) {
-                        remote_specs.push((arc_rs, url, interval));
+                        remote_specs.push(RemoteRuleSetSpec {
+                            ruleset: arc_rs,
+                            url,
+                            interval,
+                            cache_path,
+                        });
                     }
                     continue;
                 }
@@ -544,10 +575,11 @@ impl Instance {
     /// A fetch failure is logged and retried on the next interval (or once,
     /// when no `update_interval` is configured); it never breaks routing.
     fn spawn_remote_ruleset_fetchers(&self) {
-        for (rs, url, interval) in &self.remote_rulesets {
-            let rs = rs.clone();
-            let url = url.clone();
-            let interval = *interval;
+        for spec in &self.remote_rulesets {
+            let rs = spec.ruleset.clone();
+            let url = spec.url.clone();
+            let interval = spec.interval;
+            let cache_path = spec.cache_path.clone();
             let resolver = self.resolver.clone();
             let cancel = self.fetch_cancel.clone();
             tokio::spawn(async move {
@@ -560,6 +592,19 @@ impl Instance {
                     match result {
                         Ok(content) => {
                             rs.apply_content(&content);
+                            if let Some(cp) = &cache_path {
+                                if let Some(parent) = cp.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                if let Err(e) = std::fs::write(cp, &content) {
+                                    tracing::warn!(
+                                        "remote rule set '{}': failed to write cache {}: {}",
+                                        rs.tag,
+                                        cp.display(),
+                                        e
+                                    );
+                                }
+                            }
                             tracing::info!(
                                 "remote rule set '{}' loaded from {} ({} bytes)",
                                 rs.tag,
@@ -603,6 +648,25 @@ impl Instance {
         self.fetch_cancel.cancel();
         Ok(())
     }
+}
+
+/// Default disk cache path for a remote rule set:
+/// `$XDG_CACHE_HOME/flux-core/rulesets/<tag>-<url-hash>.txt` (or `~/.cache/...`).
+fn default_ruleset_cache_path(tag: &str, url: &str) -> std::path::PathBuf {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    url.hash(&mut h);
+    let base = std::env::var("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                .unwrap_or_else(|_| std::env::temp_dir())
+        });
+    base.join("flux-core")
+        .join("rulesets")
+        .join(format!("{}-{:016x}.txt", tag, h.finish()))
 }
 
 fn parse_duration(s: &str) -> Option<Duration> {
@@ -1194,6 +1258,7 @@ fn build_layered_inbound(
 ) -> FluxResult<()> {
     let tag = node.tag;
     let (addr, is_udp) = parse_inbound_carrier(&node.carrier)?;
+    let rate_limiter = node.rate_limit.as_ref().map(|c| c.build());
 
     if is_udp {
         match node.protocol {
@@ -1213,9 +1278,11 @@ fn build_layered_inbound(
                     .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
                 let certs = vec![CertificateDer::from(cert.cert)];
                 let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-                inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new(
-                    tag, addr, password, certs, key,
-                )));
+                let mut ib = flux_inbound::Hysteria2Inbound::new(tag, addr, password, certs, key);
+                if let Some(rl) = rate_limiter.clone() {
+                    ib = ib.with_rate_limiter(rl);
+                }
+                inbounds.push(Arc::new(ib));
                 return Ok(());
             }
             ProtocolConfig::Tuic { uuid, password, .. } => {
@@ -1225,14 +1292,18 @@ fn build_layered_inbound(
                     .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
                 let certs = vec![CertificateDer::from(cert.cert)];
                 let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-                inbounds.push(Arc::new(flux_inbound::TuicInbound::new(
+                let mut ib = flux_inbound::TuicInbound::new(
                     tag,
                     addr,
                     vec![parsed_uuid],
                     password,
                     certs,
                     key,
-                )));
+                );
+                if let Some(rl) = rate_limiter.clone() {
+                    ib = ib.with_rate_limiter(rl);
+                }
+                inbounds.push(Arc::new(ib));
                 return Ok(());
             }
             _ => {
@@ -1247,7 +1318,6 @@ fn build_layered_inbound(
     let securities = compile_server_securities(node.security)?;
     let framings = compile_server_framings(node.framing)?;
     let pipeline = flux_transport::pipeline::ServerTransportPipeline::new(securities, framings);
-    let rate_limiter = node.rate_limit.as_ref().map(|c| c.build());
 
     match node.protocol {
         ProtocolConfig::Vless { uuid, .. } => {
@@ -1325,13 +1395,19 @@ fn build_layered_inbound(
                     .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
                 let certs = vec![CertificateDer::from(cert.cert)];
                 let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-                inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new(
-                    tag, addr, password, certs, key,
-                )));
+                let mut ib = flux_inbound::Hysteria2Inbound::new(tag, addr, password, certs, key);
+                if let Some(rl) = rate_limiter.clone() {
+                    ib = ib.with_rate_limiter(rl);
+                }
+                inbounds.push(Arc::new(ib));
             } else {
-                inbounds.push(Arc::new(flux_inbound::Hysteria2Inbound::new_with_pipeline(
+                let mut ib = flux_inbound::Hysteria2Inbound::new_with_pipeline(
                     tag, addr, password, pipeline,
-                )));
+                );
+                if let Some(rl) = rate_limiter.clone() {
+                    ib = ib.with_rate_limiter(rl);
+                }
+                inbounds.push(Arc::new(ib));
             }
         }
         ProtocolConfig::Tuic { uuid, password, .. } => {
@@ -1342,22 +1418,30 @@ fn build_layered_inbound(
                     .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
                 let certs = vec![CertificateDer::from(cert.cert)];
                 let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-                inbounds.push(Arc::new(flux_inbound::TuicInbound::new(
+                let mut ib = flux_inbound::TuicInbound::new(
                     tag,
                     addr,
                     vec![parsed_uuid],
                     password,
                     certs,
                     key,
-                )));
+                );
+                if let Some(rl) = rate_limiter.clone() {
+                    ib = ib.with_rate_limiter(rl);
+                }
+                inbounds.push(Arc::new(ib));
             } else {
-                inbounds.push(Arc::new(flux_inbound::TuicInbound::new_with_pipeline(
+                let mut ib = flux_inbound::TuicInbound::new_with_pipeline(
                     tag,
                     addr,
                     vec![parsed_uuid],
                     password,
                     pipeline,
-                )));
+                );
+                if let Some(rl) = rate_limiter.clone() {
+                    ib = ib.with_rate_limiter(rl);
+                }
+                inbounds.push(Arc::new(ib));
             }
         }
     }

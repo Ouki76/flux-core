@@ -22,6 +22,7 @@ pub struct TuicInbound {
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     pipeline: Option<flux_transport::pipeline::ServerTransportPipeline>,
+    rate_limiter: Option<Arc<flux_common::RateLimiter>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -44,9 +45,15 @@ impl TuicInbound {
             certs,
             key,
             pipeline: None,
+            rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
+    }
+
+    pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
+        self.rate_limiter = Some(rl);
+        self
     }
 
     pub fn new_with_pipeline(
@@ -65,6 +72,7 @@ impl TuicInbound {
             certs: vec![],
             key: PrivateKeyDer::Pkcs8(vec![].into()),
             pipeline: Some(pipeline),
+            rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -238,6 +246,7 @@ impl Inbound for TuicInbound {
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let users = Arc::new(self.users.clone());
         let password = Arc::new(self.password.clone());
+        let rate_limiter = self.rate_limiter.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!(
@@ -255,12 +264,29 @@ impl Inbound for TuicInbound {
                     _ = shutdown_rx.recv() => break,
                 };
 
+                // Rate limiting at the QUIC connection attempt level.
+                let conn_guard = match &rate_limiter {
+                    Some(rl) => match rl.try_acquire(incoming.remote_address().ip()) {
+                        Some(g) => Some(g),
+                        None => {
+                            debug!(
+                                "[{}] QUIC connection from {} rejected by rate limiter",
+                                tag,
+                                incoming.remote_address()
+                            );
+                            continue; // drop the Incoming: quinn refuses the handshake
+                        }
+                    },
+                    None => None,
+                };
+
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
                 let user_list = users.clone();
                 let pw = password.clone();
 
                 tokio::spawn(async move {
+                    let _conn_guard = conn_guard; // held for the QUIC connection lifetime
                     let conn = match incoming.await {
                         Ok(c) => c,
                         Err(e) => {
