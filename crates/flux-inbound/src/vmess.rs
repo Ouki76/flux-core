@@ -4,7 +4,7 @@ use flux_types::{Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 pub struct VmessInbound {
@@ -12,6 +12,7 @@ pub struct VmessInbound {
     listen_addr: SocketAddr,
     users: Vec<Uuid>,
     pipeline: flux_transport::pipeline::ServerTransportPipeline,
+    rate_limiter: Option<Arc<flux_common::RateLimiter>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -29,9 +30,15 @@ impl VmessInbound {
             listen_addr,
             users,
             pipeline,
+            rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
+    }
+
+    pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
+        self.rate_limiter = Some(rl);
+        self
     }
 }
 
@@ -57,6 +64,7 @@ impl Inbound for VmessInbound {
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let users = Arc::new(self.users.clone());
         let pipeline = self.pipeline.clone();
+        let rate_limiter = self.rate_limiter.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] VMess inbound listening on {}", tag, self.listen_addr);
@@ -76,6 +84,20 @@ impl Inbound for VmessInbound {
                     _ = shutdown_rx.recv() => break,
                 };
 
+                // Rate limiting: reject before any per-connection work.
+                let conn_guard = match &rate_limiter {
+                    Some(rl) => match rl.try_acquire(client_addr.ip()) {
+                        Some(g) => Some(g),
+                        None => {
+                            debug!(
+                                "[{}] connection from {} rejected by rate limiter",
+                                tag, client_addr
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 crate::optimize_tcp_socket(&socket);
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
@@ -83,6 +105,7 @@ impl Inbound for VmessInbound {
                 let pipe = pipeline.clone();
 
                 tokio::spawn(async move {
+                    let _conn_guard = conn_guard;
                     let mut stream = match pipe.unwrap(socket).await {
                         Ok(s) => s,
                         Err(e) => {

@@ -16,6 +16,7 @@ pub struct MixedInbound {
     tag: String,
     listen_addr: SocketAddr,
     users: Vec<(String, String)>,
+    rate_limiter: Option<Arc<flux_common::RateLimiter>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -27,6 +28,7 @@ impl MixedInbound {
             tag: tag.into(),
             listen_addr,
             users: vec![],
+            rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -34,6 +36,11 @@ impl MixedInbound {
 
     pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
         self.users = users;
+        self
+    }
+
+    pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
+        self.rate_limiter = Some(rl);
         self
     }
 }
@@ -60,6 +67,7 @@ impl Inbound for MixedInbound {
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let users = Arc::new(self.users.clone());
         let listen_ip = self.listen_addr.ip();
+        let rate_limiter = self.rate_limiter.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!(
@@ -86,6 +94,20 @@ impl Inbound for MixedInbound {
                         break;
                     }
                 };
+                // Rate limiting: reject before any per-connection work.
+                let conn_guard = match &rate_limiter {
+                    Some(rl) => match rl.try_acquire(client_addr.ip()) {
+                        Some(g) => Some(g),
+                        None => {
+                            debug!(
+                                "[{}] connection from {} rejected by rate limiter",
+                                tag, client_addr
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 crate::optimize_tcp_socket(&socket);
 
                 let disp = dispatcher.clone();
@@ -93,6 +115,7 @@ impl Inbound for MixedInbound {
                 let user_list = users.clone();
 
                 tokio::spawn(async move {
+                    let _conn_guard = conn_guard;
                     // Peek the first byte to detect protocol with bounded timeout
                     let mut peek_buf = [0u8; 1];
                     let n = match tokio::time::timeout(

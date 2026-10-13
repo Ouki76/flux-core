@@ -11,6 +11,7 @@ pub struct HttpInbound {
     listen_addr: SocketAddr,
     users: Vec<(String, String)>,
     pipeline: flux_transport::pipeline::ServerTransportPipeline,
+    rate_limiter: Option<Arc<flux_common::RateLimiter>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -23,9 +24,15 @@ impl HttpInbound {
             listen_addr,
             users: vec![],
             pipeline: flux_transport::pipeline::ServerTransportPipeline::raw(),
+            rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
+    }
+
+    pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
+        self.rate_limiter = Some(rl);
+        self
     }
 
     pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
@@ -64,6 +71,7 @@ impl Inbound for HttpInbound {
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let users = Arc::new(self.users.clone());
         let pipeline = Arc::new(self.pipeline.clone());
+        let rate_limiter = self.rate_limiter.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] HTTP inbound listening on {}", tag, self.listen_addr);
@@ -87,6 +95,20 @@ impl Inbound for HttpInbound {
                         break;
                     }
                 };
+                // Rate limiting: reject before any per-connection work.
+                let conn_guard = match &rate_limiter {
+                    Some(rl) => match rl.try_acquire(client_addr.ip()) {
+                        Some(g) => Some(g),
+                        None => {
+                            debug!(
+                                "[{}] connection from {} rejected by rate limiter",
+                                tag, client_addr
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 crate::optimize_tcp_socket(&socket);
 
                 let disp = dispatcher.clone();
@@ -95,6 +117,7 @@ impl Inbound for HttpInbound {
                 let pipe = pipeline.clone();
 
                 tokio::spawn(async move {
+                    let _conn_guard = conn_guard;
                     let mut stream = match pipe.unwrap(socket).await {
                         Ok(s) => s,
                         Err(e) => {

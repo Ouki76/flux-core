@@ -11,6 +11,7 @@ pub struct TrojanInbound {
     listen_addr: SocketAddr,
     password_hashes: Vec<String>,
     pipeline: flux_transport::pipeline::ServerTransportPipeline,
+    rate_limiter: Option<Arc<flux_common::RateLimiter>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -32,9 +33,15 @@ impl TrojanInbound {
             listen_addr,
             password_hashes,
             pipeline,
+            rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
+    }
+
+    pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
+        self.rate_limiter = Some(rl);
+        self
     }
 }
 
@@ -60,6 +67,7 @@ impl Inbound for TrojanInbound {
         let tag: Arc<str> = Arc::from(self.tag.as_str());
         let hashes = self.password_hashes.clone();
         let pipeline = self.pipeline.clone();
+        let rate_limiter = self.rate_limiter.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] Trojan inbound listening on {}", tag, self.listen_addr);
@@ -83,6 +91,20 @@ impl Inbound for TrojanInbound {
                         break;
                     }
                 };
+                // Rate limiting: reject before any per-connection work.
+                let conn_guard = match &rate_limiter {
+                    Some(rl) => match rl.try_acquire(client_addr.ip()) {
+                        Some(g) => Some(g),
+                        None => {
+                            debug!(
+                                "[{}] connection from {} rejected by rate limiter",
+                                tag, client_addr
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 crate::optimize_tcp_socket(&socket);
 
                 let disp = dispatcher.clone();
@@ -91,6 +113,7 @@ impl Inbound for TrojanInbound {
                 let pipe = pipeline.clone();
 
                 tokio::spawn(async move {
+                    let _conn_guard = conn_guard;
                     let handshake_fut = async {
                         let mut stream = pipe.unwrap(socket).await?;
                         let (cmd, target) =

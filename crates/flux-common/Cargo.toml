@@ -11,3 +11,4 @@ tracing = { workspace = true }
 libc = { workspace = true }
 parking_lot = { workspace = true }
 socket2 = { workspace = true }
+dashmap = { workspace = true }

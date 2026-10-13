@@ -23,6 +23,7 @@ pub struct ShadowsocksInbound {
     cipher_kind: CipherKind,
     replay_filter: Arc<flux_protocol::shadowsocks2022::ReplayFilter>,
     pipeline: flux_transport::pipeline::ServerTransportPipeline,
+    rate_limiter: Option<Arc<flux_common::RateLimiter>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -40,9 +41,15 @@ impl ShadowsocksInbound {
             cipher_kind,
             replay_filter: Arc::new(flux_protocol::shadowsocks2022::ReplayFilter::new(10000)),
             pipeline: flux_transport::pipeline::ServerTransportPipeline::raw(),
+            rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
+    }
+
+    pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
+        self.rate_limiter = Some(rl);
+        self
     }
 
     pub fn with_cipher_kind(mut self, kind: CipherKind) -> Self {
@@ -95,6 +102,7 @@ impl Inbound for ShadowsocksInbound {
         let running_tcp = running.clone();
         let replay_tcp = replay_filter.clone();
         let pipeline_tcp = Arc::new(self.pipeline.clone());
+        let rate_limiter_tcp = self.rate_limiter.clone();
 
         tokio::spawn(async move {
             loop {
@@ -115,6 +123,20 @@ impl Inbound for ShadowsocksInbound {
                         break;
                     }
                 };
+                // Rate limiting: reject before any per-connection work.
+                let conn_guard = match &rate_limiter_tcp {
+                    Some(rl) => match rl.try_acquire(client_addr.ip()) {
+                        Some(g) => Some(g),
+                        None => {
+                            debug!(
+                                "[{}] connection from {} rejected by rate limiter",
+                                tag_tcp, client_addr
+                            );
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 crate::optimize_tcp_socket(&socket);
 
                 let disp = disp_tcp.clone();
@@ -124,6 +146,7 @@ impl Inbound for ShadowsocksInbound {
                 let master_key = master_key.clone();
 
                 tokio::spawn(async move {
+                    let _conn_guard = conn_guard;
                     let mut stream: flux_types::BoxedStream = match pipe.unwrap(socket).await {
                         Ok(s) => s,
                         Err(e) => {

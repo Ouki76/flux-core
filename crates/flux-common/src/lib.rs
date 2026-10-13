@@ -7,3 +7,6 @@ pub use buffer::*;
 pub use copy::*;
 pub use socket::*;
 pub use splice::*;
+pub mod ratelimit;
+
+pub use ratelimit::*;
