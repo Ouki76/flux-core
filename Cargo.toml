@@ -12,6 +12,7 @@ members = [
     "crates/flux-app",
 ]
 resolver = "2"
+exclude = ["fuzz"]
 
 [workspace.dependencies]
 flux-types = { path = "crates/flux-types" }

@@ -633,6 +633,7 @@ name = "flux-common"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "dashmap",
  "flux-types",
  "libc",
  "parking_lot",
@@ -706,6 +707,7 @@ dependencies = [
  "flux-types",
  "futures-channel",
  "futures-util",
+ "ipnet",
  "libc",
  "parking_lot",
  "quinn",
@@ -718,6 +720,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "uuid",
+ "x25519-dalek",
 ]
 
 [[package]]
@@ -732,12 +735,14 @@ dependencies = [
  "flux-protocol",
  "flux-transport",
  "flux-types",
+ "futures-channel",
  "futures-util",
  "parking_lot",
  "quinn",
  "rand 0.8.8",
  "rustls",
  "sha2",
+ "smoltcp",
  "tokio",
  "tokio-rustls",
  "tokio-util",

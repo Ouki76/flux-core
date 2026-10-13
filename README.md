@@ -15,7 +15,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **HTTP / HTTP CONNECT**: Forward proxy, tunneling, Basic authentication (Inbound & Outbound).
 - **Mixed Inbound**: Auto-detection of SOCKS5 and HTTP protocols on a single port.
 - **Transparent Inbounds**: TUN (powered by the `smoltcp` userspace TCP/IP stack — full retransmission, congestion control, out-of-order reassembly & UDP relay), REDIRECT (`SO_ORIGINAL_DST`), TPROXY (`IP_TRANSPARENT`).
-- **WireGuard**: AmneziaWG dialect with junk packet obfuscation (Outbound tunnel).
+- **WireGuard**: AmneziaWG dialect with junk packet obfuscation — server **inbound** (Noise IK responder, MAC1 anti-DoS screening, TAI64N freshness validation, per-peer allow-list with preshared keys and `allowed_ips`, session roaming & reaping; inner traffic terminated by the shared `smoltcp` userspace stack) and **outbound** tunnel with full TCP+UDP support via an embedded `smoltcp` userspace TCP/IP stack (single-demux socket reader, per-flow reply routing, transparent rekey).
 
 ### Transport & Performance
 - **Linux Zero-Copy**: Socket-to-socket `splice(2)` data transfer.
@@ -24,7 +24,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 
 ### Routing & DNS
 - **Rule Engine**: Matching by domain (exact, suffix, keyword), IP CIDR, ports, network (TCP/UDP), rule sets, and inverted matching (`invert: true`).
-- **Rule Sets**: High-capacity GeoIP and GeoSite list matching with O(1) hash lookups and O(L) suffix climbing.
+- **Rule Sets**: High-capacity GeoIP and GeoSite list matching with O(1) hash lookups and O(L) suffix climbing. Local files, inline lists, and **remote URL rule sets** (`type: "remote"`, background HTTP/HTTPS fetch with redirect support, size caps, optional `update_interval` refresh, hot-swappable without restart; fetch failures never break routing).
 - **DNS**: Built-in resolver with Fake-IP (`198.18.0.0/15`), wireformat parser (IPv4 `A` & IPv6 `AAAA`), and DNS-over-HTTPS (DoH, RFC 8484) client.
 
 ### Outbound Groups
@@ -38,6 +38,16 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **Modular Includes**: `$include` / `include` directives supporting individual files and glob patterns (e.g. `outbounds/*.json`).
 - **Environment Variables**: Automatic `${ENV_VAR}` and `${ENV_VAR:-default}` expansion across configs.
 - **Strict Graph Validation**: Pre-flight verification of outbound dependencies and cycle detection in groups.
+
+### Security Hardening
+- **Rate Limiting**: optional per-inbound connection limiting (`rate_limit`): per-client-IP token bucket (`max_conn_per_ip_per_sec` + `burst`) and a global `max_concurrent` cap; rejected connections are dropped before any per-connection allocation.
+- Handshake timeouts on every TCP inbound (slow-loris protection), bounded header/body sizes on the management API, anti-replay windows for SS-2022 and WireGuard, TAI64N freshness validation, MAC1 pre-screening for WireGuard initiations.
+
+### Testing & Verification
+- **libFuzzer targets** (`fuzz/`): VLESS/Trojan/VMess headers, DNS wire format, SOCKS5 UDP, WG initiation, URI/config/ruleset parsing. Run: `cargo +nightly fuzz run fuzz_vless_header`.
+- **Deterministic parser fuzz regression suite** (`tests/test_fuzz_parsers.rs`) — runs in CI without nightly.
+- **Soak / leak detection**: `scripts/soak.sh [duration_secs]` (default 24h) — sustained load with RSS/FD/thread sampling and leak assertion.
+- 35 sing-box interop tests run against the real `sing-box` binary (graceful skip when absent).
 
 ### Management & Control
 - **Flux Core Native REST API**: Native control plane API (`/api/v1/*`) over TCP or Unix Domain Sockets (`unix://...`) with Bearer token authentication, real-time traffic metering, dynamic outbound selector switching, delay/latency probing, route simulation dry-run, and connection lifecycle management.
