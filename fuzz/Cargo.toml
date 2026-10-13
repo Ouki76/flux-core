@@ -1,0 +1,80 @@
+[package]
+name = "flux-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tokio = { version = "1.43", features = ["rt", "io-util"] }
+uuid = { version = "1.15", features = ["v4"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
+rand = "0.8"
+
+[dependencies.flux-protocol]
+path = "../crates/flux-protocol"
+
+[dependencies.flux-dns]
+path = "../crates/flux-dns"
+
+[dependencies.flux-router]
+path = "../crates/flux-router"
+
+[dependencies.flux-app]
+path = "../crates/flux-app"
+
+[dependencies.flux-types]
+path = "../crates/flux-types"
+[[bin]]
+name = "fuzz_vless_header"
+path = "fuzz_targets/fuzz_vless_header.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "fuzz_trojan_header"
+path = "fuzz_targets/fuzz_trojan_header.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "fuzz_vmess_header"
+path = "fuzz_targets/fuzz_vmess_header.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "fuzz_dns_wire"
+path = "fuzz_targets/fuzz_dns_wire.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "fuzz_socks5_udp"
+path = "fuzz_targets/fuzz_socks5_udp.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "fuzz_ruleset_line"
+path = "fuzz_targets/fuzz_ruleset_line.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "fuzz_proxy_uri"
+path = "fuzz_targets/fuzz_proxy_uri.rs"
+test = false
+doc = false
+bench = false
+[[bin]]
+name = "fuzz_wg_initiation"
+path = "fuzz_targets/fuzz_wg_initiation.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

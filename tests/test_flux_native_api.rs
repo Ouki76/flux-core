@@ -408,3 +408,73 @@ async fn test_flux_unix_domain_socket_api() {
 
     instance.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_api_csrf_rejected_before_dispatch() {
+    let api_port = get_free_tcp_port().await;
+
+    // No secret configured: cross-origin requests must be rejected BEFORE any
+    // state-changing action is executed (regression test for CSRF-after-dispatch bug).
+    let raw_config = format!(
+        r#"{{
+            "api": {{ "listen": "127.0.0.1:{}" }},
+            "outbounds": [
+                {{ "type": "direct", "tag": "direct-node" }},
+                {{ "type": "block", "tag": "block-node" }},
+                {{
+                    "type": "selector",
+                    "tag": "sel",
+                    "outbounds": ["direct-node", "block-node"],
+                    "default": "direct-node"
+                }}
+            ]
+        }}"#,
+        api_port
+    );
+
+    let cfg = Config::from_json_str(&raw_config).unwrap();
+    let instance = Instance::new(cfg).unwrap();
+    instance.start().await.unwrap();
+
+    let api_addr = format!("127.0.0.1:{}", api_port);
+
+    // 1. Malicious cross-origin POST attempting to switch the selector
+    {
+        let mut stream = TcpStream::connect(&api_addr).await.unwrap();
+        let body = r#"{"name":"block-node"}"#;
+        let req = format!(
+            "PUT /api/v1/outbounds/sel/select HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://evil.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 2048];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.contains("403 Forbidden"),
+            "cross-origin request must be rejected, got: {}",
+            resp
+        );
+    }
+
+    // 2. Verify the selector was NOT changed by the rejected request
+    {
+        let mut stream = TcpStream::connect(&api_addr).await.unwrap();
+        stream
+            .write_all(b"GET /api/v1/outbounds/sel HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 2048];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("200 OK"));
+        assert!(
+            resp.contains(r#""current":"direct-node""#),
+            "selector must remain on direct-node, got: {}",
+            resp
+        );
+    }
+
+    instance.stop().await.unwrap();
+}
