@@ -10,6 +10,7 @@ pub mod tuic;
 pub mod tun;
 pub mod vless;
 pub mod vmess;
+pub mod wireguard;
 
 pub use http::*;
 pub use hysteria2::*;
@@ -23,5 +24,6 @@ pub use tuic::*;
 pub use tun::*;
 pub use vless::*;
 pub use vmess::*;
+pub use wireguard::*;
 
 pub use flux_common::{create_reuse_port_listener, optimize_tcp_socket};

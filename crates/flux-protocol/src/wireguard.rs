@@ -533,6 +533,9 @@ impl WireGuardHandshake {
 
     /// Server side: processes Handshake Initiation (Message 1) and formats Handshake Response (Message 2),
     /// deriving genuine ChaCha20-Poly1305 transport session keys.
+    ///
+    /// NOTE: this variant performs no peer allow-list check; prefer
+    /// [`Self::respond_to_initiation_with_peers`] for real server inbounds.
     pub fn respond_to_initiation(
         local_static: &StaticSecret,
         receiver_index: u32,
@@ -540,6 +543,44 @@ impl WireGuardHandshake {
         init_pkt: &[u8],
         psk: Option<[u8; 32]>,
     ) -> FluxResult<(Vec<u8>, WireGuardSession)> {
+        Self::respond_impl(local_static, receiver_index, awg, init_pkt, None, psk)
+            .map(|(response, session, _)| (response, session))
+    }
+
+    /// Server side with peer allow-list enforcement: the decrypted client static
+    /// public key MUST be present in `peers`; the matching peer's preshared key
+    /// (if any) is mixed into the handshake. Returns the response packet, the
+    /// derived transport session, and the authenticated peer's public key.
+    pub fn respond_to_initiation_with_peers(
+        local_static: &StaticSecret,
+        receiver_index: u32,
+        awg: &AwgConfig,
+        init_pkt: &[u8],
+        peers: &[WireGuardPeerAuth],
+    ) -> FluxResult<WireGuardHandshakeResult> {
+        let (response, session, peer_public_key) = Self::respond_impl(
+            local_static,
+            receiver_index,
+            awg,
+            init_pkt,
+            Some(peers),
+            None,
+        )?;
+        Ok(WireGuardHandshakeResult {
+            response,
+            session,
+            peer_public_key,
+        })
+    }
+
+    fn respond_impl(
+        local_static: &StaticSecret,
+        receiver_index: u32,
+        awg: &AwgConfig,
+        init_pkt: &[u8],
+        peers: Option<&[WireGuardPeerAuth]>,
+        psk: Option<[u8; 32]>,
+    ) -> FluxResult<(Vec<u8>, WireGuardSession, [u8; 32])> {
         let prefix_len = awg.s1 as usize;
         let expected_min_len = prefix_len + 4 + 4 + 32 + 48 + 28 + 32;
         if init_pkt.len() < expected_min_len {
@@ -613,6 +654,29 @@ impl WireGuardHandshake {
         client_static_arr.copy_from_slice(&client_pub_bytes);
         let client_static = X25519PublicKey::from(client_static_arr);
 
+        // Peer allow-list enforcement (constant-time comparison per entry).
+        // Resolves the effective preshared key for the authenticated peer.
+        let effective_psk: Option<[u8; 32]> = match peers {
+            Some(list) => {
+                let mut matched: Option<&WireGuardPeerAuth> = None;
+                for p in list {
+                    if constant_time_eq(&p.public_key, &client_static_arr) {
+                        matched = Some(p);
+                        break;
+                    }
+                }
+                match matched {
+                    Some(p) => p.preshared_key,
+                    None => {
+                        return Err(FluxError::AuthFailed(
+                            "wireguard initiation rejected: unknown peer public key".into(),
+                        ));
+                    }
+                }
+            }
+            None => psk,
+        };
+
         // DH 2: Client Static - Responder Static
         let ss_ss = local_static.diffie_hellman(&client_static);
         let (c2, k_ts) = kdf2(&c1, ss_ss.as_bytes());
@@ -666,7 +730,7 @@ impl WireGuardHandshake {
         let c5 = kdf1(&c4, ss_se.as_bytes());
 
         // PSK mix
-        let psk_bytes = psk.unwrap_or([0u8; 32]);
+        let psk_bytes = effective_psk.unwrap_or([0u8; 32]);
         let (c6, tau, k_empty) = kdf3(&c5, &psk_bytes);
         let h6 = blake2s_mix_hash(&h5, &tau);
 
@@ -709,8 +773,25 @@ impl WireGuardHandshake {
             Some(awg.clone()),
         );
 
-        Ok((resp_pkt, session))
+        Ok((resp_pkt, session, client_static_arr))
     }
+}
+
+/// An authorized WireGuard peer entry for server-side handshake authentication.
+#[derive(Clone, Debug)]
+pub struct WireGuardPeerAuth {
+    pub public_key: [u8; 32],
+    pub preshared_key: Option<[u8; 32]>,
+}
+
+/// Result of a peer-authenticated handshake response.
+pub struct WireGuardHandshakeResult {
+    /// Handshake Response (Message 2) packet to send back to the initiator.
+    pub response: Vec<u8>,
+    /// Derived transport session (server sends on `client_recv` key).
+    pub session: WireGuardSession,
+    /// Authenticated peer's static public key.
+    pub peer_public_key: [u8; 32],
 }
 
 fn cfg_packet_len(awg: &AwgConfig) -> usize {
