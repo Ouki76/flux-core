@@ -207,10 +207,10 @@ async fn main() -> anyhow::Result<()> {
     let config_json = format!(
         r#"{{
             "inbounds": [
-                {{ "type": "socks", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": {} }},
-                {{ "type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": {} }},
-                {{ "type": "vless", "tag": "vless-in", "listen": "127.0.0.1", "listen_port": {}, "users": [{{"uuid": "{}"}}] }},
-                {{ "type": "shadowsocks", "tag": "ss-in", "listen": "127.0.0.1", "listen_port": {}, "password": "{}" }}
+                {{ "tag": "socks-in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }}, "protocol": {{ "type": "socks" }} }},
+                {{ "tag": "http-in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }}, "protocol": {{ "type": "http" }} }},
+                {{ "tag": "vless-in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }}, "protocol": {{ "type": "vless", "uuid": "{}" }} }},
+                {{ "tag": "ss-in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }}, "protocol": {{ "type": "shadowsocks", "password": "{}" }} }}
             ],
             "outbounds": [
                 {{ "type": "direct", "tag": "direct" }}

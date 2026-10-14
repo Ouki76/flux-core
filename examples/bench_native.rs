@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let flux_port = get_free_port().await;
     let flux_cfg = format!(
         r#"{{
-            "inbounds": [{{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": {} }}],
+            "inbounds": [{{ "tag": "in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }}, "protocol": {{ "type": "socks" }} }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
         }}"#,
         flux_port
