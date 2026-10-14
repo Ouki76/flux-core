@@ -19,9 +19,10 @@ impl Pipe {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
-        // Set in-kernel pipe capacity to 64KB (optimal performance while staying within kernel user pipe limits)
+        // Set in-kernel pipe capacity to 256KB (fewer wakeups per MB on the splice
+        // hot path; kernel pipe pages are allocated lazily, so idle pipes cost ~0).
         unsafe {
-            libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 65536);
+            libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 262144);
         };
         Ok(Self {
             reader: fds[0],
@@ -132,7 +133,7 @@ async fn splice_direction(
 ) -> io::Result<u64> {
     let pipe = PipePool::acquire()?;
     let mut transferred: u64 = 0;
-    const SPLICE_CHUNK: usize = 65536; // Matches optimal in-kernel pipe size
+    const SPLICE_CHUNK: usize = 262144; // Matches the enlarged in-kernel pipe size
 
     loop {
         // 1. Drain socket into pipe in a non-blocking kernel loop
@@ -304,6 +305,9 @@ pub async fn copy_bidirectional_zero_copy_metered(
     b_to_a_1: Option<&std::sync::atomic::AtomicU64>,
     b_to_a_2: Option<&std::sync::atomic::AtomicU64>,
 ) -> io::Result<(u64, u64)> {
+    // The fallback copy futures each hold a 16KB inline buffer; boxing them keeps
+    // the per-connection spawned task small (~KBs instead of ~35KB) in the common
+    // splice path. The box is heap-allocated only when the fallback actually runs.
     #[cfg(target_os = "linux")]
     {
         let t1 = splice_direction(a, b, a_to_b_1, a_to_b_2);
@@ -317,8 +321,8 @@ pub async fn copy_bidirectional_zero_copy_metered(
                     || code == Some(libc::EMFILE)
                     || code == Some(libc::ENFILE)
                 {
-                    let f1 = copy_direction_ref(a, b, a_to_b_1, a_to_b_2);
-                    let f2 = copy_direction_ref(b, a, b_to_a_1, b_to_a_2);
+                    let f1 = Box::pin(copy_direction_ref(a, b, a_to_b_1, a_to_b_2));
+                    let f2 = Box::pin(copy_direction_ref(b, a, b_to_a_1, b_to_a_2));
                     tokio::try_join!(f1, f2)
                 } else {
                     Err(e)
@@ -329,8 +333,8 @@ pub async fn copy_bidirectional_zero_copy_metered(
 
     #[cfg(not(target_os = "linux"))]
     {
-        let f1 = copy_direction_ref(a, b, a_to_b_1, a_to_b_2);
-        let f2 = copy_direction_ref(b, a, b_to_a_1, b_to_a_2);
+        let f1 = Box::pin(copy_direction_ref(a, b, a_to_b_1, a_to_b_2));
+        let f2 = Box::pin(copy_direction_ref(b, a, b_to_a_1, b_to_a_2));
         tokio::try_join!(f1, f2)
     }
 }
