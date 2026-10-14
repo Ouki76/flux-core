@@ -83,6 +83,7 @@ strip = true
 name = "flux-core"
 version = "1.0.0"
 license = "MIT"
+rust-version = "1.88"
 edition = "2024"
 
 [dependencies]
