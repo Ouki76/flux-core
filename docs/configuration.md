@@ -1,0 +1,130 @@
+# Configuration Reference
+
+flux-core accepts **YAML** (`.yaml`, `.yml`), **JSON** (`.json`) and **JSON with comments** (`.jsonc`). Format is auto-detected by extension, or forced with `--format`.
+
+```bash
+flux-core check -c config.yaml    # validate without starting
+flux-core run   -c config.yaml    # start the proxy
+```
+
+## Top-level structure
+
+| Key | Type | Description |
+|---|---|---|
+| `include` / `$include` | `string[]` | Files or glob patterns merged into this config (e.g. `outbounds/*.json`) |
+| `log` | object | `{ "level": "error\|warn\|info\|debug\|trace" }` |
+| `dns` | object | Built-in resolver configuration (see below) |
+| `inbounds` | object[] | Listener definitions |
+| `outbounds` | object[] \| string[] | Nodes, groups, or proxy-share URIs |
+| `route` | object | Routing rules, rule sets, GeoIP |
+| `api` | object | Management API (`listen`, `secret`, `allow_insecure_api`) |
+
+Environment variables `${VAR}` and `${VAR:-default}` are expanded everywhere.
+
+## Inbounds
+
+Two forms are supported:
+
+**Shorthand** — `{ "type": "mixed"|"tun"|..., "tag": ..., ... }`
+
+**Layered** — full orthogonal pipeline composition:
+
+```yaml
+- tag: socks-in
+  carrier:    { type: tcp, listen: 127.0.0.1, listen_port: 10808 }
+  security:   { type: tls, ... }            # optional, may be a list (cascade)
+  framing:    { type: ws, path: /stream }   # optional, may be a list
+  protocol:   { type: socks, username: u, password: p }
+  rate_limit:                               # optional DoS hardening
+    max_conn_per_ip_per_sec: 10
+    burst: 20
+    max_concurrent: 10000
+```
+
+Carriers: `tcp`, `udp`, `tun`, `redirect`, `tproxy`, `quic` (TUIC/Hysteria 2), WireGuard UDP inbound.
+Protocols: `vless`, `trojan`, `vmess`, `shadowsocks`, `socks`, `http`, `tuic`, `hysteria2`, `wireguard`.
+
+## Outbounds
+
+Same layered model, plus groups and URI strings:
+
+```yaml
+outbounds:
+  - { type: direct, tag: direct }
+  - { type: block,  tag: block }
+
+  # Share-link URI (vless://, trojan://, ss://, socks5://, http://)
+  - "vless://uuid@host:443?security=reality&sni=...#my-node"
+
+  # Layered node: SS-2022 over REALITY + WebSocket
+  - tag: ss-stealth
+    carrier:  { type: tcp, address: "1.2.3.4:443" }
+    security: { type: reality, sni: "www.microsoft.com", public_key: "...", short_id: "..." }
+    framing:  { type: ws, path: "/live" }
+    protocol: { type: shadowsocks, password: "...", method: "2022-blake3-chacha20-poly1305" }
+
+  # Groups
+  - { type: selector,     tag: pick,  outbounds: [a, b], default: a }
+  - { type: urltest,      tag: auto,  outbounds: [a, b], url: "https://www.gstatic.com/generate_204", interval: "5m", tolerance: 50 }
+  - { type: fallback,     tag: fb,    outbounds: [a, b] }
+  - { type: loadbalance,  tag: lb,    outbounds: [a, b], strategy: round-robin }  # or consistent-hashing
+```
+
+Outbound graphs are validated at startup: missing references and dependency cycles are hard errors.
+
+## DNS
+
+```yaml
+dns:
+  servers:
+    - https://1.1.1.1/dns-query   # DoH (RFC 8484)
+    - 8.8.8.8:53                  # plain UDP
+  fakeip:
+    enabled: true
+    inet4_range: 198.18.0.0/15
+  client_subnet: "1.2.3.0/24"     # optional EDNS
+  rules:                          # per-domain DNS routing
+    - domains: ["example.com"]
+      servers: ["https://8.8.8.8/dns-query"]
+```
+
+## Routing
+
+```yaml
+route:
+  geoip_path: /etc/flux-core/geoip.mmdb
+  final: direct                    # fallback outbound tag
+  rule_set:
+    - tag: ads
+      type: remote                 # local | inline | remote
+      path: https://example.org/ads.txt
+      update_interval: 24h         # optional hot refresh
+      cache_path: /var/cache/flux-core/ads.txt   # optional disk cache
+  rules:
+    - domain_suffix: ["internal.corp"]
+      outbound: direct
+    - rule_set: [ads]
+      outbound: block
+    - ip_cidr: ["10.0.0.0/8"]
+      network: [tcp, udp]
+      invert: false
+      outbound: direct
+```
+
+Rule fields: `inbound`, `domain`, `domain_suffix`, `domain_keyword`, `ip_cidr`, `port`, `port_range`, `rule_set`, `geosite`, `geoip`, `process_name`, `network`, `invert`. Every rule requires `outbound`.
+
+Remote rule-set fetch failures never break routing: the last cached/compiled matcher stays active.
+
+## API
+
+```yaml
+api:
+  listen: 127.0.0.1:9090        # or unix:///run/flux-core/api.sock
+  secret: ${FLUX_API_SECRET}    # required for non-loopback listeners
+```
+
+See [api.md](api.md) for endpoints and [security.md](security.md) for hardening requirements.
+
+## Examples
+
+Complete annotated examples live in [`examples/`](../examples/) (`config.yaml`, `config.jsonc`, `nodes.json`).

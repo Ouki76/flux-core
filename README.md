@@ -130,6 +130,15 @@ Complete configuration examples are provided in the `examples/` directory:
 - `examples/config.yaml`: Full YAML configuration with VLESS Reality, Trojan, SS, DoH, and all Outbound Groups.
 - `examples/config.jsonc`: JSON with comments and modular `$include` demonstrating file splitting.
 
+## Documentation
+
+- [Configuration reference](docs/configuration.md)
+- [Deployment runbook](docs/deployment.md) (Docker, systemd, capabilities, monitoring)
+- [Security guide](docs/security.md) (hardening, threat model, fuzzing)
+- [Management API](docs/api.md) (REST endpoints, Prometheus)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Changelog](CHANGELOG.md)
+
 ## License
 
 MIT License
