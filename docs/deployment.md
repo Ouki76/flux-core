@@ -32,6 +32,10 @@ docker run -d --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE \
   --device /dev/net/tun -v $PWD/config.yaml:/etc/flux-core/config.json flux-core
 ```
 
+> **SELinux hosts (Fedora/RHEL/CentOS):** append `:Z` to volume mounts,
+> otherwise the container cannot read the config (`Permission denied`):
+> `-v $PWD/config.yaml:/etc/flux-core/config.json:Z`
+
 The image ships a `HEALTHCHECK` running `flux-core check -c /etc/flux-core/config.json`.
 
 ## systemd
