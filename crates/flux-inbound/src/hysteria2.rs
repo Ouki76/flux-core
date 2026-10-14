@@ -18,6 +18,7 @@ pub struct Hysteria2Inbound {
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     pipeline: Option<flux_transport::pipeline::ServerTransportPipeline>,
+    obfs_password: Option<String>,
     rate_limiter: Option<Arc<flux_common::RateLimiter>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
@@ -39,6 +40,7 @@ impl Hysteria2Inbound {
             certs,
             key,
             pipeline: None,
+            obfs_password: None,
             rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
@@ -47,6 +49,12 @@ impl Hysteria2Inbound {
 
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
+        self
+    }
+
+    /// Enables Salamander obfuscation with the given password (must match the client).
+    pub fn with_obfs_password(mut self, password: Option<String>) -> Self {
+        self.obfs_password = password;
         self
     }
 
@@ -64,6 +72,7 @@ impl Hysteria2Inbound {
             certs: vec![],
             key: PrivateKeyDer::Pkcs8(vec![].into()),
             pipeline: Some(pipeline),
+            obfs_password: None,
             rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
@@ -206,12 +215,22 @@ impl Inbound for Hysteria2Inbound {
         }
 
         let alpn = vec![b"h3".to_vec(), b"hysteria2".to_vec()];
-        let endpoint = QuicTransport::create_server_endpoint(
-            self.listen_addr,
-            self.certs.clone(),
-            self.key.clone_key(),
-            alpn,
-        )?;
+        let endpoint = if let Some(obfs_pwd) = &self.obfs_password {
+            QuicTransport::create_server_endpoint_obfs(
+                self.listen_addr,
+                self.certs.clone(),
+                self.key.clone_key(),
+                alpn,
+                obfs_pwd,
+            )?
+        } else {
+            QuicTransport::create_server_endpoint(
+                self.listen_addr,
+                self.certs.clone(),
+                self.key.clone_key(),
+                alpn,
+            )?
+        };
 
         self.running.store(true, Ordering::SeqCst);
         let tag: Arc<str> = Arc::from(self.tag.as_str());

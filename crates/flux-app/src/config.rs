@@ -482,6 +482,11 @@ pub enum ProtocolConfig {
         hop_interval_secs: Option<u64>,
         #[serde(default)]
         h3: bool,
+        /// Salamander obfuscation mode ("salamander"); requires obfs_password.
+        #[serde(default)]
+        obfs: Option<String>,
+        #[serde(default)]
+        obfs_password: Option<String>,
     },
     #[serde(rename = "tuic", alias = "tuic5")]
     Tuic {

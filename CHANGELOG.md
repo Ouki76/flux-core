@@ -26,6 +26,14 @@ Production-ready release of the flux-core proxy core.
 ### Security
 
 - OsRng (CSPRNG) entropy across WireGuard, Vision, Hysteria 2, ShadowTLS.
+- Supply-chain gate: `cargo audit` + `cargo deny` in CI; fixed RUSTSEC-2026-0285 (rustls 0.23.46), upgraded lru 0.13 → 0.18.5 (unsound advisories).
+- Hysteria 2 Salamander obfuscation is now fully wired (custom quinn runtime obfuscating every UDP datagram; plain clients are silently dropped).
+- UDP reply address headers (SOCKS5/Trojan/VLESS/SS) now carry the sender address per spec; VMess UDP inbound implemented (was dispatched on the TCP path).
+
+### Performance
+
+- Per-connection RSS 35.6 → 2.9 KB (boxed cold-path copy futures); 2000 held connections: 77 MB → 13 MB (sing-box: 54 MB).
+- splice(2) pipe 64 KB → 256 KB: single-stream throughput now matches/beats sing-box (avg +4.2% head-to-head).
 - Hardened Hy2 varint-length DoS caps, Fake-IP /32 underflow fix, strict DNS upstream errors, UDP reply-destination normalization, `select!` arm drop fixes (lost UDP replies / first TCP chunks).
 
 ## [0.1.0] - 2026-09-10

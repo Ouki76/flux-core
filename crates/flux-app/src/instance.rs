@@ -726,6 +726,21 @@ fn parse_outbound_carrier(carrier: &CarrierConfig) -> FluxResult<(TargetAddress,
 /// Extracts (sni, insecure, alpn) from the first `tls` security entry of a layered
 /// outbound — used for QUIC-native protocols (hysteria2, tuic) whose TLS lives in
 /// the QUIC handshake rather than the stream pipeline.
+/// Resolves Hysteria 2 obfuscation config into the Salamander password.
+/// `obfs` must be "salamander" (the only supported mode) and requires a password.
+fn resolve_hy2_obfs(obfs: Option<&str>, password: Option<String>) -> FluxResult<Option<String>> {
+    match obfs {
+        None => Ok(None),
+        Some("salamander") => password.map(Some).ok_or_else(|| {
+            FluxError::Config("hysteria2: obfs 'salamander' requires 'obfs_password'".into())
+        }),
+        Some(other) => Err(FluxError::Config(format!(
+            "hysteria2: unsupported obfs mode '{}' (supported: 'salamander')",
+            other
+        ))),
+    }
+}
+
 fn extract_quic_tls_params(
     sec_opt: &Option<FlexibleList<SecurityConfig>>,
 ) -> (Option<String>, bool, Option<Vec<String>>) {
@@ -911,6 +926,8 @@ fn build_layered_outbound(
                 down_mbps,
                 hop_interval_secs,
                 h3,
+                obfs,
+                obfs_password,
             } => {
                 let (q_sni, q_insecure, q_alpn) = extract_quic_tls_params(&node.security);
                 let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
@@ -922,7 +939,7 @@ fn build_layered_outbound(
                     hop_interval_secs: hop_interval_secs.unwrap_or(30),
                     insecure: q_insecure,
                     server_name: q_sni,
-                    obfs: None,
+                    obfs: resolve_hy2_obfs(obfs.as_deref(), obfs_password)?,
                     alpn: q_alpn,
                     h3,
                 };
@@ -1055,6 +1072,8 @@ fn build_layered_outbound(
             down_mbps,
             hop_interval_secs,
             h3,
+            obfs,
+            obfs_password,
         } => {
             let (q_sni, q_insecure, q_alpn) = extract_quic_tls_params(&node.security);
             let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
@@ -1066,7 +1085,7 @@ fn build_layered_outbound(
                 hop_interval_secs: hop_interval_secs.unwrap_or(30),
                 insecure: q_insecure,
                 server_name: q_sni,
-                obfs: None,
+                obfs: resolve_hy2_obfs(obfs.as_deref(), obfs_password)?,
                 alpn: q_alpn,
                 h3,
             };
@@ -1273,12 +1292,18 @@ fn build_layered_inbound(
                 ));
                 return Ok(());
             }
-            ProtocolConfig::Hysteria2 { password, .. } => {
+            ProtocolConfig::Hysteria2 {
+                password,
+                obfs,
+                obfs_password,
+                ..
+            } => {
                 let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
                     .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
                 let certs = vec![CertificateDer::from(cert.cert)];
                 let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-                let mut ib = flux_inbound::Hysteria2Inbound::new(tag, addr, password, certs, key);
+                let mut ib = flux_inbound::Hysteria2Inbound::new(tag, addr, password, certs, key)
+                    .with_obfs_password(resolve_hy2_obfs(obfs.as_deref(), obfs_password)?);
                 if let Some(rl) = rate_limiter.clone() {
                     ib = ib.with_rate_limiter(rl);
                 }
@@ -1389,13 +1414,20 @@ fn build_layered_inbound(
                 "wireguard is an L3 UDP tunnel and cannot be a layered inbound; use a system inbound instead: { \"type\": \"wireguard\", \"listen\": ..., \"private_key\": ..., \"peers\": [...] }".to_string(),
             ));
         }
-        ProtocolConfig::Hysteria2 { password, .. } => {
+        ProtocolConfig::Hysteria2 {
+            password,
+            obfs,
+            obfs_password,
+            ..
+        } => {
+            let obfs_pwd = resolve_hy2_obfs(obfs.as_deref(), obfs_password)?;
             if pipeline.securities.is_empty() && pipeline.framings.is_empty() {
                 let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
                     .map_err(|e| FluxError::Crypto(format!("failed to generate cert: {}", e)))?;
                 let certs = vec![CertificateDer::from(cert.cert)];
                 let key = PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-                let mut ib = flux_inbound::Hysteria2Inbound::new(tag, addr, password, certs, key);
+                let mut ib = flux_inbound::Hysteria2Inbound::new(tag, addr, password, certs, key)
+                    .with_obfs_password(obfs_pwd);
                 if let Some(rl) = rate_limiter.clone() {
                     ib = ib.with_rate_limiter(rl);
                 }
@@ -1403,7 +1435,8 @@ fn build_layered_inbound(
             } else {
                 let mut ib = flux_inbound::Hysteria2Inbound::new_with_pipeline(
                     tag, addr, password, pipeline,
-                );
+                )
+                .with_obfs_password(obfs_pwd);
                 if let Some(rl) = rate_limiter.clone() {
                     ib = ib.with_rate_limiter(rl);
                 }

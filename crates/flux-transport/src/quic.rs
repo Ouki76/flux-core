@@ -54,12 +54,8 @@ impl AsyncWrite for QuicBiStream {
 pub struct QuicTransport;
 
 impl QuicTransport {
-    /// Creates a client QUIC Endpoint with the specified ALPN protocols.
-    pub fn create_client_endpoint(
-        is_ipv6: bool,
-        alpn: Vec<Vec<u8>>,
-        insecure: bool,
-    ) -> FluxResult<quinn::Endpoint> {
+    /// Builds the shared QUIC client configuration (TLS + transport params).
+    fn build_client_config(alpn: Vec<Vec<u8>>, insecure: bool) -> FluxResult<quinn::ClientConfig> {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
@@ -93,7 +89,16 @@ impl QuicTransport {
             })?,
         ));
         client_cfg.transport_config(Arc::new(transport));
+        Ok(client_cfg)
+    }
 
+    /// Creates a client QUIC Endpoint with the specified ALPN protocols.
+    pub fn create_client_endpoint(
+        is_ipv6: bool,
+        alpn: Vec<Vec<u8>>,
+        insecure: bool,
+    ) -> FluxResult<quinn::Endpoint> {
+        let client_cfg = Self::build_client_config(alpn, insecure)?;
         let bind_addr = if is_ipv6 {
             SocketAddr::from(([0; 16], 0))
         } else {
@@ -103,6 +108,77 @@ impl QuicTransport {
         let mut endpoint = quinn::Endpoint::client(bind_addr).map_err(FluxError::Io)?;
         endpoint.set_default_client_config(client_cfg);
         Ok(endpoint)
+    }
+
+    /// Client endpoint with Salamander-obfuscated UDP (Hysteria 2 `obfs`).
+    pub fn create_client_endpoint_obfs(
+        is_ipv6: bool,
+        alpn: Vec<Vec<u8>>,
+        insecure: bool,
+        obfs_password: &str,
+    ) -> FluxResult<quinn::Endpoint> {
+        let client_cfg = Self::build_client_config(alpn, insecure)?;
+        let bind_addr = if is_ipv6 {
+            SocketAddr::from(([0; 16], 0))
+        } else {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        };
+        let socket = std::net::UdpSocket::bind(bind_addr).map_err(FluxError::Io)?;
+        socket.set_nonblocking(true).map_err(FluxError::Io)?;
+        let runtime = crate::quic_obfs::SalamanderRuntime::new(obfs_password);
+        let mut endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            runtime as Arc<dyn quinn::Runtime>,
+        )
+        .map_err(FluxError::Io)?;
+        endpoint.set_default_client_config(client_cfg);
+        Ok(endpoint)
+    }
+
+    /// Server endpoint with Salamander-obfuscated UDP (Hysteria 2 `obfs`).
+    pub fn create_server_endpoint_obfs(
+        listen_addr: SocketAddr,
+        certs: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+        key: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+        alpn: Vec<Vec<u8>>,
+        obfs_password: &str,
+    ) -> FluxResult<quinn::Endpoint> {
+        let mut server_crypto = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| {
+                FluxError::Crypto(format!("failed to configure QUIC server TLS: {}", e))
+            })?;
+        server_crypto.alpn_protocols = alpn;
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_concurrent_bidi_streams(256u32.into());
+        transport.max_concurrent_uni_streams(256u32.into());
+        transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+        transport.datagram_send_buffer_size(4 * 1024 * 1024);
+        if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
+            transport.max_idle_timeout(Some(idle));
+        }
+
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).map_err(|e| {
+                FluxError::Crypto(format!("failed to create QUIC server config: {}", e))
+            })?,
+        ));
+        server_config.transport_config(Arc::new(transport));
+
+        let socket = std::net::UdpSocket::bind(listen_addr).map_err(FluxError::Io)?;
+        socket.set_nonblocking(true).map_err(FluxError::Io)?;
+        let runtime = crate::quic_obfs::SalamanderRuntime::new(obfs_password);
+        quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config),
+            socket,
+            runtime as Arc<dyn quinn::Runtime>,
+        )
+        .map_err(FluxError::Io)
     }
 
     /// Creates a server QUIC Endpoint with certificates, private key, and ALPN protocols.

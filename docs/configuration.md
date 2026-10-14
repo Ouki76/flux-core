@@ -53,8 +53,12 @@ outbounds:
   - { type: direct, tag: direct }
   - { type: block,  tag: block }
 
-  # Share-link URI (vless://, trojan://, ss://, socks5://, http://)
-  - "vless://uuid@host:443?security=reality&sni=...#my-node"
+  # Share-link URI (vless://, vmess://, trojan://, ss://, socks5://, http://, hy2://, tuic://)
+  # Query params are parsed generically (serde) with Xray/sing-box/Clash aliases
+  # (pbk/public_key, sid/short_id, fp/utls, type/transport, ...); unknown keys
+  # are preserved, never fatal.
+  - "vless://uuid@host:443?security=reality&sni=...&pbk=...&sid=...#my-node"
+  - "hy2://password@host:443?obfs=salamander&obfs_password=...&upmbps=200#hy2-node"
 
   # Layered node: SS-2022 over REALITY + WebSocket
   - tag: ss-stealth

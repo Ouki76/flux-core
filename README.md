@@ -10,7 +10,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **VMess**: AEAD header authentication, AES-128-GCM and ChaCha20-Poly1305 ciphers (Inbound & Outbound).
 - **Shadowsocks & Shadowsocks-2022**: AEAD (ChaCha20-Poly1305, AES-256-GCM), 2022 Blake3-ciphers, ReplayFilter defense (Inbound & Outbound).
 - **TUIC v5**: Spec-compliant QUIC carrier (TLS EKM auth, per-flow bi-streams, datagram UDP), BBR congestion control (Inbound & Outbound; interoperable with sing-box).
-- **Hysteria 2**: Spec-compliant QUIC carrier with HTTP/3 auth (minimal built-in H3/QPACK server), Brutal pacer, port-hopping, TCP stream & datagram UDP relay (Inbound & Outbound; interoperable with sing-box).
+- **Hysteria 2**: Spec-compliant QUIC carrier with HTTP/3 auth (minimal built-in H3/QPACK server), Brutal pacer, port-hopping, **Salamander obfuscation** (custom quinn runtime wrapping every UDP datagram), TCP stream & datagram UDP relay (Inbound & Outbound; interoperable with sing-box).
 - **SOCKS5**: TCP CONNECT and UDP ASSOCIATE support with user/password authentication (Inbound & Outbound).
 - **HTTP / HTTP CONNECT**: Forward proxy, tunneling, Basic authentication (Inbound & Outbound).
 - **Mixed Inbound**: Auto-detection of SOCKS5 and HTTP protocols on a single port.

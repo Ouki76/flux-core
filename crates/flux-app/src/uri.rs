@@ -1,9 +1,18 @@
+//! Proxy share-link parsing.
+//!
+//! Design: a single structural URI parser decomposes any link into
+//! scheme/userinfo/host/port/query/fragment, then the query string is mapped
+//! **generically** onto a typed [`UriParams`] via serde (no hand-rolled
+//! per-protocol query parsers). Only userinfo semantics remain per-scheme
+//! (uuid vs password vs method:password), since they are protocol-defined.
+
 use crate::config::{
     CarrierConfig, FlexibleList, FramingConfig, LayeredOutboundNode, OutboundConfig,
     OutboundGroupConfig, ProtocolConfig, SecurityConfig,
 };
 use base64::Engine;
 use flux_types::{FluxError, FluxResult};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 /// Canonical specification of a proxy outbound node built from URI links.
@@ -28,6 +37,229 @@ pub struct ProxySpec {
     pub transport_path: Option<String>,
     pub transport_service_name: Option<String>,
     pub transport_headers: HashMap<String, String>,
+    /// TLS security requested explicitly (`security=tls`) or implicitly (trojan).
+    pub security_hint_tls: bool,
+    // TUIC / Hysteria 2 extras (from generic query params).
+    pub congestion_control: Option<String>,
+    pub up_mbps: Option<u64>,
+    pub down_mbps: Option<u64>,
+    pub hop_interval_secs: Option<u64>,
+    pub obfs: Option<String>,
+    pub obfs_password: Option<String>,
+}
+
+/// Typed query parameters shared by all share-link dialects (Xray, sing-box,
+/// Clash). Parsed generically: any `?k=v&...` query is deserialized into this
+/// struct; unknown keys land in `extra` instead of being dropped.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct UriParams {
+    #[serde(alias = "peer")]
+    pub sni: Option<String>,
+    pub security: Option<String>,
+    pub flow: Option<String>,
+    #[serde(alias = "pbk", alias = "public_key", alias = "publicKey")]
+    pub public_key: Option<String>,
+    #[serde(alias = "sid", alias = "short_id", alias = "shortId")]
+    pub short_id: Option<String>,
+    #[serde(alias = "fp", alias = "fingerprint", alias = "utls")]
+    pub utls: Option<String>,
+    #[serde(deserialize_with = "de_comma_list")]
+    pub alpn: Vec<String>,
+    #[serde(
+        alias = "allowInsecure",
+        alias = "allow_insecure",
+        alias = "skip-cert-verify",
+        deserialize_with = "de_bool"
+    )]
+    pub insecure: bool,
+    /// Transport/framing selector (`ws`, `httpupgrade`, `h2`, `grpc`, ...).
+    #[serde(alias = "type", alias = "transport", alias = "headerType")]
+    pub transport: Option<String>,
+    pub path: Option<String>,
+    /// WebSocket/H2 Host header.
+    pub host: Option<String>,
+    #[serde(alias = "serviceName", alias = "service_name")]
+    pub service_name: Option<String>,
+    #[serde(alias = "congestion_control", alias = "congestionControl")]
+    pub congestion_control: Option<String>,
+    /// Hysteria 2 bandwidth hints.
+    #[serde(alias = "upmbps", deserialize_with = "de_opt_u64")]
+    pub up_mbps: Option<u64>,
+    #[serde(alias = "downmbps", deserialize_with = "de_opt_u64")]
+    pub down_mbps: Option<u64>,
+    /// Hysteria 2 port-hopping list ("443,8000-9000") and interval.
+    pub ports: Option<String>,
+    #[serde(
+        alias = "hop_interval",
+        alias = "hopInterval",
+        deserialize_with = "de_opt_u64"
+    )]
+    pub hop_interval_secs: Option<u64>,
+    /// Hysteria 2 Salamander obfuscation.
+    pub obfs: Option<String>,
+    #[serde(alias = "obfs-password", alias = "obfsPassword")]
+    pub obfs_password: Option<String>,
+    /// Everything else, preserved for forward compatibility.
+    #[serde(flatten)]
+    pub extra: HashMap<String, String>,
+}
+
+fn de_bool<'de, D>(d: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::Bool(b) => b,
+        serde_json::Value::String(s) => matches!(s.as_str(), "1" | "true" | "yes"),
+        serde_json::Value::Number(n) => n.as_u64() == Some(1),
+        _ => false,
+    })
+}
+
+fn de_comma_list<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        Some(serde_json::Value::String(s)) => s.split(',').map(|p| p.trim().to_string()).collect(),
+        Some(serde_json::Value::Array(a)) => a
+            .into_iter()
+            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
+fn de_opt_u64<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        Some(serde_json::Value::Number(n)) => n.as_u64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
+    })
+}
+
+/// Structural decomposition of any `scheme://userinfo@host:port/path?query#tag` link.
+#[derive(Debug)]
+struct GenericUri<'a> {
+    scheme: &'a str,
+    userinfo: Option<&'a str>,
+    host: String,
+    port: Option<u16>,
+    query: Option<&'a str>,
+    tag: String,
+}
+
+impl<'a> GenericUri<'a> {
+    fn parse(uri: &'a str) -> FluxResult<Self> {
+        let clean = uri.trim();
+        let (scheme, rest) = clean.split_once("://").ok_or_else(|| {
+            FluxError::Config(format!("invalid proxy URI (missing scheme): {}", clean))
+        })?;
+        let scheme = scheme.to_ascii_lowercase();
+
+        // Fragment = tag.
+        let (body, tag) = match rest.split_once('#') {
+            Some((b, t)) => {
+                let decoded = urlencoding_decode(t.trim());
+                (b, decoded)
+            }
+            None => (rest, String::new()),
+        };
+
+        // Query string.
+        let (authority_path, query) = match body.split_once('?') {
+            Some((a, q)) => (a, Some(q)),
+            None => (body, None),
+        };
+
+        // Split authority from path at the first '/'.
+        let authority = authority_path.split('/').next().unwrap_or(authority_path);
+
+        // userinfo@host:port — the LAST '@' wins (passwords may contain '@').
+        let (userinfo, host_port) = match authority.rsplit_once('@') {
+            Some((u, hp)) => (Some(u), hp),
+            None => (None, authority),
+        };
+
+        let (host, port) = split_host_port(host_port)?;
+        Ok(Self {
+            scheme: Box::leak(scheme.into_boxed_str()),
+            userinfo,
+            host,
+            port,
+            query,
+            tag,
+        })
+    }
+}
+
+/// Splits `host:port`, `host`, `[v6]:port`, `[v6]` into (host, Option<port>).
+fn split_host_port(s: &str) -> FluxResult<(String, Option<u16>)> {
+    let clean = s.trim();
+    if clean.is_empty() {
+        return Err(FluxError::Config("empty host in proxy URI".into()));
+    }
+    if let Some(rest) = clean.strip_prefix('[') {
+        // IPv6 literal.
+        if let Some((h, tail)) = rest.split_once(']') {
+            let port = match tail.strip_prefix(':') {
+                Some(p) => Some(p.parse::<u16>().map_err(|_| {
+                    FluxError::Config(format!("invalid port in IPv6 address: {}", clean))
+                })?),
+                None if tail.is_empty() => None,
+                None => {
+                    return Err(FluxError::Config(format!(
+                        "garbage after IPv6 literal: {}",
+                        clean
+                    )));
+                }
+            };
+            return Ok((format!("[{}]", h), port));
+        }
+        return Err(FluxError::Config(format!(
+            "unterminated IPv6 literal: {}",
+            clean
+        )));
+    }
+    match clean.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
+            let port = p
+                .parse::<u16>()
+                .map_err(|_| FluxError::Config(format!("invalid port in address: {}", clean)))?;
+            Ok((h.to_string(), Some(port)))
+        }
+        _ => Ok((clean.to_string(), None)),
+    }
+}
+
+/// Parses a query string generically into typed [`UriParams`] via serde.
+fn parse_params(query: Option<&str>) -> FluxResult<UriParams> {
+    let mut map = serde_json::Map::new();
+    if let Some(q) = query {
+        for pair in q.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = k.trim();
+            if key.is_empty() {
+                continue;
+            }
+            map.insert(
+                key.to_string(),
+                serde_json::Value::String(urlencoding_decode(v.trim())),
+            );
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(map))
+        .map_err(|e| FluxError::Config(format!("invalid query parameters in proxy URI: {}", e)))
 }
 
 impl ProxySpec {
@@ -43,6 +275,31 @@ impl ProxySpec {
             server: server.into(),
             port,
             ..Default::default()
+        }
+    }
+
+    /// Applies generic query parameters (security, transport, flow, ...) to the spec.
+    fn apply_params(&mut self, p: &UriParams) {
+        self.sni = p.sni.clone();
+        self.insecure = p.insecure;
+        self.alpn = p.alpn.clone();
+        self.utls = p.utls.clone();
+        self.flow = p.flow.clone();
+        self.transport_type = p.transport.clone();
+        self.transport_path = p.path.clone();
+        self.transport_service_name = p.service_name.clone();
+        if let Some(h) = &p.host {
+            self.transport_headers.insert("Host".into(), h.clone());
+        }
+        if p.security.as_deref() == Some("reality") {
+            self.reality_public_key = p.public_key.clone();
+            self.reality_short_id = p.short_id.clone();
+        } else if p.security.as_deref() == Some("tls")
+            || p.security.as_deref() == Some("xtls")
+            || self.sni.is_some()
+        {
+            // plain TLS (or SNI present without explicit security) → TLS layer
+            self.security_hint_tls = true;
         }
     }
 
@@ -76,6 +333,15 @@ impl ProxySpec {
                     method: self.method,
                 }
             }
+            "vmess" => {
+                let uuid = self.auth.ok_or_else(|| {
+                    FluxError::Config(format!("outbound '{}': missing uuid for vmess", self.tag))
+                })?;
+                ProtocolConfig::Vmess {
+                    uuid,
+                    security: self.method.clone(),
+                }
+            }
             "socks" | "socks5" => ProtocolConfig::Socks {
                 username: self.username,
                 password: self.password,
@@ -92,7 +358,7 @@ impl ProxySpec {
                 ProtocolConfig::Tuic {
                     uuid,
                     password,
-                    congestion_control: None,
+                    congestion_control: self.congestion_control.clone(),
                     zero_rtt: None,
                 }
             }
@@ -100,10 +366,12 @@ impl ProxySpec {
                 let password = self.auth.or(self.password).unwrap_or_default();
                 ProtocolConfig::Hysteria2 {
                     password,
-                    up_mbps: 100,
-                    down_mbps: 100,
-                    hop_interval_secs: None,
+                    up_mbps: self.up_mbps.unwrap_or(100),
+                    down_mbps: self.down_mbps.unwrap_or(100),
+                    hop_interval_secs: self.hop_interval_secs,
                     h3: false,
+                    obfs: self.obfs.clone(),
+                    obfs_password: self.obfs_password.clone(),
                 }
             }
             "direct" => {
@@ -121,7 +389,7 @@ impl ProxySpec {
                 // Strict: an unknown protocol must never silently degrade into an
                 // unproxied direct connection (traffic leak / misconfiguration risk).
                 return Err(FluxError::Config(format!(
-                    "unsupported protocol '{}' for outbound '{}' (supported: vless, trojan, ss/shadowsocks, socks/socks5, http/https, hy2/hysteria2, tuic, direct, block)",
+                    "unsupported protocol '{}' for outbound '{}' (supported: vless, vmess, trojan, ss/shadowsocks, socks/socks5, http/https, hy2/hysteria2, tuic, direct, block)",
                     other, self.tag
                 )));
             }
@@ -133,7 +401,7 @@ impl ProxySpec {
                 public_key: pub_k,
                 short_id: self.reality_short_id,
             }))
-        } else if self.sni.is_some() || self.insecure || !self.alpn.is_empty() {
+        } else if self.security_hint_tls || self.insecure || !self.alpn.is_empty() {
             Some(FlexibleList::Single(SecurityConfig::Tls {
                 sni: self.sni,
                 alpn: self.alpn,
@@ -182,346 +450,227 @@ impl ProxySpec {
     }
 }
 
-/// Parses standard proxy sharing links (VLESS, Trojan, Shadowsocks, SOCKS5, HTTP, Hysteria 2, TUIC)
-/// into an `OutboundConfig`.
+/// Parses standard proxy sharing links into an `OutboundConfig`.
+///
+/// Supported schemes: `vless://`, `vmess://`, `trojan://`, `ss://`,
+/// `socks5://`/`socks://`, `http://`/`https://`, `hy2://`/`hysteria2://`,
+/// `tuic://`.
 pub fn parse_proxy_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    let clean = uri.trim();
-    if clean.starts_with("vless://") {
-        parse_vless_uri(clean)
-    } else if clean.starts_with("trojan://") {
-        parse_trojan_uri(clean)
-    } else if clean.starts_with("ss://") {
-        parse_shadowsocks_uri(clean)
-    } else if clean.starts_with("socks5://") || clean.starts_with("socks://") {
-        parse_socks_uri(clean)
-    } else if clean.starts_with("http://") || clean.starts_with("https://") {
-        parse_http_uri(clean)
-    } else if clean.starts_with("hy2://") || clean.starts_with("hysteria2://") {
-        parse_hysteria2_uri(clean)
-    } else if clean.starts_with("tuic://") {
-        parse_tuic_uri(clean)
+    let g = GenericUri::parse(uri)?;
+    let default_tag = || format!("{}-node", g.scheme);
+    let tag = if g.tag.is_empty() {
+        default_tag()
     } else {
-        Err(FluxError::Config(format!(
-            "unsupported or invalid proxy URI: {}",
-            clean
-        )))
-    }
-}
-
-fn parse_vless_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    let without_scheme = uri.strip_prefix("vless://").unwrap_or(uri);
-    let (body, tag) = extract_tag(without_scheme, "vless-node");
-    let (user_host_port, query) = body.split_once('?').unwrap_or((body, ""));
-    let (uuid, host_port) = user_host_port
-        .split_once('@')
-        .ok_or_else(|| FluxError::Config("missing uuid in vless uri".into()))?;
-    let (host, port) = parse_host_port(host_port, 443)?;
-
-    let params = parse_query(query);
-
-    let security = params.get("security").map(|s| s.as_str()).unwrap_or("none");
-    let sni = params
-        .get("sni")
-        .cloned()
-        .or_else(|| params.get("peer").cloned());
-    let flow = params.get("flow").cloned();
-    let fp = params
-        .get("fp")
-        .cloned()
-        .or_else(|| params.get("utls").cloned());
-
-    let (reality_pk, reality_sid) = if security == "reality" {
-        let pk = params
-            .get("pbk")
-            .or_else(|| params.get("public_key"))
-            .cloned()
-            .ok_or_else(|| {
-                FluxError::Config("missing pbk (public key) in reality vless uri".into())
-            })?;
-        let sid = params
-            .get("sid")
-            .or_else(|| params.get("short_id"))
-            .cloned();
-        (Some(pk), sid)
-    } else {
-        (None, None)
+        g.tag.clone()
     };
 
-    let alpn: Vec<String> = params
-        .get("alpn")
-        .map(|a| a.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_default();
-
-    let insecure = params
-        .get("allowInsecure")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
-
-    ProxySpec {
-        tag,
-        protocol: "vless".into(),
-        server: host,
-        port,
-        auth: Some(uuid.to_string()),
-        flow,
-        sni,
-        insecure,
-        alpn,
-        utls: fp,
-        reality_public_key: reality_pk,
-        reality_short_id: reality_sid,
-        ..Default::default()
-    }
-    .build()
-}
-
-fn parse_trojan_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    let without_scheme = uri.strip_prefix("trojan://").unwrap_or(uri);
-    let (body, tag) = extract_tag(without_scheme, "trojan-node");
-    let (user_host_port, query) = body.split_once('?').unwrap_or((body, ""));
-    let (password, host_port) = user_host_port
-        .split_once('@')
-        .ok_or_else(|| FluxError::Config("missing password in trojan uri".into()))?;
-    let (host, port) = parse_host_port(host_port, 443)?;
-
-    let params = parse_query(query);
-    let sni = params
-        .get("sni")
-        .or_else(|| params.get("peer"))
-        .cloned()
-        .unwrap_or_else(|| host.clone());
-    let fp = params
-        .get("fp")
-        .cloned()
-        .or_else(|| params.get("utls").cloned());
-    let insecure = params
-        .get("allowInsecure")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false);
-
-    ProxySpec {
-        tag,
-        protocol: "trojan".into(),
-        server: host,
-        port,
-        auth: Some(password.to_string()),
-        sni: Some(sni),
-        insecure,
-        utls: fp,
-        ..Default::default()
-    }
-    .build()
-}
-
-fn parse_shadowsocks_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    let without_scheme = uri.strip_prefix("ss://").unwrap_or(uri);
-    let (body, tag) = extract_tag(without_scheme, "ss-node");
-
-    if let Some((userinfo_b64, host_port)) = body.split_once('@') {
-        let (host, port) = parse_host_port(host_port, 8388)?;
-        let decoded = decode_base64_or_plain(userinfo_b64)?;
-        let (method, password) = decoded.split_once(':').ok_or_else(|| {
-            FluxError::Config("invalid shadowsocks userinfo (expected method:password)".into())
-        })?;
-
-        ProxySpec {
-            tag,
-            protocol: "shadowsocks".into(),
-            server: host,
-            port,
-            auth: Some(password.to_string()),
-            method: Some(method.to_string()),
-            ..Default::default()
+    let default_port: u16 = match g.scheme {
+        "vless" | "trojan" | "hy2" | "hysteria2" | "https" => 443,
+        "ss" | "shadowsocks" => 8388,
+        "socks" | "socks5" => 1080,
+        "http" => 8080,
+        "tuic" => 8443,
+        "vmess" => 443,
+        other => {
+            return Err(FluxError::Config(format!(
+                "unsupported or invalid proxy URI scheme '{}://' (supported: vless, vmess, trojan, ss, socks5, http(s), hy2, tuic)",
+                other
+            )));
         }
-        .build()
-    } else {
-        let decoded = decode_base64_or_plain(body)?;
-        let (userinfo, host_port) = decoded
-            .split_once('@')
-            .ok_or_else(|| FluxError::Config("invalid shadowsocks uri".into()))?;
-        let (host, port) = parse_host_port(host_port, 8388)?;
-        let (method, password) = userinfo.split_once(':').ok_or_else(|| {
-            FluxError::Config("invalid shadowsocks userinfo (expected method:password)".into())
-        })?;
+    };
 
-        ProxySpec {
-            tag,
-            protocol: "shadowsocks".into(),
-            server: host,
-            port,
-            auth: Some(password.to_string()),
-            method: Some(method.to_string()),
-            ..Default::default()
+    // vmess:// is a base64-encoded JSON object (VMessAEAD share format).
+    if g.scheme == "vmess" {
+        return parse_vmess_link(uri, tag);
+    }
+
+    let params = parse_params(g.query)?;
+    let port = g.port.unwrap_or(default_port);
+
+    let mut spec = ProxySpec {
+        tag,
+        protocol: match g.scheme {
+            "shadowsocks" => "ss",
+            "socks5" => "socks",
+            "hysteria2" => "hy2",
+            s => s,
         }
-        .build()
-    }
-}
-
-fn parse_socks_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    let without_scheme = uri
-        .strip_prefix("socks5://")
-        .or_else(|| uri.strip_prefix("socks://"))
-        .unwrap_or(uri);
-    let (body, tag) = extract_tag(without_scheme, "socks-node");
-
-    let (username, password, host, port) =
-        if let Some((user_pass, host_port)) = body.split_once('@') {
-            let (u, p) = user_pass.split_once(':').unwrap_or((user_pass, ""));
-            let (h, port) = parse_host_port(host_port, 1080)?;
-            (Some(u.to_string()), Some(p.to_string()), h, port)
-        } else {
-            let (h, port) = parse_host_port(body, 1080)?;
-            (None, None, h, port)
-        };
-
-    ProxySpec {
-        tag,
-        protocol: "socks".into(),
-        server: host,
+        .to_string(),
+        server: g.host.clone(),
         port,
-        username,
-        password,
+        congestion_control: params.congestion_control.clone(),
+        up_mbps: params.up_mbps,
+        down_mbps: params.down_mbps,
+        hop_interval_secs: params.hop_interval_secs,
+        obfs: params.obfs.clone(),
+        obfs_password: params.obfs_password.clone(),
         ..Default::default()
-    }
-    .build()
-}
+    };
+    spec.apply_params(&params);
 
-fn parse_http_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    let without_scheme = uri
-        .strip_prefix("http://")
-        .or_else(|| uri.strip_prefix("https://"))
-        .unwrap_or(uri);
-    let (body, tag) = extract_tag(without_scheme, "http-node");
-
-    let (username, password, host, port) =
-        if let Some((user_pass, host_port)) = body.split_once('@') {
-            let (u, p) = user_pass.split_once(':').unwrap_or((user_pass, ""));
-            let (h, port) = parse_host_port(host_port, 8080)?;
-            (Some(u.to_string()), Some(p.to_string()), h, port)
-        } else {
-            let (h, port) = parse_host_port(body, 8080)?;
-            (None, None, h, port)
-        };
-
-    ProxySpec {
-        tag,
-        protocol: "http".into(),
-        server: host,
-        port,
-        username,
-        password,
-        ..Default::default()
-    }
-    .build()
-}
-
-fn parse_hysteria2_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    let without_scheme = uri
-        .strip_prefix("hysteria2://")
-        .or_else(|| uri.strip_prefix("hy2://"))
-        .unwrap_or(uri);
-    let (body, tag) = extract_tag(without_scheme, "hy2-node");
-    let (user_host_port, _query) = body.split_once('?').unwrap_or((body, ""));
-    let (password, host_port) = user_host_port
-        .split_once('@')
-        .ok_or_else(|| FluxError::Config("missing password in hysteria2 uri".into()))?;
-    let (host, port) = parse_host_port(host_port, 443)?;
-
-    ProxySpec {
-        tag,
-        protocol: "hy2".into(),
-        server: host,
-        port,
-        auth: Some(urlencoding_decode(password)),
-        ..Default::default()
-    }
-    .build()
-}
-
-fn parse_tuic_uri(uri: &str) -> FluxResult<OutboundConfig> {
-    let without_scheme = uri.strip_prefix("tuic://").unwrap_or(uri);
-    let (body, tag) = extract_tag(without_scheme, "tuic-node");
-    let (userinfo_host_port, _query) = body.split_once('?').unwrap_or((body, ""));
-    let (userinfo, host_port) = userinfo_host_port
-        .split_once('@')
-        .ok_or_else(|| FluxError::Config("missing userinfo in tuic uri".into()))?;
-    let (uuid, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-    let (host, port) = parse_host_port(host_port, 8443)?;
-
-    ProxySpec {
-        tag,
-        protocol: "tuic".into(),
-        server: host,
-        port,
-        auth: Some(uuid.to_string()),
-        password: Some(urlencoding_decode(password)),
-        ..Default::default()
-    }
-    .build()
-}
-
-fn extract_tag<'a>(s: &'a str, default_prefix: &str) -> (&'a str, String) {
-    if let Some((body, tag_part)) = s.split_once('#') {
-        let clean_tag = urlencoding_decode(tag_part.trim());
-        (
-            body,
-            if clean_tag.is_empty() {
-                default_prefix.to_string()
+    // Per-scheme userinfo semantics (protocol-defined, not query-generic).
+    match g.scheme {
+        "vless" => {
+            let uuid = g
+                .userinfo
+                .ok_or_else(|| FluxError::Config("missing uuid in vless uri".into()))?;
+            spec.auth = Some(urlencoding_decode(uuid));
+        }
+        "trojan" => {
+            let password = g
+                .userinfo
+                .ok_or_else(|| FluxError::Config("missing password in trojan uri".into()))?;
+            spec.auth = Some(urlencoding_decode(password));
+            // Trojan is TLS-by-definition: default SNI to the server host.
+            if spec.sni.is_none() {
+                spec.sni = Some(g.host.clone());
+            }
+            spec.security_hint_tls = true;
+        }
+        "ss" | "shadowsocks" => {
+            // SIP002: ss://base64(method:password)@host:port
+            // Legacy: ss://base64(method:password@host:port)
+            let decoded_full;
+            let (userinfo, host, port): (String, String, u16) = if let Some(ui) = g.userinfo {
+                (
+                    decode_base64_or_plain(ui)?,
+                    g.host.clone(),
+                    g.port.unwrap_or(default_port),
+                )
             } else {
-                clean_tag
-            },
-        )
-    } else {
-        (s, default_prefix.to_string())
-    }
-}
-
-fn parse_host_port(s: &str, default_port: u16) -> FluxResult<(String, u16)> {
-    let clean = s.trim();
-    if clean.starts_with('[') {
-        if let Some((h, p)) = clean.split_once("]:") {
-            let port = p.parse::<u16>().map_err(|_| {
-                FluxError::Config(format!("invalid port in IPv6 address: {}", clean))
+                // Legacy format: decode the whole authority body.
+                let body = uri
+                    .trim()
+                    .split_once("://")
+                    .map(|(_, r)| r)
+                    .unwrap_or(uri.trim());
+                let body = body.split(['?', '#']).next().unwrap_or(body);
+                decoded_full = decode_base64_or_plain(body)?;
+                let (ui, hp) = decoded_full
+                    .rsplit_once('@')
+                    .ok_or_else(|| FluxError::Config("invalid shadowsocks uri".into()))?;
+                let (h, p) = split_host_port(hp)?;
+                (ui.to_string(), h, p.unwrap_or(default_port))
+            };
+            let (method, password) = userinfo.split_once(':').ok_or_else(|| {
+                FluxError::Config("invalid shadowsocks userinfo (expected method:password)".into())
             })?;
-            return Ok((format!("{}]", h), port));
-        } else if clean.ends_with(']') {
-            return Ok((clean.to_string(), default_port));
+            spec.method = Some(method.to_string());
+            spec.auth = Some(urlencoding_decode(password));
+            spec.server = host;
+            spec.port = port;
+        }
+        "socks" | "socks5" | "http" | "https" => {
+            if let Some(userinfo) = g.userinfo {
+                let (u, p) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+                spec.username = Some(urlencoding_decode(u));
+                spec.password = Some(urlencoding_decode(p));
+            }
+        }
+        "hy2" | "hysteria2" => {
+            let password = g
+                .userinfo
+                .ok_or_else(|| FluxError::Config("missing password in hysteria2 uri".into()))?;
+            spec.auth = Some(urlencoding_decode(password));
+        }
+        "tuic" => {
+            let userinfo = g
+                .userinfo
+                .ok_or_else(|| FluxError::Config("missing userinfo in tuic uri".into()))?;
+            let (uuid, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+            spec.auth = Some(urlencoding_decode(uuid));
+            spec.password = Some(urlencoding_decode(password));
+        }
+        other => {
+            return Err(FluxError::Config(format!(
+                "unsupported proxy URI scheme '{}://'",
+                other
+            )));
         }
     }
 
-    if let Some((h, p)) = clean.rsplit_once(':') {
-        let port = p
-            .parse::<u16>()
-            .map_err(|_| FluxError::Config(format!("invalid port in address: {}", clean)))?;
-        Ok((h.to_string(), port))
+    spec.build()
+}
+
+/// VMess share links are base64-encoded JSON (VMessAEAD format).
+fn parse_vmess_link(uri: &str, default_tag: String) -> FluxResult<OutboundConfig> {
+    #[derive(Deserialize)]
+    struct VmessLink {
+        #[serde(default)]
+        ps: String,
+        add: String,
+        #[serde(deserialize_with = "de_port")]
+        port: u16,
+        id: String,
+        #[serde(default)]
+        scy: Option<String>,
+        #[serde(default)]
+        net: Option<String>,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        host: Option<String>,
+        #[serde(default)]
+        sni: Option<String>,
+        #[serde(default)]
+        tls: Option<String>,
+        #[serde(default)]
+        alpn: Option<String>,
+    }
+    fn de_port<'de, D>(d: D) -> Result<u16, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Number(n) => n
+                .as_u64()
+                .and_then(|x| u16::try_from(x).ok())
+                .ok_or_else(|| serde::de::Error::custom("invalid port")),
+            serde_json::Value::String(s) => s
+                .trim()
+                .parse()
+                .map_err(|_| serde::de::Error::custom("invalid port string")),
+            _ => Err(serde::de::Error::custom("missing port")),
+        }
+    }
+
+    let payload = uri
+        .trim()
+        .strip_prefix("vmess://")
+        .ok_or_else(|| FluxError::Config("invalid vmess uri".into()))?;
+    let json = decode_base64_or_plain(payload)?;
+    let link: VmessLink = serde_json::from_str(&json)
+        .map_err(|e| FluxError::Config(format!("invalid vmess link JSON: {}", e)))?;
+
+    let tag = if link.ps.is_empty() {
+        default_tag
     } else {
-        Ok((clean.to_string(), default_port))
-    }
-}
+        link.ps
+    };
 
-fn parse_query(q: &str) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for pair in q.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            map.insert(k.trim().to_string(), urlencoding_decode(v.trim()));
-        }
+    let mut spec = ProxySpec {
+        tag,
+        protocol: "vmess".into(),
+        server: link.add,
+        port: link.port,
+        auth: Some(link.id),
+        method: link.scy.filter(|s| s != "auto" && !s.is_empty()),
+        transport_type: link.net.filter(|n| n != "tcp" && !n.is_empty()),
+        transport_path: link.path.filter(|p| !p.is_empty()),
+        sni: link.sni,
+        ..Default::default()
+    };
+    if let Some(h) = link.host.filter(|h| !h.is_empty()) {
+        spec.transport_headers.insert("Host".into(), h);
     }
-    map
-}
-
-fn decode_base64_or_plain(s: &str) -> FluxResult<String> {
-    let clean = s.trim();
-    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(clean)
-        && let Ok(decoded) = String::from_utf8(bytes)
-    {
-        return Ok(decoded);
+    if let Some(alpn) = link.alpn {
+        spec.alpn = alpn.split(',').map(|s| s.trim().to_string()).collect();
     }
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(clean)
-        && let Ok(decoded) = String::from_utf8(bytes)
-    {
-        return Ok(decoded);
+    if link.tls.as_deref() == Some("tls") {
+        spec.security_hint_tls = true;
     }
-    Ok(clean.to_string())
+    spec.build()
 }
 
 pub fn urlencoding_decode(s: &str) -> String {
@@ -539,10 +688,6 @@ pub fn urlencoding_decode(s: &str) -> String {
                     bytes.push(val);
                     continue;
                 }
-                bytes.push(b'%');
-                bytes.push(c1);
-                bytes.push(c2);
-                continue;
             }
             bytes.push(b'%');
             if let Some(c1) = h1 {
@@ -560,88 +705,129 @@ pub fn urlencoding_decode(s: &str) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn decode_base64_or_plain(s: &str) -> FluxResult<String> {
+    let clean = s.trim();
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(clean)
+        && let Ok(decoded) = String::from_utf8(bytes)
+    {
+        return Ok(decoded);
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(clean)
+        && let Ok(decoded) = String::from_utf8(bytes)
+    {
+        return Ok(decoded);
+    }
+    Ok(clean.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    fn node_of(out: OutboundConfig) -> Box<LayeredOutboundNode> {
+        match out {
+            OutboundConfig::Node(n) => n,
+            _ => panic!("expected node outbound"),
+        }
+    }
+
+    fn server_of(node: &LayeredOutboundNode) -> (String, u16) {
+        match &node.carrier {
+            CarrierConfig::Tcp { server, port, .. } => {
+                (server.clone().unwrap_or_default(), port.unwrap_or(0))
+            }
+            _ => panic!("expected tcp carrier"),
+        }
+    }
 
     #[test]
     fn test_parse_vless_reality_uri() {
         let uri = "vless://a1b2c3d4-e5f6-7890-1234-56789abcdef0@1.2.3.4:443?security=reality&sni=www.microsoft.com&pbk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&sid=0123456789abcdef&flow=xtls-rprx-vision#My-Reality-Node";
         let out = parse_proxy_uri(uri).unwrap();
-        assert_eq!(out.tag(), "My-Reality-Node");
-        match out {
-            OutboundConfig::Node(node) => {
-                assert_eq!(node.tag, "My-Reality-Node");
-                match node.protocol {
-                    ProtocolConfig::Vless { uuid, flow } => {
-                        assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
-                        assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
-                    }
-                    _ => panic!("expected vless protocol"),
-                }
-                let sec = node.security.unwrap().into_vec().pop().unwrap();
-                match sec {
-                    SecurityConfig::Reality {
-                        sni,
-                        public_key,
-                        short_id,
-                    } => {
-                        assert_eq!(sni.as_deref(), Some("www.microsoft.com"));
-                        assert_eq!(
-                            public_key,
-                            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                        );
-                        assert_eq!(short_id.as_deref(), Some("0123456789abcdef"));
-                    }
-                    _ => panic!("expected reality security"),
-                }
+        let node = node_of(out);
+        assert_eq!(node.tag, "My-Reality-Node");
+        match node.protocol {
+            ProtocolConfig::Vless { uuid, flow } => {
+                assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
+                assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
             }
-            _ => panic!("expected node outbound"),
+            _ => panic!("expected vless protocol"),
+        }
+        match node.security.unwrap().into_vec().pop().unwrap() {
+            SecurityConfig::Reality {
+                sni,
+                public_key,
+                short_id,
+            } => {
+                assert_eq!(sni.as_deref(), Some("www.microsoft.com"));
+                assert_eq!(
+                    public_key,
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                );
+                assert_eq!(short_id.as_deref(), Some("0123456789abcdef"));
+            }
+            _ => panic!("expected reality security"),
         }
     }
 
     #[test]
     fn test_parse_trojan_uri() {
         let uri = "trojan://mypassword123@trojan.example.com:443?sni=trojan.example.com#Trojan-US";
-        let out = parse_proxy_uri(uri).unwrap();
-        assert_eq!(out.tag(), "Trojan-US");
-        match out {
-            OutboundConfig::Node(node) => {
-                assert_eq!(node.tag, "Trojan-US");
-                match node.protocol {
-                    ProtocolConfig::Trojan { password } => {
-                        assert_eq!(password, "mypassword123");
-                    }
-                    _ => panic!("expected trojan protocol"),
-                }
-                let sec = node.security.unwrap().into_vec().pop().unwrap();
-                match sec {
-                    SecurityConfig::Tls { sni, .. } => {
-                        assert_eq!(sni.as_deref(), Some("trojan.example.com"));
-                    }
-                    _ => panic!("expected tls security"),
-                }
+        let node = node_of(parse_proxy_uri(uri).unwrap());
+        assert_eq!(node.tag, "Trojan-US");
+        match node.protocol {
+            ProtocolConfig::Trojan { password } => assert_eq!(password, "mypassword123"),
+            _ => panic!("expected trojan protocol"),
+        }
+        match node.security.unwrap().into_vec().pop().unwrap() {
+            SecurityConfig::Tls { sni, .. } => {
+                assert_eq!(sni.as_deref(), Some("trojan.example.com"))
             }
-            _ => panic!("expected node outbound"),
+            _ => panic!("expected tls security"),
+        }
+    }
+
+    #[test]
+    fn test_trojan_defaults_sni_to_host() {
+        let node = node_of(parse_proxy_uri("trojan://pw@example.org:443").unwrap());
+        match node.security.unwrap().into_vec().pop().unwrap() {
+            SecurityConfig::Tls { sni, .. } => assert_eq!(sni.as_deref(), Some("example.org")),
+            _ => panic!("trojan must default to TLS with host SNI"),
         }
     }
 
     #[test]
     fn test_parse_hysteria2_uri() {
         let uri = "hy2://mypassword@hy2.example.com:443?sni=hy2.example.com#Hy2-Fast";
-        let out = parse_proxy_uri(uri).unwrap();
-        assert_eq!(out.tag(), "Hy2-Fast");
-        match out {
-            OutboundConfig::Node(node) => {
-                assert_eq!(node.tag, "Hy2-Fast");
-                match node.protocol {
-                    ProtocolConfig::Hysteria2 { password, .. } => {
-                        assert_eq!(password, "mypassword");
-                    }
-                    _ => panic!("expected hysteria2 protocol"),
-                }
+        let node = node_of(parse_proxy_uri(uri).unwrap());
+        assert_eq!(node.tag, "Hy2-Fast");
+        match node.protocol {
+            ProtocolConfig::Hysteria2 { password, .. } => assert_eq!(password, "mypassword"),
+            _ => panic!("expected hysteria2 protocol"),
+        }
+    }
+
+    #[test]
+    fn test_parse_hysteria2_full_params() {
+        let uri = "hysteria2://pw@1.2.3.4:443?obfs=salamander&obfs-password=secret&upmbps=200&downmbps=500&ports=443,8000-9000&hop_interval=15#H";
+        let node = node_of(parse_proxy_uri(uri).unwrap());
+        match node.protocol {
+            ProtocolConfig::Hysteria2 {
+                up_mbps,
+                down_mbps,
+                hop_interval_secs,
+                obfs,
+                obfs_password,
+                ..
+            } => {
+                assert_eq!(up_mbps, 200);
+                assert_eq!(down_mbps, 500);
+                assert_eq!(hop_interval_secs, Some(15));
+                assert_eq!(obfs.as_deref(), Some("salamander"));
+                assert_eq!(obfs_password.as_deref(), Some("secret"));
             }
-            _ => panic!("expected node outbound"),
+            _ => panic!("expected hysteria2 protocol"),
         }
     }
 
@@ -649,21 +835,165 @@ mod tests {
     fn test_parse_tuic_uri() {
         let uri =
             "tuic://a1b2c3d4-e5f6-7890-1234-56789abcdef0:tuicpass@tuic.example.com:8443#TUIC-Node";
-        let out = parse_proxy_uri(uri).unwrap();
-        assert_eq!(out.tag(), "TUIC-Node");
-        match out {
-            OutboundConfig::Node(node) => {
-                assert_eq!(node.tag, "TUIC-Node");
-                match node.protocol {
-                    ProtocolConfig::Tuic { uuid, password, .. } => {
-                        assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
-                        assert_eq!(password, "tuicpass");
-                    }
-                    _ => panic!("expected tuic protocol"),
-                }
+        let node = node_of(parse_proxy_uri(uri).unwrap());
+        match node.protocol {
+            ProtocolConfig::Tuic { uuid, password, .. } => {
+                assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
+                assert_eq!(password, "tuicpass");
             }
-            _ => panic!("expected node outbound"),
+            _ => panic!("expected tuic protocol"),
         }
+    }
+
+    #[test]
+    fn test_parse_ss_sip002_base64_userinfo() {
+        // SIP002: ss://base64(method:password)@host:port#tag
+        let ui = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("chacha20-ietf-poly1305:mypassword");
+        let uri = format!("ss://{}@1.2.3.4:8388#SS-Node", ui);
+        let node = node_of(parse_proxy_uri(&uri).unwrap());
+        assert_eq!(node.tag, "SS-Node");
+        match node.protocol {
+            ProtocolConfig::Shadowsocks { password, method } => {
+                assert_eq!(password, "mypassword");
+                assert_eq!(method.as_deref(), Some("chacha20-ietf-poly1305"));
+            }
+            _ => panic!("expected shadowsocks"),
+        }
+    }
+
+    #[test]
+    fn test_parse_ss_legacy_full_base64() {
+        // Legacy: ss://base64(method:password@host:port)#tag
+        let body = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("aes-256-gcm:secretpw@example.com:443");
+        let uri = format!("ss://{}#Legacy", body);
+        let node = node_of(parse_proxy_uri(&uri).unwrap());
+        assert_eq!(server_of(&node), ("example.com".to_string(), 443));
+        match node.protocol {
+            ProtocolConfig::Shadowsocks { password, method } => {
+                assert_eq!(password, "secretpw");
+                assert_eq!(method.as_deref(), Some("aes-256-gcm"));
+            }
+            _ => panic!("expected shadowsocks"),
+        }
+    }
+
+    #[test]
+    fn test_parse_vmess_base64_json() {
+        let json = r#"{"v":"2","ps":"VMess-Node","add":"vm.example.com","port":"443","id":"a1b2c3d4-e5f6-7890-1234-56789abcdef0","aid":"0","scy":"aes-128-gcm","net":"ws","type":"none","host":"cdn.example.com","path":"/ws","tls":"tls","sni":"vm.example.com"}"#;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
+        let node = node_of(parse_proxy_uri(&format!("vmess://{}", b64)).unwrap());
+        assert_eq!(node.tag, "VMess-Node");
+        assert_eq!(server_of(&node).0, "vm.example.com");
+        match node.protocol {
+            ProtocolConfig::Vmess { uuid, security } => {
+                assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
+                assert_eq!(security.as_deref(), Some("aes-128-gcm"));
+            }
+            _ => panic!("expected vmess"),
+        }
+        assert!(node.security.is_some(), "tls must be enabled");
+        match node.framing.unwrap().into_vec().pop().unwrap() {
+            FramingConfig::WebSocket { path, headers } => {
+                assert_eq!(path, "/ws");
+                assert_eq!(
+                    headers.get("Host").map(|s| s.as_str()),
+                    Some("cdn.example.com")
+                );
+            }
+            _ => panic!("expected websocket framing"),
+        }
+    }
+
+    #[test]
+    fn test_parse_socks_and_http_with_auth() {
+        let node = node_of(parse_proxy_uri("socks5://user:p%40ss@1.2.3.4:1080").unwrap());
+        match node.protocol {
+            ProtocolConfig::Socks { username, password } => {
+                assert_eq!(username.as_deref(), Some("user"));
+                assert_eq!(password.as_deref(), Some("p@ss"));
+            }
+            _ => panic!("expected socks"),
+        }
+        let node = node_of(parse_proxy_uri("http://u:p@1.2.3.4:8080").unwrap());
+        match node.protocol {
+            ProtocolConfig::Http { username, password } => {
+                assert_eq!(username.as_deref(), Some("u"));
+                assert_eq!(password.as_deref(), Some("p"));
+            }
+            _ => panic!("expected http"),
+        }
+    }
+
+    #[test]
+    fn test_password_with_at_sign() {
+        // rsplit_once('@'): the LAST '@' separates userinfo from host.
+        let node = node_of(parse_proxy_uri("trojan://p@ss@host.example:443").unwrap());
+        match &node.protocol {
+            ProtocolConfig::Trojan { password } => assert_eq!(password, "p@ss"),
+            _ => panic!("expected trojan"),
+        }
+        assert_eq!(server_of(&node).0, "host.example");
+    }
+
+    #[test]
+    fn test_ipv6_host() {
+        let node = node_of(
+            parse_proxy_uri("vless://a1b2c3d4-e5f6-7890-1234-56789abcdef0@[2001:db8::1]:443")
+                .unwrap(),
+        );
+        assert_eq!(server_of(&node), ("[2001:db8::1]".to_string(), 443));
+    }
+
+    #[test]
+    fn test_default_ports() {
+        assert_eq!(
+            server_of(&node_of(parse_proxy_uri("trojan://pw@h.example").unwrap())).1,
+            443
+        );
+        assert_eq!(
+            server_of(&node_of(parse_proxy_uri("socks5://1.2.3.4").unwrap())).1,
+            1080
+        );
+    }
+
+    #[test]
+    fn test_vless_ws_transport_and_alpn() {
+        let uri = "vless://a1b2c3d4-e5f6-7890-1234-56789abcdef0@h.example:443?security=tls&sni=s.example&type=ws&path=%2Flive&host=cdn.example&alpn=h2,http/1.1&fp=chrome";
+        let node = node_of(parse_proxy_uri(uri).unwrap());
+        match node.framing.unwrap().into_vec().pop().unwrap() {
+            FramingConfig::WebSocket { path, headers } => {
+                assert_eq!(path, "/live");
+                assert_eq!(headers.get("Host").map(|s| s.as_str()), Some("cdn.example"));
+            }
+            _ => panic!("expected ws framing"),
+        }
+        match node.security.unwrap().into_vec().pop().unwrap() {
+            SecurityConfig::Tls {
+                sni, alpn, utls, ..
+            } => {
+                assert_eq!(sni.as_deref(), Some("s.example"));
+                assert_eq!(alpn, vec!["h2", "http/1.1"]);
+                assert_eq!(utls.as_deref(), Some("chrome"));
+            }
+            _ => panic!("expected tls"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_scheme_rejected() {
+        assert!(parse_proxy_uri("foobar://x@h:1").is_err());
+        assert!(parse_proxy_uri("not a uri").is_err());
+        assert!(
+            parse_proxy_uri("vless://@h:443").is_err() || parse_proxy_uri("vless://h:443").is_err()
+        );
+    }
+
+    #[test]
+    fn test_unknown_query_params_preserved_not_fatal() {
+        let uri = "vless://a1b2c3d4-e5f6-7890-1234-56789abcdef0@h:443?security=tls&futureParam=xyz&sni=a.example";
+        parse_proxy_uri(uri).expect("unknown params must not break parsing");
     }
 
     #[test]

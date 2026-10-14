@@ -110,11 +110,20 @@ impl Hysteria2Outbound {
                 .clone()
                 .map(|v| v.into_iter().map(|s| s.into_bytes()).collect())
                 .unwrap_or_else(|| vec![b"h3".to_vec(), b"hysteria2".to_vec()]);
-            let ep = QuicTransport::create_client_endpoint(
-                peer_addr.is_ipv6(),
-                alpn,
-                self.config.insecure,
-            )?;
+            let ep = if let Some(obfs_pwd) = &self.config.obfs {
+                QuicTransport::create_client_endpoint_obfs(
+                    peer_addr.is_ipv6(),
+                    alpn,
+                    self.config.insecure,
+                    obfs_pwd,
+                )?
+            } else {
+                QuicTransport::create_client_endpoint(
+                    peer_addr.is_ipv6(),
+                    alpn,
+                    self.config.insecure,
+                )?
+            };
             *ep_guard = Some(ep.clone());
             ep
         };

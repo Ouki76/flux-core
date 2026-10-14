@@ -6,6 +6,7 @@ pub mod h3_lite;
 pub mod httpupgrade;
 pub mod pipeline;
 pub mod quic;
+pub mod quic_obfs;
 pub mod reality;
 pub mod shadowtls;
 pub mod tcp;
