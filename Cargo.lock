@@ -47,12 +47,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "allocator-api2"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -600,7 +594,7 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "flux-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -630,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "flux-common"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -644,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "flux-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -676,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "flux-dns"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -697,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "flux-inbound"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -726,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "flux-outbound"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -755,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "flux-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -789,7 +783,7 @@ dependencies = [
 
 [[package]]
 name = "flux-router"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "flux-types",
  "ipnet",
@@ -801,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "flux-transport"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -838,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "flux-types"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -855,9 +849,9 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foldhash"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "futures"
@@ -1075,20 +1069,12 @@ checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-dependencies = [
- "allocator-api2",
- "equivalent",
- "foldhash",
-]
-
-[[package]]
-name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+dependencies = [
+ "foldhash",
+]
 
 [[package]]
 name = "heapless"
@@ -1255,11 +1241,11 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.13.0"
+version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "227748d55f2f0ab4735d87fd623798cb6b664512fe979705f829c9f81c934465"
+checksum = "ef9ac18847474e638e3702b76c65d4eb93428471a74778ef0f1be711717f89b5"
 dependencies = [
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -1709,9 +1695,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.44"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6725596c3f2c3a0aef021139e145d4eafe314a6623e4680ca83852b2c67ab2ba"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",

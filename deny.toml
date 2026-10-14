@@ -1,0 +1,49 @@
+# cargo-deny policy for flux-core
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Fail on any known vulnerability in the RustSec advisory database.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# RUSTSEC-2024-0449: unsafe-libyaml (transitive via serde_yaml_ng) is unmaintained.
+# Accepted risk: no safe drop-in replacement exists yet (saphyr migration tracked
+# separately); the YAML parser only processes trusted local operator config, never
+# untrusted network input.
+ignore = ["RUSTSEC-2024-0449"]
+
+[licenses]
+# The workspace is MIT-licensed; permit the standard permissive set used by
+# the Rust ecosystem. Copyleft (GPL/AGPL/LGPL) is rejected.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+    "MPL-2.0",
+    "OpenSSL",
+    # webpki-roots (Mozilla CA bundle) distribution license.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Flag duplicate versions of the same crate (supply-chain surface growth).
+multiple-versions = "warn"
+# Path-only workspace members register as wildcards; Cargo.lock pins everything.
+wildcards = "warn"
+highlight = "all"
+
+[sources]
+# Only crates.io (+ its sparse index) is allowed; no ad-hoc git registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
