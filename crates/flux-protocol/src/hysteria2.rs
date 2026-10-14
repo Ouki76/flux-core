@@ -652,4 +652,29 @@ mod tests {
         let wrong_recovered = wrong_obfs.deobfuscate(&c1).unwrap();
         assert_ne!(&wrong_recovered, plain);
     }
+    #[test]
+    fn test_port_hopper_cycles_after_interval() {
+        // Construct with the minimum enforced interval, then backdate last_hop
+        // to trigger a hop immediately (avoids a 5s sleep).
+        let mut hopper = PortHopper::new(vec![10001, 10002, 10003], 5);
+        assert_eq!(hopper.current_port(), 10001, "initial port");
+        // No hop before the interval elapses.
+        assert_eq!(hopper.current_port(), 10001);
+
+        hopper.last_hop = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        assert_eq!(hopper.current_port(), 10002, "hop 1 after interval");
+        hopper.last_hop = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        assert_eq!(hopper.current_port(), 10003, "hop 2");
+        hopper.last_hop = std::time::Instant::now() - std::time::Duration::from_secs(10);
+        assert_eq!(hopper.current_port(), 10001, "wraps around to first port");
+
+        // Single-port list never hops.
+        let mut single = PortHopper::new(vec![443], 5);
+        single.last_hop = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        assert_eq!(single.current_port(), 443);
+
+        // Empty list defaults to 443.
+        let empty = PortHopper::new(vec![], 5);
+        assert_eq!(empty.ports, vec![443]);
+    }
 }

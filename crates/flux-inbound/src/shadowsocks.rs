@@ -400,9 +400,7 @@ impl Inbound for ShadowsocksInbound {
                                     let encoded = if let CipherKind::Ss2022(method) = cipher_kind {
                                         let psk = &master_key_send[..method.key_len()];
                                         let cipher = flux_protocol::shadowsocks2022::Ss2022UdpPacketCipher::new(method, psk);
-                                        cipher
-                                            .encrypt_packet(&reply.destination, &reply.payload)
-                                            .ok()
+                                        cipher.encrypt_packet(&reply.source, &reply.payload).ok()
                                     } else {
                                         let salt_len = cipher_kind.salt_len();
                                         let mut salt = vec![0u8; salt_len];
@@ -410,7 +408,7 @@ impl Inbound for ShadowsocksInbound {
                                         let subkey = derive_subkey(&master_key_send, &salt);
                                         let mut cipher =
                                             ShadowsocksCipher::with_kind(cipher_kind, &subkey);
-                                        let addr_bytes = encode_ss_address(&reply.destination);
+                                        let addr_bytes = encode_ss_address(&reply.source);
                                         let mut plain = Vec::with_capacity(
                                             addr_bytes.len() + reply.payload.len(),
                                         );

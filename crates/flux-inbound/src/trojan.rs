@@ -233,7 +233,7 @@ impl Inbound for TrojanInbound {
 
                         let write_fut = async move {
                             while let Some(packet) = out_rx.recv().await {
-                                let encoded = flux_protocol::udp::encode_trojan_udp(&packet);
+                                let encoded = flux_protocol::udp::encode_trojan_udp_reply(&packet);
                                 if tokio::io::AsyncWriteExt::write_all(&mut write_half, &encoded)
                                     .await
                                     .is_err()

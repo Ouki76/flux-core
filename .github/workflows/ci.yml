@@ -50,6 +50,24 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+  privileged-tests:
+    name: Privileged Tests (TUN / REDIRECT)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.0
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Transparent inbound e2e (root via sudo, /dev/net/tun + iptables)
+        run: sudo -E env "PATH=$PATH" cargo test --test test_transparent_inbounds -- --nocapture --test-threads=1
+
   supply-chain:
     name: Supply Chain (audit + deny)
     runs-on: ubuntu-latest

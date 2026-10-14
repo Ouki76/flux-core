@@ -48,6 +48,9 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **Deterministic parser fuzz regression suite** (`tests/test_fuzz_parsers.rs`) — runs in CI without nightly.
 - **Soak / leak detection**: `scripts/soak.sh [duration_secs]` (default 24h) — sustained load with RSS/FD/thread sampling and leak assertion.
 - 35 sing-box interop tests run against the real `sing-box` binary (graceful skip when absent).
+- **UDP relay e2e** for every UDP-capable protocol (SOCKS5, Trojan, VMess, SS/SS-2022, VLESS, TUIC, Hy2), including reply-address-header correctness.
+- **Transparent inbound e2e** (TUN/REDIRECT/TPROXY) — root-gated, executed in the CI `privileged-tests` job with sudo.
+- **SIGHUP hot-reload e2e**: listener swap and invalid-config rollback against the real binary.
 
 ### Management & Control
 - **Flux Core Native REST API**: Native control plane API (`/api/v1/*`) over TCP or Unix Domain Sockets (`unix://...`) with Bearer token authentication, real-time traffic metering, dynamic outbound selector switching, delay/latency probing, route simulation dry-run, and connection lifecycle management.

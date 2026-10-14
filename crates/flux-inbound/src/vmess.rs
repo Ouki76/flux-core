@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use flux_protocol::vmess::{VMESS_CMD_UDP, VmessProtocol, VmessStream};
-use flux_types::{Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta};
+use flux_types::{Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta, UdpPacket};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,19 +140,6 @@ impl Inbound for VmessInbound {
                         }
                     };
 
-                    let network = if req.command == VMESS_CMD_UDP {
-                        NetworkType::Udp
-                    } else {
-                        NetworkType::Tcp
-                    };
-
-                    let meta = SessionMeta::new(
-                        client_addr,
-                        req.address.clone(),
-                        inbound_tag.clone(),
-                        network,
-                    );
-
                     let vmess_stream = VmessStream::new_server(
                         stream,
                         req.session_key,
@@ -160,6 +147,81 @@ impl Inbound for VmessInbound {
                         req.security,
                         req.resp_header,
                         req.option,
+                    );
+
+                    if req.command == VMESS_CMD_UDP {
+                        // VMess UDP-over-TCP: datagrams are `[u16 BE len][payload]` frames
+                        // inside the encrypted stream, all bound to the request target.
+                        let target = req.address.clone();
+                        let meta = SessionMeta::new(
+                            client_addr,
+                            target.clone(),
+                            inbound_tag.clone(),
+                            NetworkType::Udp,
+                        );
+                        let (pkt_tx, pkt_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+                        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<UdpPacket>(64);
+                        let (mut reader, mut writer) = tokio::io::split(vmess_stream);
+
+                        let read_fut = async move {
+                            loop {
+                                let mut len_buf = [0u8; 2];
+                                if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut len_buf)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                let payload_len = u16::from_be_bytes(len_buf) as usize;
+                                let mut payload = vec![0u8; payload_len];
+                                if tokio::io::AsyncReadExt::read_exact(&mut reader, &mut payload)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                let packet = UdpPacket::new(
+                                    bytes::Bytes::from(payload),
+                                    target.clone(),
+                                    target.clone(),
+                                );
+                                if pkt_tx.send(packet).await.is_err() {
+                                    break;
+                                }
+                            }
+                        };
+
+                        let write_fut = async move {
+                            while let Some(packet) = out_rx.recv().await {
+                                let payload_len = (packet.payload.len().min(65535)) as u16;
+                                let mut frame = Vec::with_capacity(2 + payload_len as usize);
+                                frame.extend_from_slice(&payload_len.to_be_bytes());
+                                frame.extend_from_slice(&packet.payload[..payload_len as usize]);
+                                if tokio::io::AsyncWriteExt::write_all(&mut writer, &frame)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if tokio::io::AsyncWriteExt::flush(&mut writer).await.is_err() {
+                                    break;
+                                }
+                            }
+                        };
+
+                        tokio::select! {
+                            _ = read_fut => {},
+                            _ = write_fut => {},
+                            res = disp.dispatch_packet(meta, pkt_rx, out_tx) => { let _ = res; },
+                        }
+                        return;
+                    }
+
+                    let meta = SessionMeta::new(
+                        client_addr,
+                        req.address.clone(),
+                        inbound_tag.clone(),
+                        NetworkType::Tcp,
                     );
 
                     disp.dispatch_stream(meta, Box::new(vmess_stream)).await;

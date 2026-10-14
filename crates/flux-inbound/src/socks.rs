@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use flux_protocol::socks5::{REP_SUCCESS, Socks5Command, Socks5Handshake};
-use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
+use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp_reply};
 use flux_types::{
     Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
 };
@@ -338,7 +338,7 @@ impl Inbound for SocksInbound {
                                 while let Some(pkt) = out_rx.recv().await {
                                     let maybe_peer = *client_udp_peer.lock().await;
                                     if let Some(client_sock) = maybe_peer {
-                                        let encoded = encode_socks5_udp(&pkt);
+                                        let encoded = encode_socks5_udp_reply(&pkt);
                                         let _ = udp_send.send_to(&encoded, client_sock).await;
                                     }
                                 }

@@ -3,13 +3,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flux_types::{FluxError, FluxResult, TargetAddress, UdpPacket};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-/// Encodes a UdpPacket into a SOCKS5 UDP datagram.
-pub fn encode_socks5_udp(packet: &UdpPacket) -> Bytes {
-    let mut buf = BytesMut::with_capacity(32 + packet.payload.len());
-    buf.put_u16(0x0000); // RSV
-    buf.put_u8(0x00); // FRAG
-
-    match &packet.destination {
+/// Writes `[ATYP + Addr + Port]` for `addr` into `buf`.
+fn put_addr(buf: &mut BytesMut, addr: &TargetAddress) {
+    match addr {
         TargetAddress::Ip(SocketAddr::V4(v4)) => {
             buf.put_u8(ATYP_IPV4);
             buf.put_slice(&v4.ip().octets());
@@ -29,8 +25,25 @@ pub fn encode_socks5_udp(packet: &UdpPacket) -> Bytes {
             buf.put_u16(*port);
         }
     }
+}
 
-    buf.put_slice(&packet.payload);
+/// Encodes a UdpPacket into a SOCKS5 UDP datagram.
+pub fn encode_socks5_udp(packet: &UdpPacket) -> Bytes {
+    encode_socks5_udp_with_addr(packet, &packet.destination)
+}
+
+/// Encodes a SOCKS5 UDP reply datagram: the address header is the sender
+/// (`packet.source`), as required by RFC 1928 for server-to-client datagrams.
+pub fn encode_socks5_udp_reply(packet: &UdpPacket) -> Bytes {
+    encode_socks5_udp_with_addr(packet, &packet.source)
+}
+
+fn encode_socks5_udp_with_addr(packet: &UdpPacket, addr: &TargetAddress) -> Bytes {
+    let mut buf = BytesMut::with_capacity(32 + packet.payload.len());
+    buf.put_u16(0x0000); // RSV
+    buf.put_u8(0x00); // FRAG
+    put_addr(&mut buf, addr);
+    buf.extend_from_slice(&packet.payload);
     buf.freeze()
 }
 
@@ -113,27 +126,18 @@ pub fn decode_socks5_udp(src_addr: TargetAddress, mut data: Bytes) -> FluxResult
 
 /// Encodes a Trojan UDP packet: `[ATYP + Addr + Port] + [Length (2 bytes BE)] + [\r\n] + [Payload]`.
 pub fn encode_trojan_udp(packet: &UdpPacket) -> Bytes {
+    encode_trojan_udp_with_addr(packet, &packet.destination)
+}
+
+/// Encodes a Trojan UDP reply packet: the address header is the sender
+/// (`packet.source`), per Trojan UDP-ASSOCIATE reply semantics.
+pub fn encode_trojan_udp_reply(packet: &UdpPacket) -> Bytes {
+    encode_trojan_udp_with_addr(packet, &packet.source)
+}
+
+fn encode_trojan_udp_with_addr(packet: &UdpPacket, addr: &TargetAddress) -> Bytes {
     let mut buf = BytesMut::with_capacity(32 + packet.payload.len());
-    match &packet.destination {
-        TargetAddress::Ip(SocketAddr::V4(v4)) => {
-            buf.put_u8(ATYP_IPV4);
-            buf.put_slice(&v4.ip().octets());
-            buf.put_u16(v4.port());
-        }
-        TargetAddress::Ip(SocketAddr::V6(v6)) => {
-            buf.put_u8(ATYP_IPV6);
-            buf.put_slice(&v6.ip().octets());
-            buf.put_u16(v6.port());
-        }
-        TargetAddress::Domain(domain, port) => {
-            buf.put_u8(ATYP_DOMAIN);
-            let bytes = domain.as_bytes();
-            let dlen = bytes.len().min(255);
-            buf.put_u8(dlen as u8);
-            buf.put_slice(&bytes[..dlen]);
-            buf.put_u16(*port);
-        }
-    }
+    put_addr(&mut buf, addr);
     let p_len = packet.payload.len().min(65535);
     buf.put_u16(p_len as u16);
     buf.put_slice(b"\r\n");
@@ -143,27 +147,18 @@ pub fn encode_trojan_udp(packet: &UdpPacket) -> Bytes {
 
 /// Encodes a standard VLESS UDP packet: `[Address] + [Length (2 bytes BE)] + [Payload]`.
 pub fn encode_vless_udp_packet(packet: &UdpPacket) -> Bytes {
+    encode_vless_udp_packet_with_addr(packet, &packet.destination)
+}
+
+/// Encodes a VLESS UDP reply packet: the address header is the sender
+/// (`packet.source`), matching VLESS/Xray server reply behavior.
+pub fn encode_vless_udp_reply_packet(packet: &UdpPacket) -> Bytes {
+    encode_vless_udp_packet_with_addr(packet, &packet.source)
+}
+
+fn encode_vless_udp_packet_with_addr(packet: &UdpPacket, addr: &TargetAddress) -> Bytes {
     let mut buf = BytesMut::with_capacity(32 + packet.payload.len());
-    match &packet.destination {
-        TargetAddress::Ip(SocketAddr::V4(v4)) => {
-            buf.put_u8(ATYP_IPV4);
-            buf.put_slice(&v4.ip().octets());
-            buf.put_u16(v4.port());
-        }
-        TargetAddress::Ip(SocketAddr::V6(v6)) => {
-            buf.put_u8(ATYP_IPV6);
-            buf.put_slice(&v6.ip().octets());
-            buf.put_u16(v6.port());
-        }
-        TargetAddress::Domain(domain, port) => {
-            buf.put_u8(ATYP_DOMAIN);
-            let bytes = domain.as_bytes();
-            let dlen = bytes.len().min(255);
-            buf.put_u8(dlen as u8);
-            buf.put_slice(&bytes[..dlen]);
-            buf.put_u16(*port);
-        }
-    }
+    put_addr(&mut buf, addr);
     let p_len = packet.payload.len().min(65535);
     buf.put_u16(p_len as u16);
     buf.put_slice(&packet.payload[..p_len]);

@@ -194,7 +194,8 @@ impl Inbound for VlessInbound {
 
                         let write_fut = async move {
                             while let Some(packet) = out_rx.recv().await {
-                                let encoded = flux_protocol::udp::encode_vless_udp_packet(&packet);
+                                let encoded =
+                                    flux_protocol::udp::encode_vless_udp_reply_packet(&packet);
                                 if tokio::io::AsyncWriteExt::write_all(&mut write_half, &encoded)
                                     .await
                                     .is_err()
