@@ -1186,3 +1186,175 @@ async fn test_tun_inbound_bulk_transfer_integrity() {
 
     let _ = instance.stop().await;
 }
+
+/// TUN/TCP with a **jumbo MTU**: the same byte-for-byte integrity proof as
+/// [`test_tun_inbound_bulk_transfer_integrity`], plus two assertions that make
+/// the MTU path non-vacuous:
+///
+/// * the configured `mtu` is actually programmed into the TUN *device* (a TUN
+///   carries exactly one IP packet per `read()`/`write()`, so the device MTU —
+///   not the stack's segment cap — decides how many syscalls a megabyte costs;
+///   before this was fixed the `mtu` option only sized a buffer and the device
+///   stayed at the kernel default of 1500),
+/// * the frames on the device are genuinely large: 8 MiB through a 64 KiB MTU
+///   must need far fewer packets than the same transfer at 1500.
+///
+/// The transfer itself is verified byte-for-byte (position-dependent pattern)
+/// and must end with a clean FIN, because jumbo segments exercise the
+/// assembler, sequence arithmetic and the receive-window code at sizes a
+/// 1500-byte MTU never reaches.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_tun_inbound_jumbo_mtu_integrity() {
+    const NAME: &str = "test_tun_inbound_jumbo_mtu_integrity";
+    if !must_run_here(NAME) {
+        return;
+    }
+
+    const TUN: &str = "fluxtun3";
+    const TUN_LOCAL: &str = "10.96.0.1";
+    const CLIENT: &str = "10.96.0.2";
+    const TARGET: &str = "10.96.66.2";
+    const PORT: u16 = 19_003;
+    const MTU: usize = 65_535;
+    const TOTAL: usize = 8 * 1024 * 1024;
+    const CHUNK: usize = 64 * 1024;
+
+    let mut cleanup = Cleanup::new();
+    setup_loopback_and_sysctls();
+
+    sh_ok(&format!("ip addr add {CLIENT}/32 dev lo"));
+    cleanup.on(format!("ip addr del {CLIENT}/32 dev lo"));
+
+    let echo = start_tcp_echo(SocketAddr::from(([127, 0, 0, 1], PORT))).await;
+
+    let instance = Instance::new(config_with_inbound(&format!(
+        r#"{{ "type": "tun", "tag": "tun-in", "interface_name": "{TUN}", "mtu": {MTU} }}"#
+    )))
+    .expect("tun config");
+    instance.start().await.expect("TUN inbound failed to start");
+    wait_for_iface(TUN);
+
+    // The device MTU must be what the config asked for: applying it is what
+    // makes the kernel hand the userspace stack large packets in the first
+    // place, and what lets the stack emit large segments back.
+    // `/sys/class/net` is not per-netns, so ask `ip` (which is) instead.
+    let link = sh_ok(&format!("ip -o link show {TUN}"));
+    let dev_mtu = link
+        .split_whitespace()
+        .position(|w| w == "mtu")
+        .and_then(|i| link.split_whitespace().nth(i + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    assert_eq!(
+        dev_mtu, MTU,
+        "the `mtu` option was not applied to the TUN device (device MTU {dev_mtu},          configured {MTU}) — every packet then costs a syscall per 1448 bytes"
+    );
+
+    sh_ok(&format!("ip link set {TUN} up"));
+    sh_ok(&format!("ip addr add {TUN_LOCAL}/24 dev {TUN}"));
+    sh_ok(&format!("ip route add {TARGET}/32 dev {TUN}"));
+    cleanup.on(format!("ip route del {TARGET}/32 dev {TUN}"));
+    cleanup.on(format!("ip addr del {TUN_LOCAL}/24 dev {TUN}"));
+    sh_ok(&format!(
+        "iptables -t nat -A OUTPUT -p tcp -s {CLIENT} -d {TARGET} --dport {PORT} -j RETURN"
+    ));
+    cleanup.on(format!(
+        "iptables -t nat -D OUTPUT -p tcp -s {CLIENT} -d {TARGET} --dport {PORT} -j RETURN"
+    ));
+    sh_ok(&format!(
+        "iptables -t nat -A OUTPUT -p tcp -d {TARGET} --dport {PORT} -j DNAT --to-destination 127.0.0.1:{PORT}"
+    ));
+    cleanup.on(format!(
+        "iptables -t nat -D OUTPUT -p tcp -d {TARGET} --dport {PORT} -j DNAT --to-destination 127.0.0.1:{PORT}"
+    ));
+
+    /// Byte `n` of the stream is `n as u8 ^ 0xa7`.
+    fn expected(n: usize) -> u8 {
+        (n as u8) ^ 0xa7
+    }
+
+    let sock = TcpSocket::new_v4().expect("socket");
+    sock.bind(format!("{CLIENT}:0").parse().unwrap())
+        .expect("bind client source");
+    sock.set_nodelay(true).expect("nodelay");
+    let stream = timeout(
+        Duration::from_secs(20),
+        sock.connect(format!("{TARGET}:{PORT}").parse().unwrap()),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
+    let write_task = tokio::spawn(async move {
+        let mut sent = 0usize;
+        let mut chunk = vec![0u8; CHUNK];
+        while sent < TOTAL {
+            let n = CHUNK.min(TOTAL - sent);
+            for (i, b) in chunk[..n].iter_mut().enumerate() {
+                *b = (sent + i) as u8 ^ 0xa7;
+            }
+            writer.write_all(&chunk[..n]).await.expect("write");
+            sent += n;
+        }
+        writer.shutdown().await.expect("shutdown write half");
+    });
+
+    let mut seen = 0usize;
+    let mut buf = vec![0u8; CHUNK];
+    let read_loop = async {
+        while seen < TOTAL {
+            let n = reader.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "connection closed after {seen}/{TOTAL} bytes");
+            for (i, b) in buf[..n].iter().enumerate() {
+                assert_eq!(
+                    *b,
+                    expected(seen + i),
+                    "stream corrupted at byte {} through the jumbo-MTU TUN datapath",
+                    seen + i
+                );
+            }
+            seen += n;
+        }
+    };
+    timeout(Duration::from_secs(60), read_loop)
+        .await
+        .expect("jumbo-MTU bulk transfer through the TUN stalled");
+    assert_eq!(seen, TOTAL, "short transfer");
+    write_task.await.expect("writer task");
+
+    let eof = timeout(Duration::from_secs(10), reader.read(&mut buf))
+        .await
+        .expect("no FIN after the jumbo-MTU payload: half-close not propagated")
+        .expect("read while waiting for FIN");
+    assert_eq!(eof, 0, "unexpected trailing bytes after the payload");
+
+    let stats = sh_ok(&format!("ip -s link show {TUN}"));
+    let (rx, tx) = parse_iface_packets(&stats);
+    assert!(
+        rx > 0 && tx > 0,
+        "TUN device saw no traffic (rx={rx} tx={tx}):\n{stats}"
+    );
+    // 8 MiB at a 64 KiB MTU is at most ~140 frames per direction; at the old
+    // 1500-byte MTU it was ~5800. Requiring an average frame well above the
+    // 1500-byte ceiling proves the jumbo path was really exercised instead of
+    // silently falling back to small packets.
+    let avg_frame = TOTAL as u64 / rx.max(1);
+    assert!(
+        avg_frame > 4096,
+        "average received frame is only {avg_frame} bytes (rx={rx} for {TOTAL} bytes): the \
+         transfer did not actually use jumbo frames"
+    );
+    assert!(
+        echo.bytes.load(Ordering::Relaxed) >= TOTAL as u64,
+        "echo server only saw {} of {TOTAL} bytes",
+        echo.bytes.load(Ordering::Relaxed)
+    );
+
+    eprintln!(
+        "{E2E_MARKER} {NAME}: {TOTAL} bytes verified byte-for-byte at MTU {MTU} \
+         (avg frame {avg_frame} B), clean FIN received, tun rx={rx} tx={tx}"
+    );
+
+    let _ = instance.stop().await;
+}

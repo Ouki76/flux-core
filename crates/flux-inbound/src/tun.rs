@@ -280,6 +280,47 @@ fn open_tun_device(name: &str) -> std::io::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
+/// Applies `mtu` to an existing interface with `SIOCSIFMTU`.
+///
+/// The TUN device's MTU is *not* the same thing as the userspace stack's MTU
+/// cap, and both have to agree. The kernel segments everything it hands to the
+/// device by the *device* MTU, and it delivers at most MTU-sized IP packets
+/// back into the local stack, so a device left at its 1500-byte default caps
+/// the datapath at one `read()`/`write()` syscall pair per 1448 payload bytes
+/// no matter what the stack believes. Conversely, a stack that emits segments
+/// larger than the device MTU produces oversized packets on the wire. The
+/// configured MTU is therefore programmed into the device here instead of only
+/// being used as a buffer size.
+#[cfg(target_os = "linux")]
+fn set_interface_mtu(name: &str, mtu: usize) -> std::io::Result<()> {
+    // `struct ifreq` with `ifr_mtu`: `int` at offset IFNAMSIZ (16). The
+    // padding keeps the struct at the size the kernel copies from user space.
+    #[repr(C)]
+    struct ifreq_mtu {
+        ifr_name: [libc::c_char; libc::IFNAMSIZ],
+        ifr_mtu: libc::c_int,
+        _pad: [u8; 64 - libc::IFNAMSIZ - std::mem::size_of::<libc::c_int>()],
+    }
+
+    const SIOCSIFMTU: libc::c_ulong = 0x8922;
+
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if sock < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut ifr: ifreq_mtu = unsafe { std::mem::zeroed() };
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(libc::IFNAMSIZ - 1);
+    for (i, &b) in bytes[..len].iter().enumerate() {
+        ifr.ifr_name[i] = b as libc::c_char;
+    }
+    ifr.ifr_mtu = mtu as libc::c_int;
+    let ret = unsafe { libc::ioctl(sock, SIOCSIFMTU, &ifr) };
+    let err = std::io::Error::last_os_error();
+    unsafe { libc::close(sock) };
+    if ret < 0 { Err(err) } else { Ok(()) }
+}
+
 // ---------------------------------------------------------------------------
 // smoltcp-based userspace TCP/IP stack
 //
@@ -310,10 +351,37 @@ mod smol_stack {
     use std::time::{Duration, Instant};
     use tracing::{debug, info};
 
-    const TCP_SOCKET_BUF: usize = 64 * 1024;
+    const TCP_SOCKET_BUF_MIN: usize = 64 * 1024;
+    /// Upper bound on a per-connection smoltcp buffer (2 MiB per connection
+    /// counting both directions).
+    const TCP_SOCKET_BUF_MAX: usize = 1024 * 1024;
+
+    /// Per-connection smoltcp buffer size for a given interface MTU.
+    ///
+    /// A smoltcp socket buffer *is* the advertised TCP window, and the window
+    /// has to cover several segments or the connection degenerates into one
+    /// segment per round trip. With a 1500-byte MTU the classic 64 KiB already
+    /// spans 45 segments, so it is kept (per-connection memory stays small).
+    /// With jumbo segments a single 64 KiB buffer holds *one* segment: measured
+    /// at MTU 65535 that stalled this benchmark at 58 MiB/s with the stack
+    /// actor idle 3.4 s out of 3.5 s. Scaling to 4x the MTU restores
+    /// pipelining, and window scaling (smoltcp derives the shift from the
+    /// receive capacity) keeps the advertised window honest above 64 KiB.
+    fn tcp_buffer_size(mtu: usize) -> usize {
+        mtu.saturating_mul(4)
+            .clamp(TCP_SOCKET_BUF_MIN, TCP_SOCKET_BUF_MAX)
+    }
+
     const UDP_SOCKET_BUF: usize = 256 * 1024;
     const UDP_SOCKET_MAX_PACKETS: usize = 64;
     const CONN_CHANNEL_CAP: usize = 128;
+    /// Largest chunk handed to a connection task per `to_proxy` slot.
+    ///
+    /// This is the copy granularity of the socket→proxy direction: bigger
+    /// chunks mean fewer channel sends, fewer `Bytes` allocations and fewer
+    /// task wakeups per byte, while the channel still bounds a connection to
+    /// `CONN_CHANNEL_CAP` of them.
+    const TO_PROXY_CHUNK: usize = 64 * 1024;
     const CMD_CHANNEL_CAP: usize = 4096;
 
     /// Maximum bytes buffered per connection for proxy→socket data.
@@ -333,6 +401,11 @@ mod smol_stack {
     /// Hard cap on simultaneous UDP listener sockets (~128 MiB worst case).
     const UDP_LISTENER_MAX: usize = 256;
     const TUN_OUT_CAP: usize = 2048;
+    /// Bytes of egress allowed to sit in the writer channel between two stack
+    /// iterations. Capping by *bytes* rather than frames matters once the MTU
+    /// is large: 2048 jumbo frames would be 128 MiB of queued buffers, while
+    /// 2048 small frames are 3 MiB.
+    const TUN_OUT_BYTES: usize = 4 * 1024 * 1024;
     const UDP_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Commands from connection tasks to the stack actor.
@@ -670,25 +743,48 @@ mod smol_stack {
                     let Some(pkt) = tun_out_rx.recv().await else {
                         break;
                     };
-                    let mut guard = match afd.writable().await {
-                        Ok(g) => g,
-                        Err(_) => continue,
-                    };
-                    let _ = guard.try_io(|inner| {
-                        use std::os::fd::AsRawFd;
-                        let res = unsafe {
-                            libc::write(
-                                inner.as_raw_fd(),
-                                pkt.as_ptr() as *const libc::c_void,
-                                pkt.len(),
-                            )
+                    // Retry until the frame is on the device. The previous
+                    // version called `try_io` once and ignored its result, so
+                    // the frame was *silently dropped* whenever the device
+                    // momentarily refused the write (`WouldBlock` inside
+                    // `try_io`, which is exactly the case the readiness guard
+                    // exists for). Dropped segments turn into retransmission
+                    // timeouts, and a dropped pure ACK / window update can
+                    // stall the peer's window until it probes — observed as a
+                    // rare multi-second tail stall on bulk transfers.
+                    loop {
+                        let mut guard = match afd.writable().await {
+                            Ok(g) => g,
+                            Err(_) => break,
                         };
-                        if res < 0 {
-                            Err(std::io::Error::last_os_error())
-                        } else {
-                            Ok(res as usize)
+                        match guard.try_io(|inner| {
+                            use std::os::fd::AsRawFd;
+                            let res = unsafe {
+                                libc::write(
+                                    inner.as_raw_fd(),
+                                    pkt.as_ptr() as *const libc::c_void,
+                                    pkt.len(),
+                                )
+                            };
+                            if res < 0 {
+                                Err(std::io::Error::last_os_error())
+                            } else {
+                                Ok(res as usize)
+                            }
+                        }) {
+                            // Written.
+                            Ok(Ok(_)) => break,
+                            // Interrupted: retry the same frame.
+                            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            // Real device error: the connection it belongs to
+                            // will time out; do not spin on it.
+                            Ok(Err(_)) => break,
+                            // Not writable after all: readiness was consumed by
+                            // `try_io`, so wait for it again instead of
+                            // dropping the frame.
+                            Err(_) => continue,
                         }
-                    });
+                    }
                 }
             });
         }
@@ -743,11 +839,24 @@ mod smol_stack {
             tokio::sync::mpsc::Sender<UdpPacket>,
         > = HashMap::new();
 
-        fn new_tcp_socket() -> tcp::Socket<'static> {
-            tcp::Socket::new(
-                tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
-                tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUF]),
-            )
+        let tcp_buf = tcp_buffer_size(mtu);
+        fn new_tcp_socket(tcp_buf: usize) -> tcp::Socket<'static> {
+            let mut sock = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; tcp_buf]),
+                tcp::SocketBuffer::new(vec![0u8; tcp_buf]),
+            );
+            // This is a transparent proxy, not a general purpose host stack:
+            // every millisecond an ACK is held back is a millisecond the local
+            // client's window stays closed, and there is no AQM or radio link
+            // whose batching would profit from delayed ACKs. smoltcp's 10 ms
+            // default was measurable here: with jumbo segments it turned the
+            // datapath into a stop-and-wait loop (58 MiB/s at MTU 65535).
+            sock.set_ack_delay(None);
+            // Same reasoning for Nagle. The proxy hands the socket everything
+            // it has on every poll, so there is nothing to coalesce; waiting
+            // for more data would only add latency to interactive streams.
+            sock.set_nagle_enabled(false);
+            sock
         }
 
         // Frame/command captured by the idle select arms; must be fed into the
@@ -771,7 +880,7 @@ mod smol_stack {
                                 && parsed.tcp_flags & 0x10 == 0 // pure SYN, no ACK
                                 && !tcp_listeners.contains_key(&parsed.dst.port()) =>
                         {
-                            let mut sock = new_tcp_socket();
+                            let mut sock = new_tcp_socket(tcp_buf);
                             if sock.listen(parsed.dst.port()).is_ok() {
                                 let h = sockets.add(sock);
                                 tcp_listeners.insert(parsed.dst.port(), h);
@@ -806,7 +915,7 @@ mod smol_stack {
                                 && parsed.tcp_flags & 0x10 == 0 // pure SYN, no ACK
                                 && !tcp_listeners.contains_key(&parsed.dst.port()) =>
                         {
-                            let mut sock = new_tcp_socket();
+                            let mut sock = new_tcp_socket(tcp_buf);
                             if sock.listen(parsed.dst.port()).is_ok() {
                                 let h = sockets.add(sock);
                                 tcp_listeners.insert(parsed.dst.port(), h);
@@ -932,11 +1041,32 @@ mod smol_stack {
             // `TUN_OUT_CAP` frames. Dropped data segments turn into retransmit
             // timeouts (throughput collapse) and dropped pure ACKs/window
             // updates can wedge the connection.
+            let mut queued = 0usize;
+            // Set when the byte budget leaves frames in `txq`. The actor must
+            // then iterate again instead of parking on the channel: nothing
+            // else would ever wake it for frames it is already holding.
+            let mut egress_pending = false;
             while let Some(frame) = device.txq.pop_front() {
+                if queued + frame.len() > TUN_OUT_BYTES && queued > 0 {
+                    // Leave the rest to the next iteration: the writer is not
+                    // keeping up and an unbounded jumbo-frame queue would cost
+                    // hundreds of megabytes.
+                    device.txq.push_front(frame);
+                    egress_pending = true;
+                    break;
+                }
+                queued += frame.len();
                 match stack_out_tx.try_send(frame) {
                     Ok(()) => {}
                     Err(e) => {
+                        // The writer is behind: keep the frame and poll again
+                        // instead of parking. Sleeping here with egress still
+                        // queued is a lost wakeup — nothing would wake the
+                        // actor for data it is already holding, so the peer
+                        // sees a stalled connection until unrelated traffic
+                        // arrives.
                         device.txq.push_front(e.into_inner());
+                        egress_pending = true;
                         break;
                     }
                 }
@@ -960,18 +1090,31 @@ mod smol_stack {
                         }
                     }
                     if conn.pending_to_proxy.is_none() {
-                        let mut tmp = [0u8; 8192];
                         while sock.can_recv() {
-                            match sock.recv_slice(&mut tmp) {
-                                Ok(0) => break,
-                                Ok(n) => match tx.try_send(Bytes::copy_from_slice(&tmp[..n])) {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        conn.pending_to_proxy = Some(e.into_inner());
-                                        break;
-                                    }
-                                },
+                            // One copy, straight out of the socket's receive
+                            // ring: `recv` hands the closure the contiguous
+                            // readable region, so no staging buffer is needed.
+                            // The old code copied into an 8 KiB stack array
+                            // (zeroed on every iteration) and then copied
+                            // again into `Bytes` — two extra passes over the
+                            // payload and one allocation per 8 KiB.
+                            let chunk = match sock.recv(|buf| {
+                                let n = buf.len().min(TO_PROXY_CHUNK);
+                                (n, Bytes::copy_from_slice(&buf[..n]))
+                            }) {
+                                // A zero-length chunk would be delivered to the
+                                // proxy as EOF and truncate the stream, so an
+                                // empty contiguous region ends the drain instead.
+                                Ok(chunk) if chunk.is_empty() => break,
+                                Ok(chunk) => chunk,
                                 Err(_) => break,
+                            };
+                            match tx.try_send(chunk) {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    conn.pending_to_proxy = Some(e.into_inner());
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1041,7 +1184,7 @@ mod smol_stack {
             for (handle, remote, local, port) in to_claim {
                 // The accepting socket no longer listens; replace the port listener.
                 tcp_listeners.remove(&port);
-                let mut sock = new_tcp_socket();
+                let mut sock = new_tcp_socket(tcp_buf);
                 if sock.listen(port).is_ok() {
                     let h = sockets.add(sock);
                     tcp_listeners.insert(port, h);
@@ -1174,6 +1317,9 @@ mod smol_stack {
 
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
+                // Frames still queued from the byte-budget cut-off: poll again
+                // immediately rather than sleeping until unrelated input.
+                _ = std::future::ready(()), if egress_pending => {}
                 // Capture the frame so it is processed next iteration instead of dropped.
                 f = frame_rx.recv() => {
                     if f.is_none() {
@@ -1435,6 +1581,27 @@ use smol_stack::run_stack;
 // Re-export the channel-driven stack core for the WireGuard inbound.
 pub(crate) use smol_stack::run_stack_channels;
 
+/// Default interface MTU. Kept at the Ethernet value so existing configs keep
+/// their current behaviour; a larger MTU (see [`MAX_MTU`]) is the single most
+/// effective throughput knob on this datapath, because a TUN device carries
+/// exactly one IP packet per `read()`/`write()` syscall and no read/write
+/// batching (`readv`, `writev`, …) is possible on it.
+/// Default TUN MTU.
+///
+/// 9000 (jumbo) because the datapath is syscall-bound: a TUN supports no read or
+/// write batching, so bytes-per-syscall is the only lever. Measured on loopback:
+/// MTU 1500 -> 324 MiB/s at 6.7 CPU s/GB, MTU 9000 -> 745 MiB/s at 3.4 s/GB.
+///
+/// This is safe for forwarding: the proxy terminates TCP, so the segment size on
+/// the wire is negotiated with the remote peer and never exceeds its path MTU —
+/// only same-host applications see larger packets. Set `mtu: 1500` explicitly if
+/// the device MTU has to match a 1500-byte path (e.g. bridging a real LAN).
+pub const DEFAULT_MTU: usize = 9000;
+/// Smallest MTU the userspace stack is willing to run with.
+pub const MIN_MTU: usize = 576;
+/// Largest IP packet a TUN device can carry.
+pub const MAX_MTU: usize = 65535;
+
 pub struct TunInbound {
     tag: String,
     interface_name: String,
@@ -1453,7 +1620,10 @@ impl TunInbound {
         Self {
             tag: tag.into(),
             interface_name: interface_name.into(),
-            mtu: mtu.unwrap_or(1500),
+            // 576 is the IPv4 minimum every stack must accept; 65535 is the
+            // largest IP packet a TUN device can carry. Anything outside that
+            // range would make the stack emit segments the kernel refuses.
+            mtu: mtu.unwrap_or(DEFAULT_MTU).clamp(MIN_MTU, MAX_MTU),
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -1485,6 +1655,24 @@ impl Inbound for TunInbound {
                         "[{}] TUN interface '{}' opened successfully (MTU: {})",
                         self.tag, self.interface_name, self.mtu
                     );
+                    // Program the MTU into the device itself: the kernel
+                    // segments by the device MTU, so leaving it at 1500 while
+                    // the stack is willing to emit more only wastes a syscall
+                    // pair per 1448 bytes.
+                    match set_interface_mtu(&self.interface_name, self.mtu) {
+                        Ok(()) => info!(
+                            "[{}] TUN interface '{}' MTU set to {}",
+                            self.tag, self.interface_name, self.mtu
+                        ),
+                        Err(e) => tracing::warn!(
+                            "[{}] could not set MTU {} on '{}': {} (the device keeps its \
+                             current MTU, which caps the datapath at that packet size)",
+                            self.tag,
+                            self.mtu,
+                            self.interface_name,
+                            e
+                        ),
+                    }
                     let async_fd = tokio::io::unix::AsyncFd::new(owned_fd).map_err(|e| {
                         self.running.store(false, Ordering::SeqCst);
                         FluxError::Io(std::io::Error::new(

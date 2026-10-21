@@ -54,6 +54,9 @@ struct Args {
     rounds: usize,
     bytes_per_round: u64,
     chunk: usize,
+    /// TUN device MTU. A TUN carries exactly one IP packet per read()/write(),
+    /// so this sets how many bytes each syscall can move.
+    mtu: usize,
 }
 
 impl Args {
@@ -62,6 +65,7 @@ impl Args {
             rounds: 5,
             bytes_per_round: 256 * 1024 * 1024,
             chunk: 64 * 1024,
+            mtu: 1500,
         };
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
@@ -76,10 +80,15 @@ impl Args {
                 args.rounds = v.max(1) as usize;
             } else if let Some(v) = take("--bytes") {
                 args.bytes_per_round = v.max(1);
+            } else if let Some(v) = take("--mtu") {
+                args.mtu = (v as usize).clamp(576, 65535);
             } else if let Some(v) = take("--chunk") {
                 args.chunk = (v as usize).clamp(1024, 1024 * 1024);
             } else if a == "--help" || a == "-h" {
-                println!("usage: bench_tun [--rounds N] [--bytes BYTES_PER_ROUND] [--chunk BYTES]");
+                println!(
+                    "usage: bench_tun [--rounds N] [--bytes BYTES_PER_ROUND] [--chunk BYTES] \
+                     [--mtu BYTES]"
+                );
                 std::process::exit(0);
             }
         }
@@ -157,6 +166,12 @@ fn sh_ok(cmd: &str) -> String {
 /// whole round of this benchmark runs in well under a second. (`/proc/self/stat`
 /// only has 10 ms `USER_HZ` ticks and reads as 0.00 for the faster runs.)
 fn proc_cpu_seconds() -> f64 {
+    let (u, s) = proc_cpu_split();
+    u + s
+}
+
+/// Process CPU time split into `(user, system)` seconds, all threads.
+fn proc_cpu_split() -> (f64, f64) {
     #[repr(C)]
     struct Timeval {
         tv_sec: libc::c_long,
@@ -174,11 +189,36 @@ fn proc_cpu_seconds() -> f64 {
     // 0 == RUSAGE_SELF
     let rc = unsafe { libc::getrusage(0, &mut ru as *mut Rusage as *mut libc::rusage) };
     if rc != 0 {
-        return 0.0;
+        return (0.0, 0.0);
     }
     let user = ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 / 1e6;
     let sys = ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 / 1e6;
-    user + sys
+    (user, sys)
+}
+
+/// Per-thread CPU seconds, to show which stage of the datapath burns the CPU.
+fn thread_cpu() -> Vec<(u64, String)> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
+        return out;
+    };
+    for e in dir.flatten() {
+        let Ok(s) = std::fs::read_to_string(e.path().join("stat")) else {
+            continue;
+        };
+        // "pid (comm) state ppid ..." — utime/stime are fields 14 and 15.
+        let Some(close) = s.rfind(')') else { continue };
+        let rest: Vec<&str> = s[close + 1..].split_whitespace().collect();
+        if rest.len() < 15 {
+            continue;
+        }
+        let ut: u64 = rest[11].parse().unwrap_or(0);
+        let st: u64 = rest[12].parse().unwrap_or(0);
+        let comm = s[s.find('(').map(|i| i + 1).unwrap_or(0)..close].to_string();
+        out.push((ut + st, comm));
+    }
+    out.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+    out
 }
 
 struct Echo {
@@ -363,8 +403,9 @@ async fn run(args: Args) {
 
     // --- TUN stack ----------------------------------------------------------
     let cfg = Config::from_json_str(&format!(
-        r#"{{ "inbounds": [ {{ "type": "tun", "tag": "tun-in", "interface_name": "{TUN}" }} ],
-             "outbounds": [ {{ "type": "direct", "tag": "direct" }} ] }}"#
+        r#"{{ "inbounds": [ {{ "type": "tun", "tag": "tun-in", "interface_name": "{TUN}", "mtu": {} }} ],
+             "outbounds": [ {{ "type": "direct", "tag": "direct" }} ] }}"#,
+        args.mtu
     ))
     .expect("config");
     let instance = Instance::new(cfg).expect("instance");
@@ -414,22 +455,26 @@ async fn run(args: Args) {
     let mut tun_rounds = Vec::new();
     let mut tun_cpu = Vec::new();
     for i in 0..args.rounds {
-        let cpu0 = proc_cpu_seconds();
+        let (u0, s0) = proc_cpu_split();
         let t0 = Instant::now();
         measure_once(client_src, tun_dst, args.bytes_per_round, args.chunk).await;
         let elapsed = t0.elapsed();
-        let cpu = proc_cpu_seconds() - cpu0;
+        let (u1, s1) = proc_cpu_split();
+        let (cpu, cpu_user, cpu_sys) = (u1 - u0 + s1 - s0, u1 - u0, s1 - s0);
         let mib_s = args.bytes_per_round as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
         let gb = args.bytes_per_round as f64 / 1e9;
         tun_rounds.push(mib_s);
         tun_cpu.push(cpu / gb);
         println!(
-            "  tun    round {}/{}: {:8.2} s  {:9.1} MiB/s  {:.2} CPU s/GB",
+            "  tun    round {}/{}: {:8.2} s  {:9.1} MiB/s  {:.2} CPU s/GB \
+             (user {:.2}, sys {:.2})",
             i + 1,
             args.rounds,
             elapsed.as_secs_f64(),
             mib_s,
-            cpu / gb
+            cpu / gb,
+            cpu_user / gb,
+            cpu_sys / gb
         );
     }
 
@@ -485,6 +530,14 @@ async fn run(args: Args) {
         "served by echo server: {} MiB",
         echo.served.load(Ordering::Relaxed) / (1024 * 1024)
     );
+    if std::env::var_os("FLUX_BENCH_THREADS").is_some() {
+        println!("per-thread CPU (ticks of 10 ms):");
+        for (ticks, comm) in thread_cpu() {
+            if ticks > 0 {
+                println!("  {:>6.2} s  {}", ticks as f64 / 100.0, comm);
+            }
+        }
+    }
 
     let _ = instance.stop().await;
 }
