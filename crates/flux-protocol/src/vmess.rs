@@ -1,7 +1,6 @@
-use aes_gcm::{Aes128Gcm, Nonce as AesNonce, aead::Aead};
-use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaChaNonce};
 use flux_types::{FluxError, FluxResult, NetworkType, TargetAddress};
 use rand::RngCore;
+use ring::aead::{AES_128_GCM, Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -84,6 +83,13 @@ pub fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
     let mut h = creator();
     h.update(key);
     h.finalize()
+}
+
+/// Takes the 96-bit AEAD nonce that `vmess_kdf` produces in its first 12 bytes.
+fn nonce12(full: &[u8; 32]) -> [u8; 12] {
+    let mut n = [0u8; 12];
+    n.copy_from_slice(&full[..12]);
+    n
 }
 
 pub fn vmess_kdf_16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
@@ -295,16 +301,12 @@ impl VmessProtocol {
             &cmd_key,
             &[b"VMess Header AEAD Nonce_Length", &auth_id, &conn_nonce],
         );
-        let len_nonce = AesNonce::from_slice(&len_nonce_full[..12]);
-        let len_aead = <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&len_key).unwrap();
+        let len_nonce = nonce12(&len_nonce_full);
+        let len_aead = VmessCipher::header_aead(&len_key);
 
         let len_bytes = (body.len() as u16).to_be_bytes();
-        let len_payload = aes_gcm::aead::Payload {
-            msg: &len_bytes,
-            aad: &auth_id,
-        };
         let len_enc = len_aead
-            .encrypt(len_nonce, len_payload)
+            .encrypt(len_nonce, &auth_id, &len_bytes)
             .map_err(|e| FluxError::Crypto(format!("VMess header len encrypt failed: {}", e)))?;
 
         // Body encryption
@@ -313,15 +315,11 @@ impl VmessProtocol {
             &cmd_key,
             &[b"VMess Header AEAD Nonce", &auth_id, &conn_nonce],
         );
-        let body_nonce = AesNonce::from_slice(&body_nonce_full[..12]);
-        let body_aead = <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&body_key).unwrap();
+        let body_nonce = nonce12(&body_nonce_full);
+        let body_aead = VmessCipher::header_aead(&body_key);
 
-        let body_payload = aes_gcm::aead::Payload {
-            msg: &body,
-            aad: &auth_id,
-        };
         let body_enc = body_aead
-            .encrypt(body_nonce, body_payload)
+            .encrypt(body_nonce, &auth_id, &body)
             .map_err(|e| FluxError::Crypto(format!("VMess header body encrypt failed: {}", e)))?;
 
         let mut req_pkt = Vec::with_capacity(16 + len_enc.len() + 8 + body_enc.len());
@@ -372,15 +370,11 @@ impl VmessProtocol {
             &cmd_key,
             &[b"VMess Header AEAD Nonce_Length", &auth_id, &conn_nonce],
         );
-        let len_nonce = AesNonce::from_slice(&len_nonce_full[..12]);
-        let len_aead = <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&len_key).unwrap();
+        let len_nonce = nonce12(&len_nonce_full);
+        let len_aead = VmessCipher::header_aead(&len_key);
 
-        let len_payload = aes_gcm::aead::Payload {
-            msg: &enc_len,
-            aad: &auth_id,
-        };
         let len_bytes = len_aead
-            .decrypt(len_nonce, len_payload)
+            .decrypt(len_nonce, &auth_id, &enc_len)
             .map_err(|e| FluxError::Crypto(format!("VMess header len decrypt failed: {}", e)))?;
         let body_len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
 
@@ -395,15 +389,11 @@ impl VmessProtocol {
             &cmd_key,
             &[b"VMess Header AEAD Nonce", &auth_id, &conn_nonce],
         );
-        let body_nonce = AesNonce::from_slice(&body_nonce_full[..12]);
-        let body_aead = <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&body_key).unwrap();
+        let body_nonce = nonce12(&body_nonce_full);
+        let body_aead = VmessCipher::header_aead(&body_key);
 
-        let body_payload = aes_gcm::aead::Payload {
-            msg: &enc_body,
-            aad: &auth_id,
-        };
         let body = body_aead
-            .decrypt(body_nonce, body_payload)
+            .decrypt(body_nonce, &auth_id, &enc_body)
             .map_err(|e| FluxError::Crypto(format!("VMess header body decrypt failed: {}", e)))?;
 
         if body.len() < 42 {
@@ -494,40 +484,135 @@ fn generate_chacha20_key(b: &[u8]) -> [u8; 32] {
     key
 }
 
-enum VmessCipher {
-    Aes128(Box<Aes128Gcm>),
-    ChaCha(ChaCha20Poly1305),
+/// Tag length of every VMess AEAD (AES-128-GCM and ChaCha20-Poly1305).
+const VMESS_TAG_LEN: usize = 16;
+
+/// One direction's AEAD key, with the `ring` key schedule expanded exactly once.
+///
+/// The schedule used to be rebuilt per packet through `Aes128Gcm::new_from_slice`;
+/// with `ring` it is built in `UnboundKey::new` at stream setup and reused, which
+/// matters because `ring`'s AES-128 schedule costs ~110 ns — more than the old
+/// crate's — and a VMess chunk is only 16 KiB.
+struct VmessCipher {
+    key: LessSafeKey,
 }
 
 impl VmessCipher {
     fn new(security: u8, key: &[u8; 16]) -> Self {
-        if security == VMESS_SECURITY_CHACHA20_POLY1305 {
+        let unbound = if security == VMESS_SECURITY_CHACHA20_POLY1305 {
+            // VMess derives the ChaCha key as MD5(key) ‖ MD5(MD5(key)).
             let key32 = generate_chacha20_key(key);
-            Self::ChaCha(
-                <ChaCha20Poly1305 as chacha20poly1305::aead::KeyInit>::new_from_slice(&key32)
-                    .unwrap(),
-            )
+            UnboundKey::new(&CHACHA20_POLY1305, &key32)
         } else {
-            Self::Aes128(Box::new(
-                <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(key).unwrap(),
-            ))
+            UnboundKey::new(&AES_128_GCM, key)
+        };
+        Self {
+            key: LessSafeKey::new(unbound.expect("vmess aead key length")),
         }
     }
 
-    fn encrypt(&self, nonce: &[u8; 12], plain: &[u8]) -> FluxResult<Vec<u8>> {
-        match self {
-            Self::Aes128(c) => c.encrypt(AesNonce::from_slice(nonce), plain),
-            Self::ChaCha(c) => c.encrypt(ChaChaNonce::from_slice(nonce), plain),
-        }
-        .map_err(|e| FluxError::Crypto(format!("vmess encrypt failed: {}", e)))
+    /// The request and response *header* AEADs are always AES-128-GCM.
+    fn header_aead(key: &[u8; 16]) -> Self {
+        Self::new(VMESS_SECURITY_AES_128_GCM, key)
     }
 
-    fn decrypt(&self, nonce: &[u8; 12], cipher: &[u8]) -> FluxResult<Vec<u8>> {
-        match self {
-            Self::Aes128(c) => c.decrypt(AesNonce::from_slice(nonce), cipher),
-            Self::ChaCha(c) => c.decrypt(ChaChaNonce::from_slice(nonce), cipher),
+    /// Seals `buf[start..]` in place and appends the tag to `buf`.
+    ///
+    /// `start` keeps an already-written prefix (a chunk-length field, or the
+    /// response header that precedes the first chunk) in the same buffer, so no
+    /// per-chunk scratch buffer is needed.
+    fn seal_tail(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        buf: &mut Vec<u8>,
+        start: usize,
+    ) -> FluxResult<()> {
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(aad),
+                &mut buf[start..],
+            )
+            .map_err(|_| FluxError::Crypto("vmess encrypt failed".into()))?;
+        buf.extend_from_slice(tag.as_ref());
+        Ok(())
+    }
+
+    /// Authenticates and decrypts `buf` in place, returning the plaintext.
+    fn open_in_place<'a>(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        buf: &'a mut [u8],
+    ) -> FluxResult<&'a mut [u8]> {
+        self.key
+            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), buf)
+            .map_err(|_| FluxError::Crypto("vmess decrypt failed: bad tag".into()))
+    }
+
+    /// Decrypts the ciphertext in `buf[start..]` in place and truncates `buf` to
+    /// the plaintext length.
+    fn open_tail(
+        &self,
+        nonce: [u8; 12],
+        aad: &[u8],
+        buf: &mut Vec<u8>,
+        start: usize,
+    ) -> FluxResult<()> {
+        let plain_len = self.open_in_place(nonce, aad, &mut buf[start..])?.len();
+        buf.truncate(start + plain_len);
+        Ok(())
+    }
+
+    /// Seals into a freshly allocated buffer (header paths, once per stream).
+    fn encrypt(&self, nonce: [u8; 12], aad: &[u8], plain: &[u8]) -> FluxResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(plain.len() + VMESS_TAG_LEN);
+        out.extend_from_slice(plain);
+        self.seal_tail(nonce, aad, &mut out, 0)?;
+        Ok(out)
+    }
+
+    /// Opens into a freshly allocated buffer (header paths, once per stream).
+    fn decrypt(&self, nonce: [u8; 12], aad: &[u8], cipher: &[u8]) -> FluxResult<Vec<u8>> {
+        let mut out = Vec::with_capacity(cipher.len());
+        out.extend_from_slice(cipher);
+        self.open_tail(nonce, aad, &mut out, 0)?;
+        Ok(out)
+    }
+}
+
+/// The two fixed response-header AEAD keys/nonces.
+///
+/// They depend only on the session key/IV, so they are derived once when the
+/// stream is created instead of on every header read/write (each derivation is a
+/// full `vmess_kdf` HMAC chain).
+struct RespHeaderAead {
+    len_key: VmessCipher,
+    len_nonce: [u8; 12],
+    hdr_key: VmessCipher,
+    hdr_nonce: [u8; 12],
+}
+
+impl RespHeaderAead {
+    fn new(resp_key: &[u8; 16], resp_iv: &[u8; 16]) -> Self {
+        let len_key = vmess_kdf_16(resp_key, &[b"AEAD Resp Header Len Key"]);
+        let len_nonce_full = vmess_kdf(resp_iv, &[b"AEAD Resp Header Len IV"]);
+        let hdr_key = vmess_kdf_16(resp_key, &[b"AEAD Resp Header Key"]);
+        let hdr_nonce_full = vmess_kdf(resp_iv, &[b"AEAD Resp Header IV"]);
+
+        let mut len_nonce = [0u8; 12];
+        len_nonce.copy_from_slice(&len_nonce_full[..12]);
+        let mut hdr_nonce = [0u8; 12];
+        hdr_nonce.copy_from_slice(&hdr_nonce_full[..12]);
+
+        Self {
+            len_key: VmessCipher::header_aead(&len_key),
+            len_nonce,
+            hdr_key: VmessCipher::header_aead(&hdr_key),
+            hdr_nonce,
         }
-        .map_err(|e| FluxError::Crypto(format!("vmess decrypt failed: {}", e)))
     }
 }
 
@@ -556,8 +641,8 @@ pub struct VmessStream<S> {
     expected_resp_header: u8,
     header_written: bool,
     resp_header: u8,
-    resp_key: [u8; 16],
-    resp_iv: [u8; 16],
+    /// Response-header AEAD keys, derived once per stream.
+    resp_aead: RespHeaderAead,
     read_masker: Option<Shake128Xof>,
     write_masker: Option<Shake128Xof>,
 
@@ -622,8 +707,7 @@ impl<S> VmessStream<S> {
             expected_resp_header,
             header_written: true,
             resp_header: 0,
-            resp_key,
-            resp_iv,
+            resp_aead: RespHeaderAead::new(&resp_key, &resp_iv),
             read_masker,
             write_masker,
             resp_len_buf: [0u8; 18],
@@ -678,8 +762,7 @@ impl<S> VmessStream<S> {
             expected_resp_header: 0,
             header_written: false,
             resp_header,
-            resp_key,
-            resp_iv,
+            resp_aead: RespHeaderAead::new(&resp_key, &resp_iv),
             read_masker,
             write_masker,
             resp_len_buf: [0u8; 18],
@@ -739,23 +822,20 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
                 }
             }
 
-            let resp_len_key = vmess_kdf_16(&this.resp_key, &[b"AEAD Resp Header Len Key"]);
-            let resp_len_nonce_full = vmess_kdf(&this.resp_iv, &[b"AEAD Resp Header Len IV"]);
-            let resp_len_nonce = AesNonce::from_slice(&resp_len_nonce_full[..12]);
-            let resp_len_aead =
-                <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&resp_len_key).unwrap();
-
-            let resp_len_bytes =
-                match resp_len_aead.decrypt(resp_len_nonce, this.resp_len_buf.as_slice()) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("VMess response header len decrypt failed: {}", e),
-                        )));
-                    }
-                };
-            let resp_hdr_len = u16::from_be_bytes([resp_len_bytes[0], resp_len_bytes[1]]) as usize;
+            // Decrypted in place in the fixed 18-byte buffer.
+            let resp_hdr_len = match this.resp_aead.len_key.open_in_place(
+                this.resp_aead.len_nonce,
+                b"",
+                &mut this.resp_len_buf[..],
+            ) {
+                Ok(b) => u16::from_be_bytes([b[0], b[1]]) as usize,
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("VMess response header len decrypt failed: {}", e),
+                    )));
+                }
+            };
 
             // The response header is peer-controlled: `resp_hdr_len` is the
             // decrypted length of a small header (command + payload length).
@@ -804,24 +884,20 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
                 }
             }
 
-            let resp_hdr_key = vmess_kdf_16(&this.resp_key, &[b"AEAD Resp Header Key"]);
-            let resp_hdr_nonce_full = vmess_kdf(&this.resp_iv, &[b"AEAD Resp Header IV"]);
-            let resp_hdr_nonce = AesNonce::from_slice(&resp_hdr_nonce_full[..12]);
-            let resp_hdr_aead =
-                <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&resp_hdr_key).unwrap();
+            // Decrypted in place: `resp_hdr_buf` is reusable scratch space.
+            if let Err(e) = this.resp_aead.hdr_key.open_tail(
+                this.resp_aead.hdr_nonce,
+                b"",
+                &mut this.resp_hdr_buf,
+                0,
+            ) {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("VMess response header payload decrypt failed: {}", e),
+                )));
+            }
 
-            let resp_hdr_bytes =
-                match resp_hdr_aead.decrypt(resp_hdr_nonce, &this.resp_hdr_buf[..total_resp_hdr]) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("VMess response header payload decrypt failed: {}", e),
-                        )));
-                    }
-                };
-
-            if resp_hdr_bytes.is_empty() || resp_hdr_bytes[0] != this.expected_resp_header {
+            if this.resp_hdr_buf.is_empty() || this.resp_hdr_buf[0] != this.expected_resp_header {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "mismatched VMess response header verification byte",
@@ -920,17 +996,18 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
             let nonce = Self::make_chunk_nonce(&this.dec_iv, this.read_count);
             this.read_count = this.read_count.wrapping_add(1);
 
-            let decrypted = match this.dec_cipher.decrypt(&nonce, &this.payload_buf) {
-                Ok(b) => b,
-                Err(e) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        e.to_string(),
-                    )));
-                }
-            };
+            if let Err(e) = this
+                .dec_cipher
+                .open_tail(nonce, b"", &mut this.payload_buf, 0)
+            {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )));
+            }
 
-            this.read_buf = decrypted;
+            // Swap rather than copy: both buffers are already allocated.
+            std::mem::swap(&mut this.read_buf, &mut this.payload_buf);
             this.read_pos = 0;
             this.payload_len = 0;
             this.payload_pos = 0;
@@ -982,43 +1059,49 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
         let nonce = Self::make_chunk_nonce(&this.enc_iv, this.write_count);
         this.write_count = this.write_count.wrapping_add(1);
 
-        let enc_payload = match this.enc_cipher.encrypt(&nonce, plain) {
-            Ok(b) => b,
-            Err(e) => return Poll::Ready(Err(io::Error::other(e.to_string()))),
-        };
-
         this.write_buf.clear();
 
         // If server hasn't sent AEAD response header yet, prepend it
         if !this.is_client && !this.header_written {
-            let resp_len_key = vmess_kdf_16(&this.resp_key, &[b"AEAD Resp Header Len Key"]);
-            let resp_len_nonce_full = vmess_kdf(&this.resp_iv, &[b"AEAD Resp Header Len IV"]);
-            let resp_len_nonce = AesNonce::from_slice(&resp_len_nonce_full[..12]);
-            let resp_len_aead =
-                <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&resp_len_key).unwrap();
-
-            let enc_resp_len = resp_len_aead
-                .encrypt(resp_len_nonce, 4u16.to_be_bytes().as_slice())
+            let len_start = this.write_buf.len();
+            this.write_buf.extend_from_slice(&4u16.to_be_bytes());
+            this.resp_aead
+                .len_key
+                .seal_tail(
+                    this.resp_aead.len_nonce,
+                    b"",
+                    &mut this.write_buf,
+                    len_start,
+                )
                 .unwrap();
 
-            let resp_hdr_key = vmess_kdf_16(&this.resp_key, &[b"AEAD Resp Header Key"]);
-            let resp_hdr_nonce_full = vmess_kdf(&this.resp_iv, &[b"AEAD Resp Header IV"]);
-            let resp_hdr_nonce = AesNonce::from_slice(&resp_hdr_nonce_full[..12]);
-            let resp_hdr_aead =
-                <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&resp_hdr_key).unwrap();
-
-            let resp_payload = [this.resp_header, 0x01, 0x00, 0x00];
-            let enc_resp_hdr = resp_hdr_aead
-                .encrypt(resp_hdr_nonce, resp_payload.as_slice())
+            let hdr_start = this.write_buf.len();
+            this.write_buf
+                .extend_from_slice(&[this.resp_header, 0x01, 0x00, 0x00]);
+            this.resp_aead
+                .hdr_key
+                .seal_tail(
+                    this.resp_aead.hdr_nonce,
+                    b"",
+                    &mut this.write_buf,
+                    hdr_start,
+                )
                 .unwrap();
 
-            this.write_buf.extend_from_slice(&enc_resp_len);
-            this.write_buf.extend_from_slice(&enc_resp_hdr);
             this.header_written = true;
         }
 
         this.write_buf.extend_from_slice(&len_bytes);
-        this.write_buf.extend_from_slice(&enc_payload);
+        // Seal the payload straight into the write buffer: no per-chunk
+        // allocation and no second copy.
+        let payload_start = this.write_buf.len();
+        this.write_buf.extend_from_slice(plain);
+        if let Err(e) = this
+            .enc_cipher
+            .seal_tail(nonce, b"", &mut this.write_buf, payload_start)
+        {
+            return Poll::Ready(Err(io::Error::other(e.to_string())));
+        }
         this.write_pos = 0;
         this.writing_plain_len = chunk_size;
 
@@ -1185,9 +1268,9 @@ mod tests {
             len_block[1] = 0x03; // 18 - 16 + 1
             let len_key = vmess_kdf_16(&resp_key, &[b"AEAD Resp Header Len Key"]);
             let len_nonce = vmess_kdf(&resp_iv, &[b"AEAD Resp Header Len IV"]);
-            let cipher = <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&len_key).unwrap();
+            let cipher = VmessCipher::header_aead(&len_key);
             let enc_len = cipher
-                .encrypt(AesNonce::from_slice(&len_nonce[..12]), len_block.as_slice())
+                .encrypt(nonce12(&len_nonce), b"", &len_block)
                 .unwrap();
             server_io.write_all(&enc_len).await.unwrap();
 
@@ -1197,7 +1280,7 @@ mod tests {
             hdr_block[1] = 0xFF;
             let hdr_nonce = vmess_kdf(&resp_iv, &[b"AEAD Resp Header IV"]);
             let enc_hdr = cipher
-                .encrypt(AesNonce::from_slice(&hdr_nonce[..12]), hdr_block.as_slice())
+                .encrypt(nonce12(&hdr_nonce), b"", &hdr_block)
                 .unwrap();
             server_io.write_all(&enc_hdr).await.unwrap();
             let _ = server_io.write_all(&vec![0u8; 512]).await;
