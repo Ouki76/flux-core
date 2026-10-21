@@ -25,7 +25,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 ### Routing & DNS
 - **Rule Engine**: Matching by domain (exact, suffix, keyword), IP CIDR, ports, network (TCP/UDP), rule sets, and inverted matching (`invert: true`).
 - **Rule Sets**: High-capacity GeoIP and GeoSite list matching with O(1) hash lookups and O(L) suffix climbing. Local files, inline lists, and **remote URL rule sets** (`type: "remote"`, background HTTP/HTTPS fetch with redirect support, size caps, optional `update_interval` refresh, hot-swappable without restart; fetch failures never break routing).
-- **DNS**: Built-in resolver with Fake-IP (`198.18.0.0/15`), wireformat parser (IPv4 `A` & IPv6 `AAAA`), and DNS-over-HTTPS (DoH, RFC 8484) client.
+- **DNS**: Built-in resolver with Fake-IP (`198.18.0.0/15`) served through a dedicated `dns` inbound (`dns.listen`), wireformat parser (IPv4 `A` & IPv6 `AAAA`), DoH (RFC 8484), DoT and DoQ clients, negative caching and end-to-end deadlines.
 
 ### Outbound Groups
 - **Selector**: Manual or programmatic outbound node selection.
@@ -47,7 +47,8 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **libFuzzer targets** (`fuzz/`): VLESS/Trojan/VMess headers, DNS wire format, SOCKS5 UDP, WG initiation, URI/config/ruleset parsing. Run: `cargo +nightly fuzz run fuzz_vless_header`.
 - **Deterministic parser fuzz regression suite** (`tests/test_fuzz_parsers.rs`) — runs in CI without nightly.
 - **Soak / leak detection**: `scripts/soak.sh [duration_secs]` (default 24h) — sustained load with RSS/FD/thread sampling and leak assertion.
-- 35 sing-box interop tests run against the real `sing-box` binary (graceful skip when absent).
+- 37 sing-box interop tests run against the real `sing-box` binary (graceful skip when absent), including Salamander-obfuscated Hysteria 2 **in both directions**.
+- 2 Xray interop tests run against the real `xray` binary for XTLS Vision (`xtls-rprx-vision`) **in both directions**.
 - **UDP relay e2e** for every UDP-capable protocol (SOCKS5, Trojan, VMess, SS/SS-2022, VLESS, TUIC, Hy2), including reply-address-header correctness.
 - **Transparent inbound e2e** (TUN/REDIRECT/TPROXY) — root-gated, executed in the CI `privileged-tests` job with sudo.
 - **SIGHUP hot-reload e2e**: listener swap and invalid-config rollback against the real binary.
@@ -97,6 +98,66 @@ cargo build --release -p flux-core
 ```
 
 The optimized binary will be located at `target/release/flux-core`.
+
+## Benchmarking
+
+Three harnesses ship with the tree; all are self-contained and need no external
+tooling (the native ones compare against `sing-box` when it is installed):
+
+```bash
+# TCP throughput + CPU cost per GB + peak RSS, median of interleaved rounds
+cargo run --release --example bench_native -- --rounds 5 --mb 300
+
+# Multi-stream aggregate throughput
+cargo run --release --example bench_native -- --rounds 5 --streams 8
+
+# UDP relay: datagrams/second and round-trip latency (SOCKS5 UDP ASSOCIATE)
+cargo run --release --example bench_udp -- --rounds 5 --count 20000
+
+# Micro-benchmarks: router, buffer pool, SOCKS5 proxy throughput
+cargo bench --bench throughput
+```
+
+Measurements are interleaved across rounds and reported as a median: loopback
+throughput on a busy machine drifts by >10% between runs, so a single-shot number
+is not a basis for comparing implementations.
+
+### Reference numbers
+
+Loopback, 16-core desktop, `--rounds 5` (median):
+
+Single stream, 300 MB per round, median of 7:
+
+| Path | Throughput | CPU per GB | Peak RSS |
+|---|---|---|---|
+| Direct TCP echo (no proxy) | 2.8 GB/s | — | — |
+| **flux-core** (SOCKS5 → direct) | **2.22 GB/s** | **0.59 s** | **7 MiB** |
+| sing-box (SOCKS → direct) | 2.08 GB/s | 0.93 s | 25 MiB |
+
+8 concurrent streams, 120 MB each, median of 3:
+
+| Path | Aggregate throughput | CPU per GB | Peak RSS |
+|---|---|---|---|
+| Direct TCP echo | 5095 MB/s | — | — |
+| **flux-core** | **4171 MB/s** | **0.51 s** | **8 MiB** |
+| sing-box | 4005 MB/s | 0.57 s | 28 MiB |
+
+| Path | Throughput |
+|---|---|
+| Direct UDP echo (no proxy) | 167k datagrams/s |
+| **flux-core** (SOCKS5 UDP relay, 1200 B payload) | **130k datagrams/s** — 1.25 Gbit/s, 7.7 µs round-trip |
+
+Micro-benchmarks (median): router lookup over 100 rules 90 ns (hit) / 46 ns
+(miss); pooled 64 KiB buffer acquire+release 519 ns (992 ns if the buffer is
+scrubbed, which it no longer is); TLS client connector 60 ns cached versus 7.7 µs
+to build one from scratch. Resource cost per established TCP relay:
+≈ 4 KB RSS and 6 file descriptors (2 sockets + 4 `splice` pipe ends); idle
+process footprint 7.5 MB.
+
+Absolutes depend on the machine and drift by ~10% between runs even on an idle
+box, which is why the harness interleaves rounds and reports medians — compare the
+ratios and the cost columns, not a single absolute. Measured on a 16-core desktop
+with the desktop session running.
 
 ### Running Tests
 ```bash

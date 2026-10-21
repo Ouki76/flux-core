@@ -25,10 +25,25 @@ Requests with an external `Origin` header and no `Authorization` are rejected wi
 | GET | `/api/v1/rules` | Compiled routing rules |
 | GET | `/api/v1/outbounds` | Outbound list with tags/types |
 | GET | `/api/v1/outbounds/{tag}` | Outbound detail |
-| PUT/POST | `/api/v1/outbounds/{group}/select` | Switch a Selector group's active outbound |
+| GET | `/api/v1/outbounds/{tag}/delay` | Latency probe (`?url=…&timeout=ms`; private destinations refused) |
+| PUT/POST | `/api/v1/outbounds/{group}/select` | Switch a Selector group's active outbound (the `/select` suffix is required) |
 | GET | `/api/v1/connections` | Active connections (id, meta, counters, age) |
 | DELETE | `/api/v1/connections/{id}` | Force-close one connection |
 | DELETE | `/api/v1/connections` | Force-close all connections |
+
+## Security notes
+
+- Authentication: `Authorization: Bearer <secret>`, or `?token=<secret>`. Comparison
+  is constant-time. An empty or whitespace-only `secret` is treated as **unset**.
+- Cross-origin requests are rejected before any state-changing dispatch. Only
+  HTTP origins whose host is exactly `localhost`, `127.0.0.1` or `::1` count as
+  local — `http://localhost.attacker.tld` does not.
+- Requests are bounded: 16 KiB of headers, 1 MiB of body, 15 s per connection.
+- The API listener binds exclusively (no `SO_REUSEPORT`), so another process
+  cannot race or hijack the port.
+- `GET /api/v1/outbounds/{tag}/delay` (probe) refuses private, loopback,
+  link-local and ULA destinations, and fails **closed** when a host name cannot
+  be resolved.
 
 ## Prometheus
 

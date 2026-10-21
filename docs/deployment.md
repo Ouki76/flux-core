@@ -9,7 +9,12 @@
 
 - Linux x86_64 (primary target; zero-copy `splice(2)`, TUN, REDIRECT, TPROXY are Linux-specific).
 - Kernel ≥ 4.x for `splice`/`SO_ORIGINAL_DST`; `/dev/net/tun` for the TUN inbound.
-- RAM: idle footprint is in the single-digit MB range; plan headroom for buffers under load (~256 KB per active relay pair, bounded by the buffer pool).
+- RAM: measured idle footprint 7.5 MB (16 worker threads); **~4 KB of RSS per
+  established TCP relay** (500 held loopback connections → +1.9 MB total). The
+  kernel-side `splice(2)` pipes are allocated lazily, so idle pipes cost ~0.
+- File descriptors: **6 per relayed TCP connection** (2 sockets + 4 pipe ends for
+  the two `splice` directions). Raise `LimitNOFILE` accordingly — the example
+  systemd unit uses 1048576, good for ~170k concurrent relays.
 
 ## Capabilities
 

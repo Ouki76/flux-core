@@ -20,6 +20,8 @@ flux-core run   -c config.yaml    # start the proxy
 | `api` | object | Management API (`listen`, `secret`, `allow_insecure_api`) |
 
 Environment variables `${VAR}` and `${VAR:-default}` are expanded everywhere.
+An undefined `${VAR}` without a default expands to an empty string — which is why
+an empty `api.secret` is treated as *no secret* rather than as an empty password.
 
 ## Inbounds
 
@@ -67,6 +69,21 @@ outbounds:
     framing:  { type: ws, path: "/live" }
     protocol: { type: shadowsocks, password: "...", method: "2022-blake3-chacha20-poly1305" }
 
+  # QUIC-native node (hysteria2 / tuic). TLS lives in the QUIC handshake, so the
+  # `security` block carries ONLY the TLS parameters — it is not a stream layer.
+  #
+  # Certificate verification is ON by default. A server with a self-signed
+  # certificate therefore needs an explicit `insecure: true` (as in the examples
+  # below); omitting `security` entirely no longer disables verification.
+  - tag: hy2-node
+    carrier:  { type: udp, address: "1.2.3.4:443" }
+    security: { type: tls, sni: "cdn.example.com", alpn: ["h3"], insecure: false }
+    protocol: { type: hysteria2, password: "...", up_mbps: 200, down_mbps: 500 }
+  - tag: tuic-node
+    carrier:  { type: udp, address: "1.2.3.4:443" }
+    security: { type: tls, sni: "cdn.example.com", insecure: false }
+    protocol: { type: tuic, uuid: "...", password: "...", congestion_control: bbr }
+
   # Groups
   - { type: selector,     tag: pick,  outbounds: [a, b], default: a }
   - { type: urltest,      tag: auto,  outbounds: [a, b], url: "https://www.gstatic.com/generate_204", interval: "5m", tolerance: 50 }
@@ -80,6 +97,7 @@ Outbound graphs are validated at startup: missing references and dependency cycl
 
 ```yaml
 dns:
+  listen: 127.0.0.1:5353          # serve DNS here (optional but needed for fake-IP)
   servers:
     - https://1.1.1.1/dns-query   # DoH (RFC 8484)
     - 8.8.8.8:53                  # plain UDP
@@ -91,6 +109,13 @@ dns:
     - domains: ["example.com"]
       servers: ["https://8.8.8.8/dns-query"]
 ```
+
+**Fake-IP** answers `A` queries from `inet4_range` (TTL 1 s) and answers `AAAA`
+with NODATA so clients fall back immediately; the dispatcher maps the synthetic
+address back to the name, which is what makes `domain_suffix`/`rule_set` routing
+work for applications that resolve names themselves. Point the operating system
+or browser at `dns.listen`. Without `fakeip.enabled` the same listener behaves as
+a plain forwarding resolver.
 
 ## Routing
 
@@ -118,6 +143,18 @@ route:
 Rule fields: `inbound`, `domain`, `domain_suffix`, `domain_keyword`, `ip_cidr`, `port`, `port_range`, `rule_set`, `geosite`, `geoip`, `process_name`, `network`, `invert`. Every rule requires `outbound`.
 
 Remote rule-set fetch failures never break routing: the last cached/compiled matcher stays active.
+
+Remote rule sets are fetched over HTTP/1.1 with `Content-Length` and
+`Transfer-Encoding: chunked` both handled; compressed responses are rejected
+rather than silently mis-parsed. The loader logs a **warning** when a fetched
+file yields zero usable rules (every `rule_set` rule would then match nothing and
+traffic would fall through to `final`) and when lines are skipped.
+
+Rule-set lines may be Clash style (`IP-CIDR,1.2.3.4/32,no-resolve`,
+`DOMAIN-SUFFIX,example.com`) or V2Ray/sing-box style (`suffix:example.com`,
+`domain:…`, `keyword:…`, `ip-cidr:…`). Trailing Clash modifiers such as
+`no-resolve` are accepted and ignored. Unsupported Clash types (`GEOIP`,
+`PROCESS-NAME`, …) are counted and reported, never applied silently.
 
 ## API
 

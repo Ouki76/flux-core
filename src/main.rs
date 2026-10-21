@@ -278,10 +278,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 "Configuration: Native Flux format (.json, .jsonc, .yaml, .yml) with modular $include"
             );
             println!(
-                "Protocols: SOCKS5, HTTP CONNECT, VLESS (Reality & Vision), TROJAN, SHADOWSOCKS (AEAD & 2022), VMESS (AEAD), TUN, REDIRECT, TPROXY"
+                "Protocols: SOCKS5, HTTP CONNECT, MIXED, VLESS (REALITY & Vision), TROJAN, SHADOWSOCKS (AEAD & 2022), VMESS (AEAD), TUIC v5, Hysteria 2, WireGuard/AmneziaWG, TUN, REDIRECT, TPROXY"
             );
             println!(
-                "Carriers: TCP, TLS, QUIC, WebSocket, gRPC, H2, HTTPUpgrade, ShadowTLS v3, WireGuard/AmneziaWG, TUIC v5, Hysteria 2"
+                "Carriers: TCP, UDP, QUIC, TLS, WebSocket, gRPC, H2, HTTPUpgrade, ShadowTLS v3, REALITY"
             );
             println!("Groups: Selector, UrlTest, Fallback, LoadBalance");
             println!("API: Flux Core Native API (/api/v1/*, Unix Socket, Route Tracer)");

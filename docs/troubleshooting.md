@@ -9,6 +9,9 @@
 | Config validation errors | Bad outbound reference or cycle | Run `flux-core check -c config.yaml`; error names the offending tag |
 | `Permission denied` on TUN/TPROXY/REDIRECT | Missing capabilities | Grant `CAP_NET_ADMIN` / `CAP_NET_BIND_SERVICE` (see deployment.md) |
 | REALITY outbound fails handshake | Wrong `public_key`/`short_id`/SNI mismatch | Re-derive the public key from the server's private key; verify `sni` matches the decoy |
+| `security=reality requires the public key` | Share link has `security=reality` but no `pbk=` | Add `&pbk=<server public key>`; a REALITY link without it is refused rather than silently downgraded to plaintext |
+| `tun inbound ... failed to open device` | Missing `CAP_NET_ADMIN` or the interface does not exist | Grant the capability or create the interface (`deployment.md`); a TUN inbound that cannot open its device now fails the start instead of running silently |
+| QUIC outbound (`hy2`/`tuic`) fails with a certificate error | Server uses a self-signed certificate and verification is now on by default | Add `security: { type: tls, insecure: true }` if you trust the server, or install a proper certificate |
 
 ## Runtime issues
 
@@ -20,7 +23,11 @@
 
 **Remote rule set not updating** — fetch failures are silent-by-design (routing must not break). Check logs at `warn` level; verify the URL returns the expected format and is within the size cap; delete the disk cache file to force a clean fetch.
 
-**DNS leaks / slow resolution** — verify `dns.servers` ordering, per-domain `dns.rules`, and that DoH endpoints are reachable; use `POST /api/v1/dns/resolve` to test the built-in resolver directly.
+**Rule set loads but rules do not match** — look for `no usable rules parsed` or `N line(s) ignored` warnings. A rule set that parses to zero entries makes every `rule_set` rule match nothing, so traffic falls through to `final`. Compressed responses are rejected (only `identity` encoding is supported), and both `Content-Length` and chunked bodies are handled.
+
+**`flow: xtls-rprx-vision` tunnel fails** — the flow requires TLS on the carrier (Vision only pads a TLS handshake; there is nothing to pad otherwise), and both sides must agree on the flow. Vision framing is Xray-compatible and covered by bidirectional interop tests; check that the `security` block configures TLS and that the server-side user entry also carries `flow: xtls-rprx-vision`.
+
+**DNS leaks / slow resolution** — verify `dns.servers` ordering, per-domain `dns.rules`, and that DoH endpoints are reachable; use `GET/POST /api/v1/dns/resolve` to test the built-in resolver directly. Resolution is deadline-bounded end to end (12 s) with 4–5 s per transport step, so a `Timeout` error means the upstream is unreachable rather than that the proxy is wedged.
 
 **Memory growth** — run `scripts/soak.sh` and compare against the RSS assertions; report with the soak log. The per-connection buffer pool is bounded; unbounded growth is a bug.
 
