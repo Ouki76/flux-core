@@ -2,19 +2,6 @@ use base64::prelude::*;
 use flux_types::{FluxError, FluxResult, TargetAddress};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-fn constant_time_eq_str(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.len() != b_bytes.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 pub struct HttpHandshake;
 
 impl HttpHandshake {
@@ -100,9 +87,10 @@ impl HttpHandshake {
             {
                 let cred_str = String::from_utf8_lossy(&decoded);
                 if let Some((u, p)) = cred_str.split_once(':')
-                    && user_list
-                        .iter()
-                        .any(|(lu, lp)| constant_time_eq_str(lu, u) && constant_time_eq_str(lp, p))
+                    && user_list.iter().any(|(lu, lp)| {
+                        flux_common::constant_time_eq_str(lu, u)
+                            && flux_common::constant_time_eq_str(lp, p)
+                    })
                 {
                     auth_ok = true;
                     authenticated_user = Some(u.to_string());
@@ -139,8 +127,25 @@ impl HttpHandshake {
 
             Ok((target, prefix, authenticated_user))
         } else {
-            // Forward proxy GET/POST/HEAD http://example.com:80/path OR origin-form /path with Host: header
+            // Forward proxy request in absolute-URI form
+            // (`http://example.com/path`, `https://example.com/path`) or in
+            // origin-form (`/path` with a `Host:` header).
             let (target, path) = if uri.starts_with("http://") || uri.starts_with("https://") {
+                // An absolute `https://` URI means the client expects TLS to the
+                // origin. This proxy speaks plain HTTP to the upstream, so the
+                // default port must follow the scheme: dialling 443 in cleartext
+                // (or 80 for an https URL) silently sends the request to the
+                // wrong service over an unencrypted connection.
+                let is_tls_uri = uri.starts_with("https://");
+                let default_port = if is_tls_uri { 443 } else { 80 };
+                if is_tls_uri {
+                    return Err(FluxError::Protocol {
+                        protocol: "http",
+                        message: "absolute-form https:// requests are not supported by the HTTP \
+                                  proxy; use CONNECT for TLS destinations"
+                            .into(),
+                    });
+                }
                 let without_scheme = uri.split_once("://").map(|(_, rest)| rest).unwrap_or(uri);
                 let (host_and_port, path) = match without_scheme.split_once('/') {
                     Some((hp, p)) => (hp, format!("/{}", p)),
@@ -149,7 +154,7 @@ impl HttpHandshake {
                 let target: TargetAddress = if host_and_port.contains(':') {
                     host_and_port.parse()?
                 } else {
-                    format!("{}:80", host_and_port).parse()?
+                    format!("{}:{}", host_and_port, default_port).parse()?
                 };
                 (target, path)
             } else if let Some(host_hdr) = header_str.lines().find_map(|l| {
@@ -188,7 +193,10 @@ impl HttpHandshake {
             let mut reconstructed = Vec::new();
             reconstructed.extend_from_slice(new_request_line.as_bytes());
 
-            for line in header_str.lines().skip(1) {
+            // `header_str` includes the terminating blank line, so `lines()`
+            // yields a trailing empty element; emitting it verbatim would produce
+            // `\r\n\r\n\r\n` and terminate the header block one line early.
+            for line in header_str.lines().skip(1).take_while(|l| !l.is_empty()) {
                 if let Some((k, _)) = line.split_once(':')
                     && k.trim().eq_ignore_ascii_case("proxy-authorization")
                 {
@@ -275,7 +283,13 @@ impl HttpHandshake {
 
         let resp_str = String::from_utf8_lossy(&buf[..h_end]);
         let first_line = resp_str.lines().next().unwrap_or("");
-        if !first_line.contains("200") {
+        // Parse the status code rather than substring-matching "200": a reason
+        // phrase containing "200", or a code like 2000, would otherwise pass.
+        let status = first_line
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok());
+        if status != Some(200) {
             return Err(FluxError::Protocol {
                 protocol: "http",
                 message: format!("http proxy connect failed: {}", first_line),

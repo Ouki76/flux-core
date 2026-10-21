@@ -24,7 +24,10 @@ pub struct Hysteria2Outbound {
     connection: Arc<Mutex<Option<quinn::Connection>>>,
     h3_handle: Arc<Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>>,
     dialer: Option<Arc<dyn flux_types::StreamDialer>>,
-    udp_demux: Arc<Mutex<Option<UdpDemuxMap>>>,
+    /// Per-connection datagram demultiplexer, tagged with the QUIC connection it
+    /// belongs to (`Connection::stable_id`) so a reconnect rebuilds it instead of
+    /// leaving sessions registered against a dead connection.
+    udp_demux: Arc<Mutex<Option<(usize, UdpDemuxMap)>>>,
     next_udp_session: Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -180,9 +183,17 @@ impl Outbound for Hysteria2Outbound {
 
         // Register this session in the per-connection datagram demuxer.
         let (tx, rx) = mpsc::channel::<UdpPacket>(64);
+        let conn_id = conn.stable_id();
         {
             let mut demux = self.udp_demux.lock().await;
-            if demux.is_none() {
+            // A replaced connection (reconnect / port hop) invalidates both the
+            // reader task and every registered session: rebuild the demuxer, or
+            // all UDP replies for the new connection are silently dropped.
+            let needs_rebuild = match demux.as_ref() {
+                Some((id, _)) => *id != conn_id,
+                None => true,
+            };
+            if needs_rebuild {
                 // Spawn the per-connection datagram reader.
                 let conn_c = conn.clone();
                 let sessions: UdpDemuxMap = Arc::new(dashmap::DashMap::new());
@@ -208,9 +219,9 @@ impl Outbound for Hysteria2Outbound {
                         }
                     }
                 });
-                *demux = Some(sessions);
+                *demux = Some((conn_id, sessions));
             }
-            if let Some(ref d) = *demux {
+            if let Some((_, d)) = demux.as_ref() {
                 d.insert(session_id, tx);
             }
         }

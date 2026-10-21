@@ -35,19 +35,6 @@ pub struct Socks5Request {
     pub address: TargetAddress,
 }
 
-fn constant_time_eq_str(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.len() != b_bytes.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// SOCKS5 protocol handler supporting RFC 1928 and RFC 1929 authentication.
 pub struct Socks5Handshake;
 
@@ -132,7 +119,8 @@ impl Socks5Handshake {
             let password = String::from_utf8_lossy(&p_buf).to_string();
 
             let matched = user_list.iter().any(|(u, p)| {
-                constant_time_eq_str(u, &username) && constant_time_eq_str(p, &password)
+                flux_common::constant_time_eq_str(u, &username)
+                    && flux_common::constant_time_eq_str(p, &password)
             });
             if matched {
                 // Success: 0x01 0x00
@@ -149,8 +137,13 @@ impl Socks5Handshake {
                 )))
             }
         } else {
-            // No auth required
-            if methods.contains(&METHOD_NO_AUTH) {
+            // No auth required.
+            //
+            // The check must look at the `nmethods` bytes actually received:
+            // `methods` is a zero-filled `[u8; 256]` and `METHOD_NO_AUTH` is
+            // `0x00`, so `methods.contains(&0x00)` is always true and would
+            // accept a client that never offered "no authentication".
+            if methods[..nmethods].contains(&METHOD_NO_AUTH) {
                 stream.write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH]).await?;
                 stream.flush().await?;
                 Ok(None)

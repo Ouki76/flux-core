@@ -13,19 +13,6 @@ pub fn hash_trojan_password(password: &str) -> String {
     format!("{:x}", result)
 }
 
-fn constant_time_eq_str(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.len() != b_bytes.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
-        diff |= x.to_ascii_lowercase() ^ y.to_ascii_lowercase();
-    }
-    diff == 0
-}
-
 pub struct TrojanProtocol;
 
 impl TrojanProtocol {
@@ -113,10 +100,17 @@ impl TrojanProtocol {
         }
 
         let hex_str = String::from_utf8_lossy(&header_buf[..56]);
-        if !valid_hashes.is_empty()
-            && !valid_hashes
-                .iter()
-                .any(|h| constant_time_eq_str(h, &hex_str))
+        // Trojan has no anonymous mode: the password hash is the only
+        // authentication. An empty allow-list is a misconfiguration, not a
+        // permission to accept everyone.
+        if valid_hashes.is_empty() {
+            return Err(FluxError::AuthFailed(
+                "no Trojan passwords configured for this inbound; refusing all clients".into(),
+            ));
+        }
+        if !valid_hashes
+            .iter()
+            .any(|h| flux_common::constant_time_eq_str(h, &hex_str))
         {
             return Err(FluxError::AuthFailed("invalid trojan password hash".into()));
         }

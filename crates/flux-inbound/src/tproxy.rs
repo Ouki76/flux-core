@@ -37,13 +37,20 @@ pub fn enable_tproxy_socket(socket: &Socket, is_v6: bool) -> std::io::Result<()>
         } else {
             IP_RECVORIGDSTADDR
         };
-        let _ = libc::setsockopt(
+        // Destination-address reporting is what makes TPROXY usable: without it
+        // every captured connection looks like it was addressed to the local
+        // listening port, and routing decides on the wrong destination. Surface
+        // the failure instead of continuing with a half-working listener.
+        let ret = libc::setsockopt(
             fd,
             level,
             orig_dst_opt,
             &enable as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         );
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
     Ok(())
 }
@@ -186,7 +193,13 @@ impl Inbound for TproxyInbound {
         let _ = tcp_sock.set_reuse_address(true);
         #[cfg(all(unix, not(target_os = "solaris")))]
         let _ = tcp_sock.set_reuse_port(true);
-        let _ = enable_tproxy_socket(&tcp_sock, is_v6);
+        enable_tproxy_socket(&tcp_sock, is_v6).map_err(|e| {
+            FluxError::Config(format!(
+                "tproxy inbound '{}': cannot enable IP_TRANSPARENT/IP_RECVORIGDSTADDR on the TCP \
+                 listener ({}). CAP_NET_ADMIN is required.",
+                self.tag, e
+            ))
+        })?;
         tcp_sock
             .bind(&self.listen_addr.into())
             .map_err(FluxError::Io)?;
@@ -202,7 +215,13 @@ impl Inbound for TproxyInbound {
         let _ = udp_sock.set_reuse_address(true);
         #[cfg(all(unix, not(target_os = "solaris")))]
         let _ = udp_sock.set_reuse_port(true);
-        let _ = enable_tproxy_socket(&udp_sock, is_v6);
+        enable_tproxy_socket(&udp_sock, is_v6).map_err(|e| {
+            FluxError::Config(format!(
+                "tproxy inbound '{}': cannot enable IP_TRANSPARENT/IP_RECVORIGDSTADDR on the UDP \
+                 listener ({}). CAP_NET_ADMIN is required.",
+                self.tag, e
+            ))
+        })?;
         udp_sock
             .bind(&self.listen_addr.into())
             .map_err(FluxError::Io)?;

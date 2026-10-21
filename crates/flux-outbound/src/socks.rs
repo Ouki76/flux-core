@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use flux_dns::DnsResolver;
 use flux_protocol::socks5::{CMD_CONNECT, CMD_UDP_ASSOCIATE, Socks5Handshake};
 use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp};
-use flux_transport::tcp::TcpTransport;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, StreamDialer,
     TargetAddress, UdpPacket,
@@ -10,7 +9,7 @@ use flux_types::{
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
 pub struct SocksOutbound {
@@ -18,6 +17,9 @@ pub struct SocksOutbound {
     server_address: TargetAddress,
     auth: Option<(String, String)>,
     resolver: Arc<DnsResolver>,
+    /// Retained for API compatibility; connection timeouts are enforced by
+    /// `dialer` (the carrier) rather than here.
+    #[allow(dead_code)]
     connect_timeout: Duration,
     dialer: Arc<dyn StreamDialer>,
 }
@@ -71,8 +73,11 @@ impl Outbound for SocksOutbound {
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
-        let server_addr = self.resolver.resolve(&self.server_address).await?;
-        let mut tcp_stream = TcpTransport::connect(server_addr, self.connect_timeout).await?;
+        // The UDP-associate control channel must travel over the same carrier as
+        // TCP traffic (TLS/WebSocket/REALITY/…). Dialling a bare `TcpStream`
+        // here bypassed `self.dialer`, so a layered SOCKS outbound silently spoke
+        // plaintext for UDP.
+        let mut tcp_stream: BoxedStream = self.dialer.dial().await?;
 
         let auth_ref = self.auth.as_ref().map(|(u, p)| (u.as_str(), p.as_str()));
         let relay_opt = Socks5Handshake::client_handshake_with_auth(
@@ -89,8 +94,9 @@ impl Outbound for SocksOutbound {
                 .into(),
         })?;
 
-        // If relay address returned 0.0.0.0 or [::], use the server's IP address
+        // If the relay address is 0.0.0.0 or [::], substitute the server's IP.
         if relay_addr.ip().is_unspecified() {
+            let server_addr = self.resolver.resolve(&self.server_address).await?;
             relay_addr = SocketAddr::new(server_addr.ip(), relay_addr.port());
         }
 
@@ -113,7 +119,9 @@ impl Outbound for SocksOutbound {
 }
 
 pub struct SocksPacketEndpoint {
-    _tcp_conn: Arc<Mutex<TcpStream>>,
+    // Keeps the UDP-associate control connection alive for the lifetime of the
+    // endpoint; dropping it tells the server to tear the association down.
+    _tcp_conn: Arc<Mutex<BoxedStream>>,
     udp_socket: Arc<UdpSocket>,
     relay_addr: SocketAddr,
 }

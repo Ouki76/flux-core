@@ -10,7 +10,6 @@ pub const VLESS_VERSION: u8 = 0x00;
 
 pub const VLESS_CMD_TCP: u8 = 0x01;
 pub const VLESS_CMD_UDP: u8 = 0x02;
-pub const VLESS_CMD_MUX: u8 = 0x03;
 
 pub const VLESS_ATYP_IPV4: u8 = 0x01;
 pub const VLESS_ATYP_DOMAIN: u8 = 0x02;
@@ -139,13 +138,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VlessClientStream<S> {
 }
 
 fn constant_time_eq_uuid(a: &Uuid, b: &Uuid) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    let mut diff = 0u8;
-    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    // Delegate to the shared helper so every secret comparison in the workspace
+    // goes through one `subtle`-backed implementation.
+    flux_common::constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
 pub struct VlessProtocol;
@@ -236,10 +231,18 @@ impl VlessProtocol {
         uuid_bytes.copy_from_slice(&ver_uuid[1..17]);
 
         let client_uuid = Uuid::from_bytes(uuid_bytes);
-        if !valid_uuids.is_empty()
-            && !valid_uuids
-                .iter()
-                .any(|u| constant_time_eq_uuid(u, &client_uuid))
+        // VLESS has no anonymous mode: the UUID *is* the credential. An empty
+        // allow-list therefore means "misconfigured", and must not degrade into
+        // "accept everyone" (unlike SOCKS5/HTTP, where an empty user list
+        // deliberately means no authentication).
+        if valid_uuids.is_empty() {
+            return Err(FluxError::AuthFailed(
+                "no VLESS users configured for this inbound; refusing all clients".into(),
+            ));
+        }
+        if !valid_uuids
+            .iter()
+            .any(|u| constant_time_eq_uuid(u, &client_uuid))
         {
             return Err(FluxError::AuthFailed(format!(
                 "unauthorized vless uuid: {}",

@@ -4,6 +4,9 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+/// Budget for the complete Hysteria 2 HTTP/3 authentication exchange.
+pub const HY2_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub const HYSTERIA2_VERSION: u8 = 2;
 pub const HYSTERIA2_CMD_TCP: u8 = 1;
 pub const HYSTERIA2_CMD_UDP: u8 = 2;
@@ -30,60 +33,12 @@ pub struct Hysteria2Config {
     pub h3: bool,
 }
 
-#[derive(Clone, Debug)]
-pub struct SalamanderObfs {
-    key: [u8; 32],
-}
-
-impl SalamanderObfs {
-    pub fn new(password: &str) -> Self {
-        let key = blake3::hash(password.as_bytes());
-        Self {
-            key: *key.as_bytes(),
-        }
-    }
-
-    pub fn obfuscate(&self, packet: &[u8]) -> Vec<u8> {
-        use rand::RngCore;
-        let mut salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-        let mut hasher = blake3::Hasher::new_keyed(&self.key);
-        hasher.update(&salt);
-        let mut xof = hasher.finalize_xof();
-
-        let mut out = Vec::with_capacity(16 + packet.len());
-        out.extend_from_slice(&salt);
-
-        let mut keystream = vec![0u8; packet.len()];
-        xof.fill(&mut keystream);
-
-        for (p, k) in packet.iter().zip(keystream.iter()) {
-            out.push(p ^ k);
-        }
-        out
-    }
-
-    pub fn deobfuscate(&self, data: &[u8]) -> Option<Vec<u8>> {
-        if data.len() < 16 {
-            return None;
-        }
-        let salt = &data[..16];
-        let payload = &data[16..];
-
-        let mut hasher = blake3::Hasher::new_keyed(&self.key);
-        hasher.update(salt);
-        let mut xof = hasher.finalize_xof();
-
-        let mut keystream = vec![0u8; payload.len()];
-        xof.fill(&mut keystream);
-
-        let mut out = Vec::with_capacity(payload.len());
-        for (p, k) in payload.iter().zip(keystream.iter()) {
-            out.push(p ^ k);
-        }
-        Some(out)
-    }
-}
+/// Salamander obfuscation, backed by the single canonical implementation in
+/// `flux-common` (8-byte salt + BLAKE2b-256(psk ‖ salt) keystream, matching the
+/// Hysteria 2 reference implementation and sing-box).
+///
+/// Kept as a thin alias so existing call sites keep their name.
+pub type SalamanderObfs = flux_common::Salamander;
 
 fn default_hop_interval_secs() -> u64 {
     30
@@ -160,19 +115,6 @@ impl PortHopper {
         }
         self.ports[self.current_idx]
     }
-}
-
-fn constant_time_eq_str(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.len() != b_bytes.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 pub struct Hysteria2Protocol;
@@ -414,9 +356,17 @@ impl Hysteria2Protocol {
             Ok(Box::new(send_request) as Box<dyn std::any::Any + Send + Sync>)
         };
 
-        tokio::time::timeout(Duration::from_millis(500), auth_fut)
+        // The auth exchange requires a full QUIC handshake, TLS 1.3 and an HTTP/3
+        // request/response — three round trips. A 500 ms cap failed on any link
+        // above ~150 ms RTT (i.e. most real paths) and on a loaded local machine;
+        // this is a handshake budget, not a latency target.
+        tokio::time::timeout(HY2_AUTH_TIMEOUT, auth_fut)
             .await
-            .map_err(|_| FluxError::Timeout("HTTP/3 authentication timed out".into()))?
+            .map_err(|_| {
+                FluxError::Timeout(format!(
+                    "HTTP/3 authentication timed out after {HY2_AUTH_TIMEOUT:?}"
+                ))
+            })?
     }
 
     /// Formats a client authentication frame for Hysteria 2.
@@ -458,7 +408,7 @@ impl Hysteria2Protocol {
             message: format!("invalid utf-8 in password: {}", e),
         })?;
 
-        if !constant_time_eq_str(pw, expected_password) {
+        if !flux_common::constant_time_eq_str(pw, expected_password) {
             return Err(FluxError::AuthFailed("invalid hysteria2 password".into()));
         }
 
@@ -608,50 +558,51 @@ mod tests {
 
     #[test]
     fn test_salamander_obfs_roundtrip() {
-        let obfs = SalamanderObfs::new("my-salamander-secret");
+        let obfs = SalamanderObfs::new("my-salamander-secret").expect("valid password");
         let plain = b"QUIC Initial Packet Data Simulated";
         let scrambled = obfs.obfuscate(plain);
-        assert_ne!(&scrambled[16..], plain);
+        assert_ne!(&scrambled[flux_common::SALAMANDER_SALT_LEN..], plain);
         let recovered = obfs.deobfuscate(&scrambled).unwrap();
         assert_eq!(&recovered, plain);
     }
 
     #[test]
     fn test_salamander_obfs_edge_cases() {
-        let obfs = SalamanderObfs::new("my-salamander-secret");
+        let obfs = SalamanderObfs::new("my-salamander-secret").expect("valid password");
+        let salt_len = flux_common::SALAMANDER_SALT_LEN;
 
-        // 1. Truncated packet less than 16 bytes returns None
+        // 1. Anything shorter than the salt cannot be a Salamander packet.
         assert_eq!(obfs.deobfuscate(&[]), None);
         assert_eq!(obfs.deobfuscate(&[1, 2, 3, 4, 5]), None);
-        assert_eq!(obfs.deobfuscate(&[0u8; 15]), None);
+        assert_eq!(obfs.deobfuscate(&[0u8; 7]), None);
 
-        // 2. Empty payload (length 16 bytes: exactly salt)
+        // 2. Empty payload (exactly one salt) round-trips.
         let empty_scrambled = obfs.obfuscate(&[]);
-        assert_eq!(empty_scrambled.len(), 16);
-        let recovered_empty = obfs.deobfuscate(&empty_scrambled).unwrap();
-        assert!(recovered_empty.is_empty());
+        assert_eq!(empty_scrambled.len(), salt_len);
+        assert!(obfs.deobfuscate(&empty_scrambled).unwrap().is_empty());
 
-        // 3. Different calls produce distinct salts / ciphertexts
+        // 3. Different calls produce distinct salts / ciphertexts.
         let plain = b"Sensitive QUIC Frame Data";
         let c1 = obfs.obfuscate(plain);
         let c2 = obfs.obfuscate(plain);
         assert_ne!(c1, c2);
-        assert_ne!(&c1[..16], &c2[..16]);
+        assert_ne!(&c1[..salt_len], &c2[..salt_len]);
         assert_eq!(obfs.deobfuscate(&c1).unwrap(), plain);
         assert_eq!(obfs.deobfuscate(&c2).unwrap(), plain);
 
         // 4. Large payload (64 KB)
         let large_plain = vec![0x42u8; 65536];
         let large_scrambled = obfs.obfuscate(&large_plain);
-        assert_eq!(large_scrambled.len(), 16 + 65536);
-        assert_ne!(&large_scrambled[16..], &large_plain[..]);
+        assert_eq!(large_scrambled.len(), salt_len + 65536);
+        assert_ne!(&large_scrambled[salt_len..], &large_plain[..]);
         assert_eq!(obfs.deobfuscate(&large_scrambled).unwrap(), large_plain);
 
         // 5. Wrong key deobfuscation produces garbled data
-        let wrong_obfs = SalamanderObfs::new("wrong-password");
+        let wrong_obfs = SalamanderObfs::new("wrong-password").expect("valid password");
         let wrong_recovered = wrong_obfs.deobfuscate(&c1).unwrap();
         assert_ne!(&wrong_recovered, plain);
     }
+
     #[test]
     fn test_port_hopper_cycles_after_interval() {
         // Construct with the minimum enforced interval, then backdate last_hop

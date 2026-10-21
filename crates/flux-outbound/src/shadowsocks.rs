@@ -211,13 +211,43 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
     }
 
     async fn recv_packet(&self) -> FluxResult<UdpPacket> {
-        let mut guard = flux_common::BufferPool::packet_pool().acquire_guard();
-        let (len, from) = self
-            .udp_socket
-            .recv_from(&mut guard)
-            .await
-            .map_err(FluxError::Io)?;
+        // A single malformed datagram from the network must not be fatal: the
+        // caller drives exactly one reply pump for this endpoint, and returning
+        // `Err` there would tear the pump down and silently kill all further
+        // UDP replies for this outbound. Log and keep reading instead.
+        loop {
+            let mut guard = flux_common::BufferPool::packet_pool().acquire_guard();
+            let (len, from) = self
+                .udp_socket
+                .recv_from(&mut guard)
+                .await
+                .map_err(FluxError::Io)?;
 
+            match self.decode_datagram(&guard[..len], from).await {
+                Ok(pkt) => return Ok(pkt),
+                Err(e) => {
+                    tracing::debug!(
+                        "shadowsocks UDP: dropping undecodable datagram from {} ({} bytes): {}",
+                        from,
+                        len,
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+impl ShadowsocksPacketEndpoint {
+    /// Decodes one received datagram into a `UdpPacket`.
+    async fn decode_datagram(
+        &self,
+        buf: &[u8],
+        from: std::net::SocketAddr,
+    ) -> FluxResult<UdpPacket> {
+        let len = buf.len();
+        let guard = buf;
         match &self.inner {
             ShadowsocksPacketEndpointInner::Ss2022(cipher) => {
                 let (target, payload) = cipher.decrypt_packet(&guard[..len]).await?;
@@ -252,6 +282,12 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
                 let target =
                     flux_protocol::socks5::Socks5Handshake::read_address(&mut cursor, atyp).await?;
                 let pos = 1 + cursor.position() as usize;
+                if pos > plain.len() {
+                    return Err(FluxError::Protocol {
+                        protocol: "shadowsocks-udp",
+                        message: "address header overruns payload".into(),
+                    });
+                }
                 let payload = bytes::Bytes::copy_from_slice(&plain[pos..]);
 
                 Ok(UdpPacket::new(payload, TargetAddress::Ip(from), target))

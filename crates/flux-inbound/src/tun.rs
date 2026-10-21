@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use bytes::Bytes;
-use flux_types::{Dispatcher, FluxResult, Inbound, NetworkType};
+use flux_types::{Dispatcher, FluxError, FluxResult, Inbound, NetworkType};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -307,7 +307,7 @@ mod smol_stack {
     use std::net::{IpAddr, SocketAddr};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tracing::{debug, info};
 
     const TCP_SOCKET_BUF: usize = 64 * 1024;
@@ -315,6 +315,23 @@ mod smol_stack {
     const UDP_SOCKET_MAX_PACKETS: usize = 64;
     const CONN_CHANNEL_CAP: usize = 128;
     const CMD_CHANNEL_CAP: usize = 4096;
+
+    /// Maximum bytes buffered per connection for proxy→socket data.
+    ///
+    /// Without a bound, a fast local client feeding a stalled remote would let
+    /// `pending_from_proxy` grow until the process dies: the command channel's
+    /// own capacity does not help because every command is drained into this
+    /// queue unconditionally.
+    const MAX_PENDING_FROM_PROXY: usize = 256 * 1024;
+
+    /// Idle UDP "listener" sockets are reclaimed after this long.
+    ///
+    /// Each entry costs `2 × UDP_SOCKET_BUF` (512 KiB) of smoltcp buffers, so a
+    /// destination-port sweep would otherwise allocate them forever.
+    const UDP_LISTENER_IDLE: Duration = Duration::from_secs(60);
+
+    /// Hard cap on simultaneous UDP listener sockets (~128 MiB worst case).
+    const UDP_LISTENER_MAX: usize = 256;
     const TUN_OUT_CAP: usize = 2048;
     const UDP_SESSION_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -510,6 +527,67 @@ mod smol_stack {
         pending_from_proxy: VecDeque<Bytes>,
     }
 
+    impl TcpConn {
+        /// Bytes still waiting to be handed to the smoltcp socket.
+        fn pending_from_proxy_bytes(&self) -> usize {
+            self.pending_from_proxy.iter().map(|b| b.len()).sum()
+        }
+    }
+
+    /// Monotonic "now" used only for UDP-listener bookkeeping.
+    fn now_instant() -> Instant {
+        Instant::now()
+    }
+
+    /// Drops UDP listener sockets that have been idle for [`UDP_LISTENER_IDLE`],
+    /// evicting the least recently used entries first when above
+    /// [`UDP_LISTENER_MAX`]. Each live entry holds 512 KiB of smoltcp buffers,
+    /// so this is what keeps a UDP destination-port sweep from exhausting RAM.
+    fn reap_idle_udp_listeners(
+        listeners: &mut HashMap<u16, (SocketHandle, Instant)>,
+        sockets: &mut SocketSet<'static>,
+        now: Instant,
+    ) {
+        if !listeners.is_empty() {
+            listeners.retain(|_, (handle, last_used)| {
+                let idle = now.saturating_duration_since(*last_used) > UDP_LISTENER_IDLE;
+                if idle {
+                    sockets.remove(*handle);
+                }
+                !idle
+            });
+        }
+        while listeners.len() >= UDP_LISTENER_MAX {
+            let Some(victim) = listeners
+                .iter()
+                .min_by_key(|(_, (_, last_used))| *last_used)
+                .map(|(port, _)| *port)
+            else {
+                break;
+            };
+            if let Some((handle, _)) = listeners.remove(&victim) {
+                sockets.remove(handle);
+            }
+        }
+    }
+
+    /// Creates a bound UDP socket for a destination port, with both smoltcp
+    /// buffers sized from the shared constants.
+    fn new_udp_socket(port: u16) -> Option<udp::Socket<'static>> {
+        let mut sock = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
+                vec![0u8; UDP_SOCKET_BUF],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
+                vec![0u8; UDP_SOCKET_BUF],
+            ),
+        );
+        sock.bind(IpListenEndpoint { addr: None, port }).ok()?;
+        Some(sock)
+    }
+
     fn ip_ep_to_std(ep: IpEndpoint) -> Option<SocketAddr> {
         // smoltcp with `std` uses core::net address types directly.
         let ip: IpAddr = ep.addr.into();
@@ -647,7 +725,9 @@ mod smol_stack {
 
         // port → listening socket
         let mut tcp_listeners: HashMap<u16, SocketHandle> = HashMap::new();
-        let mut udp_listeners: HashMap<u16, SocketHandle> = HashMap::new();
+        // port → (handle, last activity). Entries are reclaimed when idle so a
+        // destination-port sweep cannot pin 512 KiB of smoltcp buffers per port.
+        let mut udp_listeners: HashMap<u16, (SocketHandle, Instant)> = HashMap::new();
         // active connections/flows
         let mut tcp_conns: HashMap<SocketHandle, TcpConn> = HashMap::new();
         let mut udp_sessions: HashMap<
@@ -666,6 +746,9 @@ mod smol_stack {
         // stack on the next iteration instead of being silently dropped.
         let mut pending_frame: Option<Vec<u8>> = None;
         let mut pending_cmd: Option<StackCmd> = None;
+        // A closed sender makes `recv()`/`next()` resolve immediately on every
+        // poll; selecting on it unconditionally would spin the CPU at 100%.
+        let mut cmd_rx_open = true;
 
         loop {
             // ---- 1. Feed pending inbound frames into the device queue, pre-creating
@@ -687,25 +770,14 @@ mod smol_stack {
                             }
                         }
                         NetworkType::Udp if !udp_listeners.contains_key(&parsed.dst.port()) => {
-                            let mut sock = udp::Socket::new(
-                                udp::PacketBuffer::new(
-                                    vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
-                                    vec![0u8; UDP_SOCKET_BUF],
-                                ),
-                                udp::PacketBuffer::new(
-                                    vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
-                                    vec![0u8; UDP_SOCKET_BUF],
-                                ),
+                            reap_idle_udp_listeners(
+                                &mut udp_listeners,
+                                &mut sockets,
+                                now_instant(),
                             );
-                            if sock
-                                .bind(IpListenEndpoint {
-                                    addr: None,
-                                    port: parsed.dst.port(),
-                                })
-                                .is_ok()
-                            {
+                            if let Some(sock) = new_udp_socket(parsed.dst.port()) {
                                 let h = sockets.add(sock);
-                                udp_listeners.insert(parsed.dst.port(), h);
+                                udp_listeners.insert(parsed.dst.port(), (h, Instant::now()));
                             }
                         }
                         _ => {}
@@ -733,25 +805,14 @@ mod smol_stack {
                             }
                         }
                         NetworkType::Udp if !udp_listeners.contains_key(&parsed.dst.port()) => {
-                            let mut sock = udp::Socket::new(
-                                udp::PacketBuffer::new(
-                                    vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
-                                    vec![0u8; UDP_SOCKET_BUF],
-                                ),
-                                udp::PacketBuffer::new(
-                                    vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_MAX_PACKETS],
-                                    vec![0u8; UDP_SOCKET_BUF],
-                                ),
+                            reap_idle_udp_listeners(
+                                &mut udp_listeners,
+                                &mut sockets,
+                                now_instant(),
                             );
-                            if sock
-                                .bind(IpListenEndpoint {
-                                    addr: None,
-                                    port: parsed.dst.port(),
-                                })
-                                .is_ok()
-                            {
+                            if let Some(sock) = new_udp_socket(parsed.dst.port()) {
                                 let h = sockets.add(sock);
-                                udp_listeners.insert(parsed.dst.port(), h);
+                                udp_listeners.insert(parsed.dst.port(), (h, Instant::now()));
                             }
                         }
                         _ => {}
@@ -769,6 +830,19 @@ mod smol_stack {
                     None => None,
                 };
                 let Some(cmd) = cmd else { break };
+
+                // Backpressure: if accepting this chunk would push a connection
+                // past its buffer budget, leave the command (and everything
+                // behind it) in the bounded channel. That blocks the proxy task
+                // in `send().await` instead of growing an unbounded queue here.
+                if let StackCmd::TcpData { handle, data } = &cmd
+                    && let Some(conn) = tcp_conns.get(handle)
+                    && conn.pending_from_proxy_bytes() + data.len() > MAX_PENDING_FROM_PROXY
+                {
+                    pending_cmd = Some(cmd);
+                    break;
+                }
+
                 cmds_processed += 1;
                 match cmd {
                     StackCmd::TcpData { handle, data } => {
@@ -791,7 +865,7 @@ mod smol_stack {
                         client,
                         payload,
                     } => {
-                        if let Some(&handle) = udp_listeners.get(&remote.port()) {
+                        if let Some(&(handle, _)) = udp_listeners.get(&remote.port()) {
                             let sock = sockets.get_mut::<udp::Socket>(handle);
                             let meta = udp::UdpMetadata {
                                 endpoint: IpEndpoint {
@@ -843,7 +917,8 @@ mod smol_stack {
             // ---- 5. Post-poll: claim new connections, pump socket→proxy data,
             //         reap closed sockets, dispatch UDP datagrams.
             let mut to_claim: Vec<(SocketHandle, SocketAddr, SocketAddr, u16)> = vec![];
-            let mut to_remove: Vec<SocketHandle> = vec![];
+            // (handle, force_reset)
+            let mut to_remove: Vec<(SocketHandle, bool)> = vec![];
             for (handle, conn) in tcp_conns.iter_mut() {
                 let sock = sockets.get_mut::<tcp::Socket>(*handle);
                 // Flush a chunk that previously didn't fit into the channel.
@@ -873,22 +948,25 @@ mod smol_stack {
                         }
                     }
                 }
-                let dead = !sock.is_active()
-                    && conn.pending_to_proxy.is_none()
-                    && conn.pending_from_proxy.is_empty();
-                let closed_done = matches!(sock.state(), tcp::State::Closed)
-                    || (!sock.may_recv() && !sock.may_send());
-                if dead || closed_done {
-                    to_remove.push(*handle);
+                let nothing_queued =
+                    conn.pending_to_proxy.is_none() && conn.pending_from_proxy.is_empty();
+                let dead = !sock.is_active() && nothing_queued;
+                // A socket that can neither send nor receive *and* has flushed all
+                // buffered data is finished: tear it down without a RST so a
+                // graceful FIN/FIN-ACK exchange is not truncated into an abort.
+                let finished = matches!(sock.state(), tcp::State::Closed | tcp::State::TimeWait)
+                    || (!sock.may_recv() && !sock.may_send() && nothing_queued);
+                if dead || finished {
+                    // Only force a reset when data may still be outstanding.
+                    to_remove.push((*handle, !nothing_queued));
                 }
             }
-            for handle in to_remove {
+            for (handle, force_reset) in to_remove {
                 if let Some(conn) = tcp_conns.remove(&handle) {
                     drop(conn.to_proxy); // EOF for the proxy task
                 }
-                // Only remove sockets that are truly closed; abort half-open corpses.
                 let sock = sockets.get_mut::<tcp::Socket>(handle);
-                if !matches!(sock.state(), tcp::State::Listen) {
+                if force_reset && !matches!(sock.state(), tcp::State::Listen | tcp::State::Closed) {
                     sock.abort();
                 }
                 sockets.remove(handle);
@@ -959,8 +1037,11 @@ mod smol_stack {
 
             // UDP datagrams → per-flow dispatcher sessions.
             let udp_handles: Vec<(u16, SocketHandle)> =
-                udp_listeners.iter().map(|(p, h)| (*p, *h)).collect();
+                udp_listeners.iter().map(|(p, (h, _))| (*p, *h)).collect();
             for (port, handle) in udp_handles {
+                if let Some(entry) = udp_listeners.get_mut(&port) {
+                    entry.1 = Instant::now();
+                }
                 loop {
                     let sock = sockets.get_mut::<udp::Socket>(handle);
                     let (payload, meta) = match sock.recv() {
@@ -1050,8 +1131,20 @@ mod smol_stack {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
                 // Capture the frame so it is processed next iteration instead of dropped.
-                f = frame_rx.recv() => { pending_frame = f; }
-                c = cmd_rx.next() => { pending_cmd = c; } // keep the command for step 2
+                f = frame_rx.recv() => {
+                    if f.is_none() {
+                        // The carrier reader is gone: no packet can ever enter
+                        // the stack again, so the actor has nothing left to do.
+                        break;
+                    }
+                    pending_frame = f;
+                }
+                c = cmd_rx.next(), if cmd_rx_open => { // keep the command for step 2
+                    if c.is_none() {
+                        cmd_rx_open = false;
+                    }
+                    pending_cmd = c;
+                }
                 _ = tokio::time::sleep(wait_std) => {}
             }
         }
@@ -1342,13 +1435,17 @@ impl Inbound for TunInbound {
                         "[{}] TUN interface '{}' opened successfully (MTU: {})",
                         self.tag, self.interface_name, self.mtu
                     );
-                    let async_fd = match tokio::io::unix::AsyncFd::new(owned_fd) {
-                        Ok(afd) => Arc::new(afd),
-                        Err(e) => {
-                            tracing::error!("[{}] failed to register TUN AsyncFd: {}", self.tag, e);
-                            return Ok(());
-                        }
-                    };
+                    let async_fd = tokio::io::unix::AsyncFd::new(owned_fd).map_err(|e| {
+                        self.running.store(false, Ordering::SeqCst);
+                        FluxError::Io(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "tun inbound '{}': failed to register device with the reactor: {}",
+                                self.tag, e
+                            ),
+                        ))
+                    })?;
+                    let async_fd = Arc::new(async_fd);
                     let tag: Arc<str> = Arc::from(self.tag.as_str());
                     tokio::spawn(run_stack(
                         async_fd,
@@ -1360,12 +1457,17 @@ impl Inbound for TunInbound {
                     ));
                 }
                 Err(e) => {
-                    tracing::error!(
-                        "[{}] failed to open TUN device '{}': {}. Need root or CAP_NET_ADMIN.",
-                        self.tag,
-                        self.interface_name,
-                        e
-                    );
+                    // Report the failure instead of reporting a successful start:
+                    // a `tun` inbound that silently does nothing makes the whole
+                    // configuration look healthy while no traffic is captured.
+                    self.running.store(false, Ordering::SeqCst);
+                    return Err(FluxError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!(
+                            "tun inbound '{}': failed to open device '{}': {}.                              Root or CAP_NET_ADMIN is required.",
+                            self.tag, self.interface_name, e
+                        ),
+                    )));
                 }
             }
         }
@@ -1373,7 +1475,11 @@ impl Inbound for TunInbound {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = dispatcher;
-            tracing::error!("[{}] TUN inbound is only supported on Linux", self.tag);
+            self.running.store(false, Ordering::SeqCst);
+            return Err(FluxError::Config(format!(
+                "tun inbound '{}': TUN is only supported on Linux",
+                self.tag
+            )));
         }
 
         Ok(())
