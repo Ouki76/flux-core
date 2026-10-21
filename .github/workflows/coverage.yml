@@ -1,0 +1,143 @@
+name: Coverage
+
+# Line coverage, measured with `cargo llvm-cov` (llvm-tools-preview is a *stable*
+# rustup component, so this works without nightly — it just needs rustup, which
+# CI has and the distro-toolchain developer machines do not).
+#
+# Why not on every PR: instrumentation makes the whole suite several times
+# slower, and a coverage number is a trend, not a per-commit verdict. It runs on
+# every push to main (so the trend is continuous) and on demand.
+#
+# This job gates the coverage *pipeline*: if instrumented compilation, test
+# execution or the report step breaks, it fails. It deliberately does not gate on
+# a coverage percentage yet — there is no recorded baseline to compare against,
+# and a threshold picked out of the air would be noise. See docs/quality.md §6.
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      singbox:
+        description: "Install sing-box so the interop suites are included"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # `cargo install`ed binaries live in $HOME/.cargo-tools, never in ~/.cargo/bin
+  # (which belongs to the rustup shims and must not be restored from a cache).
+
+jobs:
+  line-coverage:
+    name: Line coverage (cargo llvm-cov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain with llvm-tools-preview
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+          # `cargo llvm-cov` shells out to llvm-profdata/llvm-cov from the
+          # sysroot; this component is what puts them there.
+          components: llvm-tools-preview
+
+      # Instrumented builds have their own artefacts in the same target dir;
+      # sharing the dependency cache with CI is still a net win.
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: flux-core
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Cache cargo-llvm-cov
+        id: llvm-cov-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo-tools/bin/cargo-llvm-cov
+          key: ${{ runner.os }}-cargo-tools-llvm-cov-v1
+
+      - name: Install cargo-llvm-cov
+        if: steps.llvm-cov-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-llvm-cov --root "$HOME/.cargo-tools"
+
+      - name: Install sing-box (interop tests contribute to the number)
+        if: ${{ github.event.inputs.singbox != 'false' }}
+        run: |
+          set -euo pipefail
+          VERSION="1.11.15"
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/sing-box-${VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version
+
+      - name: Expose cargo tools on PATH
+        # Kept in $GITHUB_ENV rather than repeated as an env: override, because
+        # `${{ env.PATH }}` is not a reliable way to read the inherited PATH.
+        run: echo "$HOME/.cargo-tools/bin" >>"$GITHUB_PATH"
+
+      - name: Probe the coverage toolchain
+        # `scripts/coverage.sh --check` prints the tier it would use and exits 3
+        # if nothing is usable. On a rustup runner it must be tier 1: if it is
+        # not, that is a broken toolchain and this job should say so plainly
+        # instead of failing inside a compiler invocation.
+        run: ./scripts/coverage.sh --check
+
+      - name: Measure coverage (lcov)
+        env:
+          SINGBOX_BIN: /usr/local/bin/sing-box
+        run: ./scripts/coverage.sh --lcov target/coverage/lcov.info
+
+      - name: Summarise total coverage
+        run: |
+          set -euo pipefail
+          lcov=target/coverage/lcov.info
+          [ -f "$lcov" ] || { echo "::error::$lcov was not produced"; exit 1; }
+          # Sum hit / found lines across all records (this is per-file LF/LH, so
+          # a plain sum over the file is exactly the project-wide line coverage).
+          read -r hit found < <(awk -F: '
+            /^LF:/ { lf += $2 }
+            /^LH:/ { lh += $2 }
+            END    { printf "%d %d\n", lh, lf }
+          ' "$lcov")
+          if [ "$found" -eq 0 ]; then
+            echo "::error::lcov report contains no instrumented lines"
+            exit 1
+          fi
+          pct=$(awk -v lh="$hit" -v lf="$found" 'BEGIN { printf "%.2f", lh * 100.0 / lf }')
+          files=$(grep -c '^SF:' "$lcov" || true)
+          {
+            echo "### Line coverage"
+            echo
+            echo "| Metric | Value |"
+            echo "|---|---:|"
+            echo "| Lines hit | ${hit} |"
+            echo "| Lines found | ${found} |"
+            echo "| **Line coverage** | **${pct} %** |"
+            echo "| Source files in report | ${files} |"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo
+            echo "Method: \`cargo llvm-cov --workspace --lib --tests\` on"
+            echo "\`$(rustc --version)\`. Examples, benches and doc-tests are not"
+            echo "instrumented. No threshold is enforced yet — see docs/quality.md §6."
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload lcov report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: target/coverage/lcov.info
+          if-no-files-found: warn
+          retention-days: 90

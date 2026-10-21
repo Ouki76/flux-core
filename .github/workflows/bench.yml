@@ -1,0 +1,144 @@
+name: Benchmarks
+
+# Throughput tracking, not a wall-clock race. Shared CI runners are noisy, so
+# this workflow's job is to put a number in the record every week and to fail
+# only on a *large* regression against a stored baseline.
+#
+# Policy (docs/quality.md §5):
+#   * Report always: flux-core median/min/max, the direct-loopback reference,
+#     flux-core as a percentage of direct, and the delta against the baseline.
+#   * Fail (exit 1) only when the flux-core median is more than 25 % below
+#     `benches/baseline.json` **and** that baseline was recorded on this runner
+#     class (`provisional: false`).
+#   * The committed baseline is provisional (recorded on a developer machine), so
+#     the gate starts dormant. Dispatch this workflow with
+#     `update_baseline: true`, download the `bench-baseline` artifact, commit it
+#     to `benches/baseline.json`, and the gate arms itself for that runner class.
+#
+# Results are kept two ways: the step summary (visible in the run) and a
+# `bench-results` artifact holding the raw log plus a JSON record per run.
+
+on:
+  schedule:
+    # Weekly, Monday 05:00 UTC — off-peak, and far enough from the nightly
+    # dependency churn that a regression is attributable.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: "Record the measured numbers as the baseline (instead of comparing)"
+        type: boolean
+        default: false
+      rounds:
+        description: "Interleaved measurement rounds"
+        type: string
+        default: "5"
+      mb:
+        description: "Megabytes per measurement"
+        type: string
+        default: "300"
+      allow_regression:
+        description: "Report only — never fail, even on a large regression"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Machine class label written into the result record and compared against the
+  # baseline. Change this if the runner label changes, and re-record.
+  RUNNER_CLASS: github-actions-ubuntu-latest
+
+jobs:
+  throughput:
+    name: Throughput (bench_native)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+
+      # Shares the dependency cache with CI: the numbers come from a release
+      # build, and recompiling every dependency weekly would be wasteful. The
+      # `release` target directory is cached too, which is why the measurement
+      # starts in seconds rather than minutes.
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: flux-core
+
+      # bench_native measures flux-core's *release* binary over loopback, so the
+      # release profile (lto = "fat", codegen-units = 1) is part of what is being
+      # measured — a debug build would report numbers that mean nothing.
+      - name: Build release binary
+        run: cargo build --locked --release --bin flux-core
+
+      - name: Run throughput benchmark and compare with the baseline
+        env:
+          # `scripts/bench_regress.sh` writes the markdown summary to
+          # $GITHUB_STEP_SUMMARY itself and exits non-zero on a real regression.
+          INPUT_UPDATE: ${{ github.event.inputs.update_baseline }}
+          INPUT_ROUNDS: ${{ github.event.inputs.rounds }}
+          INPUT_MB: ${{ github.event.inputs.mb }}
+          INPUT_ALLOW: ${{ github.event.inputs.allow_regression }}
+        run: |
+          set -euo pipefail
+          args=(--runner-class "${RUNNER_CLASS}")
+          args+=(--rounds "${INPUT_ROUNDS:-5}")
+          args+=(--mb "${INPUT_MB:-300}")
+          if [ "${INPUT_UPDATE:-false}" = "true" ]; then
+            args+=(--update-baseline)
+          fi
+          if [ "${INPUT_ALLOW:-false}" = "true" ]; then
+            args+=(--no-gate)
+          fi
+          echo "bench: scripts/bench_regress.sh ${args[*]}"
+          ./scripts/bench_regress.sh "${args[@]}"
+
+      # Keep the measured numbers around so a trend is visible across runs even
+      # when a run is green. 90 days covers a full quarter of weekly points.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            target/bench-results/*.json
+            target/bench-results/*.log
+          if-no-files-found: warn
+          retention-days: 90
+
+      # The baseline is committed by hand on purpose: a workflow that silently
+      # rewrites the yardstick can hide a regression by moving the goalposts.
+      - name: Upload recorded baseline
+        if: ${{ github.event.inputs.update_baseline == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-baseline
+          path: benches/baseline.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Note how to arm the regression gate
+        if: ${{ github.event.inputs.update_baseline != 'true' }}
+        run: |
+          {
+            echo
+            echo "---"
+            echo "**To (re-)record the baseline:** dispatch this workflow with"
+            echo "\`update_baseline: true\`, download the \`bench-baseline\` artifact,"
+            echo "and commit it as \`benches/baseline.json\`. The 25 % gate is armed"
+            echo "only while \`provisional\` is \`false\` and the recorded"
+            echo "\`runner_class\` matches \`${RUNNER_CLASS}\`."
+          } >>"${GITHUB_STEP_SUMMARY}"

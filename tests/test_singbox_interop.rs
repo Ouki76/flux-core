@@ -4512,3 +4512,225 @@ async fn test_interop_vision_xray_to_flux() {
 
     inst.stop().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// VLESS UDP (both directions). This pairing had no test at all, which is how a
+// framing mismatch between the two implementations went unnoticed.
+// ---------------------------------------------------------------------------
+
+/// Waits until a TCP port accepts connections (sing-box sets up its listeners
+/// asynchronously after the process starts).
+async fn wait_for_singbox_port(port: u16) {
+    for _ in 0..200 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("sing-box did not open port {port} in time");
+}
+
+/// SOCKS5 UDP ASSOCIATE round trip through `socks_port` to `target`.
+async fn socks5_udp_roundtrip(
+    socks_port: u16,
+    target: std::net::SocketAddr,
+    payload: bytes::Bytes,
+) -> Result<bytes::Bytes, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut ctrl = tokio::net::TcpStream::connect(("127.0.0.1", socks_port))
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    ctrl.write_all(&[0x05, 0x01, 0x00])
+        .await
+        .map_err(|e| format!("greeting: {e}"))?;
+    let mut sel = [0u8; 2];
+    ctrl.read_exact(&mut sel)
+        .await
+        .map_err(|e| format!("sel: {e}"))?;
+    if sel != [0x05, 0x00] {
+        return Err(format!("unexpected method selection {sel:?}"));
+    }
+
+    // UDP ASSOCIATE with a wildcard bind address.
+    ctrl.write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .map_err(|e| format!("associate: {e}"))?;
+    let mut hdr = [0u8; 4];
+    ctrl.read_exact(&mut hdr)
+        .await
+        .map_err(|e| format!("reply hdr: {e}"))?;
+    if hdr[1] != 0x00 {
+        return Err(format!("UDP associate rejected: rep=0x{:02x}", hdr[1]));
+    }
+    let relay = match hdr[3] {
+        0x01 => {
+            let mut a = [0u8; 6];
+            ctrl.read_exact(&mut a)
+                .await
+                .map_err(|e| format!("v4 addr: {e}"))?;
+            std::net::SocketAddr::from(([a[0], a[1], a[2], a[3]], u16::from_be_bytes([a[4], a[5]])))
+        }
+        other => return Err(format!("unexpected atyp {other}")),
+    };
+    // A wildcard relay address means "the address you already reached me on".
+    let relay = if relay.ip().is_unspecified() {
+        std::net::SocketAddr::from(([127, 0, 0, 1], relay.port()))
+    } else {
+        relay
+    };
+
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| format!("udp bind: {e}"))?;
+
+    // SOCKS5 UDP request header: RSV(2) FRAG(1) ATYP(1) ADDR PORT
+    let mut req = vec![0x00, 0x00, 0x00, 0x01];
+    match target.ip() {
+        std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
+        std::net::IpAddr::V6(_) => return Err("IPv6 target not supported here".into()),
+    }
+    req.extend_from_slice(&target.port().to_be_bytes());
+    req.extend_from_slice(&payload);
+    udp.send_to(&req, relay)
+        .await
+        .map_err(|e| format!("udp send: {e}"))?;
+
+    let mut buf = vec![0u8; 2048];
+    let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), udp.recv_from(&mut buf))
+        .await
+        .map_err(|_| "timed out waiting for the relayed UDP reply".to_string())?
+        .map_err(|e| format!("udp recv: {e}"))?;
+
+    // Strip the SOCKS5 UDP reply header.
+    if n < 10 || buf[3] != 0x01 {
+        return Err(format!("malformed UDP reply header (len {n})"));
+    }
+    Ok(bytes::Bytes::copy_from_slice(&buf[10..n]))
+}
+
+#[tokio::test]
+async fn test_interop_vless_udp_flux_to_singbox() {
+    let udp_echo = start_udp_echo_server().await;
+    let sbox_port = get_free_tcp_port().await;
+    let uuid = "b1c2d3e4-f5a6-7890-1234-56789abcdef1";
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "vless",
+                "tag": "vless-udp-in",
+                "listen": "127.0.0.1",
+                "listen_port": {},
+                "users": [{{"uuid": "{}"}}]
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        sbox_port, uuid
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "sbox-vless-udp",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
+            }}]
+        }}"#,
+        sbox_port, uuid
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst.registry.get_outbound("sbox-vless-udp").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(udp_echo),
+        "test",
+        NetworkType::Udp,
+    );
+    let endpoint = outbound
+        .dial_packet(&meta)
+        .await
+        .expect("dial VLESS UDP endpoint");
+
+    let payload = bytes::Bytes::from_static(b"VLESS UDP flux-core -> sing-box verified!");
+    endpoint
+        .send_packet(UdpPacket::new(
+            payload.clone(),
+            TargetAddress::Ip("127.0.0.1:0".parse().unwrap()),
+            TargetAddress::Ip(udp_echo),
+        ))
+        .await
+        .expect("send through the VLESS UDP tunnel");
+
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(5), endpoint.recv_packet())
+        .await
+        .expect("sing-box must answer a VLESS UDP datagram within 5 s")
+        .expect("recv VLESS UDP reply");
+    assert_eq!(reply.payload, payload);
+}
+
+#[tokio::test]
+async fn test_interop_vless_udp_singbox_to_flux() {
+    let udp_echo = start_udp_echo_server().await;
+    let flux_port = get_free_tcp_port().await;
+    let socks_port = get_free_tcp_port().await;
+    let uuid = "c1d2e3f4-a5b6-7890-1234-56789abcdef2";
+
+    let flux_server_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "tag": "flux-vless-udp-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
+            }}],
+            "outbounds": [{{ "type": "direct", "tag": "direct" }}]
+        }}"#,
+        flux_port, uuid
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_server_cfg).unwrap()).unwrap();
+    // `Instance::start` builds the dispatcher and starts every inbound itself.
+    flux_inst.start().await.unwrap();
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "socks",
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "listen_port": {}
+            }}],
+            "outbounds": [{{
+                "type": "vless",
+                "tag": "vless-out",
+                "server": "127.0.0.1",
+                "server_port": {},
+                "uuid": "{}"
+            }}]
+        }}"#,
+        socks_port, flux_port, uuid
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        let _ = flux_inst.stop().await;
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    wait_for_singbox_port(socks_port).await;
+
+    // SOCKS5 UDP associate through sing-box -> flux VLESS UDP server.
+    let payload = bytes::Bytes::from_static(b"VLESS UDP sing-box -> flux-core verified!");
+    let reply = socks5_udp_roundtrip(socks_port, udp_echo, payload.clone())
+        .await
+        .expect("sing-box must relay a UDP datagram through flux-core's VLESS inbound");
+    assert_eq!(reply, payload);
+
+    let _ = flux_inst.stop().await;
+}

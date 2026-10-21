@@ -1265,3 +1265,78 @@ async fn test_21_hysteria2_inbound_server_e2e() {
 
     srv_instance.stop().await.unwrap();
 }
+
+/// VLESS UDP end to end: flux client -> flux server -> echo.
+///
+/// This pairing had no test at all, which is how a framing mismatch survived:
+/// flux prefixed every VLESS datagram with a SOCKS address (Trojan's framing)
+/// while VLESS defines a bare `[len][payload]` stream, so it never interoperated
+/// with sing-box or Xray.
+#[tokio::test]
+async fn test_21b_vless_udp_end_to_end() {
+    let udp_echo = start_udp_echo_server().await;
+    let srv_port = get_free_tcp_port().await;
+    let uuid = "f1a2b3c4-d5e6-7890-1234-56789abcdef9";
+
+    let srv_cfg = Config::from_json_str(&format!(
+        r#"{{
+            "inbounds": [{{
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
+            }}],
+            "outbounds": [{{ "type": "direct", "tag": "direct" }}]
+        }}"#,
+        srv_port, uuid
+    ))
+    .unwrap();
+    let server = Instance::new(srv_cfg).unwrap();
+    server.start().await.unwrap();
+
+    let cli_cfg = Config::from_json_str(&format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "vless-out",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
+            }}]
+        }}"#,
+        srv_port, uuid
+    ))
+    .unwrap();
+    let client = Instance::new(cli_cfg).unwrap();
+    let outbound = client.registry.get_outbound("vless-out").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(udp_echo),
+        "test",
+        NetworkType::Udp,
+    );
+    let endpoint = outbound
+        .dial_packet(&meta)
+        .await
+        .expect("dial VLESS UDP endpoint");
+
+    for i in 0..3 {
+        let payload = bytes::Bytes::from(format!("VLESS UDP datagram {i}"));
+        endpoint
+            .send_packet(UdpPacket::new(
+                payload.clone(),
+                TargetAddress::Ip("127.0.0.1:0".parse().unwrap()),
+                TargetAddress::Ip(udp_echo),
+            ))
+            .await
+            .expect("send datagram");
+        let reply = tokio::time::timeout(Duration::from_secs(5), endpoint.recv_packet())
+            .await
+            .expect("reply within 5 s")
+            .expect("recv reply");
+        assert_eq!(
+            reply.payload, payload,
+            "datagram {i} must round-trip intact"
+        );
+    }
+
+    let _ = server.stop().await;
+}

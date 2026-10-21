@@ -1,5 +1,16 @@
 # cargo-deny policy for flux-core
 # Docs: https://embarkstudios.github.io/cargo-deny/
+#
+# This file is the authoritative supply-chain policy, and every section below is
+# actually executed: CI runs
+#   cargo deny check advisories bans licenses sources
+# (`ci.yml` → "Supply Chain (audit + deny)"). Adding a section here that no job
+# runs would be a policy that cannot fail, so keep the two in sync — the same
+# command is listed in docs/quality.md §1.
+#
+# `cargo audit` runs as well, as a second opinion straight from the RustSec
+# database; `deny.toml` is still what decides what is acceptable, because it is
+# the only place where an accepted risk can be written down and reviewed.
 
 [advisories]
 # Fail on any known vulnerability in the RustSec advisory database.

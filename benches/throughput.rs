@@ -200,11 +200,157 @@ fn bench_tls_connector(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cost of the relay copy itself: 1 MiB pushed through a pair of duplex streams
+/// by (a) `tokio::io::copy_bidirectional` and (b) the pooled-buffer variant.
+///
+/// This is the floor under every TCP-path number the project reports: the proxy
+/// burns this much CPU per byte before it does any protocol work. It is also why
+/// the "flux direct" row in `bench_tls` costs ~0.3 CPU s/GB at multi-GB/s rates —
+/// the copy path, not the socket, is the cost.
+fn bench_copy_paths(c: &mut Criterion) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const BYTES: usize = 1 << 20;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("relay_copy_1mib");
+    group.throughput(Throughput::Bytes(BYTES as u64));
+
+    // Runs one relay pass: `server` writes BYTES, the copy shuttles it, and
+    // `client` reads BYTES back. Both directions are exercised.
+    async fn one_pass(pooled: bool) {
+        let (mut client, proxy_in) = tokio::io::duplex(64 * 1024);
+        let (proxy_out, mut server) = tokio::io::duplex(64 * 1024);
+        let payload = vec![0x5Au8; BYTES];
+
+        let writer = tokio::spawn(async move {
+            server.write_all(&payload).await.unwrap();
+            server.shutdown().await.unwrap();
+        });
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; BYTES];
+            client.read_exact(&mut buf).await.unwrap();
+            buf.len()
+        });
+
+        if pooled {
+            let mut a = proxy_in;
+            let mut b = proxy_out;
+            let _ = flux_common::copy::copy_bidirectional_pooled(&mut a, &mut b)
+                .await
+                .unwrap();
+        } else {
+            let _ = flux_common::copy::copy_bidirectional(proxy_in, proxy_out)
+                .await
+                .unwrap();
+        }
+        assert_eq!(writer.await.unwrap(), ());
+        assert_eq!(reader.await.unwrap(), BYTES);
+    }
+
+    group.bench_function("default_tokio", |b| {
+        b.to_async(&rt).iter(|| one_pass(false))
+    });
+    group.bench_function("pooled_buffers", |b| {
+        b.to_async(&rt).iter(|| one_pass(true))
+    });
+    group.finish();
+}
+
+/// Per-connection setup cost of a SOCKS5 inbound: TCP connect + method
+/// negotiation + CONNECT, no payload.
+///
+/// The concurrency matrix reports this as "setup ms"; at 2048 concurrent streams
+/// it decides whether a burst of new connections costs milliseconds or seconds.
+fn bench_socks_handshake(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let echo_addr = rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 32 * 1024];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if socket.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    });
+
+    let socks_port = rt.block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    });
+    let config_json = format!(
+        r#"{{
+            "inbounds": [
+                {{
+                    "tag": "socks-in",
+                    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                    "protocol": {{ "type": "socks" }}
+                }}
+            ],
+            "outbounds": [
+                {{ "type": "direct", "tag": "direct" }}
+            ]
+        }}"#,
+        socks_port
+    );
+    let instance = rt.block_on(async {
+        let cfg = Config::from_json_str(&config_json).unwrap();
+        let inst = Instance::new(cfg).unwrap();
+        inst.start().await.unwrap();
+        inst
+    });
+
+    let mut group = c.benchmark_group("socks5_inbound");
+    group.bench_function("handshake_connect_only", |b| {
+        b.to_async(&rt).iter(|| async {
+            let mut conn = TcpStream::connect(format!("127.0.0.1:{}", socks_port))
+                .await
+                .unwrap();
+            Socks5Handshake::client_handshake(
+                &mut conn,
+                CMD_CONNECT,
+                &TargetAddress::Ip(echo_addr),
+            )
+            .await
+            .unwrap();
+            drop(conn);
+        })
+    });
+    group.finish();
+
+    rt.block_on(async {
+        let _ = instance.stop().await;
+    });
+}
+
 criterion_group!(
     benches,
     bench_router,
     bench_buffer_pool,
     bench_tls_connector,
-    bench_proxy_throughput
+    bench_proxy_throughput,
+    bench_copy_paths,
+    bench_socks_handshake
 );
 criterion_main!(benches);

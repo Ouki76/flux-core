@@ -1,0 +1,248 @@
+name: Release
+
+# Triggered only by a `v*` tag, which is the project's single "this is a
+# release" signal. Re-running a failed release is `gh run rerun <id>` (or the
+# "Re-run all jobs" button) against the same tag — no separate dispatch path,
+# which keeps the tag as the only source of truth.
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # `cargo install`ed binaries live in $HOME/.cargo-tools, never in ~/.cargo/bin
+  # (which belongs to the rustup shims and must not be restored from a cache).
+
+jobs:
+  # Nothing is built for release until the repository is green: the tag is
+  # supposed to describe a tested commit, so the full suite runs before the
+  # matrix. A failed preflight means "fix, delete the tag, re-tag".
+  preflight:
+    name: Preflight (tag ↔ version, fmt, clippy, full test suite)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+          components: clippy, rustfmt
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: flux-core
+
+      # The most common release mistake is tagging the wrong commit or reusing a
+      # version: the tag and the crate version must agree, because the artefacts
+      # are named after the version and the tag is what `gh release` publishes.
+      - name: Tag matches Cargo.toml `version`
+        run: |
+          set -euo pipefail
+          version=$(awk '/^\[package\]/{f=1;next} /^\[/{f=0} f && /^version[[:space:]]*=/{gsub(/[" ]/,"",$3); print $3; exit}' Cargo.toml)
+          tag="${GITHUB_REF_NAME}"
+          echo "Cargo.toml version: ${version}"
+          echo "tag:                ${tag}"
+          if [ "v${version}" != "${tag}" ]; then
+            echo "::error::tag ${tag} does not match Cargo.toml version v${version}"
+            exit 1
+          fi
+
+      - name: Install sing-box (interop tests must actually run for a release)
+        run: |
+          set -euo pipefail
+          VERSION="1.11.15"
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 0755 "/tmp/sing-box-${VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sing-box version
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+      - name: Full test suite
+        run: cargo test --locked --workspace
+        env:
+          SINGBOX_BIN: /usr/local/bin/sing-box
+
+      - name: Release-profile build check (host target)
+        run: cargo build --locked --release
+
+  build:
+    name: Build linux-${{ matrix.arch }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Primary artefact: native build on the runner, fully reproducible from
+          # the tag.
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            via_cross: false
+          # Secondary artefact: best effort. `cross` builds inside its own image,
+          # so it works without emulation, but it pulls a container image and a
+          # toolchain this repository does not otherwise need. A failure here is
+          # reported (`continue-on-error` + the warning step below) and does not
+          # stop the x86_64 release; see docs/quality.md §3.
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            via_cross: true
+    # Only the cross/emulated target is allowed to fail.
+    continue-on-error: ${{ matrix.via_cross }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # The host toolchain is only needed to drive cargo (and, for the
+      # `via_cross` leg, to build `cross` itself); the actual aarch64 compile
+      # happens inside the cross container image.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+
+      - name: Cache cargo-cross
+        if: matrix.via_cross
+        id: cross-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo-tools/bin/cross
+          key: ${{ runner.os }}-cargo-tools-cross-v1
+
+      - name: Install cross
+        if: matrix.via_cross && steps.cross-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cross --root "$HOME/.cargo-tools"
+
+      - name: Build (native)
+        if: ${{ !matrix.via_cross }}
+        run: cargo build --locked --release --bin flux-core
+
+      - name: Build (cross)
+        if: matrix.via_cross
+        run: '"$HOME/.cargo-tools/bin/cross" build --locked --release --bin flux-core --target ${{ matrix.target }}'
+
+      # One tarball per target plus a per-file checksum file; the publish job
+      # re-verifies both before anything is attached to the release.
+      - name: Stage archive
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="flux-core-${version}-linux-${{ matrix.arch }}"
+          bin="target/${{ matrix.target }}/release/flux-core"
+          if [ ! -x "$bin" ]; then
+            # A native build lands in target/release; a cross build always sets
+            # an explicit --target, so this fallback only covers that case.
+            bin="target/release/flux-core"
+          fi
+          [ -x "$bin" ] || { echo "::error::no flux-core binary at $bin"; ls -R target | head -50; exit 1; }
+          install -d "dist/${name}"
+          install -m 0755 "$bin" "dist/${name}/flux-core"
+          install -m 0644 LICENSE README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          ls -l dist
+
+      - name: Verify the archive is self-consistent
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c ./*.sha256
+          tar -tzf ./*.tar.gz
+
+      - name: Upload dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Warn that this artefact is missing from the release
+        if: failure() && matrix.via_cross
+        run: |
+          echo "::warning::linux-${{ matrix.arch }} could not be built (${{ matrix.target }} via cross). The release will contain the other architectures only — see docs/quality.md §3."
+
+  publish:
+    name: Publish GitHub Release
+    needs: [ preflight, build ]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # The only job that writes: it creates the release and attaches assets.
+      contents: write
+    steps:
+      - name: Download artefacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          ls -l
+          for f in ./*.sha256; do sha256sum -c "$f"; done
+
+      # SHA256SUMS over every tarball: one file to check against whatever mirror
+      # or download manager was used, plus the per-asset .sha256 files.
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ./*.tar.gz | sed 's| \./| |' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # `--verify-tag` fails if the tag does not exist on the remote, so a
+          # rerun of a deleted tag cannot publish a phantom release.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists — uploading assets with --clobber"
+            gh release upload "$tag" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" \
+              dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS \
+              --title "flux-core ${tag#v}" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+      - name: Release summary
+        run: |
+          set -euo pipefail
+          {
+            echo "### Released \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "| Asset | SHA256 |"
+            echo "|---|---|"
+            while read -r sum file; do
+              echo "| \`${file}\` | \`${sum}\` |"
+            done < dist/SHA256SUMS
+          } >>"${GITHUB_STEP_SUMMARY}"

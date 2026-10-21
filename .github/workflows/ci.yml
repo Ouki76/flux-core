@@ -6,13 +6,34 @@ on:
   pull_request:
     branches: [ "main" ]
 
+# Least privilege by default; individual jobs opt into more (only the supply
+# chain job needs to write a check run).
+permissions:
+  contents: read
+
+# Supersede in-flight runs for the same ref. CI here builds a release binary and
+# runs the interop suites, so a stale run is expensive and never useful. PRs are
+# cancelled aggressively; pushes to main are left alone so every merged commit
+# keeps a complete record.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
+# Every job pins the toolchain explicitly (`toolchain: "1.91.0"`) rather than
+# reading it from an environment variable: `1.91.0` is Cargo.toml's
+# `rust-version`, so CI doubles as the MSRV gate, and a value that lives in the
+# `with:` block of each install step cannot be shadowed by an unrelated env
+# override. Bump all of them *together* with `rust-version` in Cargo.toml.
 jobs:
-  check-and-test:
-    name: Check, Lint & Test
+  # Fast, cheap, and first to fail: formatting problems should not burn a
+  # ten-minute build. Separate job purely so it reports in seconds.
+  formatting:
+    name: Formatting
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -20,11 +41,45 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: "1.91.0"
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      # There is no `actionlint` on the runners and nothing may be installed, so
+      # `scripts/check_workflows.sh` does the parts of that job which are
+      # mechanical: duplicate YAML keys, undefined `steps.<id>` references,
+      # `run:` blocks that are not valid shell, and workflow references to
+      # scripts that do not exist. It is a real gate on the workflows themselves;
+      # the negatives it cannot model (action versions, expression types) are
+      # listed in its header.
+      - name: Validate workflows and scripts
+        run: ./scripts/check_workflows.sh
+
+  check-and-test:
+    name: Check, Lint & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
           components: clippy, rustfmt
 
+      # `shared-key` lets the privileged and API-stability jobs reuse the same
+      # dependency cache instead of compiling the workspace three times. Only
+      # `main` is allowed to *write* it, so a PR cannot evict the cache everyone
+      # else depends on.
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: flux-core
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install sing-box (for interop tests)
         run: |
@@ -36,55 +91,297 @@ jobs:
           sudo install -m 0755 "/tmp/sing-box-${VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
           sing-box version
 
-      - name: Check code formatting
-        run: cargo fmt --check
-
       - name: Run Clippy linter
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Run unit & integration tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
         env:
           SINGBOX_BIN: /usr/local/bin/sing-box
 
+      # A release-profile compile is a different code path (`lto = "fat"`,
+      # `codegen-units = 1`, `strip`); catching a break here beats catching it in
+      # the release workflow.
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --locked --release
 
   privileged-tests:
     name: Privileged Tests (TUN / REDIRECT)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # The *same* pinned toolchain as the other jobs: running this suite on a
+      # different rustc would make its result hard to interpret against the main
+      # test job.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.91.0
+          toolchain: "1.91.0"
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: flux-core
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The suite skips itself when the capabilities it needs are missing (root
+      # plus /dev/net/tun for the direct variant, user+net namespaces for the
+      # re-exec variant). That graceful skip is right on a laptop and wrong here:
+      # this job exists to run those tests, so a missing capability must be a hard
+      # failure rather than a green build. Only /dev/net/tun is a hard
+      # prerequisite — it cannot be created from inside a container — everything
+      # else is reported so a failure is diagnosable from the log alone.
+      - name: Verify privileged environment
+        run: |
+          set -euo pipefail
+          [ -e /dev/net/tun ] || { echo "::error::/dev/net/tun is missing"; exit 1; }
+          sudo -n true
+          echo "sudo: ok"
+          sudo iptables -t nat -S >/dev/null && echo "iptables: ok"
+          if unshare --user --map-root-user --net true 2>/dev/null; then
+            echo "unprivileged user+net namespaces: available"
+          else
+            echo "::warning::unprivileged user+net namespaces are unavailable; the suite will have to run as root"
+          fi
+
+      # The suite re-executes itself inside a user+network namespace when it is
+      # started unprivileged, and needs real root otherwise. Running it via sudo
+      # therefore exercises it either way, and keeps this job independent of
+      # which of the two strategies `tests/test_transparent_inbounds.rs` uses.
+      #
+      # `sudo -E` keeps the cargo/rustup environment of the runner user; `HOME`
+      # is passed explicitly because sudo rewrites it, and without it the rustup
+      # shim would look for a toolchain under /root. GitHub's passwordless
+      # sudoers entry includes SETENV, so -E is honoured.
+      # `FLUX_ALLOW_TRANSPARENT_SKIP` is deliberately *not* set: it is the suite's
+      # escape hatch for machines that genuinely cannot provide the capabilities,
+      # and setting it here would convert every future skip into a pass.
       - name: Transparent inbound e2e (root via sudo, /dev/net/tun + iptables)
-        run: sudo -E env "PATH=$PATH" cargo test --test test_transparent_inbounds -- --nocapture --test-threads=1
+        run: |
+          set -euo pipefail
+          sudo -E env PATH="$PATH" HOME="$HOME" \
+            $([ -n "${CARGO_HOME:-}" ] && echo "CARGO_HOME=$CARGO_HOME") \
+            $([ -n "${RUSTUP_HOME:-}" ] && echo "RUSTUP_HOME=$RUSTUP_HOME") \
+            cargo test --locked --test test_transparent_inbounds -- \
+              --nocapture --test-threads=1 2>&1 | tee transparent-inbounds.log
+          # A "SKIP:" line means the guard fired despite the checks above: that is
+          # a silent no-op and must not pass, whichever version of the suite is
+          # in the tree.
+          if grep -q 'SKIP:' transparent-inbounds.log; then
+            echo "::error::a transparent-inbound test skipped inside the privileged job"
+            exit 1
+          fi
+          # A suite that discovered no tests at all would also be green.
+          if ! grep -qE '[0-9]+ passed' transparent-inbounds.log; then
+            echo "::error::the transparent-inbound suite reported no passing tests"
+            exit 1
+          fi
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transparent-inbounds-log
+          path: transparent-inbounds.log
+          if-no-files-found: ignore
+          retention-days: 7
 
   supply-chain:
     name: Supply Chain (audit + deny)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # rustsec/audit-check publishes a check run, so it needs these scopes.
+    permissions:
+      contents: read
+      checks: write
+      issues: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-
+      # RustSec advisory scan: a second opinion straight from the upstream
+      # database, independent of the cargo-deny policy below.
       - name: cargo audit (RustSec advisory scan)
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+      # deny.toml is authoritative — including its `[advisories]` section (the
+      # yanked-crate policy and the documented RUSTSEC-2024-0449 exception),
+      # which only `cargo deny check advisories` enforces. Running the full
+      # `cargo deny check` keeps the file honest: every gate it declares is
+      # actually executed here, so the policy cannot silently rot.
+      - name: Cache cargo-deny
+        id: deny-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo-tools/bin/cargo-deny
+          key: ${{ runner.os }}-cargo-tools-deny-v1
 
-      - name: cargo deny (licenses, bans, sources)
-        run: cargo deny check licenses bans sources
+      - name: Install cargo-deny
+        if: steps.deny-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-deny --root "$HOME/.cargo-tools"
+
+      - name: cargo deny (advisories, licenses, bans, sources)
+        run: '"$HOME/.cargo-tools/bin/cargo-deny" check advisories bans licenses sources'
+
+  # ---------------------------------------------------------------------------
+  # API stability
+  #
+  # `cargo-semver-checks` is built from source here and never installed on a
+  # developer machine (docs/quality.md §4): it is a CI-only concern.
+  #
+  # This job is deliberately NON-BLOCKING, and that is a considered decision:
+  #   1. the tool is a large build whose own dependency tree can fail to compile
+  #      on an older pinned toolchain (1.91.0) for reasons that have nothing to
+  #      do with this repository's API;
+  #   2. until the first `v*` tag exists there is no baseline to diff against —
+  #      release.yml creates those tags.
+  # A hard failure in either situation trains people to ignore a red CI. Instead
+  # every outcome (installed / not installable / no baseline / breaking change)
+  # is written to the job summary and, where applicable, to a ::warning::
+  # annotation: visible without gating merges.
+  # Promote it to blocking by removing `continue-on-error` from the check step
+  # once the tool is reliably available on the pinned toolchain — tracked in
+  # docs/quality.md "Known gaps".
+  # ---------------------------------------------------------------------------
+  api-stability:
+    name: API Stability (cargo-semver-checks, advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # The baseline revision must be reachable from history.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: flux-core
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Cache cargo-semver-checks
+        id: semver-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo-tools/bin/cargo-semver-checks
+          key: ${{ runner.os }}-cargo-tools-semver-checks-v1
+
+      - name: Install cargo-semver-checks
+        id: install
+        if: steps.semver-cache.outputs.cache-hit != 'true'
+        # See the block comment above: an install failure is a tooling problem,
+        # not a regression in this repository.
+        continue-on-error: true
+        run: cargo install --locked cargo-semver-checks --root "$HOME/.cargo-tools"
+
+      # A cache hit skips the install step, so `steps.install.outcome` is
+      # `skipped` rather than `success` — which is *not* a failure. Decide on the
+      # presence of the binary instead of on the outcome of a step that is
+      # deliberately conditional.
+      - name: Check tool availability
+        id: tool
+        run: |
+          set -euo pipefail
+          if [ -x "$HOME/.cargo-tools/bin/cargo-semver-checks" ]; then
+            echo "ok=true" >>"${GITHUB_OUTPUT}"
+          else
+            echo "ok=false" >>"${GITHUB_OUTPUT}"
+            echo "::warning::cargo-semver-checks could not be installed on this toolchain — API stability was NOT checked for this commit"
+          fi
+
+      - name: Resolve baseline revision
+        id: baseline
+        run: |
+          set -euo pipefail
+          rev=""
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              # Compare the PR head against the tip of the branch it targets:
+              # catches breaking changes introduced by *this* PR.
+              rev="origin/${GITHUB_BASE_REF}"
+              ;;
+            push)
+              if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+                # Release build: compare against the previous release tag.
+                rev=$(git describe --tags --abbrev=0 --match 'v*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+              else
+                # Push to main: compare against the most recent release.
+                rev=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+              fi
+              ;;
+            *)
+              rev=""
+              ;;
+          esac
+          if [ -n "$rev" ]; then
+            git rev-parse --verify "${rev}^{commit}" >/dev/null
+            echo "resolved baseline revision: $rev"
+          else
+            echo "::warning::no baseline revision (no reachable v* tag) — API stability check skipped"
+          fi
+          echo "rev=$rev" >>"${GITHUB_OUTPUT}"
+
+      - name: Check public API for semver breakage
+        id: check
+        if: steps.tool.outputs.ok == 'true' && steps.baseline.outputs.rev != ''
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          "$HOME/.cargo-tools/bin/cargo-semver-checks" semver-checks check-release \
+            --workspace \
+            --baseline-rev "${{ steps.baseline.outputs.rev }}" \
+            2>&1 | tee semver-checks.log
+
+      - name: Summarise
+        if: always()
+        env:
+          TOOL: ${{ steps.tool.outputs.ok }}
+          CHECK: ${{ steps.check.outcome }}
+          REV: ${{ steps.baseline.outputs.rev }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### cargo-semver-checks (advisory — never blocks a merge)"
+            echo
+            echo "| Step | Result |"
+            echo "|---|---|"
+            echo "| tool available | \`${TOOL}\` |"
+            echo "| baseline revision | \`${REV:-none}\` |"
+            echo "| check | \`${CHECK:-skipped}\` |"
+            echo
+            if [ "${TOOL:-false}" != "true" ]; then
+              echo "> The tool could not be built on the pinned toolchain (1.91.0)."
+              echo "> API stability was **not** checked for this commit. This is a"
+              echo "> toolchain-provisioning issue, not a defect in this change."
+            elif [ -z "${REV:-}" ]; then
+              echo "> No reachable \`v*\` tag, so there is no baseline to diff against."
+              echo "> The first release produced by \`.github/workflows/release.yml\`"
+              echo "> makes this check meaningful."
+            elif [ "$CHECK" = "failure" ]; then
+              echo "> **Semver-breaking API change detected against \`${REV}\`.**"
+              echo "> Either this is intentional (the version needs a major/minor"
+              echo "> bump) or it should be reworked before release."
+            else
+              echo "> No breaking API change detected against \`${REV}\`."
+            fi
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload semver report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semver-checks-report
+          path: semver-checks.log
+          if-no-files-found: ignore
+          retention-days: 14
