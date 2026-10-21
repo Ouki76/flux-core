@@ -119,6 +119,14 @@ pub fn vmess_user_cmd_key(uuid: &Uuid) -> [u8; 16] {
     out
 }
 
+/// Upper bound on the VMess response header length, in bytes.
+///
+/// A spec-conforming response header is one command byte plus a two-byte
+/// payload length, so 4 bytes is already generous; the peer may otherwise
+/// claim up to 65535 and force both a large allocation and (before the buffer
+/// was sized from the wire) an out-of-bounds slice panic.
+pub const MAX_VMESS_RESP_HDR: usize = 4;
+
 pub const VMESS_VERSION: u8 = 1;
 pub const VMESS_SECURITY_AES_128_GCM: u8 = 3;
 pub const VMESS_SECURITY_CHACHA20_POLY1305: u8 = 4;
@@ -166,7 +174,21 @@ impl VmessProtocol {
         block.into()
     }
 
+    /// Process-wide replay filter for VMess AEAD auth IDs.
+    ///
+    /// The auth ID encodes a timestamp that is already checked against a 120 s
+    /// window, but freshness is not uniqueness: a captured header used to be
+    /// accepted again on every replay inside that window (v2ray and Xray both
+    /// wrap the decoder in `antireplay.NewReplayFilter(120)` for this reason).
+    fn replay_filter() -> &'static crate::shadowsocks2022::ReplayFilter {
+        static FILTER: std::sync::OnceLock<crate::shadowsocks2022::ReplayFilter> =
+            std::sync::OnceLock::new();
+        FILTER.get_or_init(|| crate::shadowsocks2022::ReplayFilter::new(16384))
+    }
+
     /// Verifies standard V2Ray VMess AEAD 16-byte AuthID against a list of valid user UUIDs.
+    ///
+    /// Also rejects an auth ID that was already accepted (replay).
     pub fn verify_auth_id(auth_id: &[u8; 16], valid_uuids: &[Uuid]) -> Option<(Uuid, u64)> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -186,6 +208,11 @@ impl VmessProtocol {
             let ts = u64::from_be_bytes(decrypted[0..8].try_into().unwrap());
             let crc = u32::from_be_bytes(decrypted[12..16].try_into().unwrap());
             if crc32_ieee(&decrypted[0..12]) == crc && now.abs_diff(ts) <= 120 {
+                // The ID is cryptographically valid; now ensure it is not a
+                // replay of an earlier accepted header.
+                if !Self::replay_filter().check_and_insert(auth_id, ts) {
+                    return None;
+                }
                 return Some((*uuid, ts));
             }
         }
@@ -537,7 +564,7 @@ pub struct VmessStream<S> {
     // Client reading response header
     resp_len_buf: [u8; 18],
     resp_len_pos: usize,
-    resp_hdr_buf: [u8; 20],
+    resp_hdr_buf: Vec<u8>,
     resp_hdr_pos: usize,
 
     write_buf: Vec<u8>,
@@ -601,7 +628,7 @@ impl<S> VmessStream<S> {
             write_masker,
             resp_len_buf: [0u8; 18],
             resp_len_pos: 0,
-            resp_hdr_buf: [0u8; 20],
+            resp_hdr_buf: Vec::new(),
             resp_hdr_pos: 0,
             write_buf: Vec::with_capacity(16384 + 32),
             write_pos: 0,
@@ -657,7 +684,7 @@ impl<S> VmessStream<S> {
             write_masker,
             resp_len_buf: [0u8; 18],
             resp_len_pos: 0,
-            resp_hdr_buf: [0u8; 20],
+            resp_hdr_buf: Vec::new(),
             resp_hdr_pos: 0,
             write_buf: Vec::with_capacity(16384 + 32),
             write_pos: 0,
@@ -730,7 +757,23 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
                 };
             let resp_hdr_len = u16::from_be_bytes([resp_len_bytes[0], resp_len_bytes[1]]) as usize;
 
+            // The response header is peer-controlled: `resp_hdr_len` is the
+            // decrypted length of a small header (command + payload length).
+            // Anything larger is either a protocol error or an attempt to make
+            // us buffer/index out of bounds.
+            if resp_hdr_len > MAX_VMESS_RESP_HDR {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("VMess response header too long: {resp_hdr_len} bytes"),
+                )));
+            }
+
             let total_resp_hdr = resp_hdr_len + 16;
+            if this.resp_hdr_buf.len() != total_resp_hdr {
+                this.resp_hdr_buf.clear();
+                this.resp_hdr_buf.resize(total_resp_hdr, 0);
+                this.resp_hdr_pos = 0;
+            }
             while this.resp_hdr_pos < total_resp_hdr {
                 let mut tmp = [0u8; 32];
                 let needed = total_resp_hdr - this.resp_hdr_pos;
@@ -746,8 +789,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
                             )));
                         }
                         let pos = this.resp_hdr_pos;
-                        this.resp_hdr_buf[pos..pos + n].copy_from_slice(&tmp[..n]);
-                        this.resp_hdr_pos += n;
+                        let end = pos + n;
+                        let Some(dst) = this.resp_hdr_buf.get_mut(pos..end) else {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "VMess response header buffer overrun",
+                            )));
+                        };
+                        dst.copy_from_slice(&tmp[..n]);
+                        this.resp_hdr_pos = end;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => return Poll::Pending,
@@ -1111,6 +1161,85 @@ mod tests {
         assert_ne!(buf2, [0, 0]);
     }
 
+    /// Regression: a peer that declares an oversized response header must be
+    /// rejected, not panic the client task (the header length is decrypted from
+    /// the wire and used to index a fixed-size buffer).
+    #[tokio::test]
+    async fn test_vmess_rejects_oversized_response_header() {
+        let test_uuid = Uuid::new_v4();
+        let target = TargetAddress::domain("example.com", 443);
+        let (mut client_io, mut server_io) = tokio::io::duplex(4096);
+
+        let srv = tokio::spawn(async move {
+            let req = VmessProtocol::read_request_header(&mut server_io, &[test_uuid])
+                .await
+                .unwrap();
+
+            // Derive the response keys exactly as a real server would.
+            let resp_key = vmess_kdf_16(&req.session_key, &[b"AEAD Resp Header Key"]);
+            let resp_iv = vmess_kdf(&req.session_iv, &[b"AEAD Resp Header IV"]);
+
+            // Fixed part: option | command | payload length.
+            let mut len_block = [0u8; 18];
+            len_block[0] = req.option;
+            len_block[1] = 0x03; // 18 - 16 + 1
+            let len_key = vmess_kdf_16(&resp_key, &[b"AEAD Resp Header Len Key"]);
+            let len_nonce = vmess_kdf(&resp_iv, &[b"AEAD Resp Header Len IV"]);
+            let cipher = <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&len_key).unwrap();
+            let enc_len = cipher
+                .encrypt(AesNonce::from_slice(&len_nonce[..12]), len_block.as_slice())
+                .unwrap();
+            server_io.write_all(&enc_len).await.unwrap();
+
+            // Declare an absurd header length and then supply garbage bytes.
+            let mut hdr_block = vec![0u8; 2 + 16];
+            hdr_block[0] = 0xFF; // 65535
+            hdr_block[1] = 0xFF;
+            let hdr_nonce = vmess_kdf(&resp_iv, &[b"AEAD Resp Header IV"]);
+            let enc_hdr = cipher
+                .encrypt(AesNonce::from_slice(&hdr_nonce[..12]), hdr_block.as_slice())
+                .unwrap();
+            server_io.write_all(&enc_hdr).await.unwrap();
+            let _ = server_io.write_all(&vec![0u8; 512]).await;
+            let _ = server_io.flush().await;
+            // Keep the stream alive so the client observes the length error
+            // rather than an EOF.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            req
+        });
+
+        let cli = tokio::spawn(async move {
+            let (key, iv, resp_hdr) = VmessProtocol::write_request_header(
+                &mut client_io,
+                &test_uuid,
+                NetworkType::Tcp,
+                &target,
+                VMESS_SECURITY_AES_128_GCM,
+            )
+            .await
+            .unwrap();
+            let mut stream = VmessStream::new_client(
+                client_io,
+                key,
+                iv,
+                VMESS_SECURITY_AES_128_GCM,
+                resp_hdr,
+                0x05,
+            );
+            // Whatever happens, it must be an error — never a panic.
+            let res = stream.write_all(b"x").await.and(stream.flush().await);
+            let mut buf = [0u8; 16];
+            let read_res = stream.read(&mut buf).await;
+            assert!(
+                res.is_err() || read_res.is_err(),
+                "an oversized response header must produce an error"
+            );
+        });
+
+        srv.await.unwrap();
+        cli.await.unwrap();
+    }
+
     #[test]
     fn test_vmess_kdf_standard_test_vector() {
         let key = b"Demo Key for KDF Value Test";
@@ -1125,5 +1254,55 @@ mod tests {
             hex,
             "53e9d7e1bd7bd25022b71ead07d8a596efc8a845c7888652fd684b4903dc8892"
         );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// A valid auth ID must be accepted once and rejected on replay, even though
+    /// its embedded timestamp is still inside the freshness window.
+    #[test]
+    fn auth_id_replay_is_rejected() {
+        let uuid = Uuid::new_v4();
+        let auth_id = VmessProtocol::create_auth_id(&uuid, now_secs());
+
+        let first = VmessProtocol::verify_auth_id(&auth_id, &[uuid]);
+        assert!(first.is_some(), "a fresh, valid auth ID must be accepted");
+
+        let replay = VmessProtocol::verify_auth_id(&auth_id, &[uuid]);
+        assert!(
+            replay.is_none(),
+            "replaying the same auth ID must be rejected inside the 120 s window"
+        );
+    }
+
+    /// Distinct auth IDs for the same user must both be accepted (the filter
+    /// keys on the ID, not on the user).
+    #[test]
+    fn distinct_auth_ids_are_independent() {
+        let uuid = Uuid::new_v4();
+        let a = VmessProtocol::create_auth_id(&uuid, now_secs());
+        let b = VmessProtocol::create_auth_id(&uuid, now_secs());
+        assert_ne!(a, b);
+        assert!(VmessProtocol::verify_auth_id(&a, &[uuid]).is_some());
+        assert!(VmessProtocol::verify_auth_id(&b, &[uuid]).is_some());
+    }
+
+    /// An auth ID for an unknown user is rejected regardless of the filter.
+    #[test]
+    fn unknown_user_is_rejected() {
+        let known = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let auth_id = VmessProtocol::create_auth_id(&other, now_secs());
+        assert!(VmessProtocol::verify_auth_id(&auth_id, &[known]).is_none());
     }
 }

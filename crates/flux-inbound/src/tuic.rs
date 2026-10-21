@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
-use flux_protocol::tuic::{TUIC_AUTH_LEN, TUIC_CMD_CONNECT, TUIC_VERSION, TuicV5Protocol};
+use flux_protocol::tuic::{
+    TUIC_AUTH_LEN, TUIC_CMD_CONNECT, TUIC_STREAM_AUTH_LEN, TUIC_VERSION, TuicV5Protocol,
+};
 use flux_transport::quic::{QuicBiStream, QuicTransport};
 use flux_types::{
     Dispatcher, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
@@ -11,6 +13,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncReadExt;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tracing::{debug, info, warn};
+
+/// Absolute budget for the TUIC stream-mode handshake (transport unwrap + AUTH +
+/// CONNECT header). Matches the 10 s used by the other TCP inbounds.
+const TUIC_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Reads exactly `buf.len()` bytes, giving up at `deadline`.
+async fn read_exact_until<S>(stream: &mut S, buf: &mut [u8], deadline: tokio::time::Instant) -> bool
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    matches!(
+        tokio::time::timeout_at(deadline, stream.read_exact(buf)).await,
+        Ok(Ok(_))
+    )
+}
 use uuid::Uuid;
 
 /// TUIC v5 inbound (QUIC-native, spec-compatible with sing-box).
@@ -77,18 +94,10 @@ impl TuicInbound {
             shutdown_tx,
         }
     }
-
-    fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-        if a.len() != b.len() {
-            return false;
-        }
-        let mut diff = 0u8;
-        for (&x, &y) in a.iter().zip(b.iter()) {
-            diff |= x ^ y;
-        }
-        diff == 0
-    }
 }
+
+/// Upper bound on remembered stream-AUTH tokens.
+const TUIC_SEEN_TOKEN_CAPACITY: usize = 4096;
 
 #[async_trait]
 impl Inbound for TuicInbound {
@@ -113,6 +122,11 @@ impl Inbound for TuicInbound {
             let users = Arc::new(self.users.clone());
             let password = Arc::new(self.password.clone());
             let mut shutdown_rx = self.shutdown_tx.subscribe();
+            // Timestamped AUTH frames are replayable for the whole freshness
+            // window unless the server remembers which ones it has already
+            // accepted. Bounded so a flood of distinct timestamps cannot grow it.
+            let seen_tokens: Arc<dashmap::DashMap<([u8; 16], u64), ()>> =
+                Arc::new(dashmap::DashMap::new());
 
             info!(
                 "[{}] TUIC v5 Stream/TCP inbound listening on {}",
@@ -134,6 +148,7 @@ impl Inbound for TuicInbound {
                     let user_list = users.clone();
                     let pw = password.clone();
                     let p = pipe.clone();
+                    let seen = seen_tokens.clone();
 
                     tokio::spawn(async move {
                         let mut stream = match p.unwrap(socket).await {
@@ -147,19 +162,56 @@ impl Inbound for TuicInbound {
                             }
                         };
 
-                        // Layered mode: AUTH frame (legacy HMAC token) then CONNECT frame.
-                        let mut auth_buf = [0u8; TUIC_AUTH_LEN];
-                        if stream.read_exact(&mut auth_buf).await.is_err() {
+                        // Everything below must complete inside one absolute
+                        // handshake budget: without it a client that connects and
+                        // then sends nothing (slow-loris) parks this task and its
+                        // descriptors forever. `timeout_at` keeps the budget
+                        // absolute rather than per-read.
+                        let deadline = tokio::time::Instant::now() + TUIC_HANDSHAKE_TIMEOUT;
+
+                        // Layered mode: timestamped AUTH frame then CONNECT frame.
+                        let mut auth_buf = [0u8; TUIC_STREAM_AUTH_LEN];
+                        if !read_exact_until(&mut stream, &mut auth_buf, deadline).await {
                             return;
                         }
-                        let uuid = match TuicV5Protocol::parse_auth_frame(&auth_buf) {
-                            Ok((u, token)) => {
+                        let uuid = match TuicV5Protocol::parse_stream_auth_frame(&auth_buf) {
+                            Ok((u, ts, token)) => {
                                 if !user_list.is_empty() && !user_list.contains(&u) {
                                     return;
                                 }
-                                let expected = TuicV5Protocol::legacy_token(&u, &pw);
-                                if !Self::constant_time_eq(&token, &expected) {
+                                // Bind the credential to a moment in time: the old
+                                // static token was replayable forever.
+                                if !TuicV5Protocol::stream_token_fresh(ts) {
+                                    warn!(
+                                        "[{}] TUIC stream auth from {} rejected: timestamp outside the accepted window",
+                                        inbound_tag, client_addr
+                                    );
                                     return;
+                                }
+                                let expected = TuicV5Protocol::stream_token(&u, &pw, ts);
+                                if !flux_common::constant_time_eq(&token, &expected) {
+                                    return;
+                                }
+                                // Reject a replayed AUTH frame: without this the
+                                // token is valid for the whole window on any
+                                // number of fresh connections.
+                                if seen.insert((*u.as_bytes(), ts), ()).is_some() {
+                                    warn!(
+                                        "[{}] TUIC stream auth replay from {} rejected",
+                                        inbound_tag, client_addr
+                                    );
+                                    return;
+                                }
+                                if seen.len() > TUIC_SEEN_TOKEN_CAPACITY {
+                                    // Drop the oldest half rather than flushing
+                                    // everything: a scan must not reopen a window
+                                    // for tokens already seen this second.
+                                    let drop_count = seen.len() / 2;
+                                    let keys: Vec<_> =
+                                        seen.iter().take(drop_count).map(|e| *e.key()).collect();
+                                    for k in keys {
+                                        seen.remove(&k);
+                                    }
                                 }
                                 u
                             }
@@ -168,7 +220,7 @@ impl Inbound for TuicInbound {
 
                         // Read CONNECT header: [5, 0x01, addr...]
                         let mut hdr = [0u8; 2];
-                        if stream.read_exact(&mut hdr).await.is_err() {
+                        if !read_exact_until(&mut stream, &mut hdr, deadline).await {
                             return;
                         }
                         if hdr[0] != TUIC_VERSION || hdr[1] != TUIC_CMD_CONNECT {
@@ -176,18 +228,18 @@ impl Inbound for TuicInbound {
                         }
                         // Peek the address: read ATYP byte first
                         let mut atyp = [0u8; 1];
-                        if stream.read_exact(&mut atyp).await.is_err() {
+                        if !read_exact_until(&mut stream, &mut atyp, deadline).await {
                             return;
                         }
                         let mut addr_buf = atyp.to_vec();
                         let more = match atyp[0] {
                             0x00 => {
                                 let mut lb = [0u8; 1];
-                                if stream.read_exact(&mut lb).await.is_err() {
+                                if !read_exact_until(&mut stream, &mut lb, deadline).await {
                                     return;
                                 }
                                 let mut rest = vec![0u8; lb[0] as usize + 2];
-                                if stream.read_exact(&mut rest).await.is_err() {
+                                if !read_exact_until(&mut stream, &mut rest, deadline).await {
                                     return;
                                 }
                                 let mut v = lb.to_vec();
@@ -196,14 +248,14 @@ impl Inbound for TuicInbound {
                             }
                             0x01 => {
                                 let mut rest = [0u8; 4 + 2];
-                                if stream.read_exact(&mut rest).await.is_err() {
+                                if !read_exact_until(&mut stream, &mut rest, deadline).await {
                                     return;
                                 }
                                 rest.to_vec()
                             }
                             0x02 => {
                                 let mut rest = vec![0u8; 16 + 2];
-                                if stream.read_exact(&mut rest).await.is_err() {
+                                if !read_exact_until(&mut stream, &mut rest, deadline).await {
                                     return;
                                 }
                                 rest.to_vec()
@@ -365,7 +417,7 @@ impl Inbound for TuicInbound {
                                             {
                                                 return;
                                             }
-                                            if !TuicInbound::constant_time_eq(&token, &expected) {
+                                            if !flux_common::constant_time_eq(&token, &expected) {
                                                 warn!(
                                                     "[{}] TUIC token mismatch from {}",
                                                     tag2,

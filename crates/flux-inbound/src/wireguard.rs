@@ -25,6 +25,15 @@ use x25519_dalek::StaticSecret;
 pub const WG_INBOUND_DEFAULT_MTU: usize = 1420;
 /// Channel capacity between the UDP receive loop and the smoltcp stack actor.
 const FRAME_CHANNEL_CAP: usize = 2048;
+
+/// Minimum on-wire length of a WireGuard transport (data) packet:
+/// `type(4) + receiver_index(4) + counter(8)` header plus a 16-byte AEAD tag.
+const WG_DATA_HEADER_LEN: usize = 16 + 16;
+
+/// Upper bound on concurrent sessions held by the inbound. Each authenticated
+/// handshake creates one; a misbehaving (but authorized) peer must not be able
+/// to grow this map without limit.
+const MAX_SESSIONS: usize = 4096;
 /// How often the session reaper scans for expired sessions.
 const REAPER_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -125,6 +134,12 @@ impl Inbound for WireGuardInbound {
         // Live sessions keyed by our receiver index; inner-src-IP → index for replies.
         let sessions: Arc<DashMap<u32, Arc<PeerSessionState>>> = Arc::new(DashMap::new());
         let ip_to_index: Arc<DashMap<IpAddr, u32>> = Arc::new(DashMap::new());
+        // Greatest TAI64N seen per peer. WireGuard requires a responder to reject
+        // any initiation that is not strictly newer than the last one accepted;
+        // the freshness window alone allowed a captured initiation to be replayed
+        // indefinitely (burning four X25519 operations and replacing the peer's
+        // session each time).
+        let peer_timestamps: Arc<DashMap<[u8; 32], [u8; 12]>> = Arc::new(DashMap::new());
 
         // smoltcp stack channels
         let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(FRAME_CHANNEL_CAP);
@@ -157,6 +172,7 @@ impl Inbound for WireGuardInbound {
             let socket = socket.clone();
             let sessions = sessions.clone();
             let ip_to_index = ip_to_index.clone();
+            let peer_timestamps = peer_timestamps.clone();
             let tag = tag.clone();
             let running = self.running.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -195,15 +211,32 @@ impl Inbound for WireGuardInbound {
                         break;
                     }
                     let pkt = &buf[..n];
-                    if pkt.len() < 4 {
-                        continue;
-                    }
 
-                    let msg_type = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
+                    let Some(msg_type) = pkt
+                        .get(0..4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    else {
+                        continue; // runt datagram: not a WireGuard message
+                    };
 
                     if msg_type == awg.h4 {
                         // ---- Data packet: [h4][receiver_index(4)][counter(8)][ciphertext]
-                        let receiver_index = u32::from_le_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+                        // A data packet is at least the 16-byte header plus a 16-byte
+                        // Poly1305 tag. Reject runts before indexing: an attacker could
+                        // otherwise send `h4` alone and panic this (the only) receive loop,
+                        // permanently taking the inbound down.
+                        let Some(idx_bytes) = pkt.get(4..8) else {
+                            continue;
+                        };
+                        if pkt.len() < WG_DATA_HEADER_LEN {
+                            continue;
+                        }
+                        let receiver_index = u32::from_le_bytes([
+                            idx_bytes[0],
+                            idx_bytes[1],
+                            idx_bytes[2],
+                            idx_bytes[3],
+                        ]);
                         let Some(entry) = sessions.get(&receiver_index) else {
                             debug!(
                                 "[{}] wireguard data for unknown session {}",
@@ -274,7 +307,27 @@ impl Inbound for WireGuardInbound {
                         ]) == awg.h1
                     {
                         // ---- Handshake initiation (possibly with AWG s1 junk prefix)
-                        let receiver_index = rand::random::<u32>();
+                        // Bind a session slot with a fresh receiver index. `rand::random`
+                        // could collide with a live session, which would silently hijack
+                        // (and later reap) another peer's tunnel, so retry a few times on
+                        // collision instead of trusting the RNG.
+                        let Some(receiver_index) = (0..8).find_map(|_| {
+                            let candidate = rand::random::<u32>();
+                            (!sessions.contains_key(&candidate)).then_some(candidate)
+                        }) else {
+                            warn!(
+                                "[{}] wireguard session table saturated; rejecting handshake from {}",
+                                tag, peer_addr
+                            );
+                            continue;
+                        };
+                        if sessions.len() >= MAX_SESSIONS {
+                            warn!(
+                                "[{}] wireguard session limit ({}) reached; rejecting handshake from {}",
+                                tag, MAX_SESSIONS, peer_addr
+                            );
+                            continue;
+                        }
                         let result = WireGuardHandshake::respond_to_initiation_with_peers(
                             &local_static,
                             receiver_index,
@@ -284,6 +337,22 @@ impl Inbound for WireGuardInbound {
                         );
                         match result {
                             Ok(hs) => {
+                                // Reject replayed initiations: the timestamp must be
+                                // strictly newer than the last accepted one per peer.
+                                {
+                                    let fresh = match peer_timestamps.get(&hs.peer_public_key) {
+                                        Some(last) => hs.peer_timestamp > *last,
+                                        None => true,
+                                    };
+                                    if !fresh {
+                                        debug!(
+                                            "[{}] wireguard initiation from {} replayed (stale TAI64N); dropped",
+                                            tag, peer_addr
+                                        );
+                                        continue;
+                                    }
+                                    peer_timestamps.insert(hs.peer_public_key, hs.peer_timestamp);
+                                }
                                 let allowed_ips = peers_allowed
                                     .iter()
                                     .find(|(pk, _)| *pk == hs.peer_public_key)

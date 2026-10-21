@@ -544,7 +544,7 @@ impl WireGuardHandshake {
         psk: Option<[u8; 32]>,
     ) -> FluxResult<(Vec<u8>, WireGuardSession)> {
         Self::respond_impl(local_static, receiver_index, awg, init_pkt, None, psk)
-            .map(|(response, session, _)| (response, session))
+            .map(|(response, session, _, _)| (response, session))
     }
 
     /// Server side with peer allow-list enforcement: the decrypted client static
@@ -558,7 +558,7 @@ impl WireGuardHandshake {
         init_pkt: &[u8],
         peers: &[WireGuardPeerAuth],
     ) -> FluxResult<WireGuardHandshakeResult> {
-        let (response, session, peer_public_key) = Self::respond_impl(
+        let (response, session, peer_public_key, peer_timestamp) = Self::respond_impl(
             local_static,
             receiver_index,
             awg,
@@ -570,6 +570,7 @@ impl WireGuardHandshake {
             response,
             session,
             peer_public_key,
+            peer_timestamp,
         })
     }
 
@@ -580,7 +581,7 @@ impl WireGuardHandshake {
         init_pkt: &[u8],
         peers: Option<&[WireGuardPeerAuth]>,
         psk: Option<[u8; 32]>,
-    ) -> FluxResult<(Vec<u8>, WireGuardSession, [u8; 32])> {
+    ) -> FluxResult<HandshakeParts> {
         let prefix_len = awg.s1 as usize;
         let expected_min_len = prefix_len + 4 + 4 + 32 + 48 + 28 + 32;
         if init_pkt.len() < expected_min_len {
@@ -608,7 +609,7 @@ impl WireGuardHandshake {
             // AmneziaWG: MAC1 covers the message starting at the type field (junk prefix excluded).
             let expected_mac1 = blake2s_mac16(&mac1_key, &init_pkt[prefix_len..mac1_offset]);
             let received_mac1 = &init_pkt[mac1_offset..mac1_offset + 16];
-            if !constant_time_eq(&expected_mac1, received_mac1) {
+            if !flux_common::constant_time_eq(&expected_mac1, received_mac1) {
                 return Err(FluxError::AuthFailed(
                     "wireguard initiation rejected: invalid mac1".into(),
                 ));
@@ -660,7 +661,7 @@ impl WireGuardHandshake {
             Some(list) => {
                 let mut matched: Option<&WireGuardPeerAuth> = None;
                 for p in list {
-                    if constant_time_eq(&p.public_key, &client_static_arr) {
+                    if flux_common::constant_time_eq(&p.public_key, &client_static_arr) {
                         matched = Some(p);
                         break;
                     }
@@ -695,7 +696,9 @@ impl WireGuardHandshake {
             .map_err(|e| {
                 FluxError::AuthFailed(format!("failed to decrypt timestamp in initiation: {}", e))
             })?;
+        let mut peer_timestamp = [0u8; 12];
         if ts_plain.len() == 12 {
+            peer_timestamp.copy_from_slice(&ts_plain[..12]);
             let tai64_sec = u64::from_be_bytes(ts_plain[0..8].try_into().unwrap());
             // TAI64N epoch offset: 2^62 + 10 seconds
             let unix_sec = tai64_sec.saturating_sub(0x4000_0000_0000_000a);
@@ -773,9 +776,12 @@ impl WireGuardHandshake {
             Some(awg.clone()),
         );
 
-        Ok((resp_pkt, session, client_static_arr))
+        Ok((resp_pkt, session, client_static_arr, peer_timestamp))
     }
 }
+
+/// Response packet, derived session, authenticated peer key and its TAI64N.
+type HandshakeParts = (Vec<u8>, WireGuardSession, [u8; 32], [u8; 12]);
 
 /// An authorized WireGuard peer entry for server-side handshake authentication.
 #[derive(Clone, Debug)]
@@ -792,22 +798,16 @@ pub struct WireGuardHandshakeResult {
     pub session: WireGuardSession,
     /// Authenticated peer's static public key.
     pub peer_public_key: [u8; 32],
+    /// TAI64N timestamp from the initiation (12 bytes, big-endian nanoseconds).
+    ///
+    /// The responder must remember the greatest value seen per peer and reject
+    /// anything that is not strictly newer (WireGuard's replay defence for
+    /// handshake initiations); the caller enforces that with this value.
+    pub peer_timestamp: [u8; 12],
 }
 
 fn cfg_packet_len(awg: &AwgConfig) -> usize {
     awg.s1 as usize + 4 + 4 + 32 + 48 + 28 + 32
-}
-
-/// Constant-time byte-slice equality (used for MAC comparisons).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]

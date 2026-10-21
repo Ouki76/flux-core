@@ -729,13 +729,89 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Ss2022Stream<S> {
     }
 }
 
+/// Sliding replay window for SS-2022 UDP packet IDs (`SIP022` requires the server
+/// to drop duplicate `(session_id, packet_id)` pairs).
+///
+/// The timestamp check only bounds *freshness*: without this a captured datagram
+/// is accepted again on every replay until it ages out of the window.
+#[derive(Debug)]
+struct UdpReplayWindow {
+    /// Highest packet id accepted so far (or `None` before the first packet).
+    highest: Option<u64>,
+    /// Bitmap of the 64 packet ids below `highest`.
+    bitmap: u64,
+}
+
+impl UdpReplayWindow {
+    const fn new() -> Self {
+        Self {
+            highest: None,
+            bitmap: 0,
+        }
+    }
+
+    /// Returns true when `pid` is new (and records it), false for a replay.
+    fn accept(&mut self, pid: u64) -> bool {
+        match self.highest {
+            None => {
+                self.highest = Some(pid);
+                self.bitmap = 1;
+                true
+            }
+            Some(high) => {
+                if pid > high {
+                    let shift = pid - high;
+                    self.bitmap = if shift >= 64 {
+                        1
+                    } else {
+                        (self.bitmap << shift) | 1
+                    };
+                    self.highest = Some(pid);
+                    true
+                } else {
+                    let diff = high - pid;
+                    if diff >= 64 {
+                        return false; // too old: outside the window
+                    }
+                    let bit = 1u64 << diff;
+                    if self.bitmap & bit != 0 {
+                        return false; // duplicate
+                    }
+                    self.bitmap |= bit;
+                    true
+                }
+            }
+        }
+    }
+}
+
 pub struct Ss2022UdpPacketCipher {
     method: Ss2022CipherMethod,
     psk: Vec<u8>,
     session_id: [u8; 8],
     packet_id: std::sync::atomic::AtomicU64,
     aead: Ss2022Aead,
+    /// Replay window for packets carrying *our* session id.
+    own_replay: Mutex<UdpReplayWindow>,
+    /// Peer session ids seen so far → (derived AEAD, replay window).
+    ///
+    /// The cache bounds *memory*: without it, every datagram carrying a fresh
+    /// session id would pin a key schedule plus a window forever. Note that it
+    /// does not bound work — a fresh session id per datagram still costs one
+    /// BLAKE3-XOF plus an AES key schedule, which is inherent to SS-2022 UDP.
+    ///
+    /// It also makes replay protection best-effort: evicting an entry resets its
+    /// window, so a captured datagram can be accepted again after eviction. The
+    /// timestamp check (30 s) is the primary defence for UDP, exactly as the spec
+    /// intends; the window closes the cheap "resend immediately" case.
+    peers: Mutex<LruCache<[u8; 8], (Ss2022Aead, UdpReplayWindow)>>,
 }
+
+/// Maximum number of peer UDP session ids remembered per cipher.
+///
+/// Sized well above the number of peers a relay realistically serves at once, so
+/// legitimate traffic does not evict a live window.
+const UDP_PEER_CACHE: usize = 1024;
 
 impl Ss2022UdpPacketCipher {
     pub fn new(method: Ss2022CipherMethod, psk: &[u8]) -> Self {
@@ -749,6 +825,10 @@ impl Ss2022UdpPacketCipher {
             session_id,
             packet_id: std::sync::atomic::AtomicU64::new(0),
             aead,
+            own_replay: Mutex::new(UdpReplayWindow::new()),
+            peers: Mutex::new(LruCache::new(
+                NonZeroUsize::new(UDP_PEER_CACHE).expect("non-zero"),
+            )),
         }
     }
 
@@ -801,12 +881,51 @@ impl Ss2022UdpPacketCipher {
         ]);
 
         let nonce = Self::make_nonce(pid);
-        let plain = if pkt_session_id == self.session_id {
-            self.aead.decrypt(&nonce, &buf[16..])?
+
+        // Resolve (and cache) the AEAD for the packet's session id, deriving the
+        // subkey at most once per peer session.
+        let mut peer_sid = [0u8; 8];
+        peer_sid.copy_from_slice(pkt_session_id);
+        // Authentication MUST come before the replay window is advanced: a forged
+        // datagram that only carried a valid session id and a huge packet id would
+        // otherwise push `highest` forward and make every subsequent legitimate
+        // packet look "too old", silently killing the tunnel's UDP.
+        let plain = if peer_sid == self.session_id {
+            // Packet from the peer using our session id.
+            let plain = self.aead.decrypt(&nonce, &buf[16..])?;
+            if !self.own_replay.lock().accept(pid) {
+                return Err(FluxError::AuthFailed(
+                    "shadowsocks-2022 UDP replay detected".into(),
+                ));
+            }
+            plain
         } else {
-            let subkey = derive_2022_subkey(&self.psk, pkt_session_id, self.method.key_len());
-            let aead = Ss2022Aead::new(self.method, &subkey);
-            aead.decrypt(&nonce, &buf[16..])?
+            // Packet carrying the peer's own session id: derive (and cache) the
+            // subkey once per session instead of per datagram.
+            let mut peers = self.peers.lock();
+            if peers.get(&peer_sid).is_none() {
+                let subkey = derive_2022_subkey(&self.psk, &peer_sid, self.method.key_len());
+                peers.put(
+                    peer_sid,
+                    (
+                        Ss2022Aead::new(self.method, &subkey),
+                        UdpReplayWindow::new(),
+                    ),
+                );
+            }
+            // Decrypt with the (possibly just-derived) session key first…
+            let plain = {
+                let (aead, _) = peers.get(&peer_sid).expect("just inserted");
+                aead.decrypt(&nonce, &buf[16..])?
+            };
+            // …and only record the packet id once it is proven authentic.
+            let (_, window) = peers.get_mut(&peer_sid).expect("present");
+            if !window.accept(pid) {
+                return Err(FluxError::AuthFailed(
+                    "shadowsocks-2022 UDP replay detected".into(),
+                ));
+            }
+            plain
         };
 
         if plain.len() < 8 + 1 {
@@ -1163,5 +1282,116 @@ mod tests {
         let (dec_target, dec_payload) = receiver.decrypt_packet(&pkt_valid).await.unwrap();
         assert_eq!(dec_target, target);
         assert_eq!(&dec_payload[..], payload);
+    }
+}
+
+#[cfg(test)]
+mod udp_replay_tests {
+    use super::*;
+
+    #[test]
+    fn window_accepts_increasing_ids() {
+        let mut w = UdpReplayWindow::new();
+        for pid in 0..200u64 {
+            assert!(w.accept(pid), "fresh id {pid} must be accepted");
+        }
+    }
+
+    #[test]
+    fn window_rejects_duplicates() {
+        let mut w = UdpReplayWindow::new();
+        assert!(w.accept(42));
+        assert!(!w.accept(42), "duplicate must be rejected");
+        assert!(w.accept(43));
+        assert!(!w.accept(43));
+        // Out-of-order but unseen is fine.
+        assert!(w.accept(41));
+        assert!(!w.accept(41));
+    }
+
+    #[test]
+    fn window_rejects_too_old_ids() {
+        let mut w = UdpReplayWindow::new();
+        assert!(w.accept(1000));
+        assert!(!w.accept(1000 - 64), "outside the 64-entry window");
+    }
+
+    #[test]
+    fn window_handles_large_jumps() {
+        let mut w = UdpReplayWindow::new();
+        assert!(w.accept(1));
+        assert!(w.accept(1_000_000), "a big jump resets the bitmap");
+        assert!(!w.accept(1_000_000));
+        assert!(w.accept(999_999));
+        assert!(!w.accept(999_999));
+    }
+
+    /// A forged datagram must not advance the replay window.
+    ///
+    /// The window is keyed on packet ids, so accepting an id before checking the
+    /// AEAD tag would let an unauthenticated packet with a huge id push `highest`
+    /// forward and make every later legitimate packet look stale — a one-packet
+    /// remote DoS for the UDP path.
+    #[tokio::test]
+    async fn forged_datagram_does_not_poison_the_replay_window() {
+        let key = [9u8; 16];
+        let method = Ss2022CipherMethod::Blake3Aes128Gcm;
+        let sender = Ss2022UdpPacketCipher::new(method, &key);
+        let receiver = Ss2022UdpPacketCipher::new(method, &key);
+        let target: TargetAddress = "1.2.3.4:53".parse().unwrap();
+
+        // One genuine datagram so the receiver's window is initialised.
+        let good = sender.encrypt_packet(&target, b"real").unwrap();
+        receiver
+            .decrypt_packet(&good)
+            .await
+            .expect("genuine packet");
+
+        // Forge a packet with the correct session id but a huge packet id and a
+        // garbage payload (bad AEAD tag).
+        let mut forged = good.clone();
+        forged[8..16].copy_from_slice(&u64::MAX.to_be_bytes());
+        for b in forged[16..].iter_mut() {
+            *b ^= 0xFF;
+        }
+        assert!(
+            receiver.decrypt_packet(&forged).await.is_err(),
+            "a forged packet must be rejected"
+        );
+
+        // The next genuine datagram must still be accepted.
+        let next = sender.encrypt_packet(&target, b"after-forgery").unwrap();
+        let (_, payload) = receiver
+            .decrypt_packet(&next)
+            .await
+            .expect("a forged packet must not poison the replay window");
+        assert_eq!(&payload[..], b"after-forgery");
+    }
+
+    /// A replayed SS-2022 UDP datagram must be rejected end to end.
+    #[tokio::test]
+    async fn replayed_datagram_is_rejected() {
+        let key = [7u8; 16];
+        let method = Ss2022CipherMethod::Blake3Aes128Gcm;
+        let sender = Ss2022UdpPacketCipher::new(method, &key);
+        let receiver = Ss2022UdpPacketCipher::new(method, &key);
+
+        let target: TargetAddress = "1.2.3.4:53".parse().unwrap();
+        let wire = sender.encrypt_packet(&target, b"query").unwrap();
+
+        // First delivery is accepted.
+        let (t, payload) = receiver
+            .decrypt_packet(&wire)
+            .await
+            .expect("first delivery");
+        assert_eq!(t, target);
+        assert_eq!(&payload[..], b"query");
+
+        // Replay of the exact same bytes must fail.
+        let err = receiver.decrypt_packet(&wire).await;
+        assert!(
+            matches!(err, Err(FluxError::AuthFailed(_))),
+            "replay must be rejected, got {err:?}"
+        );
     }
 }

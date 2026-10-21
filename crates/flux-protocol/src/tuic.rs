@@ -28,6 +28,16 @@ pub const TUIC_CMD_HEARTBEAT: u8 = 0x04;
 
 pub const TUIC_AUTH_LEN: usize = 2 + 16 + 32;
 
+/// Accepted clock skew for the stream-mode AUTH timestamp.
+pub const TUIC_STREAM_TOKEN_WINDOW_SECS: u64 = 300;
+
+/// Stream-mode AUTH frame length: version, command, timestamp, uuid, token.
+///
+/// Our stream mode previously reused the 50-byte QUIC AUTH frame, which has no
+/// room for a nonce; the extended frame adds an 8-byte timestamp so the token can
+/// be bound to a moment in time and cannot be replayed.
+pub const TUIC_STREAM_AUTH_LEN: usize = 2 + 8 + 16 + 32;
+
 const ATYP_DOMAIN: u8 = 0x00;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_IPV6: u8 = 0x02;
@@ -69,9 +79,57 @@ fn proto_err(msg: impl Into<String>) -> FluxError {
 pub struct TuicV5Protocol;
 
 impl TuicV5Protocol {
-    /// Builds an AUTHENTICATE frame. `token` is the 32-byte TLS 1.3
-    /// ExportKeyingMaterial derived from the QUIC connection
-    /// (label = raw UUID bytes, context = password).
+    /// Builds the timestamped stream-mode AUTH frame:
+    /// `version, command, timestamp u64, uuid[16], token[32]`.
+    pub fn build_stream_auth_frame(uuid: &Uuid, password: &str) -> Vec<u8> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let token = Self::stream_token(uuid, password, now);
+        let mut buf = Vec::with_capacity(TUIC_STREAM_AUTH_LEN);
+        buf.push(TUIC_VERSION);
+        buf.push(TUIC_CMD_AUTHENTICATE);
+        buf.extend_from_slice(&now.to_be_bytes());
+        buf.extend_from_slice(uuid.as_bytes());
+        buf.extend_from_slice(&token);
+        buf
+    }
+
+    /// Parses the timestamped stream-mode AUTH frame, returning
+    /// `(uuid, timestamp, token)`.
+    pub fn parse_stream_auth_frame(data: &[u8]) -> FluxResult<(Uuid, u64, [u8; 32])> {
+        if data.len() < TUIC_STREAM_AUTH_LEN {
+            return Err(proto_err("stream auth frame too short"));
+        }
+        if data[0] != TUIC_VERSION {
+            return Err(proto_err(format!("unsupported tuic version {}", data[0])));
+        }
+        if data[1] != TUIC_CMD_AUTHENTICATE {
+            return Err(proto_err(format!(
+                "expected AUTHENTICATE command, got {}",
+                data[1]
+            )));
+        }
+        let ts = u64::from_be_bytes([
+            data[2], data[3], data[4], data[5], data[6], data[7], data[8], data[9],
+        ]);
+        let mut uuid_bytes = [0u8; 16];
+        uuid_bytes.copy_from_slice(&data[10..26]);
+        let mut token = [0u8; 32];
+        token.copy_from_slice(&data[26..58]);
+        Ok((Uuid::from_bytes(uuid_bytes), ts, token))
+    }
+
+    /// True when `ts` is inside the accepted window.
+    pub fn stream_token_fresh(ts: u64) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        now.abs_diff(ts) <= TUIC_STREAM_TOKEN_WINDOW_SECS
+    }
+
     pub fn build_auth_frame(uuid: &Uuid, token: &[u8; 32]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(TUIC_AUTH_LEN);
         buf.push(TUIC_VERSION);
@@ -241,27 +299,33 @@ impl TuicV5Protocol {
         ]
     }
 
-    /// Builds a HEARTBEAT datagram.
-    pub fn build_heartbeat_frame() -> Vec<u8> {
-        vec![TUIC_VERSION, TUIC_CMD_HEARTBEAT]
-    }
-
-    /// Legacy HMAC-SHA256 token for layered (non-QUIC) transports, where TLS
-    /// ExportKeyingMaterial is unavailable. flux-extension only.
-    pub fn legacy_token(uuid: &Uuid, password: &str) -> [u8; 32] {
+    /// Builds a stream-mode AUTH token bound to a timestamp.
+    ///
+    /// Used for layered (non-QUIC) carriers, where TLS ExportKeyingMaterial is
+    /// unavailable. This is a flux-core extension, not part of TUIC v5; if the
+    /// carrier provides no encryption the token is visible to an on-path
+    /// observer, so configure a security layer for it.
+    ///
+    /// The token replaces a static `HMAC(password, uuid)`: it covers a fresh
+    /// 8-byte timestamp, which the server rejects outside
+    /// [`TUIC_STREAM_TOKEN_WINDOW_SECS`], and remembers accepted
+    /// `(uuid, timestamp)` pairs so it cannot be replayed within that window.
+    pub fn stream_token(uuid: &Uuid, password: &str, timestamp: u64) -> [u8; 32] {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(password.as_bytes())
             .expect("HMAC accepts any key length");
         mac.update(uuid.as_bytes());
+        mac.update(&timestamp.to_be_bytes());
         let res = mac.finalize().into_bytes();
         let mut out = [0u8; 32];
         out.copy_from_slice(&res);
         out
     }
 
-    /// Legacy combined command frame helpers (used by the TCP-pipeline layering).
-    /// New code should use build_connect_frame / parse_connect_frame.
+    /// Builds a `version, command, address` frame.
+    ///
+    /// This is the plain command frame used by the layered (non-QUIC) pipeline.
     pub fn build_command_frame(command: u8, target: &TargetAddress) -> Vec<u8> {
         let mut buf = Vec::with_capacity(16);
         buf.push(TUIC_VERSION);
@@ -330,5 +394,55 @@ mod tests {
         assert_eq!(f6[2], ATYP_IPV6);
         let (_, parsed_v6) = TuicV5Protocol::parse_command_frame(&f6).unwrap();
         assert_eq!(parsed_v6, v6);
+    }
+}
+
+#[cfg(test)]
+mod stream_token_tests {
+    use super::*;
+
+    #[test]
+    fn stream_auth_frame_binds_a_fresh_timestamp() {
+        let uuid = Uuid::new_v4();
+        let frame = TuicV5Protocol::build_stream_auth_frame(&uuid, "pw");
+        assert_eq!(frame.len(), TUIC_STREAM_AUTH_LEN);
+        let (parsed_uuid, ts, token) = TuicV5Protocol::parse_stream_auth_frame(&frame).unwrap();
+        assert_eq!(parsed_uuid, uuid);
+        assert!(TuicV5Protocol::stream_token_fresh(ts));
+        // The token must verify for this timestamp.
+        assert_eq!(token, TuicV5Protocol::stream_token(&uuid, "pw", ts));
+    }
+
+    #[test]
+    fn token_is_bound_to_the_timestamp() {
+        let uuid = Uuid::new_v4();
+        let a = TuicV5Protocol::stream_token(&uuid, "pw", 1_000);
+        let b = TuicV5Protocol::stream_token(&uuid, "pw", 1_001);
+        assert_ne!(a, b, "a captured token must not verify for another time");
+    }
+
+    #[test]
+    fn stale_timestamps_are_rejected() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(TuicV5Protocol::stream_token_fresh(now));
+        assert!(!TuicV5Protocol::stream_token_fresh(
+            now - TUIC_STREAM_TOKEN_WINDOW_SECS - 10
+        ));
+        assert!(!TuicV5Protocol::stream_token_fresh(
+            now + TUIC_STREAM_TOKEN_WINDOW_SECS + 10
+        ));
+    }
+
+    #[test]
+    fn truncated_frames_are_rejected() {
+        let uuid = Uuid::new_v4();
+        let frame = TuicV5Protocol::build_stream_auth_frame(&uuid, "pw");
+        assert!(
+            TuicV5Protocol::parse_stream_auth_frame(&frame[..TUIC_STREAM_AUTH_LEN - 1]).is_err()
+        );
+        assert!(TuicV5Protocol::parse_stream_auth_frame(&[]).is_err());
     }
 }

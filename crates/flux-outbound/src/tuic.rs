@@ -184,10 +184,11 @@ impl Outbound for TuicOutbound {
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
         if let Some(ref d) = self.dialer {
             // Layered mode (TUIC frames over an arbitrary stream transport):
-            // AUTH frame with the legacy HMAC token, then the CONNECT command.
+            // timestamped AUTH frame, then the CONNECT command. The token covers
+            // the timestamp, so a captured frame cannot be replayed.
             let mut stream = d.dial().await?;
-            let token = TuicV5Protocol::legacy_token(&self.config.uuid, &self.config.password);
-            let auth_frame = TuicV5Protocol::build_auth_frame(&self.config.uuid, &token);
+            let auth_frame =
+                TuicV5Protocol::build_stream_auth_frame(&self.config.uuid, &self.config.password);
             let cmd_frame = TuicV5Protocol::build_command_frame(
                 flux_protocol::tuic::TUIC_CMD_CONNECT,
                 &meta.destination,
