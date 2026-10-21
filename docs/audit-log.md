@@ -218,7 +218,7 @@ cleanup.
 Final state after cleanup: **525 tests, 0 failed** (was 516; +9 pipeline tests),
 fmt/clippy/audit/deny/doc all green.
 
-### Open: a rare mux teardown race
+### Closed: the rare mux teardown race
 
 One full-suite run failed with, in `test_mux_vless_flux_to_singbox`:
 
@@ -231,6 +231,28 @@ background loops and 8 test threads each) — not reproducible. The message is
 raised when the client's handshake is still waiting for the server's status byte
 and the underlying session reports EOF (`mux.rs:1209`/`:1217`), i.e. a teardown
 race between the peer closing the session and the reply arriving, not a data
-corruption. Cycle 3 should either reproduce it deterministically (e.g. by closing
-the session from the server at a chosen point) or add the session's event state to
-the error so the next occurrence is diagnosable.
+corruption. **Cycle 3 verdict (see `docs/mux-teardown-race.md`):**
+
+- The observed failure was a **legitimate** session teardown (the transport went
+  away: peer EOF or a socket read/write error), not a premature close by us. This
+  was proved by exhaustion: `Shared::close()` is the only way a session ends, its
+  call sites are a closed set, and none of the mux layer's own teardown paths can
+  fire inside that test.
+- The **actual defect was the error itself**: one byte-identical message for six
+  distinct events, one of which it described *falsely* (it claimed the status byte
+  never arrived when it had), reported as `InvalidData` ("corrupt") rather than
+  `UnexpectedEof`. The next occurrence now prints, for example:
+  `mux stream 3 closed before the server status byte (no status byte received;
+  0 response byte(s) received; session closed: peer closed the connection
+  (1 stream(s) open at teardown))`
+- Reading the teardown paths also turned up a **genuine hang**: `open_stream()`
+  could register a stream after `close()` had cleared the stream map, leaving its
+  only sender alive in a map nobody drains, so the stream's first read waited
+  forever instead of failing. Fixed with a re-check under the map lock.
+- Five deterministic reproductions (duplex fake peers stopping at chosen points)
+  fail on the previous code (27 passed / 5 failed) and pass now (32 / 0). 100
+  additional stress runs under eight CPU burners produced no teardown.
+
+The test-infra half of this class was fixed separately: the port allocator now
+also *connects* to a candidate port, so a live listener (including one held with
+`SO_REUSEPORT`, which every flux listener sets) is skipped instead of handed out.

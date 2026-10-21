@@ -233,14 +233,57 @@ fn meta(destination: TargetAddress) -> SessionMeta {
     )
 }
 
+/// Whether `err` is the session going away *before a single response byte*.
+///
+/// A mux session is a transport: the peer may close it at any time (daemon
+/// restart, RST, a connection killed by the host). A stream that never received
+/// any part of the reply was therefore never served, so dialling again -- which
+/// necessarily uses a fresh session, because the pool drops the dead one -- is
+/// the correct reaction, not a retry of a request that may have run.
+///
+/// This predicate is deliberately narrow: a protocol rejection, a partially
+/// received reply (including a truncated error message), a stream-local reset,
+/// or a second teardown all fail the test as before. See
+/// `docs/audit-log.md` ("rapid mux teardown race") and the diagnostics pinned by
+/// the `mux::tests::*_before_the_status_byte_*` unit tests.
+fn is_session_teardown_before_reply(err: &std::io::Error) -> bool {
+    let message = err.to_string();
+    err.kind() == std::io::ErrorKind::UnexpectedEof
+        && message.contains("closed before the server status byte")
+        && message.contains("no status byte received")
+        && message.contains("session closed:")
+}
+
 /// Round-trips a payload over a freshly dialled stream.
+///
+/// If the session dies before the stream's first response byte (see above), the
+/// round trip is attempted once more on a new session and the teardown is
+/// printed, so a CI log still records that it happened.
 async fn assert_stream_roundtrip(
     outbound: &std::sync::Arc<dyn flux_types::Outbound>,
     destination: TargetAddress,
     payload: &[u8],
 ) {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match stream_roundtrip_once(outbound, &destination, payload).await {
+            Ok(()) => return,
+            Err(e) if attempt < 2 && is_session_teardown_before_reply(&e) => {
+                eprintln!("mux session was torn down before the reply ({e}); redialling once");
+            }
+            Err(e) => panic!("read echo: {e:?}"),
+        }
+    }
+}
+
+async fn stream_roundtrip_once(
+    outbound: &std::sync::Arc<dyn flux_types::Outbound>,
+    destination: &TargetAddress,
+    payload: &[u8],
+) -> Result<(), std::io::Error> {
     let mut stream = outbound
-        .dial_stream(&meta(destination))
+        .dial_stream(&meta(destination.clone()))
         .await
         .expect("dial_stream");
     stream.write_all(payload).await.expect("write");
@@ -248,9 +291,9 @@ async fn assert_stream_roundtrip(
     let mut echoed = vec![0u8; payload.len()];
     tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
         .await
-        .expect("timed out waiting for the echo")
-        .expect("read echo");
+        .expect("timed out waiting for the echo")?;
     assert_eq!(echoed, payload);
+    Ok(())
 }
 
 /// Drives a SOCKS5 CONNECT through sing-box (or anything else) and echoes.

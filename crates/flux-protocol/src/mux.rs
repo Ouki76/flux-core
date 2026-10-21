@@ -150,6 +150,15 @@ fn smux_io(message: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
 }
 
+/// A stream that ended before its peer ever described the outcome.
+///
+/// This is an EOF (the endpoint went away), not corrupt data: callers and
+/// retry policies treat the two very differently, and it used to be reported
+/// as `InvalidData`.
+fn smux_eof(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, message.into())
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -354,6 +363,19 @@ struct PendingAccept {
     rx: mpsc::Receiver<StreamEvent>,
 }
 
+/// Why a session was torn down, captured once at teardown.
+///
+/// Streams embed this in the error they return when they lose their session
+/// mid-handshake: without it the caller only learns *that* it died, which is
+/// exactly the information the one-off `test_mux_vless_flux_to_singbox`
+/// failure lacked (we could not tell a peer close from our own bug).
+#[derive(Debug)]
+struct CloseInfo {
+    reason: String,
+    /// Streams still registered when the teardown started.
+    open_streams: usize,
+}
+
 struct Shared {
     config: MuxConfig,
     role: Role,
@@ -375,6 +397,8 @@ struct Shared {
     /// event channel was full. Keeping at most one deferred delivery per
     /// stream bounds what a FIN flood can spawn.
     fin_pending: PlMutex<HashSet<u32>>,
+    /// Set exactly once, by the first `close()`.
+    close_info: PlMutex<Option<Arc<CloseInfo>>>,
 }
 
 fn now_ms() -> u64 {
@@ -393,11 +417,25 @@ impl Shared {
         self.closed.load(Ordering::Acquire)
     }
 
+    /// The recorded teardown, if the session has already been closed.
+    fn close_info(&self) -> Option<Arc<CloseInfo>> {
+        self.close_info.lock().clone()
+    }
+
     fn close(&self, reason: &str) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         debug!("smux: closing session: {}", reason);
+        // Record the teardown *before* dropping the stream senders: a stream
+        // woken by that drop must be able to report why it lost its session,
+        // not just that its channel ended. The stream count is captured here
+        // because clearing the map would lose it.
+        *self.close_info.lock() = Some(Arc::new(CloseInfo {
+            reason: reason.to_string(),
+            open_streams: self.open_streams.load(Ordering::Relaxed),
+        }));
+        self.open_streams.store(0, Ordering::Relaxed);
         // Dropping the senders makes every stream reader observe EOF.
         self.streams.lock().clear();
         // `notify_waiters` does not leave a permit behind, so a task that
@@ -468,12 +506,24 @@ impl Shared {
         self.next_id.fetch_add(2, Ordering::SeqCst)
     }
 
-    fn register(&self, stream_id: u32, tx: mpsc::Sender<StreamEvent>) {
+    /// Registers a stream, returning `false` if the session is already gone.
+    ///
+    /// The closed flag is re-checked while holding the map lock that `close()`
+    /// clears: without that, a stream opened while the session was closing
+    /// could be inserted *after* the clear and left there forever -- its sender
+    /// would stay alive in the map, so its reads would never observe the end
+    /// and would hang instead of failing.
+    fn register(&self, stream_id: u32, tx: mpsc::Sender<StreamEvent>) -> bool {
         // A reused stream id must not inherit the previous stream's deferred
         // EOF state.
         self.fin_pending.lock().remove(&stream_id);
-        self.streams.lock().insert(stream_id, tx);
+        let mut streams = self.streams.lock();
+        if self.is_closed() {
+            return false;
+        }
+        streams.insert(stream_id, tx);
         self.open_streams.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     fn unregister(&self, stream_id: u32) {
@@ -558,7 +608,9 @@ impl MuxSession {
         }
         let stream_id = self.shared.allocate_id();
         let (tx, rx) = mpsc::channel(self.shared.config.queue_capacity());
-        self.shared.register(stream_id, tx);
+        if !self.shared.register(stream_id, tx) {
+            return Err(smux_err("session closed"));
+        }
         if !self.shared.try_send_frame(stream_id, CMD_SYN, Bytes::new()) {
             self.shared.unregister(stream_id);
             return Err(smux_err("failed to queue SYN frame"));
@@ -639,6 +691,7 @@ impl MuxSession {
             credit_wakers: PlMutex::new(Vec::new()),
             out_wakers: PlMutex::new(Vec::new()),
             fin_pending: PlMutex::new(HashSet::new()),
+            close_info: PlMutex::new(None),
         });
         let reader = tokio::spawn(reader_loop(shared.clone(), read_half, accepts_tx));
         let writer = tokio::spawn(writer_loop(shared.clone(), write_half, out_rx));
@@ -850,6 +903,11 @@ fn handle_syn(shared: &Arc<Shared>, header: &FrameHeader, accepts: &mpsc::Sender
         // before it was closed (ids may be reused, like smux).
         shared.fin_pending.lock().remove(&stream_id);
         let mut streams = shared.streams.lock();
+        if shared.is_closed() {
+            // The session died while this SYN was in flight: registering the
+            // stream now would strand its sender in a map nobody drains.
+            return;
+        }
         if streams.contains_key(&stream_id) {
             // Duplicate SYN: ignore, like smux.
             return;
@@ -1004,6 +1062,11 @@ pub struct MuxStream {
     status_sent: bool,
     read_buf: Bytes,
     remote_eof: bool,
+    /// A `FIN` for this stream was actually received (as opposed to the event
+    /// channel simply ending because the session went away).
+    fin_seen: bool,
+    /// Payload bytes the session delivered to this stream, for diagnostics.
+    response_bytes: usize,
     write_closed: bool,
     fin_sent: bool,
 }
@@ -1024,6 +1087,8 @@ impl MuxStream {
             status_sent: false,
             read_buf: Bytes::new(),
             remote_eof: false,
+            fin_seen: false,
+            response_bytes: 0,
             write_closed: false,
             fin_sent: false,
         }
@@ -1090,10 +1155,12 @@ impl MuxStream {
         match Pin::new(&mut self.rx).poll_recv(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(StreamEvent::Data(data))) => {
+                self.response_bytes += data.len();
                 self.read_buf = data;
                 Poll::Ready(Ok(true))
             }
             Poll::Ready(Some(StreamEvent::Fin)) => {
+                self.fin_seen = true;
                 self.remote_eof = true;
                 Poll::Ready(Ok(false))
             }
@@ -1168,6 +1235,56 @@ impl MuxStream {
         }
     }
 
+    /// How far the client-side response handshake got, for the error below.
+    fn handshake_stage(&self) -> String {
+        match self.handshake.state {
+            Handshake::Status => "no status byte received".to_string(),
+            Handshake::Length => {
+                "status byte 0x01 (error) received, waiting for the message length".to_string()
+            }
+            Handshake::Message(len) => format!(
+                "status byte 0x01 (error) received, {}/{} error-message bytes",
+                self.handshake.message.len(),
+                len
+            ),
+            Handshake::Done => "handshake complete".to_string(),
+        }
+    }
+
+    /// The error for a stream that ended before the server's status byte.
+    ///
+    /// It carries everything needed to tell a *legitimate* teardown (the peer
+    /// really went away) from a mux bug (we closed too early): how far the
+    /// reply got, whether a FIN arrived, and -- when the session is gone -- why
+    /// it went and how many streams it stranded.
+    fn closed_before_status_error(&self) -> std::io::Error {
+        let close = self.shared.close_info();
+        let session = match &close {
+            Some(info) => format!(
+                "session closed: {} ({} stream(s) open at teardown)",
+                info.reason, info.open_streams
+            ),
+            None => "session still open".to_string(),
+        };
+        let end = match (self.fin_seen, close.is_some()) {
+            (true, _) => format!("peer sent FIN for this stream; {session}"),
+            (false, true) => session,
+            // A live session whose stream channel ended is the reader's
+            // receive-buffer reset: a stream-local failure, not a teardown.
+            (false, false) => {
+                "stream reset by the session (receive buffer overflow); session still open"
+                    .to_string()
+            }
+        };
+        smux_eof(format!(
+            "mux stream {} closed before the server status byte ({}; {} response byte(s) received; {})",
+            self.stream_id,
+            self.handshake_stage(),
+            self.response_bytes,
+            end
+        ))
+    }
+
     fn shutdown_stream(&mut self) -> std::io::Result<()> {
         if self.fin_sent {
             return Ok(());
@@ -1206,17 +1323,13 @@ impl AsyncRead for MuxStream {
                 this.advance_handshake()?;
                 if !this.handshake.is_done() {
                     if this.remote_eof {
-                        return Poll::Ready(Err(smux_io(
-                            "mux stream closed before the server status byte",
-                        )));
+                        return Poll::Ready(Err(this.closed_before_status_error()));
                     }
                     match this.poll_next_event(cx) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(true)) => continue,
                         Poll::Ready(Ok(false)) => {
-                            return Poll::Ready(Err(smux_io(
-                                "mux stream closed before the server status byte",
-                            )));
+                            return Poll::Ready(Err(this.closed_before_status_error()));
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     }
@@ -2206,6 +2319,7 @@ mod tests {
             credit_wakers: PlMutex::new(Vec::new()),
             out_wakers: PlMutex::new(Vec::new()),
             fin_pending: PlMutex::new(HashSet::new()),
+            close_info: PlMutex::new(None),
         });
         assert_eq!(server_shared.allocate_id(), 2);
         assert_eq!(server_shared.allocate_id(), 4);
@@ -2318,7 +2432,7 @@ mod tests {
         let client = MuxSession::connect(client_side, MuxConfig::default())
             .await
             .expect("client");
-        let mut stream = client.open_stream().await.expect("open");
+        let mut stream = open(&client, &TargetAddress::domain("echo.example", 80)).await;
         let stream_id = stream.id();
         stream
             .write_all(&encode_stream_request(
@@ -2390,7 +2504,7 @@ mod tests {
         let client = MuxSession::connect(client_side, MuxConfig::default())
             .await
             .expect("client");
-        let mut stream = client.open_stream().await.expect("open");
+        let mut stream = open(&client, &TargetAddress::domain("echo.example", 80)).await;
         let stream_id = stream.id();
         stream
             .write_all(&encode_stream_request(
@@ -2839,7 +2953,7 @@ mod tests {
         let client = MuxSession::connect(client_side, MuxConfig::default())
             .await
             .expect("client");
-        let mut stream = client.open_stream().await.expect("open");
+        let mut stream = open(&client, &TargetAddress::domain("echo.example", 80)).await;
         let stream_id = stream.id();
         stream
             .write_all(&encode_stream_request(
@@ -2957,7 +3071,7 @@ mod tests {
         peer.read_exact(&mut preface).await.expect("preface");
         assert_eq!(preface, [PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX]);
 
-        let mut stream = client.open_stream().await.expect("open");
+        let mut stream = open(&client, &TargetAddress::domain("echo.example", 80)).await;
         let stream_id = stream.id();
         stream
             .write_all(&encode_stream_request(
@@ -3381,5 +3495,260 @@ mod tests {
             drop(peer);
             drop(client);
         }
+    }
+
+    // =======================================================================
+    // Teardown diagnosis: what a stream reports when the reply never lands
+    // =======================================================================
+    //
+    // A client stream that is closed before the server's status byte has one
+    // thing in common with every other one: the caller only learns *that* it
+    // died. The tests below pin down what it must also say -- *why* -- because
+    // the one-off interop failure was exactly this message with no further
+    // information (`test_mux_vless_flux_to_singbox`, see docs/audit-log.md).
+    //
+    // The shapes covered are the three ways a stream can end mid-handshake:
+    //   1. the whole session goes away (peer EOF / transport error / drop);
+    //   2. the peer half-closes this stream (FIN) and stays connected;
+    //   3. the session stays open but resets this stream (receive overflow).
+
+    /// Consumes the two-byte session preface so the peer sees frames only.
+    async fn skip_session_preface(peer: &mut tokio::io::DuplexStream) {
+        let mut preface = [0u8; 2];
+        peer.read_exact(&mut preface)
+            .await
+            .expect("session preface");
+        assert_eq!(preface, [PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX]);
+    }
+
+    /// Performs one read and requires it to fail, returning the error.
+    async fn read_expect_error(stream: &mut MuxStream) -> std::io::Error {
+        let mut buf = [0u8; 16];
+        tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+            .await
+            .expect("a stream whose reply can never arrive must not hang")
+            .expect_err("a stream with no status byte must fail, not report a clean EOF")
+    }
+
+    /// The session dying before the status byte is an EOF on the *session*, and
+    /// the error must name the teardown reason instead of only "closed".
+    #[tokio::test]
+    async fn session_teardown_before_the_status_byte_names_the_reason() {
+        let (client_side, mut peer) = raw_pair(64 * 1024);
+        let client = MuxSession::connect(client_side, MuxConfig::default())
+            .await
+            .expect("client");
+        let mut stream = open(&client, &TargetAddress::domain("echo.example", 80)).await;
+        let stream_id = stream.id();
+        // Let the peer see the SYN and the stream request, then drop the whole
+        // transport without ever writing the status byte.
+        skip_session_preface(&mut peer).await;
+        assert!(expect_frame(&mut peer, CMD_PSH, stream_id, Duration::from_secs(2)).await);
+        drop(peer);
+
+        let err = read_expect_error(&mut stream).await;
+        let message = err.to_string();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::UnexpectedEof,
+            "a session that went away is an unexpected EOF, not corrupt data: {message}"
+        );
+        assert!(
+            message.contains("closed before the server status byte"),
+            "the original phrase is kept so existing logs stay greppable: {message}"
+        );
+        assert!(
+            message.contains("no status byte received"),
+            "must say the reply never started: {message}"
+        );
+        assert!(
+            message.contains("session closed: peer closed the connection"),
+            "must carry the reason the session was torn down: {message}"
+        );
+        assert!(
+            message.contains("1 stream(s) open at teardown"),
+            "must say how many streams the teardown stranded: {message}"
+        );
+        assert!(
+            !message.contains("sent FIN"),
+            "the peer never half-closed this stream, only the session: {message}"
+        );
+    }
+
+    /// A stream-level FIN with the session still alive is a *different* event
+    /// from a dead session and must be reported as such.
+    #[tokio::test]
+    async fn stream_fin_before_the_status_byte_says_the_session_is_alive() {
+        let (client_side, mut peer) = raw_pair(64 * 1024);
+        let client = MuxSession::connect(client_side, MuxConfig::default())
+            .await
+            .expect("client");
+        let mut stream = open(&client, &TargetAddress::domain("echo.example", 80)).await;
+        let stream_id = stream.id();
+        skip_session_preface(&mut peer).await;
+        assert!(expect_frame(&mut peer, CMD_PSH, stream_id, Duration::from_secs(2)).await);
+        peer.write_all(&FrameHeader::new(CMD_FIN, stream_id, 0).encode())
+            .await
+            .expect("fin");
+        peer.flush().await.expect("flush");
+
+        let err = read_expect_error(&mut stream).await;
+        let message = err.to_string();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            message.contains("peer sent FIN for this stream"),
+            "must say the peer half-closed the stream: {message}"
+        );
+        assert!(
+            message.contains("session still open"),
+            "a FIN is not a session teardown: {message}"
+        );
+    }
+
+    /// A truncated error response already carried the status byte. Claiming it
+    /// never arrived (the old message) is simply false, and it hides how much of
+    /// the peer's explanation was received.
+    #[tokio::test]
+    async fn truncated_error_reply_reports_the_partial_status() {
+        let (client_side, mut peer) = raw_pair(64 * 1024);
+        let client = MuxSession::connect(client_side, MuxConfig::default())
+            .await
+            .expect("client");
+        let mut stream = open(&client, &TargetAddress::domain("echo.example", 80)).await;
+        let stream_id = stream.id();
+        skip_session_preface(&mut peer).await;
+        assert!(expect_frame(&mut peer, CMD_PSH, stream_id, Duration::from_secs(2)).await);
+
+        // status = error, followed by a varint announcing 12 message bytes of
+        // which the peer only manages to send two before closing the stream.
+        let mut payload = vec![1u8, 12u8, b'a', b'b'];
+        let mut frame = FrameHeader::new(CMD_PSH, stream_id, payload.len() as u16)
+            .encode()
+            .to_vec();
+        frame.append(&mut payload);
+        peer.write_all(&frame).await.expect("partial error reply");
+        peer.write_all(&FrameHeader::new(CMD_FIN, stream_id, 0).encode())
+            .await
+            .expect("fin");
+        peer.flush().await.expect("flush");
+
+        let err = read_expect_error(&mut stream).await;
+        let message = err.to_string();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            message.contains("status byte 0x01"),
+            "the status byte *was* received and must be reported: {message}"
+        );
+        assert!(
+            message.contains("2/12"),
+            "must report how much of the error message arrived: {message}"
+        );
+        assert!(
+            !message.contains("no status byte received"),
+            "must not claim the reply never started: {message}"
+        );
+        assert!(
+            message.contains("4 response byte(s)"),
+            "must report how many response bytes arrived: {message}"
+        );
+    }
+
+    /// A stream the session resets while the session itself stays healthy is a
+    /// third, distinct shape: the caller must not be told the session died.
+    #[tokio::test]
+    async fn stream_reset_during_the_handshake_does_not_blame_the_session() {
+        let (client_side, mut peer) = raw_pair(256 * 1024);
+        // Two frames of queue depth, so the third unsolicited frame overflows
+        // the stream's receive buffer while the application is not reading.
+        let config = MuxConfig {
+            max_frame_size: 1024,
+            max_buffered_bytes: 2048,
+            ..Default::default()
+        };
+        let client = MuxSession::connect(client_side, config)
+            .await
+            .expect("client");
+        let mut stream = open(&client, &TargetAddress::domain("echo.example", 80)).await;
+        let stream_id = stream.id();
+        skip_session_preface(&mut peer).await;
+        assert!(expect_frame(&mut peer, CMD_PSH, stream_id, Duration::from_secs(2)).await);
+
+        // The reply stalls mid-handshake (status=error, 255 message bytes
+        // announced, one delivered) and then two more frames arrive with
+        // nobody reading, which overflows the two-slot queue.
+        let mut stalled_reply = vec![1u8, 0xFF, 0x01];
+        let mut frame = FrameHeader::new(CMD_PSH, stream_id, stalled_reply.len() as u16)
+            .encode()
+            .to_vec();
+        frame.append(&mut stalled_reply);
+        peer.write_all(&frame).await.expect("status + length");
+        let mut frame = FrameHeader::new(CMD_PSH, stream_id, 1).encode().to_vec();
+        frame.push(b'x');
+        peer.write_all(&frame).await.expect("one message byte");
+        for byte in 0u8..2 {
+            let mut frame = FrameHeader::new(CMD_PSH, stream_id, 1024).encode().to_vec();
+            frame.extend(std::iter::repeat_n(byte, 1024));
+            peer.write_all(&frame).await.expect("overflowing psh");
+        }
+        peer.flush().await.expect("flush");
+        // Give the reader time to overflow the queue and reset the stream.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let err = read_expect_error(&mut stream).await;
+        let message = err.to_string();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(
+            message.contains("session still open"),
+            "the session survived the reset: {message}"
+        );
+        assert!(
+            message.contains("reset this stream") || message.contains("receive buffer"),
+            "must name the reset rather than a session teardown: {message}"
+        );
+        assert!(
+            !message.contains("session closed"),
+            "must not blame the session for a stream-local reset: {message}"
+        );
+
+        // And the session really is healthy: a second stream still works.
+        let mut other = open(&client, &TargetAddress::domain("alive.example", 80)).await;
+        let mut frame = FrameHeader::new(CMD_PSH, other.id(), 2).encode().to_vec();
+        frame.extend_from_slice(&[0u8, b'k']);
+        peer.write_all(&frame)
+            .await
+            .expect("status for other stream");
+        peer.flush().await.expect("flush");
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), other.read_exact(&mut byte))
+            .await
+            .expect("second stream blocked by a reset neighbour")
+            .expect("read");
+        assert_eq!(&byte, b"k");
+    }
+
+    /// `open_stream` must never leave a stream registered on a session that has
+    /// already been torn down: the session map holds the only sender, so such a
+    /// stream would wait for a status byte forever instead of failing.
+    #[tokio::test]
+    async fn a_stream_registered_after_teardown_is_refused_not_leaked() {
+        let (client_side, _peer) = raw_pair(4096);
+        let client = MuxSession::connect(client_side, MuxConfig::default())
+            .await
+            .expect("client");
+        client.shared.close("test teardown");
+
+        let (tx, mut rx) = mpsc::channel(2);
+        let _accepted = client.shared.register(12345, tx);
+        assert!(
+            !client.shared.streams.lock().contains_key(&12345),
+            "a stream registered after teardown was left in the session map"
+        );
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_millis(200), rx.recv()).await,
+                Ok(None)
+            ),
+            "its receiver must observe the end instead of waiting forever"
+        );
     }
 }
