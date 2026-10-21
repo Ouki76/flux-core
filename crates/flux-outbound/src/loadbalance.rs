@@ -173,3 +173,76 @@ impl Outbound for LoadBalanceOutbound {
         self.outbounds.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lb(strategy: BalanceStrategy, tags: &[&str]) -> LoadBalanceOutbound {
+        LoadBalanceOutbound::new(
+            "lb",
+            tags.iter().map(|s| s.to_string()).collect(),
+            Some(strategy),
+            crate::selector::test_support::FakeRegistry::of(&[
+                ("a", false),
+                ("b", false),
+                ("c", false),
+            ]),
+        )
+    }
+
+    /// Round-robin must actually rotate over the members, not pin the first one.
+    #[test]
+    fn round_robin_visits_every_member() {
+        let r = lb(BalanceStrategy::RoundRobin, &["a", "b", "c"]);
+        let m = crate::selector::test_support::meta();
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            seen.push(r.outbounds[r.select_index(&m)].clone());
+        }
+        assert_eq!(seen, vec!["a", "b", "c", "a", "b", "c"]);
+    }
+
+    /// Consistent hashing must be stable for the same destination…
+    #[test]
+    fn consistent_hashing_is_stable_per_destination() {
+        let r = lb(BalanceStrategy::ConsistentHashing, &["a", "b", "c"]);
+        let m = crate::selector::test_support::meta();
+        let first = r.select_index(&m);
+        for _ in 0..20 {
+            assert_eq!(r.select_index(&m), first);
+        }
+        // …and must actually spread across members for different destinations.
+        let mut spread = std::collections::HashSet::new();
+        for i in 0..64 {
+            let mut m = crate::selector::test_support::meta();
+            m.destination = format!("host{i}.example:443").parse().unwrap();
+            spread.insert(r.select_index(&m));
+        }
+        assert!(
+            spread.len() > 1,
+            "hashing pinned every destination to one member"
+        );
+    }
+
+    #[test]
+    fn empty_group_is_not_a_panic() {
+        let r = lb(BalanceStrategy::RoundRobin, &[]);
+        assert_eq!(r.select_index(&crate::selector::test_support::meta()), 0);
+    }
+
+    /// The group must report the per-destination requirement if *any* member
+    /// needs one association per destination.
+    #[test]
+    fn reports_per_destination_if_any_member_needs_it() {
+        let reg = crate::selector::test_support::FakeRegistry::of(&[("a", false), ("vm", true)]);
+        let r = LoadBalanceOutbound::new("lb", vec!["a".to_string(), "vm".to_string()], None, reg);
+        assert!(r.udp_endpoint_per_destination());
+    }
+
+    #[test]
+    fn plain_members_do_not_require_per_destination() {
+        let r = lb(BalanceStrategy::RoundRobin, &["a", "b"]);
+        assert!(!r.udp_endpoint_per_destination());
+    }
+}

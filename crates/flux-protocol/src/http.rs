@@ -360,3 +360,113 @@ mod tests {
         cli.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod proxy_semantics_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// Feeds a raw request to the server-side handshake and returns the result,
+    /// plus everything the server wrote back.
+    async fn feed(
+        request: &[u8],
+    ) -> (
+        FluxResult<(TargetAddress, Option<Vec<u8>>, Option<String>)>,
+        Vec<u8>,
+    ) {
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        client.write_all(request).await.unwrap();
+        // Close the write side so the server never blocks waiting for more bytes.
+        drop(client);
+
+        let res = HttpHandshake::server_handshake_with_auth(&mut server, Some(&[])).await;
+        // Drain whatever the server wrote (200 / 407 responses).
+        let mut written = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            tokio::io::AsyncReadExt::read_to_end(&mut server, &mut written),
+        )
+        .await;
+        (res, written)
+    }
+
+    /// An absolute `https://` URI must be refused: forwarding it in cleartext
+    /// silently downgrades TLS to plaintext on port 443.
+    #[tokio::test]
+    async fn absolute_https_uri_is_rejected() {
+        let (res, _) =
+            feed(b"GET https://example.com/secret HTTP/1.1\r\nHost: example.com\r\n\r\n").await;
+        let err = res.expect_err("https:// absolute form must be rejected");
+        assert!(
+            err.to_string().contains("not supported"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Absolute `http://` form is rewritten to origin-form, and the upstream
+    /// request must contain exactly one blank line (the header block terminator).
+    #[tokio::test]
+    async fn absolute_http_uri_is_rewritten_without_extra_crlf() {
+        let (res, written) =
+            feed(b"GET http://example.com/a?b=c HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\n\r\n").await;
+        let (target, prefix, _) = res.expect("absolute http:// form must be accepted");
+        assert_eq!(target.host(), "example.com");
+        assert_eq!(target.port(), 80);
+
+        let head = prefix.expect("rewritten request must be returned");
+        let text = String::from_utf8_lossy(&head);
+        assert!(
+            text.starts_with("GET /a?b=c HTTP/1.1\r\n"),
+            "request line must be origin-form, got: {text:?}"
+        );
+        assert!(
+            !text.contains("\r\n\r\n\r\n"),
+            "header block must terminate exactly once, got: {text:?}"
+        );
+        // `written` holds the 200/407 reply; a forwarded request sends none.
+        assert!(written.is_empty() || written.starts_with(b"HTTP/1.1 4"));
+    }
+
+    /// Origin-form with a Host header must default to port 80.
+    #[tokio::test]
+    async fn origin_form_uses_the_host_header() {
+        let (res, _) = feed(b"GET /path HTTP/1.1\r\nHost: example.org\r\n\r\n").await;
+        let (target, _, _) = res.expect("origin-form with Host must be accepted");
+        assert_eq!(target.host(), "example.org");
+        assert_eq!(target.port(), 80);
+    }
+
+    /// A request with neither an absolute URI nor a Host header is unusable and
+    /// must be rejected rather than guessed at.
+    #[tokio::test]
+    async fn request_without_host_is_rejected() {
+        let (res, _) = feed(b"GET /path HTTP/1.1\r\n\r\n").await;
+        assert!(res.is_err(), "a request with no target must be rejected");
+    }
+
+    /// Proxy credentials must never be forwarded to the origin server.
+    #[tokio::test]
+    async fn proxy_authorization_is_stripped_upstream() {
+        let allowed = vec![("agent".to_string(), "pw".to_string())];
+        let (mut client, mut server) = tokio::io::duplex(8192);
+        use base64::Engine;
+        let cred = base64::engine::general_purpose::STANDARD.encode("agent:pw");
+        let req = format!(
+            "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nProxy-Authorization: Basic {cred}\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+        drop(client);
+
+        let (_, prefix, user) =
+            HttpHandshake::server_handshake_with_auth(&mut server, Some(&allowed))
+                .await
+                .expect("authenticated request must be accepted");
+        assert_eq!(user.as_deref(), Some("agent"));
+        let head = prefix.expect("rewritten request must be returned");
+        let text = String::from_utf8_lossy(&head);
+        assert!(
+            !text.to_ascii_lowercase().contains("proxy-authorization"),
+            "proxy credentials leaked upstream: {text:?}"
+        );
+    }
+}

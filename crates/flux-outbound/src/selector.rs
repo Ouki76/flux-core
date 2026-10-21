@@ -104,3 +104,140 @@ impl Outbound for SelectorOutbound {
         self.outbounds.clone()
     }
 }
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Minimal fakes shared by the group-outbound unit tests.
+
+    use super::*;
+
+    /// An outbound that records nothing and never dials: the group tests only
+    /// exercise selection logic.
+    pub struct FakeOutbound {
+        pub tag: String,
+        pub per_destination: bool,
+    }
+
+    impl FakeOutbound {
+        pub fn new(tag: &str) -> Self {
+            Self {
+                tag: tag.to_string(),
+                per_destination: false,
+            }
+        }
+
+        pub fn per_destination(mut self, yes: bool) -> Self {
+            self.per_destination = yes;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Outbound for FakeOutbound {
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+        fn protocol(&self) -> &'static str {
+            "fake"
+        }
+        async fn dial_stream(&self, _meta: &SessionMeta) -> FluxResult<BoxedStream> {
+            Err(FluxError::Protocol {
+                protocol: "fake",
+                message: "fake outbound cannot dial".into(),
+            })
+        }
+        async fn dial_packet(&self, _meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+            Err(FluxError::Protocol {
+                protocol: "fake",
+                message: "fake outbound cannot dial".into(),
+            })
+        }
+        fn udp_endpoint_per_destination(&self) -> bool {
+            self.per_destination
+        }
+    }
+
+    pub struct FakeRegistry(pub Vec<Arc<dyn Outbound>>);
+
+    impl FakeRegistry {
+        pub fn of(tags: &[(&str, bool)]) -> Arc<Self> {
+            Arc::new(Self(
+                tags.iter()
+                    .map(|(t, per)| {
+                        Arc::new(FakeOutbound::new(t).per_destination(*per)) as Arc<dyn Outbound>
+                    })
+                    .collect(),
+            ))
+        }
+    }
+
+    impl OutboundLookup for FakeRegistry {
+        fn get(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
+            self.0.iter().find(|o| o.tag() == tag).cloned()
+        }
+    }
+
+    pub fn meta() -> SessionMeta {
+        SessionMeta::new(
+            "127.0.0.1:1000".parse().unwrap(),
+            "example.com:443".parse().unwrap(),
+            "test",
+            flux_types::NetworkType::Tcp,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+
+    fn selector(default: Option<&str>) -> SelectorOutbound {
+        let reg = FakeRegistry::of(&[("a", false), ("b", false)]);
+        SelectorOutbound::new(
+            "sel",
+            vec!["a".into(), "b".into()],
+            default.map(String::from),
+            reg,
+        )
+    }
+
+    #[test]
+    fn defaults_to_the_first_member() {
+        assert_eq!(selector(None).current(), "a");
+    }
+
+    #[test]
+    fn honours_an_explicit_valid_default() {
+        assert_eq!(selector(Some("b")).current(), "b");
+    }
+
+    /// A default that is not among the members must not be adopted: otherwise
+    /// every dial would fail with "selected outbound not found".
+    #[test]
+    fn ignores_a_default_outside_the_candidate_list() {
+        assert_eq!(selector(Some("nope")).current(), "a");
+    }
+
+    #[test]
+    fn select_switches_only_to_known_members() {
+        let s = selector(None);
+        s.select("b").unwrap();
+        assert_eq!(s.current(), "b");
+        // An unknown target is rejected and the selection is unchanged.
+        assert!(s.select("nope").is_err());
+        assert_eq!(s.current(), "b");
+    }
+
+    #[test]
+    fn reports_itself_as_a_selector_group() {
+        let s = selector(None);
+        assert!(s.is_group());
+        assert_eq!(s.group_type(), Some("selector"));
+        assert_eq!(
+            s.candidate_outbounds(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(s.current_selected(), Some("a".to_string()));
+    }
+}

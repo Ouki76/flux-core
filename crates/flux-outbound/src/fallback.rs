@@ -242,3 +242,60 @@ impl Outbound for FallbackOutbound {
         self.cancel_token.cancel();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fallback(tags: &[&str]) -> FallbackOutbound {
+        FallbackOutbound::new(
+            "fb",
+            tags.iter().map(|s| s.to_string()).collect(),
+            None,
+            None,
+            crate::selector::test_support::FakeRegistry::of(&[("a", false), ("b", false)]),
+        )
+    }
+
+    /// The group starts on its primary member, in the configured order.
+    #[test]
+    fn starts_on_the_primary_member() {
+        assert_eq!(fallback(&["a", "b"]).current(), "a");
+    }
+
+    /// With no members the group must fall back to `direct` rather than an empty
+    /// tag that would never resolve.
+    #[test]
+    fn empty_group_falls_back_to_direct() {
+        assert_eq!(fallback(&[]).current(), "direct");
+    }
+
+    #[test]
+    fn reports_its_candidates_and_current_selection() {
+        let f = fallback(&["a", "b"]);
+        assert!(f.is_group());
+        assert_eq!(f.group_type(), Some("fallback"));
+        assert_eq!(f.current_selected(), Some("a".to_string()));
+        assert_eq!(
+            f.candidate_outbounds(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    /// `stop()` must cancel the probe loop so a reload does not leak it.
+    #[test]
+    fn stop_cancels_probing() {
+        let f = std::sync::Arc::new(fallback(&["a"]));
+        assert!(!f.cancel_token.is_cancelled());
+        f.stop();
+        assert!(f.cancel_token.is_cancelled());
+    }
+
+    /// A per-destination member must make the whole group per-destination.
+    #[test]
+    fn delegates_per_destination_flag() {
+        let reg = crate::selector::test_support::FakeRegistry::of(&[("vm", true), ("a", false)]);
+        let f = FallbackOutbound::new("fb", vec!["vm".into(), "a".into()], None, None, reg);
+        assert!(f.udp_endpoint_per_destination());
+    }
+}

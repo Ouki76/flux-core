@@ -237,7 +237,7 @@ impl Outbound for Hysteria2Outbound {
 }
 
 /// Hysteria 2 UDP endpoint over QUIC datagrams:
-/// [sessionID u32 BE][packetID u16 BE][fragID u8][fragTotal u8][vstring dest][data].
+/// `[sessionID u32 BE][packetID u16 BE][fragID u8][fragTotal u8][vstring dest][data]`.
 pub struct Hysteria2DatagramEndpoint {
     conn: quinn::Connection,
     session_id: u32,

@@ -241,3 +241,91 @@ impl Outbound for UrlTestOutbound {
         self.cancel_token.cancel();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn urltest(tolerance_ms: u64) -> UrlTestOutbound {
+        UrlTestOutbound::new(
+            "ut",
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            None,
+            None,
+            Some(Duration::from_millis(tolerance_ms)),
+            crate::selector::test_support::FakeRegistry::of(&[
+                ("a", false),
+                ("b", false),
+                ("c", false),
+            ]),
+        )
+    }
+
+    fn record(t: &UrlTestOutbound, tag: &str, ms: u64) {
+        t.latencies
+            .insert(tag.to_string(), Duration::from_millis(ms));
+    }
+
+    #[test]
+    fn starts_on_the_first_candidate_before_any_probe() {
+        assert_eq!(urltest(50).current_best_tag(), Some("a".to_string()));
+    }
+
+    /// The fastest member wins when no measurement exists for the incumbent.
+    #[test]
+    fn switches_to_the_fastest_member() {
+        let t = urltest(50);
+        record(&t, "a", 200);
+        record(&t, "b", 30);
+        record(&t, "c", 100);
+        t.recalculate_best();
+        assert_eq!(t.current_best_tag(), Some("b".to_string()));
+    }
+
+    /// Hysteresis: a marginally faster member must not cause flapping.
+    #[test]
+    fn tolerance_prevents_flapping() {
+        let t = urltest(50);
+        record(&t, "a", 100);
+        record(&t, "b", 80); // 20 ms better, inside the 50 ms tolerance
+        t.recalculate_best();
+        assert_eq!(
+            t.current_best_tag(),
+            Some("a".to_string()),
+            "a 20 ms improvement must not beat the 50 ms tolerance"
+        );
+    }
+
+    /// …but a clearly faster member still wins.
+    #[test]
+    fn switches_when_the_improvement_exceeds_tolerance() {
+        let t = urltest(50);
+        record(&t, "a", 200);
+        record(&t, "b", 20); // 180 ms better
+        t.recalculate_best();
+        assert_eq!(t.current_best_tag(), Some("b".to_string()));
+    }
+
+    /// A member with no successful probe must never be selected.
+    #[test]
+    fn unmeasured_members_are_never_selected() {
+        let t = urltest(50);
+        record(&t, "b", 10);
+        record(&t, "c", 5);
+        t.recalculate_best();
+        // `a` has no latency entry, so `c` wins despite being listed first.
+        assert_eq!(t.current_best_tag(), Some("c".to_string()));
+    }
+
+    #[test]
+    fn reports_its_candidates() {
+        let t = urltest(50);
+        assert!(t.is_group());
+        assert_eq!(t.group_type(), Some("urltest"));
+        assert_eq!(
+            t.candidate_outbounds(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(t.url(), "http://cp.cloudflare.com/generate_204");
+    }
+}
