@@ -25,6 +25,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 ### Routing & DNS
 - **Rule Engine**: Matching by domain (exact, suffix, keyword), IP CIDR, ports, network (TCP/UDP), rule sets, and inverted matching (`invert: true`).
 - **Rule Sets**: High-capacity GeoIP and GeoSite list matching with O(1) hash lookups and O(L) suffix climbing. Local files, inline lists, and **remote URL rule sets** (`type: "remote"`, background HTTP/HTTPS fetch with redirect support, size caps, optional `update_interval` refresh, hot-swappable without restart; fetch failures never break routing).
+- **Multiplexing**: smux v1 (sing-box compatible) for VLESS/VMess/Trojan/Shadowsocks, including muxed UDP, off by default.
 - **DNS**: Built-in resolver with Fake-IP (`198.18.0.0/15`) served through a dedicated `dns` inbound (`dns.listen`), wireformat parser (IPv4 `A` & IPv6 `AAAA`), DoH (RFC 8484), DoT and DoQ clients, negative caching and end-to-end deadlines.
 
 ### Outbound Groups
@@ -47,10 +48,12 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **libFuzzer targets** (`fuzz/`): VLESS/Trojan/VMess headers, DNS wire format, SOCKS5 UDP, WG initiation, URI/config/ruleset parsing. Run: `cargo +nightly fuzz run fuzz_vless_header`.
 - **Deterministic parser fuzz regression suite** (`tests/test_fuzz_parsers.rs`) — runs in CI without nightly.
 - **Soak / leak detection**: `scripts/soak.sh [duration_secs]` (default 24h) — sustained load with RSS/FD/thread sampling and leak assertion.
-- 37 sing-box interop tests run against the real `sing-box` binary (graceful skip when absent), including Salamander-obfuscated Hysteria 2 **in both directions**.
-- 2 Xray interop tests run against the real `xray` binary for XTLS Vision (`xtls-rprx-vision`) **in both directions**.
+- 39 sing-box interop tests plus 15 mux interop tests run against the real `sing-box` binary (graceful skip when absent), including Salamander-obfuscated Hysteria 2 **in both directions**.
+- 6 Xray interop tests run against the real `xray` binary: XTLS Vision **and** REALITY (plain and Vision), both directions.
+- `h2spec` 2.6.0 against the H2 listener: 108/108 applicable cases pass.
+- TUN, REDIRECT and TPROXY are tested end-to-end inside a user network namespace, so they are no longer skipped.
 - **UDP relay e2e** for every UDP-capable protocol (SOCKS5, Trojan, VMess, SS/SS-2022, VLESS, TUIC, Hy2), including reply-address-header correctness.
-- **Transparent inbound e2e** (TUN/REDIRECT/TPROXY) — root-gated, executed in the CI `privileged-tests` job with sudo.
+- **Transparent inbound e2e** (TUN/REDIRECT/TPROXY) — six tests that re-exec into a user network namespace, so they run unprivileged here and in the CI `privileged-tests` job. A missing environment is a hard failure, never a silent pass.
 - **SIGHUP hot-reload e2e**: listener swap and invalid-config rollback against the real binary.
 
 ### Management & Control

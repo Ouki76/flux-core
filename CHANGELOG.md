@@ -4,6 +4,69 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.0] - 2026-10-22
+
+Closes the four gaps that remained after the 1.2.1 review — a missing feature, an
+untested ingress class, and two silent data-corruption bugs found by finally
+measuring the data paths.
+
+### Added
+
+- **Stream multiplexing (smux v1)**, verified byte-for-byte against sing-box
+  1.11.4 rather than guessed: the session preface, the 8-byte little-endian frame
+  header with a **u32** stream id, the `sp.mux.sing-box.arpa:444` signalling
+  destination, the per-stream `[flags][socksaddr]` preamble and the optional
+  padding layer. Available for VLESS, VMess, Trojan and Shadowsocks, inbound and
+  outbound, over any carrier (verified over TCP and WebSocket), including muxed
+  UDP. Off by default.
+- **VLESS UDP now interoperates in both directions.** `VLESS_CMD_UDP` carries a
+  bare `[len][payload]` stream; the old code prefixed every datagram with a SOCKS
+  address (Trojan's framing), so VLESS UDP had never worked against sing-box or
+  Xray. `VLESS_CMD_PACKETADDR` (what sing-box emits for UDP) is implemented too.
+- **DNS: CNAME chains** (followed within one response and across re-queries,
+  bounded and loop-safe, minimum TTL), IPv6 fake-IP (`fc00::/18`), PTR,
+  APA/TXT/MX/HTTPS-SVCB parsing with unknown types preserved rather than dropped,
+  SOA-derived negative TTL, and verbatim forwarding of unmodelled query types.
+- **Real end-to-end tests for TUN, REDIRECT and TPROXY**, executed inside a user
+  network namespace (`unshare --user --map-root-user --net`) instead of silently
+  skipping. Six tests, each asserting a real byte-for-byte round trip.
+- **Conformance and interop coverage**: 4 REALITY tests against the real `xray`
+  binary (plain and with Vision, both directions), and `h2spec` 2.6.0 against the
+  H2 listener — 108/108 applicable cases pass.
+- **Benchmark matrix**: concurrency (1/64/512/2048 streams), TLS/REALITY cost
+  isolation, WireGuard, TUN; plus release/benchmark/coverage CI workflows,
+  `cargo-semver-checks`, a local workflow linter and `docs/quality.md`.
+
+### Fixed (data corruption)
+
+- **REALITY duplicated data under load.** When the transport returned `Pending`
+  while writing an encrypted record, the record was buffered and the plaintext was
+  *not* acknowledged; on the retry the same buffer was encrypted and appended a
+  second time. Sustained transfers diverged within 0.3–11 MB. A `pending_unacked`
+  counter now acknowledges the buffered record exactly once. Covered by a
+  512 KiB byte-exact record-boundary test.
+- **WireGuard truncated replies on half-close.** `TcpClose` cleared the unsent
+  queue and closed the socket, so an application that called
+  `shutdown(SHUT_WR)` lost the tail of its own response (a 4 MiB echo stalled at
+  314 KiB). The connection now sends FIN only after the queue has drained.
+- **WireGuard dropped inner frames silently** when the stack channel was full
+  (`try_send`); it now applies backpressure.
+- **H2 server tore down the whole connection** on any per-stream error, so a peer
+  saw `ECONNRESET` instead of `RST_STREAM`/`GOAWAY`; extra streams are refused
+  individually.
+- **SOCKS5 BIND was rejected by closing the socket** without a reply, leaving the
+  client waiting for its own timeout (RFC 1928 §6 requires REP `0x07`). Fixed in
+  both the SOCKS and the mixed inbound.
+- The TUN datapath dropped queued proxy data, truncated the tail on close, never
+  forwarded a peer FIN and dropped frames under backpressure — four separate
+  defects found by the new e2e tests.
+
+### Changed
+
+- Config rejects unknown keys (`deny_unknown_fields`), so a misspelled key is an
+  error instead of a silently disabled feature.
+- `dns.fakeip` gains `inet6_range`.
+
 ## [1.2.1] - 2026-10-21
 
 Second-pass audit: an independent review of everything added in 1.1.0/1.2.0 by two
