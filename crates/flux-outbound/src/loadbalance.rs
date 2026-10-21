@@ -145,6 +145,18 @@ impl Outbound for LoadBalanceOutbound {
         )))
     }
 
+    fn udp_endpoint_per_destination(&self) -> bool {
+        // Conservative: if *any* member needs one association per destination,
+        // treat the group that way. Over-splitting costs an extra association;
+        // under-splitting (the old behaviour) silently mixes destinations.
+        self.outbounds.iter().any(|tag| {
+            self.lookup
+                .get(tag)
+                .map(|m| m.udp_endpoint_per_destination())
+                .unwrap_or(false)
+        })
+    }
+
     fn is_group(&self) -> bool {
         true
     }

@@ -23,6 +23,41 @@ impl Drop for ActiveConnectionGuard {
     }
 }
 
+/// Cache key for UDP packet endpoints.
+///
+/// The destination is `Some` only for outbounds whose UDP association is bound to
+/// a single destination (see `Outbound::udp_endpoint_per_destination`).
+type EndpointKey = (Arc<str>, Option<flux_types::TargetAddress>);
+
+/// Endpoints for one outbound tag.
+///
+/// Protocols that carry the destination inside every datagram share a single
+/// endpoint; protocols that bind one association per destination (VMess) get a
+/// nested map. Storing it this way means the lookup path never has to rebuild the
+/// cache key — and therefore never has to clone the (possibly reverse-mapped)
+/// effective destination just to find the entry.
+enum EndpointSlot {
+    Shared(Arc<dyn PacketEndpoint>),
+    PerDestination(std::collections::HashMap<flux_types::TargetAddress, Arc<dyn PacketEndpoint>>),
+}
+
+impl EndpointSlot {
+    fn get(
+        &self,
+        dest: &flux_types::TargetAddress,
+        per_destination: bool,
+    ) -> Option<Arc<dyn PacketEndpoint>> {
+        match (self, per_destination) {
+            (EndpointSlot::Shared(ep), false) => Some(ep.clone()),
+            (EndpointSlot::PerDestination(map), true) => map.get(dest).cloned(),
+            _ => None,
+        }
+    }
+}
+
+/// Upper bound on nested per-destination endpoints for one outbound tag.
+const MAX_ENDPOINTS_PER_TAG: usize = 256;
+
 pub struct DefaultDispatcher {
     router: Arc<Router>,
     outbounds: Arc<dyn OutboundLookup>,
@@ -70,6 +105,158 @@ impl DefaultDispatcher {
 
     fn get_outbound(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
         self.outbounds.get(tag)
+    }
+
+    /// Routes `destination` and establishes a UDP endpoint for the resulting
+    /// outbound, registering it in `endpoints` for subsequent datagrams.
+    ///
+    /// Returns `None` when the destination cannot be served (unknown outbound or
+    /// a failed dial); the caller drops the packet.
+    #[allow(clippy::too_many_arguments)]
+    async fn dial_udp_endpoint(
+        &self,
+        meta: &SessionMeta,
+        endpoints: &mut std::collections::HashMap<Arc<str>, EndpointSlot>,
+        route_cache: &mut std::collections::HashMap<
+            flux_types::TargetAddress,
+            (Arc<str>, flux_types::TargetAddress),
+        >,
+        destination: &flux_types::TargetAddress,
+        cancel_token: &tokio_util::sync::CancellationToken,
+        packet_tx: &mpsc::Sender<UdpPacket>,
+        dead_ep_tx: &mpsc::UnboundedSender<EndpointKey>,
+        per_destination_tags: &mut std::collections::HashSet<Arc<str>>,
+    ) -> Option<Arc<dyn PacketEndpoint>> {
+        const MAX_ROUTE_CACHE_ENTRIES: usize = 4096;
+
+        let (tag, eff_dest) = match route_cache.get(destination) {
+            Some((tag, dest)) => (tag.clone(), dest.clone()),
+            None => {
+                let mut pkt_meta = meta.clone();
+                pkt_meta.destination = destination.clone();
+                let effective_meta = self.resolve_effective_meta(&pkt_meta);
+                let tag: Arc<str> = self.router.route(&effective_meta).into();
+                let dest = effective_meta.destination.clone();
+                if route_cache.len() >= MAX_ROUTE_CACHE_ENTRIES {
+                    // Evict a single arbitrary entry instead of flushing the whole
+                    // cache: a full clear would re-run the rule engine for every
+                    // known destination on the next packet (thundering herd).
+                    if let Some(key) = route_cache.keys().next().cloned() {
+                        route_cache.remove(&key);
+                    }
+                }
+                route_cache.insert(destination.clone(), (tag.clone(), dest.clone()));
+                (tag, dest)
+            }
+        };
+
+        let outbound = match self.get_outbound(&tag) {
+            Some(o) => o,
+            None => {
+                error!(
+                    "outbound '{}' not found for UDP destination {}",
+                    tag, eff_dest
+                );
+                return None;
+            }
+        };
+
+        let mut dial_meta = meta.clone();
+        dial_meta.destination = eff_dest.clone();
+
+        let ep: Arc<dyn PacketEndpoint> = match outbound.dial_packet(&dial_meta).await {
+            Ok(ep) => Arc::from(ep),
+            Err(e) => {
+                warn!(
+                    "failed to dial UDP endpoint [{}] for {}: {}",
+                    tag, eff_dest, e
+                );
+                return None;
+            }
+        };
+
+        let per_destination = outbound.udp_endpoint_per_destination();
+        if per_destination {
+            per_destination_tags.insert(tag.clone());
+        }
+
+        // Register the cache key *before* spawning: the reply pump needs an owned
+        // copy of it to report its own death, and `tag`/`eff_dest` are consumed here.
+        let key: EndpointKey = if per_destination {
+            (tag.clone(), Some(eff_dest.clone()))
+        } else {
+            (tag.clone(), None)
+        };
+
+        let ep_recv = ep.clone();
+        let reply_tx = packet_tx.clone();
+        let meter_recv = self.meter.clone();
+        let token = cancel_token.clone();
+        let client_addr = flux_types::TargetAddress::Ip(meta.source);
+        let dead_tx = dead_ep_tx.clone();
+        let dead_key = key.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = token.cancelled() => break,
+                    res = ep_recv.recv_packet() => match res {
+                        Ok(mut reply) => {
+                            let r_len = reply.payload.len() as u64;
+                            // Normalize reply addressing: some endpoints (e.g. direct)
+                            // report destination = responder instead of the original
+                            // client. Transparent inbounds (TUN/TPROXY/WireGuard) need
+                            // destination = client to route the inner reply packet back.
+                            reply.destination = client_addr.clone();
+                            if reply_tx.send(reply).await.is_err() {
+                                break;
+                            }
+                            if let Some(m) = &meter_recv {
+                                m.record_traffic(0, r_len);
+                            }
+                        }
+                        Err(e) => {
+                            debug!("UDP endpoint [{}] read loop ended: {}", dead_key.0, e);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Let the owning task forget this endpoint so the next datagram
+            // re-dials instead of talking to a closed socket.
+            let _ = dead_tx.send(dead_key);
+        });
+
+        match endpoints.entry(tag.clone()) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let slot = if per_destination {
+                    EndpointSlot::PerDestination(std::iter::once((eff_dest, ep.clone())).collect())
+                } else {
+                    EndpointSlot::Shared(ep.clone())
+                };
+                v.insert(slot);
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => match o.get_mut() {
+                EndpointSlot::PerDestination(map) => {
+                    // Cap the nested map: a client addressing many destinations
+                    // must not grow this (and its reply tasks) without bound.
+                    if map.len() >= MAX_ENDPOINTS_PER_TAG
+                        && !map.contains_key(&eff_dest)
+                        && let Some(oldest) = map.keys().next().cloned()
+                    {
+                        debug!(
+                            "UDP endpoint cache for [{}] full ({}); evicting {}",
+                            tag, MAX_ENDPOINTS_PER_TAG, oldest
+                        );
+                        map.remove(&oldest);
+                    }
+                    map.insert(eff_dest, ep.clone());
+                }
+                EndpointSlot::Shared(existing) => {
+                    *existing = ep.clone();
+                }
+            },
+        }
+        Some(ep)
     }
 }
 
@@ -255,11 +442,9 @@ impl Dispatcher for DefaultDispatcher {
         mut packet_rx: mpsc::Receiver<UdpPacket>,
         packet_tx: mpsc::Sender<UdpPacket>,
     ) {
-        const MAX_ROUTE_CACHE_ENTRIES: usize = 4096;
-
         let cancel_token = tokio_util::sync::CancellationToken::new();
         // Endpoints are only accessed from this task; a plain HashMap avoids DashMap sharding overhead.
-        let mut endpoints: std::collections::HashMap<Arc<str>, Arc<dyn PacketEndpoint>> =
+        let mut endpoints: std::collections::HashMap<Arc<str>, EndpointSlot> =
             std::collections::HashMap::new();
         // Per-destination routing cache: (outbound tag, effective destination after Fake-IP remap).
         // Avoids re-running the full rule engine for every single packet.
@@ -268,103 +453,145 @@ impl Dispatcher for DefaultDispatcher {
             (Arc<str>, flux_types::TargetAddress),
         > = std::collections::HashMap::new();
         let meter = self.meter.clone();
+        // Reply pumps report the tag of an endpoint whose read loop ended (fatal
+        // error or EOF) so the cached entry can be dropped and re-dialled.
+        // Without this the map keeps a permanently dead endpoint and every later
+        // datagram for that outbound is written into the void.
+        let (dead_ep_tx, mut dead_ep_rx) = mpsc::unbounded_channel::<EndpointKey>();
+        // Outbound tags whose UDP endpoint is bound to one destination.
+        let mut per_destination_tags: std::collections::HashSet<Arc<str>> =
+            std::collections::HashSet::new();
 
         while let Some(packet) = packet_rx.recv().await {
+            while let Ok(key) = dead_ep_rx.try_recv() {
+                debug!(
+                    "UDP endpoint [{}] closed; it will be re-dialled on demand",
+                    key.0
+                );
+                match (endpoints.get_mut(key.0.as_ref()), key.1) {
+                    (Some(EndpointSlot::PerDestination(map)), Some(dest)) => {
+                        map.remove(&dest);
+                    }
+                    (Some(_), None) => {
+                        endpoints.remove(key.0.as_ref());
+                    }
+                    _ => {}
+                }
+            }
             let bytes_len = packet.payload.len() as u64;
 
-            // Resolve routing decision for this destination (cached per unique destination).
-            let (outbound_tag, effective_dest) = match route_cache.get(&packet.destination) {
-                Some((tag, dest)) => (tag.clone(), dest.clone()),
+            // ---- Fast path: routing decision and endpoint both cached. This is
+            // every datagram after the first per destination, and it neither
+            // allocates nor clones the tag or destination.
+            //
+            // The routing cache holds the *effective* destination (after Fake-IP
+            // reverse mapping), which is exactly what the endpoint is registered
+            // under; rebuilding the key from `packet.destination` would miss
+            // whenever remapping applied and re-dial on every single datagram.
+            let cached_endpoint = route_cache
+                .get(&packet.destination)
+                .and_then(|(tag, dest)| {
+                    endpoints.get(tag.as_ref()).and_then(|slot| {
+                        slot.get(dest, per_destination_tags.contains(tag.as_ref()))
+                    })
+                });
+
+            let endpoint = match cached_endpoint {
+                Some(ep) => ep,
                 None => {
-                    let mut pkt_meta = meta.clone();
-                    pkt_meta.destination = packet.destination.clone();
-                    let effective_meta = self.resolve_effective_meta(&pkt_meta);
-                    let tag: Arc<str> = self.router.route(&effective_meta).into();
-                    let dest = effective_meta.destination.clone();
-                    if route_cache.len() >= MAX_ROUTE_CACHE_ENTRIES {
-                        // Evict a single arbitrary entry instead of flushing the whole
-                        // cache: a full clear would re-run the rule engine for every
-                        // known destination on the next packet (thundering herd).
-                        if let Some(key) = route_cache.keys().next().cloned() {
-                            route_cache.remove(&key);
-                        }
+                    let endpoint = self
+                        .dial_udp_endpoint(
+                            &meta,
+                            &mut endpoints,
+                            &mut route_cache,
+                            &packet.destination,
+                            &cancel_token,
+                            &packet_tx,
+                            &dead_ep_tx,
+                            &mut per_destination_tags,
+                        )
+                        .await;
+                    match endpoint {
+                        Some(ep) => ep,
+                        None => continue,
                     }
-                    route_cache.insert(packet.destination.clone(), (tag.clone(), dest.clone()));
-                    (tag, dest)
                 }
             };
 
-            // Get or create outbound endpoint
-            let endpoint = if let Some(ep) = endpoints.get(&outbound_tag) {
-                ep.clone()
-            } else {
-                let outbound = match self.get_outbound(&outbound_tag) {
-                    Some(o) => o,
-                    None => {
-                        error!(
-                            "outbound '{}' not found for UDP destination {}",
-                            outbound_tag, effective_dest
-                        );
-                        continue;
-                    }
-                };
-
-                let mut dial_meta = meta.clone();
-                dial_meta.destination = effective_dest.clone();
-
-                let ep: Arc<dyn PacketEndpoint> = match outbound.dial_packet(&dial_meta).await {
-                    Ok(ep) => Arc::from(ep),
-                    Err(e) => {
-                        warn!(
-                            "failed to dial UDP endpoint [{}] for {}: {}",
-                            outbound_tag, effective_dest, e
-                        );
-                        continue;
-                    }
-                };
-
-                // Spawn reply listener for this endpoint that forwards packets back to packet_tx
-                let ep_recv = ep.clone();
-                let reply_tx = packet_tx.clone();
-                let meter_recv = meter.clone();
-                let token = cancel_token.clone();
-                let client_addr = flux_types::TargetAddress::Ip(meta.source);
-                tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            _ = token.cancelled() => break,
-                            res = ep_recv.recv_packet() => match res {
-                                Ok(mut reply) => {
-                                    let r_len = reply.payload.len() as u64;
-                                    // Normalize reply addressing: some endpoints (e.g. direct)
-                                    // report destination = responder instead of the original
-                                    // client. Transparent inbounds (TUN/TPROXY/WireGuard) need
-                                    // destination = client to route the inner reply packet back.
-                                    reply.destination = client_addr.clone();
-                                    if reply_tx.send(reply).await.is_err() {
-                                        break;
-                                    }
-                                    if let Some(m) = &meter_recv {
-                                        m.record_traffic(0, r_len);
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                });
-
-                endpoints.insert(outbound_tag.clone(), ep.clone());
-                ep
-            };
-
+            // An `Arc` clone is an atomic increment: cheap enough to keep on the
+            // hot path so a failed send can still identify its cache slot.
+            let tag_for_err = route_cache.get(&packet.destination).map(|(t, _)| t.clone());
             if let Err(e) = endpoint.send_packet(packet).await {
-                debug!("failed to forward UDP packet: {}", e);
+                // The write side can die before the read pump notices (stream
+                // reset, ICMP error). Drop the cached entry so the next datagram
+                // re-dials instead of writing into a dead socket. Dropping the
+                // whole slot is fine: a send error is rare and re-dialling is
+                // cheap.
+                debug!("failed to forward UDP packet: {}; dropping endpoint", e);
+                if let Some(tag) = tag_for_err {
+                    endpoints.remove(tag.as_ref());
+                }
             } else if let Some(m) = &meter {
                 m.record_traffic(bytes_len, 0);
             }
         }
 
         cancel_token.cancel();
+    }
+}
+
+#[cfg(test)]
+mod endpoint_slot_tests {
+    use super::*;
+    use flux_types::{PacketEndpoint, UdpPacket};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Dummy(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl PacketEndpoint for Dummy {
+        async fn send_packet(&self, _packet: UdpPacket) -> FluxResult<()> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        async fn recv_packet(&self) -> FluxResult<UdpPacket> {
+            std::future::pending().await
+        }
+    }
+
+    fn dest(s: &str) -> flux_types::TargetAddress {
+        s.parse().unwrap()
+    }
+
+    /// The key must resolve for the *effective* destination the endpoint was
+    /// registered under, which is not the raw packet destination once Fake-IP
+    /// reverse mapping is involved. Getting this wrong re-dialled (and leaked) an
+    /// endpoint per datagram.
+    #[test]
+    fn per_destination_lookup_uses_the_effective_destination() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let ep: Arc<dyn PacketEndpoint> = Arc::new(Dummy(counter.clone()));
+
+        let mut map: std::collections::HashMap<flux_types::TargetAddress, Arc<dyn PacketEndpoint>> =
+            std::collections::HashMap::new();
+        let effective = dest("example.com:443");
+        map.insert(effective.clone(), ep.clone());
+
+        let slot = EndpointSlot::PerDestination(map);
+        assert!(
+            slot.get(&effective, true).is_some(),
+            "lookup by the registered destination must hit"
+        );
+        assert!(
+            slot.get(&dest("198.18.0.5:443"), true).is_none(),
+            "lookup by a raw Fake-IP address must miss"
+        );
+        // A shared slot ignores the destination entirely.
+        let shared = EndpointSlot::Shared(ep);
+        assert!(shared.get(&dest("1.1.1.1:53"), false).is_some());
+        assert!(
+            shared.get(&dest("1.1.1.1:53"), true).is_none(),
+            "a shared slot must not answer per-destination lookups"
+        );
     }
 }

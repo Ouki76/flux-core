@@ -44,8 +44,12 @@ pub fn parse_with_format(
 
 /// Loads a native flux-core configuration file (.json, .jsonc, .yaml, .yml)
 /// with support for `$include` modular includes and env var expansion across all formats.
-pub fn load_config(path: impl AsRef<Path>, _format: Option<ConfigFormat>) -> FluxResult<Config> {
-    Config::load_with_includes(path)
+///
+/// `format` forces the parser for the **root** file (the `--format` CLI flag);
+/// `Auto` detects it from the extension. Included files are always detected from
+/// their own extension, so a mixed-format tree keeps working.
+pub fn load_config(path: impl AsRef<Path>, format: Option<ConfigFormat>) -> FluxResult<Config> {
+    Config::load_with_includes_format(path, format.unwrap_or(ConfigFormat::Auto))
 }
 
 /// Alias for load_config.
@@ -54,6 +58,10 @@ pub fn load_any_config(path: impl AsRef<Path>, format: Option<ConfigFormat>) -> 
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+// Reject unknown keys: a typo (`fake_ip_range` instead of `fakeip.inet4_range`)
+// used to be ignored silently, which silently disabled the feature the user
+// thought they had configured.
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default, rename = "include", alias = "$include")]
     pub include: Vec<String>,
@@ -69,6 +77,7 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     pub listen: Option<String>,
     pub secret: Option<String>,
@@ -104,12 +113,20 @@ where
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     pub level: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsConfig {
+    /// Address to serve DNS on (e.g. `127.0.0.1:5353`). When set, a DNS inbound
+    /// is started; with `fakeip.enabled` it hands out fake addresses so that
+    /// domain-based routing also works for applications that resolve names
+    /// themselves.
+    #[serde(default)]
+    pub listen: Option<String>,
     #[serde(default)]
     pub servers: Vec<String>,
     pub fakeip: Option<FakeIpConfig>,
@@ -130,6 +147,7 @@ pub struct DnsRuleConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FakeIpConfig {
     pub enabled: Option<bool>,
     pub inet4_range: Option<String>,
@@ -564,7 +582,10 @@ pub struct RateLimitConfig {
 impl RateLimitConfig {
     pub fn build(&self) -> Arc<flux_common::RateLimiter> {
         let rate = self.max_conn_per_ip_per_sec.unwrap_or(0);
-        let burst = self.burst.unwrap_or(rate.max(1) * 2).max(1);
+        let burst = self
+            .burst
+            .unwrap_or_else(|| rate.max(1).saturating_mul(2))
+            .max(1);
         flux_common::RateLimiter::new(rate, burst, self.max_concurrent.unwrap_or(0))
     }
 }
@@ -803,10 +824,23 @@ impl RuleConfig {
         let mut ports: Vec<PortRange> = self.port.iter().map(|&p| PortRange::single(p)).collect();
         for pr in &self.port_range {
             if let Some((s, e)) = pr.split_once(':').or_else(|| pr.split_once('-')) {
-                if let (Ok(start), Ok(end)) = (s.trim().parse::<u16>(), e.trim().parse::<u16>()) {
-                    ports.push(PortRange::range(start, end));
+                let start = s.trim().parse::<u16>().map_err(|_| {
+                    FluxError::Config(format!("invalid port_range '{}': bad start port", pr))
+                })?;
+                let end = e.trim().parse::<u16>().map_err(|_| {
+                    FluxError::Config(format!("invalid port_range '{}': bad end port", pr))
+                })?;
+                if start > end {
+                    return Err(FluxError::Config(format!(
+                        "invalid port_range '{}': start {start} is greater than end {end}",
+                        pr
+                    )));
                 }
-            } else if let Ok(p) = pr.trim().parse::<u16>() {
+                ports.push(PortRange::range(start, end));
+            } else {
+                let p = pr.trim().parse::<u16>().map_err(|_| {
+                    FluxError::Config(format!("invalid port_range '{}': expected N or A-B", pr))
+                })?;
                 ports.push(PortRange::single(p));
             }
         }
@@ -843,8 +877,91 @@ impl RuleConfig {
     }
 }
 
-/// Expands environment variables like `${VAR}` or `${VAR:-default}` in the text.
-/// `$$` is unescaped to `$`.
+/// Like [`try_expand_env_vars`], but leaves comment lines untouched.
+///
+/// YAML comments begin with `#`; expanding them made a commented-out
+/// `# secret: ${DB_PASS}` abort the load when `DB_PASS` was unset.
+fn expand_env_vars_skipping_comments(raw: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.split_inclusive('\n') {
+        if line.trim_start().starts_with('#') {
+            out.push_str(line);
+        } else {
+            out.push_str(&try_expand_env_vars(line)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Expands `${VAR}` and `${VAR:-default}` in the text; `$$` unescapes to `$`.
+///
+/// An undefined variable **without** a default is a configuration error: silently
+/// substituting `""` turns a typo into a working-looking config with an empty
+/// secret or password.
+pub fn try_expand_env_vars(input: &str) -> Result<String, String> {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if chars.peek() == Some(&'$') {
+                chars.next();
+                result.push('$');
+                continue;
+            }
+            if chars.peek() == Some(&'{') {
+                chars.next();
+                let mut var_expr = String::new();
+                let mut closed = false;
+                for vc in chars.by_ref() {
+                    if vc == '}' {
+                        closed = true;
+                        break;
+                    }
+                    var_expr.push(vc);
+                }
+                if !closed {
+                    return Err(format!("unterminated ${{...}} in config: ${{{var_expr}"));
+                }
+                if let Some((var_name, default_val)) = var_expr.split_once(":-") {
+                    if var_name.is_empty() {
+                        return Err(
+                            "empty environment variable name in ${:-default} in config".to_string()
+                        );
+                    }
+                    if default_val.contains("${") {
+                        return Err(format!(
+                            "nested environment variable defaults are not supported: ${{{var_expr}}}"
+                        ));
+                    }
+                    let val = std::env::var(var_name).unwrap_or_default();
+                    if val.is_empty() {
+                        result.push_str(default_val);
+                    } else {
+                        result.push_str(&val);
+                    }
+                } else {
+                    match std::env::var(&var_expr) {
+                        Ok(v) => result.push_str(&v),
+                        Err(_) => {
+                            return Err(format!(
+                                "undefined environment variable ${{{var_expr}}} in config \
+                                 (use ${{{var_expr}:-default}} to provide a fallback)"
+                            ));
+                        }
+                    }
+                }
+            } else {
+                result.push('$');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    Ok(result)
+}
+
+/// Lenient variant used by callers that cannot propagate an error.
 pub fn expand_env_vars(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -962,15 +1079,17 @@ pub fn strip_comments(input: &str) -> String {
 impl Config {
     /// Parse configuration from a JSON string (with optional comments and env vars).
     pub fn from_json_str(raw: &str) -> FluxResult<Self> {
-        let expanded = expand_env_vars(raw);
-        let stripped = strip_comments(&expanded);
-        serde_json::from_str(&stripped)
+        // Strip comments *before* expansion: expanding first made a commented-out
+        // line containing `${SOME_UNSET_VAR}` abort the whole configuration.
+        let stripped = strip_comments(raw);
+        let expanded = try_expand_env_vars(&stripped).map_err(FluxError::Config)?;
+        serde_json::from_str(&expanded)
             .map_err(|e| FluxError::Config(format!("failed to parse json config: {}", e)))
     }
 
     /// Parse configuration from a YAML string (with env vars).
     pub fn from_yaml_str(raw: &str) -> FluxResult<Self> {
-        let expanded = expand_env_vars(raw);
+        let expanded = expand_env_vars_skipping_comments(raw).map_err(FluxError::Config)?;
         serde_yaml_ng::from_str(&expanded)
             .map_err(|e| FluxError::Config(format!("failed to parse yaml config: {}", e)))
     }
@@ -992,8 +1111,18 @@ impl Config {
         }
     }
 
-    /// Read and parse a single configuration file.
+    /// Read and parse a single configuration file, detecting the format from
+    /// its extension.
     pub fn from_file(path: impl AsRef<Path>) -> FluxResult<Self> {
+        Self::from_file_format(path, ConfigFormat::Auto)
+    }
+
+    /// Read and parse a single configuration file with an explicit format.
+    ///
+    /// `Auto` keeps extension-based detection (JSON/JSONC first, YAML fallback);
+    /// `Json`/`Yaml` force the parser regardless of the file name, which is what
+    /// the documented `--format` flag promises.
+    pub fn from_file_format(path: impl AsRef<Path>, format: ConfigFormat) -> FluxResult<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(|e| {
             FluxError::Config(format!("cannot read config file '{:?}': {}", path, e))
@@ -1002,11 +1131,28 @@ impl Config {
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.to_ascii_lowercase());
-        Self::from_str_auto(&content, ext.as_deref())
+        match format {
+            ConfigFormat::Auto => Self::from_str_auto(&content, ext.as_deref()),
+            ConfigFormat::Json => Self::from_json_str(&content),
+            ConfigFormat::Yaml => Self::from_yaml_str(&content).map_err(|e| {
+                FluxError::Config(format!(
+                    "failed to parse '{:?}' as YAML (forced by --format): {}",
+                    path, e
+                ))
+            }),
+        }
     }
 
     /// Load configuration file and recursively merge all files specified in `include` / `$include`.
     pub fn load_with_includes(root_path: impl AsRef<Path>) -> FluxResult<Self> {
+        Self::load_with_includes_format(root_path, ConfigFormat::Auto)
+    }
+
+    /// Like [`Config::load_with_includes`] but forces `format` for the root file.
+    pub fn load_with_includes_format(
+        root_path: impl AsRef<Path>,
+        format: ConfigFormat,
+    ) -> FluxResult<Self> {
         let root_path = root_path.as_ref().canonicalize().map_err(|e| {
             FluxError::Config(format!(
                 "cannot canonicalize path '{:?}': {}",
@@ -1018,7 +1164,7 @@ impl Config {
         let mut visited = HashSet::new();
         visited.insert(root_path.clone());
 
-        let mut root_config = Self::from_file(&root_path)?;
+        let mut root_config = Self::from_file_format(&root_path, format)?;
         let base_dir = root_path.parent().unwrap_or_else(|| Path::new("."));
 
         root_config.resolve_includes(base_dir, &mut visited)?;
@@ -1032,6 +1178,14 @@ impl Config {
         base_dir: &Path,
         visited: &mut HashSet<PathBuf>,
     ) -> FluxResult<()> {
+        // `visited` stops cycles, but a long *chain* of includes (a1 → a2 → … → a500)
+        // would still recurse once per file and can overflow the stack.
+        const MAX_INCLUDE_DEPTH: usize = 32;
+        if visited.len() > MAX_INCLUDE_DEPTH {
+            return Err(FluxError::Config(format!(
+                "include chain deeper than {MAX_INCLUDE_DEPTH} files; check for an accidental loop"
+            )));
+        }
         let includes = std::mem::take(&mut self.include);
         for pattern in includes {
             let full_pattern = if Path::new(&pattern).is_absolute() {
@@ -1043,14 +1197,47 @@ impl Config {
             let pattern_str = full_pattern.to_string_lossy().into_owned();
             let mut matched_files = Vec::new();
 
-            if pattern_str.contains('*') || pattern_str.contains('?') || pattern_str.contains('[') {
-                if let Ok(entries) = glob::glob(&pattern_str) {
-                    for entry in entries.flatten() {
-                        matched_files.push(entry);
+            // A path that exists literally wins: a real file name may contain glob
+            // metacharacters (`rules[1].json`), which used to be misparsed.
+            if full_pattern.is_file() {
+                matched_files.push(full_pattern);
+            } else if pattern_str.contains('*')
+                || pattern_str.contains('?')
+                || pattern_str.contains('[')
+            {
+                match glob::glob(&pattern_str) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            match entry {
+                                Ok(path) => matched_files.push(path),
+                                Err(e) => {
+                                    return Err(FluxError::Config(format!(
+                                        "include pattern '{}': {}",
+                                        pattern, e
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        return Err(FluxError::Config(format!(
+                            "invalid include pattern '{}': {}",
+                            pattern, e
+                        )));
                     }
                 }
-            } else if full_pattern.is_file() {
-                matched_files.push(full_pattern);
+                if matched_files.is_empty() {
+                    return Err(FluxError::Config(format!(
+                        "include pattern '{}' matched no files",
+                        pattern
+                    )));
+                }
+            } else {
+                // A literal path that does not exist is a typo, not a no-op.
+                return Err(FluxError::Config(format!(
+                    "included file '{}' does not exist (resolved to '{}')",
+                    pattern, pattern_str
+                )));
             }
 
             for file_path in matched_files {
@@ -1422,6 +1609,53 @@ fn check_cycle(
 }
 
 #[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn yaml_doc() -> String {
+        "inbounds: []\noutbounds: [{ type: direct, tag: direct }]\n".to_string()
+    }
+
+    #[test]
+    fn explicit_format_overrides_the_extension() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.txt");
+        std::fs::write(&path, yaml_doc()).unwrap();
+
+        // Forcing YAML parses a file whose extension says nothing.
+        assert!(Config::from_file_format(&path, ConfigFormat::Yaml).is_ok());
+        // Auto-detect also falls back to YAML.
+        assert!(Config::from_file_format(&path, ConfigFormat::Auto).is_ok());
+        // Forcing JSON must fail loudly instead of silently guessing.
+        let err = Config::from_file_format(&path, ConfigFormat::Json).unwrap_err();
+        assert!(err.to_string().contains("json"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_config_honours_the_format_argument() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cfg.txt");
+        std::fs::write(&path, yaml_doc()).unwrap();
+        assert!(load_config(&path, Some(ConfigFormat::Yaml)).is_ok());
+        assert!(load_config(&path, Some(ConfigFormat::Json)).is_err());
+    }
+
+    #[test]
+    fn format_from_str_round_trips() {
+        for (text, expect) in [
+            ("auto", ConfigFormat::Auto),
+            ("json", ConfigFormat::Json),
+            ("jsonc", ConfigFormat::Json),
+            ("yaml", ConfigFormat::Yaml),
+            ("YML", ConfigFormat::Yaml),
+        ] {
+            assert_eq!(text.parse::<ConfigFormat>().unwrap(), expect);
+        }
+        assert!("toml".parse::<ConfigFormat>().is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1534,5 +1768,86 @@ route:
         let cfg = Config::from_json_str(raw).unwrap();
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("cyclic dependency"));
+    }
+}
+
+#[cfg(test)]
+mod env_expansion_tests {
+    use super::*;
+
+    #[test]
+    fn undefined_variable_without_default_is_an_error() {
+        let err = try_expand_env_vars("secret: ${FLUX_DEFINITELY_UNSET_XYZ}").unwrap_err();
+        assert!(err.contains("undefined environment variable"), "{err}");
+    }
+
+    #[test]
+    fn default_and_empty_default_are_accepted() {
+        assert_eq!(
+            try_expand_env_vars("${FLUX_DEFINITELY_UNSET_XYZ:-fallback}").unwrap(),
+            "fallback"
+        );
+        assert_eq!(
+            try_expand_env_vars("${FLUX_DEFINITELY_UNSET_XYZ:-}").unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn dollar_escape_survives() {
+        assert_eq!(try_expand_env_vars("cost $$5").unwrap(), "cost $5");
+    }
+
+    /// A commented-out line must not be expanded, or a stale
+    /// `# secret: ${DB_PASS}` would abort the whole load.
+    #[test]
+    fn yaml_comments_are_not_expanded() {
+        let yaml = "# secret: ${FLUX_DEFINITELY_UNSET_XYZ}\nlog:\n  level: info\n";
+        let out = expand_env_vars_skipping_comments(yaml).unwrap();
+        assert!(out.contains("${FLUX_DEFINITELY_UNSET_XYZ}"), "{out}");
+    }
+
+    #[test]
+    fn json_comments_are_stripped_before_expansion() {
+        let json = "{\n  // \"secret\": \"${FLUX_DEFINITELY_UNSET_XYZ}\",\n  \"log\": {\"level\": \"info\"}\n}";
+        let cfg = Config::from_json_str(json).expect("commented-out variable must not fail");
+        let _ = cfg;
+    }
+}
+
+#[cfg(test)]
+mod unknown_key_tests {
+    use super::*;
+
+    /// A misspelled key must be reported, not silently ignored — a typo used to
+    /// disable the feature the user thought they had configured.
+    #[test]
+    fn unknown_top_level_key_is_rejected() {
+        let json = r#"{"outbounds": [{"type": "direct", "tag": "direct"}], "dns_typo": {}}"#;
+        let err = Config::from_json_str(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected an unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_dns_key_is_rejected() {
+        let json = r#"{"outbounds": [{"type": "direct", "tag": "direct"}],
+                       "dns": {"listen": "127.0.0.1:5353", "fake_ip_range": "198.18.0.0/15"}}"#;
+        let err = Config::from_json_str(json).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "got: {err}");
+    }
+
+    #[test]
+    fn documented_keys_are_accepted() {
+        let json = r#"{
+            "log": {"level": "info"},
+            "dns": {"listen": "127.0.0.1:5353", "servers": ["1.1.1.1"],
+                    "fakeip": {"enabled": true, "inet4_range": "198.18.0.0/15"}},
+            "api": {"listen": "127.0.0.1:9090", "secret": "s"},
+            "outbounds": [{"type": "direct", "tag": "direct"}]
+        }"#;
+        Config::from_json_str(json).expect("documented keys must parse");
     }
 }

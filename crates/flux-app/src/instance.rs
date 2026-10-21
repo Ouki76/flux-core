@@ -379,6 +379,25 @@ impl Instance {
 
         // 5. Inbounds
         let mut inbounds: Vec<Arc<dyn Inbound>> = Vec::new();
+
+        // DNS inbound (fake-IP responder / forwarding resolver), when configured.
+        if let Some(listen) = config.dns.as_ref().and_then(|d| d.listen.as_deref()) {
+            let addr: std::net::SocketAddr = listen.parse().map_err(|e| {
+                FluxError::Config(format!("invalid dns.listen '{}': {}", listen, e))
+            })?;
+            let pool = resolver.fake_ip().cloned();
+            if pool.is_none() {
+                tracing::info!(
+                    "dns.listen is set but fake-ip is disabled: serving as a plain resolver"
+                );
+            }
+            inbounds.push(Arc::new(flux_inbound::DnsInbound::new(
+                "dns-in",
+                addr,
+                resolver.clone(),
+                pool,
+            )));
+        }
         for in_cfg in config.inbounds {
             match in_cfg {
                 InboundConfig::Node(node) => {
@@ -592,6 +611,26 @@ impl Instance {
                     match result {
                         Ok(content) => {
                             rs.apply_content(&content);
+                            // A rule set that loads but parses to zero usable
+                            // entries makes every `rule_set` rule match nothing,
+                            // so traffic silently falls through to the final
+                            // outbound. Say so instead of only logging a size.
+                            if rs.parsed_entry_count() == 0 {
+                                tracing::warn!(
+                                    "remote rule set '{}': no usable rules parsed from {} bytes — \
+                                     `rule_set` rules referencing it match NOTHING",
+                                    rs.tag,
+                                    content.len()
+                                );
+                            } else if rs.unparsed_entry_count() > 0 {
+                                tracing::warn!(
+                                    "remote rule set '{}': {} rule(s) parsed, {} line(s) ignored \
+                                     (unsupported type or malformed)",
+                                    rs.tag,
+                                    rs.parsed_entry_count(),
+                                    rs.unparsed_entry_count()
+                                );
+                            }
                             if let Some(cp) = &cache_path {
                                 if let Some(parent) = cp.parent() {
                                     let _ = std::fs::create_dir_all(parent);
@@ -664,23 +703,39 @@ fn default_ruleset_cache_path(tag: &str, url: &str) -> std::path::PathBuf {
                 .map(|h| std::path::PathBuf::from(h).join(".cache"))
                 .unwrap_or_else(|_| std::env::temp_dir())
         });
+    // The tag comes from the configuration and may contain path separators
+    // (`../../x`), so restrict it to a safe character set before it becomes a
+    // file name.
+    let safe_tag: String = tag
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe_tag = safe_tag.trim_matches('.').replace("..", "_");
     base.join("flux-core")
         .join("rulesets")
-        .join(format!("{}-{:016x}.txt", tag, h.finish()))
+        .join(format!("{}-{:016x}.txt", safe_tag, h.finish()))
 }
 
 fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
+    // Saturating arithmetic: a hostile `9e18h` must clamp, not overflow-panic in
+    // debug builds.
     if let Some(rest) = s.strip_suffix('s') {
         rest.parse::<u64>().ok().map(Duration::from_secs)
     } else if let Some(rest) = s.strip_suffix('m') {
         rest.parse::<u64>()
             .ok()
-            .map(|m| Duration::from_secs(m * 60))
+            .map(|m| Duration::from_secs(m.saturating_mul(60)))
     } else if let Some(rest) = s.strip_suffix('h') {
         rest.parse::<u64>()
             .ok()
-            .map(|h| Duration::from_secs(h * 3600))
+            .map(|h| Duration::from_secs(h.saturating_mul(3600)))
     } else {
         s.parse::<u64>().ok().map(Duration::from_secs)
     }
@@ -741,6 +796,14 @@ fn resolve_hy2_obfs(obfs: Option<&str>, password: Option<String>) -> FluxResult<
     }
 }
 
+/// SNI to use when a QUIC outbound has no explicit `tls.server_name`:
+/// the carrier host name, unless it is a bare IP literal (SNI must be a name).
+fn default_quic_sni(host: &str) -> Option<String> {
+    host.parse::<std::net::IpAddr>()
+        .is_err()
+        .then(|| host.to_string())
+}
+
 fn extract_quic_tls_params(
     sec_opt: &Option<FlexibleList<SecurityConfig>>,
 ) -> (Option<String>, bool, Option<Vec<String>>) {
@@ -757,9 +820,14 @@ fn extract_quic_tls_params(
             }
         }
     }
-    // No TLS security configured: QUIC-native protocols (hy2/tuic) traditionally
-    // use self-signed certs on the server — default to insecure for compatibility.
-    (None, true, None)
+    // No TLS security block configured for a QUIC-native outbound (hy2/tuic).
+    //
+    // This used to default to `insecure: true`, which silently disabled
+    // certificate verification for every QUIC outbound that did not spell out a
+    // `security: {type: tls}` block — a one-config-line path to MITM. Verification
+    // is now on by default; servers with self-signed certificates must opt in
+    // explicitly with `insecure: true`.
+    (None, false, None)
 }
 
 fn compile_client_securities(
@@ -904,8 +972,27 @@ fn build_layered_outbound(
             } => {
                 let priv_k = crate::config::decode_key_32bytes(&private_key)?;
                 let pub_k = crate::config::decode_key_32bytes(&peer_public_key)?;
-                let psk = preshared_key.and_then(|k| crate::config::decode_key_32bytes(&k).ok());
-                let local_ip = local_address.as_deref().and_then(|a| a.parse().ok());
+                // A malformed key or address must be a hard error: silently dropping them
+                // turns a typo into "no PSK" / "no source address", i.e. a tunnel that
+                // quietly differs from what the operator wrote.
+                let psk = match preshared_key {
+                    Some(k) => Some(crate::config::decode_key_32bytes(&k).map_err(|e| {
+                        FluxError::Config(format!(
+                            "outbound '{}': invalid preshared_key: {}",
+                            tag, e
+                        ))
+                    })?),
+                    None => None,
+                };
+                let local_ip = match local_address.as_deref() {
+                    Some(a) => Some(a.parse().map_err(|e| {
+                        FluxError::Config(format!(
+                            "outbound '{}': invalid local_address '{}': {}",
+                            tag, a, e
+                        ))
+                    })?),
+                    None => None,
+                };
                 let wg_cfg = flux_protocol::wireguard::WireGuardConfig {
                     private_key: priv_k,
                     peer_public_key: pub_k,
@@ -930,6 +1017,7 @@ fn build_layered_outbound(
                 obfs_password,
             } => {
                 let (q_sni, q_insecure, q_alpn) = extract_quic_tls_params(&node.security);
+                let q_sni = q_sni.or_else(|| default_quic_sni(&target.host()));
                 let hy2_cfg = flux_protocol::hysteria2::Hysteria2Config {
                     server: target.host(),
                     ports: vec![target.port()],
@@ -957,6 +1045,7 @@ fn build_layered_outbound(
                 let parsed_uuid = Uuid::parse_str(&uuid)
                     .map_err(|e| FluxError::Config(format!("invalid tuic uuid {}: {}", uuid, e)))?;
                 let (q_sni, q_insecure, q_alpn) = extract_quic_tls_params(&node.security);
+                let q_sni = q_sni.or_else(|| default_quic_sni(&target.host()));
                 let tuic_cfg = flux_protocol::tuic::TuicV5Config {
                     server: target.host(),
                     server_port: target.port(),
@@ -1052,8 +1141,24 @@ fn build_layered_outbound(
         } => {
             let priv_k = crate::config::decode_key_32bytes(&private_key)?;
             let pub_k = crate::config::decode_key_32bytes(&peer_public_key)?;
-            let psk = preshared_key.and_then(|k| crate::config::decode_key_32bytes(&k).ok());
-            let local_ip = local_address.as_deref().and_then(|a| a.parse().ok());
+            // A malformed key or address must be a hard error: silently dropping them
+            // turns a typo into "no PSK" / "no source address", i.e. a tunnel that
+            // quietly differs from what the operator wrote.
+            let psk = match preshared_key {
+                Some(k) => Some(crate::config::decode_key_32bytes(&k).map_err(|e| {
+                    FluxError::Config(format!("outbound '{}': invalid preshared_key: {}", tag, e))
+                })?),
+                None => None,
+            };
+            let local_ip = match local_address.as_deref() {
+                Some(a) => Some(a.parse().map_err(|e| {
+                    FluxError::Config(format!(
+                        "outbound '{}': invalid local_address '{}': {}",
+                        tag, a, e
+                    ))
+                })?),
+                None => None,
+            };
             let wg_cfg = flux_protocol::wireguard::WireGuardConfig {
                 private_key: priv_k,
                 peer_public_key: pub_k,

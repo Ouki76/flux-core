@@ -176,7 +176,10 @@ impl ApiServer {
     }
 
     pub fn with_secret(mut self, secret: Option<String>) -> Self {
-        self.ctx.secret = secret;
+        // An empty/whitespace-only secret is not a secret. Treating it as `Some("")`
+        // would defeat the unsafe-bind guard (which checks `is_none()`) and let a
+        // `Authorization: Bearer ` header authenticate.
+        self.ctx.secret = secret.filter(|s| !s.trim().is_empty());
         self
     }
 
@@ -247,7 +250,13 @@ impl ApiServer {
             );
         }
 
-        let listener = flux_common::create_reuse_port_listener(addr)?;
+        // Deliberately *not* SO_REUSEPORT: the management API is a single-owner
+        // resource, and port sharing would let any same-uid process race or
+        // hijack API traffic. Only the proxy's data-plane listeners need
+        // SO_REUSEPORT (for zero-downtime reload).
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(flux_types::FluxError::Io)?;
         info!("Flux Core Native API server listening on http://{}", addr);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -311,17 +320,47 @@ fn is_private_or_restricted_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn constant_time_eq_str(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-    if a_bytes.len() != b_bytes.len() {
+/// True when `origin` is a same-machine HTTP origin
+/// (`http(s)://localhost[:port]`, `http(s)://127.0.0.1[:port]`, `http(s)://[::1][:port]`).
+///
+/// A prefix test is *not* sufficient: `http://localhost.attacker.tld` starts with
+/// `http://localhost` yet is fully attacker-controlled. The authority is therefore
+/// parsed and the host compared exactly. Anything unparseable counts as external.
+fn origin_is_local(origin: &str) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return false;
     }
-    let mut diff = 0u8;
-    for (&x, &y) in a_bytes.iter().zip(b_bytes.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    // An origin never carries a path, but be liberal: keep only the authority.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // Drop any userinfo component.
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    let host = if let Some(after_bracket) = host_port.strip_prefix('[') {
+        // IPv6 literal: `[::1]` or `[::1]:port`
+        let Some((host, tail)) = after_bracket.split_once(']') else {
+            return false;
+        };
+        if !tail.is_empty() && (!tail.starts_with(':') || tail[1..].parse::<u16>().is_err()) {
+            return false;
+        }
+        host
+    } else {
+        match host_port.rsplit_once(':') {
+            Some((host, port)) => {
+                if port.parse::<u16>().is_err() {
+                    return false;
+                }
+                host
+            }
+            None => host_port,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
 async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
@@ -419,7 +458,7 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 if let Some(token) = trimmed
                     .strip_prefix("Bearer ")
                     .or_else(|| trimmed.strip_prefix("bearer "))
-                    && constant_time_eq_str(token.trim(), expected_secret.as_str())
+                    && flux_common::constant_time_eq_str(token.trim(), expected_secret.as_str())
                 {
                     is_authorized = true;
                     break;
@@ -430,7 +469,7 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             for param in query_str.split('&') {
                 if let Some((k, v)) = param.split_once('=')
                     && k == "token"
-                    && constant_time_eq_str(v, expected_secret.as_str())
+                    && flux_common::constant_time_eq_str(v, expected_secret.as_str())
                 {
                     is_authorized = true;
                     break;
@@ -445,11 +484,8 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         if let Some((k, v)) = line.split_once(':')
             && k.trim().eq_ignore_ascii_case("origin")
         {
-            let orig = v.trim();
-            if !orig.starts_with("http://127.0.0.1")
-                && !orig.starts_with("http://localhost")
-                && !orig.starts_with("https://localhost")
-            {
+            let origin = v.trim();
+            if !origin_is_local(origin) {
                 has_external_origin = true;
             }
             break;
@@ -789,7 +825,10 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 Ok(resolved_sock) => {
                                     is_private_or_restricted_ip(resolved_sock.ip())
                                 }
-                                Err(_) => false,
+                                // Fail closed: if the name cannot be resolved we
+                                // cannot prove it is safe, so the probe is refused
+                                // instead of being allowed through.
+                                Err(_) => true,
                             }
                         } else if let Ok(addrs) =
                             tokio::net::lookup_host(format!("{}:{}", d, port)).await
@@ -798,7 +837,8 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                                 .into_iter()
                                 .any(|sa| is_private_or_restricted_ip(sa.ip()))
                         } else {
-                            false
+                            // Resolution failed: fail closed (see above).
+                            true
                         }
                     }
                 };
@@ -858,11 +898,14 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         }
     } else if path_clean.starts_with("/api/v1/outbounds/") && (method == "PUT" || method == "POST")
     {
-        // Switch selected outbound in group
+        // Switch the selected outbound in a group. The endpoint is documented as
+        // `.../outbounds/<group>/select`; require the suffix so that an unrelated
+        // future `/outbounds/<tag>/<action>` route cannot silently mutate state.
         let selector_tag = path_clean
             .strip_prefix("/api/v1/outbounds/")
             .unwrap_or("")
-            .trim_end_matches("/select")
+            .strip_suffix("/select")
+            .unwrap_or("")
             .trim_matches('/');
         let parsed_body: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
         let target_name = parsed_body

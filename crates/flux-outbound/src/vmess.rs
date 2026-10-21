@@ -70,6 +70,12 @@ impl Outbound for VmessOutbound {
         Ok(Box::new(vmess_stream))
     }
 
+    fn udp_endpoint_per_destination(&self) -> bool {
+        // VMess UDP frames are `[len][payload]` on a stream bound to the
+        // destination in the request header: one association per destination.
+        true
+    }
+
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
         let mut stream = self.dialer.dial().await?;
 

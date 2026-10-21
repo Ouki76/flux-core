@@ -212,6 +212,15 @@ impl Outbound for UrlTestOutbound {
         active.dial_packet(meta).await
     }
 
+    fn udp_endpoint_per_destination(&self) -> bool {
+        // Delegate to the member that actually carries the datagrams: a VMess
+        // member behind a group still needs one association per destination,
+        // and the dispatcher's cache key must agree with the member's behaviour.
+        self.get_active()
+            .map(|m| m.udp_endpoint_per_destination())
+            .unwrap_or(false)
+    }
+
     fn is_group(&self) -> bool {
         true
     }

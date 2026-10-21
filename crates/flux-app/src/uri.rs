@@ -39,6 +39,9 @@ pub struct ProxySpec {
     pub transport_headers: HashMap<String, String>,
     /// TLS security requested explicitly (`security=tls`) or implicitly (trojan).
     pub security_hint_tls: bool,
+    /// Set when the URI requested `security=reality` without a public key;
+    /// `build()` turns this into a configuration error.
+    pub reality_missing_pbk: bool,
     // TUIC / Hysteria 2 extras (from generic query params).
     pub congestion_control: Option<String>,
     pub up_mbps: Option<u64>,
@@ -148,7 +151,8 @@ where
 /// Structural decomposition of any `scheme://userinfo@host:port/path?query#tag` link.
 #[derive(Debug)]
 struct GenericUri<'a> {
-    scheme: &'a str,
+    /// Owned: the scheme is lower-cased during parsing.
+    scheme: String,
     userinfo: Option<&'a str>,
     host: String,
     port: Option<u16>,
@@ -190,7 +194,7 @@ impl<'a> GenericUri<'a> {
 
         let (host, port) = split_host_port(host_port)?;
         Ok(Self {
-            scheme: Box::leak(scheme.into_boxed_str()),
+            scheme: scheme.to_string(),
             userinfo,
             host,
             port,
@@ -229,13 +233,20 @@ fn split_host_port(s: &str) -> FluxResult<(String, Option<u16>)> {
         )));
     }
     match clean.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => {
-            let port = p
-                .parse::<u16>()
-                .map_err(|_| FluxError::Config(format!("invalid port in address: {}", clean)))?;
+        Some((h, p)) if !h.is_empty() && !p.is_empty() => {
+            // A colon that is not followed by a valid port is an error: folding it
+            // into the host name produced outbounds like `host:abc` that only fail
+            // much later, at connect time.
+            let port = p.parse::<u16>().map_err(|_| {
+                FluxError::Config(format!(
+                    "invalid port '{}' in address '{}' (expected a number 0-65535)",
+                    p, clean
+                ))
+            })?;
             Ok((h.to_string(), Some(port)))
         }
-        _ => Ok((clean.to_string(), None)),
+        Some((h, _)) => Ok((h.to_string(), None)),
+        None => Ok((clean.to_string(), None)),
     }
 }
 
@@ -252,9 +263,10 @@ fn parse_params(query: Option<&str>) -> FluxResult<UriParams> {
             if key.is_empty() {
                 continue;
             }
+            // Query values are form-encoded, so `+` does mean a space here.
             map.insert(
                 key.to_string(),
-                serde_json::Value::String(urlencoding_decode(v.trim())),
+                serde_json::Value::String(urlencoding_decode_query(v.trim())),
             );
         }
     }
@@ -292,8 +304,19 @@ impl ProxySpec {
             self.transport_headers.insert("Host".into(), h.clone());
         }
         if p.security.as_deref() == Some("reality") {
-            self.reality_public_key = p.public_key.clone();
-            self.reality_short_id = p.short_id.clone();
+            // A REALITY link without `pbk` cannot authenticate the server. The
+            // previous behaviour silently fell back to *no* TLS layer, i.e. a
+            // plaintext VLESS/Trojan stream — the exact silent downgrade the
+            // unknown-scheme branch rejects. Refuse it instead.
+            match &p.public_key {
+                Some(pk) if !pk.trim().is_empty() => {
+                    self.reality_public_key = Some(pk.clone());
+                    self.reality_short_id = p.short_id.clone();
+                }
+                _ => {
+                    self.reality_missing_pbk = true;
+                }
+            }
         } else if p.security.as_deref() == Some("tls")
             || p.security.as_deref() == Some("xtls")
             || self.sni.is_some()
@@ -305,6 +328,12 @@ impl ProxySpec {
 
     /// Builds canonical `OutboundConfig` from this proxy specification.
     pub fn build(self) -> FluxResult<OutboundConfig> {
+        if self.reality_missing_pbk {
+            return Err(FluxError::Config(format!(
+                "outbound '{}': security=reality requires the public key (`pbk=`)",
+                self.tag
+            )));
+        }
         let proto = self.protocol.trim().to_ascii_lowercase();
         let carrier = CarrierConfig::Tcp {
             address: None,
@@ -457,14 +486,19 @@ impl ProxySpec {
 /// `tuic://`.
 pub fn parse_proxy_uri(uri: &str) -> FluxResult<OutboundConfig> {
     let g = GenericUri::parse(uri)?;
-    let default_tag = || format!("{}-node", g.scheme);
+    // Fragment-less links must still get distinct tags: using the bare scheme
+    // made two such outbounds collide, and `validate()` then rejected the config
+    // with "duplicate outbound tag".
     let tag = if g.tag.is_empty() {
-        default_tag()
+        static NEXT_LINK_ID: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT_LINK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{}-{}-{}", g.scheme, g.host, n)
     } else {
         g.tag.clone()
     };
 
-    let default_port: u16 = match g.scheme {
+    let default_port: u16 = match g.scheme.as_str() {
         "vless" | "trojan" | "hy2" | "hysteria2" | "https" => 443,
         "ss" | "shadowsocks" => 8388,
         "socks" | "socks5" => 1080,
@@ -489,7 +523,7 @@ pub fn parse_proxy_uri(uri: &str) -> FluxResult<OutboundConfig> {
 
     let mut spec = ProxySpec {
         tag,
-        protocol: match g.scheme {
+        protocol: match g.scheme.as_str() {
             "shadowsocks" => "ss",
             "socks5" => "socks",
             "hysteria2" => "hy2",
@@ -509,7 +543,7 @@ pub fn parse_proxy_uri(uri: &str) -> FluxResult<OutboundConfig> {
     spec.apply_params(&params);
 
     // Per-scheme userinfo semantics (protocol-defined, not query-generic).
-    match g.scheme {
+    match g.scheme.as_str() {
         "vless" => {
             let uuid = g
                 .userinfo
@@ -565,6 +599,16 @@ pub fn parse_proxy_uri(uri: &str) -> FluxResult<OutboundConfig> {
                 let (u, p) = userinfo.split_once(':').unwrap_or((userinfo, ""));
                 spec.username = Some(urlencoding_decode(u));
                 spec.password = Some(urlencoding_decode(p));
+            }
+            if g.scheme == "https" {
+                // `https://` means "HTTP proxy reached over TLS". Without this
+                // hint the outbound is emitted with `security: None`, i.e. a
+                // cleartext HTTP proxy on port 443 that would also send
+                // `Proxy-Authorization` in the clear.
+                spec.security_hint_tls = true;
+                if spec.sni.is_none() {
+                    spec.sni = Some(g.host.clone());
+                }
             }
         }
         "hy2" | "hysteria2" => {
@@ -673,6 +717,16 @@ fn parse_vmess_link(uri: &str, default_tag: String) -> FluxResult<OutboundConfig
     spec.build()
 }
 
+/// Decodes a form-encoded **query value**, where `+` means a space.
+pub fn urlencoding_decode_query(s: &str) -> String {
+    urlencoding_decode(&s.replace('+', "%20"))
+}
+
+/// Decodes `%XX` escapes in a URI component.
+///
+/// `+` is left alone: it is only a space in form-encoded query values, and this
+/// decoder is also used for userinfo (where a password may legitimately contain
+/// `+`). Use [`urlencoding_decode_query`] for query values.
 pub fn urlencoding_decode(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
     let mut chars = s.bytes();
@@ -696,9 +750,11 @@ pub fn urlencoding_decode(s: &str) -> String {
             if let Some(c2) = h2 {
                 bytes.push(c2);
             }
-        } else if b == b'+' {
-            bytes.push(b' ');
         } else {
+            // NOTE: `+` is *not* decoded to a space here. It only means "space" in
+            // `application/x-www-form-urlencoded` query values, and these decoders
+            // are also applied to userinfo — decoding it there silently corrupts
+            // every password containing `+`.
             bytes.push(b);
         }
     }
@@ -724,6 +780,33 @@ fn decode_base64_or_plain(s: &str) -> FluxResult<String> {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    /// `https://` proxy links must carry a TLS security layer. Emitting a
+    /// cleartext HTTP proxy for an `https://` link would send
+    /// `Proxy-Authorization` unprotected to port 443.
+    #[test]
+    fn https_proxy_link_gets_tls() {
+        let out = parse_proxy_uri("https://user:pass@proxy.example:443").unwrap();
+        let node = node_of(out);
+        assert!(
+            node.security.is_some(),
+            "https:// proxy link must produce a TLS security layer, got none"
+        );
+    }
+
+    /// `security=reality` without `pbk` must fail loudly rather than silently
+    /// degrading to a plaintext stream.
+    #[test]
+    fn reality_without_public_key_is_rejected() {
+        let err = parse_proxy_uri(
+            "vless://11111111-2222-3333-4444-555555555555@example.com:443?security=reality&sni=example.com",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("pbk"),
+            "expected a pbk error, got: {err}"
+        );
+    }
 
     fn node_of(out: OutboundConfig) -> Box<LayeredOutboundNode> {
         match out {
@@ -998,11 +1081,61 @@ mod tests {
 
     #[test]
     fn test_urlencoding_decode_utf8() {
-        assert_eq!(urlencoding_decode("hello+world"), "hello world");
+        // `+` is literal in userinfo/fragments (a password may contain it) and a
+        // space only in form-encoded query values.
+        assert_eq!(urlencoding_decode("hello+world"), "hello+world");
+        assert_eq!(urlencoding_decode_query("hello+world"), "hello world");
         assert_eq!(
             urlencoding_decode("%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82"),
             "привет"
         );
         assert_eq!(urlencoding_decode("node%201"), "node 1");
+    }
+}
+
+#[cfg(test)]
+mod parser_hardening_tests {
+    use super::*;
+
+    fn node_of(out: OutboundConfig) -> Box<LayeredOutboundNode> {
+        match out {
+            OutboundConfig::Node(n) => n,
+            _ => panic!("expected node outbound"),
+        }
+    }
+
+    /// A password containing `+` must survive the round trip intact.
+    #[test]
+    fn password_plus_is_not_decoded_to_space() {
+        // Trojan's whole userinfo is the password (there is no username field).
+        let out = parse_proxy_uri("trojan://p%2Bss+word@example.com:443#t").unwrap();
+        let node = node_of(out);
+        match &node.protocol {
+            crate::config::ProtocolConfig::Trojan { password } => {
+                assert_eq!(password, "p+ss+word", "`+` must stay literal in userinfo");
+            }
+            other => panic!("unexpected protocol {other:?}"),
+        }
+    }
+
+    /// Two fragment-less links must get distinct tags instead of colliding.
+    #[test]
+    fn fragment_less_links_get_unique_tags() {
+        let a = node_of(parse_proxy_uri("socks5://127.0.0.1:1080").unwrap());
+        let b = node_of(parse_proxy_uri("socks5://127.0.0.1:1080").unwrap());
+        assert_ne!(
+            a.tag, b.tag,
+            "fragment-less links must get unique tags to survive validation"
+        );
+    }
+
+    /// A non-numeric port must be an error rather than being folded into the host.
+    #[test]
+    fn non_numeric_port_is_rejected() {
+        let err = parse_proxy_uri("socks5://example.com:abc").unwrap_err();
+        assert!(
+            err.to_string().contains("port") || err.to_string().contains("host"),
+            "unexpected error: {err}"
+        );
     }
 }
