@@ -79,12 +79,12 @@ use flux_types::{
     StreamDialer, TargetAddress, UdpPacket,
 };
 use parking_lot::Mutex as PlMutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -227,8 +227,15 @@ impl Default for MuxConfig {
 
 impl MuxConfig {
     /// Bounded per-stream frame queue depth derived from the byte budget.
+    ///
+    /// The *peer* chooses frame lengths, and the wire format allows up to
+    /// `u16::MAX` bytes per frame; `max_frame_size` only bounds what we emit.
+    /// The reader rejects frames longer than `frame_size()` (see `reader_loop`),
+    /// so `queue_capacity * frame_size <= max_buffered_bytes`: the byte budget
+    /// holds because the frame length is bounded, not because we hope the peer
+    /// sends small frames.
     fn queue_capacity(&self) -> usize {
-        (self.max_buffered_bytes / self.max_frame_size.max(1)).clamp(2, 1024)
+        (self.max_buffered_bytes / self.frame_size()).clamp(2, 1024)
     }
 
     fn frame_size(&self) -> usize {
@@ -360,10 +367,14 @@ struct Shared {
     /// Send credit advertised by a `UPD`-sending (v2-style) peer. `i64::MAX`
     /// means "no window" (plain smux v1), which is what sing-box speaks.
     peer_window: AtomicI64,
-    /// Wakes writers when the peer advertises more window.
-    credit_ready: Notify,
-    /// Wakes writers when a slot in the frame queue frees up.
-    out_ready: Notify,
+    /// Wakers of writers parked waiting for peer window credit.
+    credit_wakers: PlMutex<Vec<Waker>>,
+    /// Wakers of writers parked on a full frame queue.
+    out_wakers: PlMutex<Vec<Waker>>,
+    /// Streams whose EOF has been received but not yet delivered because the
+    /// event channel was full. Keeping at most one deferred delivery per
+    /// stream bounds what a FIN flood can spawn.
+    fin_pending: PlMutex<HashSet<u32>>,
 }
 
 fn now_ms() -> u64 {
@@ -389,7 +400,58 @@ impl Shared {
         debug!("smux: closing session: {}", reason);
         // Dropping the senders makes every stream reader observe EOF.
         self.streams.lock().clear();
+        // `notify_waiters` does not leave a permit behind, so a task that
+        // registers after this point would wait forever; the worker loops use
+        // `Notified::enable` plus an `is_closed()` check to close that window.
         self.shutdown.notify_waiters();
+        // Every writer parked on the frame queue or on window credit must be
+        // woken, otherwise it waits for a wakeup that will never come.
+        self.wake_out();
+        self.wake_credit();
+    }
+
+    /// Registers `waker` to be woken when frame queue space frees up.
+    fn park_out(&self, waker: &Waker) {
+        register_waker(&mut self.out_wakers.lock(), waker);
+    }
+
+    /// Wakes every writer parked on the frame queue.
+    fn wake_out(&self) {
+        // Drop the guard before waking: a waker must never be called with one of
+        // the session's locks held.
+        let wakers = std::mem::take(&mut *self.out_wakers.lock());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Registers `waker` to be woken when the peer advertises more window.
+    fn park_credit(&self, waker: &Waker) {
+        register_waker(&mut self.credit_wakers.lock(), waker);
+    }
+
+    /// Wakes every writer parked on window credit.
+    fn wake_credit(&self) {
+        let wakers = std::mem::take(&mut *self.credit_wakers.lock());
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+
+    /// Delivers `StreamEvent::Fin` to a stream whose event channel is full,
+    /// coalescing repeated FIN frames for the same stream into a single task so
+    /// a peer cannot spawn tasks without bound.
+    fn deliver_fin(self: &Arc<Self>, stream_id: u32, sink: mpsc::Sender<StreamEvent>) {
+        // The guard is dropped here, before the task is spawned.
+        let first_for_stream = self.fin_pending.lock().insert(stream_id);
+        if !first_for_stream {
+            return; // a deferred delivery is already queued for this stream
+        }
+        let shared = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = sink.send(StreamEvent::Fin).await;
+            shared.fin_pending.lock().remove(&stream_id);
+        });
     }
 
     fn try_send_frame(&self, stream_id: u32, cmd: u8, payload: Bytes) -> bool {
@@ -407,15 +469,52 @@ impl Shared {
     }
 
     fn register(&self, stream_id: u32, tx: mpsc::Sender<StreamEvent>) {
+        // A reused stream id must not inherit the previous stream's deferred
+        // EOF state.
+        self.fin_pending.lock().remove(&stream_id);
         self.streams.lock().insert(stream_id, tx);
         self.open_streams.fetch_add(1, Ordering::Relaxed);
     }
 
     fn unregister(&self, stream_id: u32) {
+        self.fin_pending.lock().remove(&stream_id);
         if self.streams.lock().remove(&stream_id).is_some() {
             self.open_streams.fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Records `waker` once: a task that parks twice for the same condition must
+/// not grow the registry.
+fn register_waker(list: &mut Vec<Waker>, waker: &Waker) {
+    if !list.iter().any(|registered| registered.will_wake(waker)) {
+        list.push(waker.clone());
+    }
+}
+
+/// Queues a frame, retrying from a detached task when the queue is momentarily
+/// full so a control frame (a FIN) is never silently dropped.
+fn send_frame_or_defer(shared: &Arc<Shared>, stream_id: u32, cmd: u8, payload: Bytes) {
+    if shared.is_closed() {
+        return;
+    }
+    if shared.try_send_frame(stream_id, cmd, payload.clone()) {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let shared = Arc::clone(shared);
+    handle.spawn(async move {
+        let _ = shared
+            .out_tx
+            .send(OutFrame {
+                stream_id,
+                cmd,
+                payload,
+            })
+            .await;
+    });
 }
 
 /// One multiplexed physical connection.
@@ -450,7 +549,11 @@ impl MuxSession {
         if self.shared.is_closed() {
             return Err(smux_err("session closed"));
         }
-        if !self.has_capacity() {
+        // `max_streams` is a hard cap only on the accepting side. A client
+        // treats it as a pooling target: `MuxClient::session` deliberately
+        // reuses the least loaded session once the pool is full, so refusing
+        // here would turn the pooling hint into a spurious dial failure.
+        if self.shared.role == Role::Server && !self.has_capacity() {
             return Err(smux_err("stream limit reached on this session"));
         }
         let stream_id = self.shared.allocate_id();
@@ -533,8 +636,9 @@ impl MuxSession {
             shutdown: Notify::new(),
             last_activity_ms: AtomicU64::new(now_ms()),
             peer_window: AtomicI64::new(i64::MAX),
-            credit_ready: Notify::new(),
-            out_ready: Notify::new(),
+            credit_wakers: PlMutex::new(Vec::new()),
+            out_wakers: PlMutex::new(Vec::new()),
+            fin_pending: PlMutex::new(HashSet::new()),
         });
         let reader = tokio::spawn(reader_loop(shared.clone(), read_half, accepts_tx));
         let writer = tokio::spawn(writer_loop(shared.clone(), write_half, out_rx));
@@ -560,6 +664,15 @@ async fn reader_loop(
         while filled < FRAME_HEADER_LEN {
             let idle = shared.config.idle_timeout;
             let idle_enabled = idle.is_some() && shared.open_streams.load(Ordering::Relaxed) == 0;
+            // Register for shutdown *before* checking the flag: `notify_waiters`
+            // leaves no permit behind, so a close that lands between the check
+            // and the wait would otherwise strand this task forever.
+            let shutdown = shared.shutdown.notified();
+            tokio::pin!(shutdown);
+            shutdown.as_mut().enable();
+            if shared.is_closed() {
+                return;
+            }
             let read = read_half.read(&mut header_bytes[filled..]);
             tokio::pin!(read);
             let idle_sleep = tokio::time::sleep(idle.unwrap_or(Duration::from_secs(3600)));
@@ -579,7 +692,7 @@ async fn reader_loop(
                         return;
                     }
                 },
-                _ = shared.shutdown.notified() => return,
+                _ = &mut shutdown => return,
                 _ = &mut idle_sleep, if idle_enabled => {
                     shared.close("idle session timeout");
                     return;
@@ -598,6 +711,18 @@ async fn reader_loop(
             "smux: rx cmd={} sid={} len={}",
             header.cmd, header.stream_id, header.length
         );
+
+        // `max_frame_size` bounds what we buffer from the peer, not only what
+        // we emit: `queue_capacity` is derived from it, so accepting longer
+        // frames would multiply a stream's byte budget by up to 64x.
+        if header.length as usize > shared.config.frame_size() {
+            shared.close(&format!(
+                "frame of {} bytes exceeds the configured maximum of {}",
+                header.length,
+                shared.config.frame_size()
+            ));
+            return;
+        }
 
         let mut payload = BytesMut::new();
         if header.length > 0 {
@@ -677,14 +802,18 @@ async fn reader_loop(
             }
             CMD_FIN => {
                 let sink = shared.streams.lock().get(&header.stream_id).cloned();
-                if let Some(sink) = sink
-                    && let Err(mpsc::error::TrySendError::Full(_)) =
-                        sink.clone().try_send(StreamEvent::Fin)
-                {
-                    // Deliver the EOF once the consumer drains its buffer.
-                    tokio::spawn(async move {
-                        let _ = sink.send(StreamEvent::Fin).await;
-                    });
+                if let Some(sink) = sink {
+                    match sink.try_send(StreamEvent::Fin) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            // Deliver the EOF once the consumer drains its
+                            // buffer, at most once per stream.
+                            shared.deliver_fin(header.stream_id, sink);
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            shared.unregister(header.stream_id);
+                        }
+                    }
                 }
             }
             CMD_NOP => {
@@ -717,6 +846,9 @@ fn handle_syn(shared: &Arc<Shared>, header: &FrameHeader, accepts: &mpsc::Sender
     }
     let (tx, rx) = mpsc::channel(shared.config.queue_capacity());
     {
+        // Clear any deferred EOF left over from a stream that used this id
+        // before it was closed (ids may be reused, like smux).
+        shared.fin_pending.lock().remove(&stream_id);
         let mut streams = shared.streams.lock();
         if streams.contains_key(&stream_id) {
             // Duplicate SYN: ignore, like smux.
@@ -742,7 +874,7 @@ fn apply_window_update(shared: &Arc<Shared>, payload: &Bytes) {
     // session. smux v2 tracks this per stream; sing-box never sends UPD for
     // v1 sessions, so this only matters for v2-style peers and tests.
     shared.peer_window.store(window, Ordering::Release);
-    shared.credit_ready.notify_waiters();
+    shared.wake_credit();
     trace!("smux: peer advertised window {}", window);
 }
 
@@ -763,6 +895,13 @@ async fn writer_loop(
     ticker.tick().await;
 
     loop {
+        // Same lost-wakeup guard as the reader: register before checking.
+        let shutdown = shared.shutdown.notified();
+        tokio::pin!(shutdown);
+        shutdown.as_mut().enable();
+        if shared.is_closed() {
+            return;
+        }
         let first = tokio::select! {
             frame = out_rx.recv() => match frame {
                 Some(frame) => frame,
@@ -771,7 +910,7 @@ async fn writer_loop(
                     return;
                 }
             },
-            _ = shared.shutdown.notified() => return,
+            _ = &mut shutdown => return,
             _ = ticker.tick(), if keepalive.is_some() => {
                 if shared.try_send_frame(0, CMD_NOP, Bytes::new()) {
                     continue;
@@ -780,13 +919,13 @@ async fn writer_loop(
             }
         };
 
-        shared.out_ready.notify_one();
+        shared.wake_out();
         buffer.clear();
         push_frame(&mut buffer, &first);
         // Coalesce everything already queued into a single write.
         while let Ok(frame) = out_rx.try_recv() {
             push_frame(&mut buffer, &frame);
-            shared.out_ready.notify_one();
+            shared.wake_out();
             if buffer.len() >= 32 * 1024 {
                 break;
             }
@@ -1035,8 +1174,10 @@ impl MuxStream {
         }
         self.fin_sent = true;
         self.write_closed = true;
-        self.shared
-            .try_send_frame(self.stream_id, CMD_FIN, Bytes::new());
+        // Never drop the half close: if the frame queue is momentarily full the
+        // FIN is retried from a task (the peer would otherwise wait for EOF
+        // forever).
+        send_frame_or_defer(&self.shared, self.stream_id, CMD_FIN, Bytes::new());
         // The stream stays registered so the peer may keep sending: FIN is a
         // half close, not a teardown.
         Ok(())
@@ -1124,27 +1265,36 @@ impl AsyncWrite for MuxStream {
         // 1. Reserve a slot in the session's frame queue. Doing this before
         //    consuming window credit keeps the accounting exact when a poll
         //    would block halfway through.
-        let permit = loop {
-            match this.shared.out_tx.try_reserve() {
-                Ok(permit) => break permit,
-                Err(_) => {
-                    if this.shared.is_closed() {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "mux session is closed",
-                        )));
-                    }
-                    let notified = this.shared.out_ready.notified();
-                    let mut notified = std::pin::pin!(notified);
-                    if notified.as_mut().poll(cx).is_pending() {
-                        return Poll::Pending;
-                    }
+        let permit = match this.shared.out_tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(_) => {
+                if this.shared.is_closed() {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "mux session is closed",
+                    )));
+                }
+                // Register the waker *before* looking again: a `Notified`
+                // future dropped on `Pending` leaves no registration behind, so
+                // the task would never be woken.
+                this.shared.park_out(cx.waker());
+                match this.shared.out_tx.try_reserve() {
+                    Ok(permit) => permit,
+                    Err(_) => return Poll::Pending,
                 }
             }
         };
 
         // 2. Consume peer window credit advertised by a UPD-sending peer.
         loop {
+            // A closed session must fail the write instead of parking the
+            // caller forever on credit that will never arrive.
+            if this.shared.is_closed() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mux session is closed",
+                )));
+            }
             let window = this.shared.peer_window.load(Ordering::Acquire);
             if window == i64::MAX {
                 break;
@@ -1165,11 +1315,17 @@ impl AsyncWrite for MuxStream {
                 }
                 continue;
             }
-            let notified = this.shared.credit_ready.notified();
-            let mut notified = std::pin::pin!(notified);
-            if notified.as_mut().poll(cx).is_pending() {
-                return Poll::Pending;
+            this.shared.park_credit(cx.waker());
+            if this.shared.peer_window.load(Ordering::Acquire) >= take as i64 {
+                continue;
             }
+            if this.shared.is_closed() {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "mux session is closed",
+                )));
+            }
+            return Poll::Pending;
         }
 
         permit.send(OutFrame {
@@ -1199,25 +1355,9 @@ impl Drop for MuxStream {
         // is momentarily full, retry from a task instead of dropping it.
         if !self.fin_sent {
             self.fin_sent = true;
-            if !self
-                .shared
-                .try_send_frame(self.stream_id, CMD_FIN, Bytes::new())
-                && let Ok(handle) = tokio::runtime::Handle::try_current()
-            {
-                let shared = self.shared.clone();
-                let stream_id = self.stream_id;
-                handle.spawn(async move {
-                    let _ = shared
-                        .out_tx
-                        .send(OutFrame {
-                            stream_id,
-                            cmd: CMD_FIN,
-                            payload: Bytes::new(),
-                        })
-                        .await;
-                });
-            }
+            send_frame_or_defer(&self.shared, self.stream_id, CMD_FIN, Bytes::new());
         }
+        self.shared.fin_pending.lock().remove(&self.stream_id);
         if self.shared.streams.lock().remove(&self.stream_id).is_some() {
             self.shared.open_streams.fetch_sub(1, Ordering::Relaxed);
         }
@@ -1695,22 +1835,30 @@ where
     }
     let mut padded = false;
     if version == PREFACE_VERSION_1 {
-        let mut flags = [0u8; 1];
-        conn.read_exact(&mut flags)
-            .await
-            .map_err(|e| smux_err(format!("failed to read the multiplex padding flag: {e}")))?;
-        padded = flags[0] != 0;
-        if padded {
-            let mut len = [0u8; 2];
-            conn.read_exact(&mut len).await.map_err(|e| {
-                smux_err(format!("failed to read the multiplex padding length: {e}"))
-            })?;
-            let padding_len = u16::from_be_bytes(len) as usize;
-            let mut discard = vec![0u8; padding_len];
-            conn.read_exact(&mut discard)
+        // The whole padding preface -- not just the first two bytes -- must
+        // honour the handshake timeout, otherwise a peer can pin this task (and
+        // its connection) indefinitely by promising padding it never sends.
+        tokio::time::timeout(timeout, async {
+            let mut flags = [0u8; 1];
+            conn.read_exact(&mut flags)
                 .await
-                .map_err(|e| smux_err(format!("failed to skip the multiplex padding: {e}")))?;
-        }
+                .map_err(|e| smux_err(format!("failed to read the multiplex padding flag: {e}")))?;
+            padded = flags[0] != 0;
+            if padded {
+                let mut len = [0u8; 2];
+                conn.read_exact(&mut len).await.map_err(|e| {
+                    smux_err(format!("failed to read the multiplex padding length: {e}"))
+                })?;
+                let padding_len = u16::from_be_bytes(len) as usize;
+                let mut discard = vec![0u8; padding_len];
+                conn.read_exact(&mut discard)
+                    .await
+                    .map_err(|e| smux_err(format!("failed to skip the multiplex padding: {e}")))?;
+            }
+            Ok::<(), FluxError>(())
+        })
+        .await
+        .map_err(|_| smux_err("timed out reading the multiplex padding preface"))??;
     }
     if config.padding && !padded {
         return Err(smux_err("non-padded multiplex connection rejected"));
@@ -1846,7 +1994,7 @@ pub async fn serve_udp_stream(
     let _ = packet_tx.send(first).await;
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    let read_task = tokio::spawn(async move {
+    let mut read_task = tokio::spawn(async move {
         loop {
             let destination = if packet_addr {
                 match read_socksaddr(&mut reader).await {
@@ -1871,7 +2019,7 @@ pub async fn serve_udp_stream(
         }
     });
 
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(packet) = out_rx.recv().await {
             let mut frame = Vec::with_capacity(32 + packet.payload.len());
             if packet_addr {
@@ -1890,10 +2038,18 @@ pub async fn serve_udp_stream(
     });
 
     tokio::select! {
-        _ = read_task => {}
-        _ = write_task => {}
+        _ = &mut read_task => {}
+        _ = &mut write_task => {}
         _ = dispatcher.dispatch_packet(meta, packet_rx, out_tx) => {}
     }
+    // Neither helper task may outlive the association. Left detached, the
+    // reader would keep the stream (and its session slot) registered forever,
+    // which both leaks a slot per association and pins the session: an idle
+    // timeout never fires while a stream is open.
+    read_task.abort();
+    write_task.abort();
+    let _ = read_task.await;
+    let _ = write_task.await;
     Ok(())
 }
 
@@ -2047,8 +2203,9 @@ mod tests {
             shutdown: Notify::new(),
             last_activity_ms: AtomicU64::new(now_ms()),
             peer_window: AtomicI64::new(i64::MAX),
-            credit_ready: Notify::new(),
-            out_ready: Notify::new(),
+            credit_wakers: PlMutex::new(Vec::new()),
+            out_wakers: PlMutex::new(Vec::new()),
+            fin_pending: PlMutex::new(HashSet::new()),
         });
         assert_eq!(server_shared.allocate_id(), 2);
         assert_eq!(server_shared.allocate_id(), 4);
@@ -2570,6 +2727,653 @@ mod tests {
                 Ok(Ok(_)) => {}
                 Ok(Err(_)) => return,
             }
+        }
+    }
+
+// =======================================================================
+    // Hardening tests for the untrusted-input paths (security audit)
+    // =======================================================================
+
+    /// Minimal dispatcher whose packet path returns immediately.
+    struct ImmediatePackets;
+
+    #[async_trait::async_trait]
+    impl Dispatcher for ImmediatePackets {
+        async fn dispatch_stream(&self, _meta: SessionMeta, _stream: BoxedStream) {}
+        async fn dial_outbound(&self, _meta: &SessionMeta) -> FluxResult<BoxedStream> {
+            Err(smux_err("unused"))
+        }
+        async fn bridge_streams(&self, _meta: SessionMeta, _stream: BoxedStream, _out: BoxedStream) {
+        }
+        async fn dispatch_packet(
+            &self,
+            _meta: SessionMeta,
+            _rx: mpsc::Receiver<UdpPacket>,
+            _tx: mpsc::Sender<UdpPacket>,
+        ) {
+            // Ends the association immediately, like a dispatcher that could not
+            // route the first datagram.
+        }
+    }
+
+    /// Reads one `[header][payload]` frame from a raw peer.
+    async fn read_raw_frame(peer: &mut tokio::io::DuplexStream) -> Option<(u8, u32, Vec<u8>)> {
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        peer.read_exact(&mut header).await.ok()?;
+        let decoded = FrameHeader::decode(&header).ok()?;
+        let mut payload = vec![0u8; decoded.length as usize];
+        if !payload.is_empty() {
+            peer.read_exact(&mut payload).await.ok()?;
+        }
+        Some((decoded.cmd, decoded.stream_id, payload))
+    }
+
+    /// Waits for a specific frame, discarding everything before it.
+    async fn expect_frame(
+        peer: &mut tokio::io::DuplexStream,
+        cmd: u8,
+        stream_id: u32,
+        budget: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match tokio::time::timeout(remaining, read_raw_frame(peer)).await {
+                Ok(Some((c, s, _))) if c == cmd && s == stream_id => return true,
+                Ok(Some(_)) => continue,
+                _ => return false,
+            }
+        }
+    }
+
+    /// Builds the server half of a session by hand so the test can inspect the
+    /// shared state. The peer must already have written the session preface.
+    async fn manual_server_session(
+        server_side: tokio::io::DuplexStream,
+        config: &MuxConfig,
+    ) -> (Arc<MuxSession>, mpsc::Receiver<PendingAccept>) {
+        let mut server_side = server_side;
+        let mut preface = [0u8; 2];
+        server_side
+            .read_exact(&mut preface)
+            .await
+            .expect("preface");
+        assert_eq!(preface, [PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX]);
+        let (accepts_tx, accepts_rx) = mpsc::channel::<PendingAccept>(8);
+        let session = MuxSession::start(
+            Box::new(server_side),
+            config.clone(),
+            Role::Server,
+            Some(accepts_tx),
+        );
+        (session, accepts_rx)
+    }
+
+    fn udp_datagram(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + payload.len());
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// A session that closes must wake every writer blocked on it: a peer that
+    /// advertises a zero window and then disappears must not leave the
+    /// application's `write_all` parked forever.
+    #[tokio::test]
+    async fn session_close_wakes_a_writer_blocked_on_window_credit() {
+        let (client_side, mut peer) = raw_pair(64 * 1024);
+        let client = MuxSession::connect(client_side, MuxConfig::default())
+            .await
+            .expect("client");
+        let mut stream = client.open_stream().await.expect("open");
+        let stream_id = stream.id();
+        stream
+            .write_all(&encode_stream_request(
+                &TargetAddress::domain("example.com", 80),
+                NetworkType::Tcp,
+            ))
+            .await
+            .expect("request");
+        stream.flush().await.expect("flush");
+        drain_for(&mut peer, Duration::from_millis(200)).await;
+
+        // Zero window: every further write waits for credit.
+        peer.write_all(&upd_frame(stream_id, 0)).await.expect("upd");
+        peer.flush().await.expect("flush");
+
+        // The writer parks inside `poll_write`, waiting for credit.
+        let writer = tokio::spawn(async move { stream.write_all(b"x").await.is_err() });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !writer.is_finished(),
+            "the write must block while the window is empty"
+        );
+
+        // The peer vanishes, which closes the session underneath the writer.
+        drop(peer);
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("a writer parked on window credit was never woken after the session closed");
+        assert!(
+            joined.expect("write task panicked"),
+            "the blocked write must fail once the session is closed"
+        );
+    }
+
+    /// Same requirement for a writer parked because the session's frame queue is
+    /// full: closing the session has to wake it.
+    #[tokio::test]
+    async fn session_close_wakes_a_writer_blocked_on_the_frame_queue() {
+        let (client_side, peer) = raw_pair(4096);
+        let client = MuxSession::connect(client_side, MuxConfig::default())
+            .await
+            .expect("client");
+        let mut stream = client.open_stream().await.expect("open");
+
+        // The peer never reads, so the session writer blocks and the frame
+        // queue fills: this task parks inside `poll_write`.
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0xA5u8; 4096];
+            loop {
+                if stream.write_all(&chunk).await.is_err() {
+                    return true;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !writer.is_finished(),
+            "the writer must be parked on the full frame queue"
+        );
+
+        drop(peer);
+
+        let joined = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("a writer parked on the frame queue was never woken after the session closed");
+        assert!(
+            joined.expect("write task panicked"),
+            "the blocked write must fail once the session is closed"
+        );
+    }
+
+    /// A session that is closed immediately after it starts must still stop both
+    /// of its worker tasks: `Notify::notify_waiters` leaves no permit behind, so
+    /// a task that registers after the close would otherwise hang forever (one
+    /// leaked task and `Shared` per closed session).
+    #[tokio::test]
+    async fn closing_a_session_stops_its_worker_tasks() {
+        for round in 0..16 {
+            let (mut peer, server_raw) = tokio::io::duplex(64 * 1024);
+            peer.write_all(&[PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX])
+                .await
+                .expect("preface");
+            let (session, _accepts_rx) =
+                manual_server_session(server_raw, &MuxConfig::default()).await;
+            // Close before either task has had a chance to run.
+            session.shared.close("closed before the tasks were polled");
+            let tasks: Vec<_> = session.tasks.lock().drain(..).collect();
+            assert_eq!(tasks.len(), 2, "round {round}");
+            for task in tasks {
+                match tokio::time::timeout(Duration::from_secs(2), task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => panic!("round {round}: session task failed: {e}"),
+                    Err(_) => panic!(
+                        "round {round}: a session task never observed the close (lost wakeup)"
+                    ),
+                }
+            }
+            drop(peer);
+        }
+    }
+
+    /// A half close must survive a momentarily full frame queue instead of being
+    /// silently dropped (the peer would then wait for EOF forever).
+    #[tokio::test]
+    async fn half_close_fin_is_not_lost_when_the_frame_queue_is_full() {
+        // A tiny duplex keeps the session writer blocked, so the 64-slot frame
+        // queue fills up while the peer reads nothing.
+        let (client_side, mut peer) = raw_pair(4096);
+        let client = MuxSession::connect(client_side, MuxConfig::default())
+            .await
+            .expect("client");
+        // Consume the session preface so the frames parse from their own start.
+        let mut preface = [0u8; 2];
+        peer.read_exact(&mut preface).await.expect("preface");
+        assert_eq!(preface, [PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX]);
+
+        let mut stream = client.open_stream().await.expect("open");
+        let stream_id = stream.id();
+        stream
+            .write_all(&encode_stream_request(
+                &TargetAddress::domain("example.com", 80),
+                NetworkType::Tcp,
+            ))
+            .await
+            .expect("request");
+        stream.flush().await.expect("flush");
+
+        let chunk = vec![0x5Au8; 1024];
+        let mut queued = 0usize;
+        for _ in 0..256 {
+            if tokio::time::timeout(Duration::from_millis(50), stream.write_all(&chunk))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            queued += 1;
+        }
+        assert!(queued > 0, "expected to be able to queue some frames");
+
+        // The queue is saturated: the FIN must still reach the peer.
+        stream.shutdown().await.expect("shutdown");
+
+        assert!(
+            expect_frame(&mut peer, CMD_FIN, stream_id, Duration::from_secs(5)).await,
+            "the half-close FIN was dropped because the frame queue was full"
+        );
+    }
+
+    /// A peer can send FIN as fast as it likes; the reader must not spawn one
+    /// detached task per frame (unbounded memory).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_fin_frames_do_not_spawn_unbounded_tasks() {
+        let config = MuxConfig::default();
+        let (mut peer, server_raw) = tokio::io::duplex(1024 * 1024);
+        peer.write_all(&[PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX])
+            .await
+            .expect("preface");
+        let (session, mut accepts_rx) = manual_server_session(server_raw, &config).await;
+
+        peer.write_all(&FrameHeader::new(CMD_SYN, 3, 0).encode())
+            .await
+            .expect("syn");
+        peer.flush().await.expect("flush");
+        // Hold the accepted stream without reading it: its event channel fills.
+        let _pending = tokio::time::timeout(Duration::from_secs(2), accepts_rx.recv())
+            .await
+            .expect("no stream accepted")
+            .expect("accept channel closed");
+
+        let baseline = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        let frame = FrameHeader::new(CMD_FIN, 3, 0).encode();
+        // 2000 FINs for one stream: at most one deferred delivery may be in
+        // flight, so the task count must stay essentially flat.
+        for _ in 0..2000 {
+            peer.write_all(&frame).await.expect("fin");
+        }
+        peer.flush().await.expect("flush");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let alive = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        let spawned = alive.saturating_sub(baseline);
+        assert!(
+            spawned < 100,
+            "a 2000-frame FIN flood spawned {spawned} tasks: per-stream EOF delivery must be coalesced"
+        );
+        session.shared.close("test finished");
+    }
+
+    /// When the dispatcher returns, the association's reader task must not stay
+    /// behind holding the stream (which leaks a stream slot per UDP association
+    /// and wedges the session at `max_streams`).
+    #[tokio::test]
+    async fn udp_association_releases_its_stream_when_the_dispatcher_returns() {
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        let config = MuxConfig::default();
+        let client = MuxSession::connect(Box::new(client_raw), config.clone())
+            .await
+            .expect("client");
+        let (session, mut accepts_rx) = manual_server_session(server_raw, &config).await;
+
+        let mut stream = client.open_stream().await.expect("open");
+        stream
+            .write_all(&encode_stream_request(
+                &TargetAddress::domain("dns.example", 53),
+                NetworkType::Udp,
+            ))
+            .await
+            .expect("request");
+        stream
+            .write_all(&udp_datagram(b"abc"))
+            .await
+            .expect("datagram");
+        stream.flush().await.expect("flush");
+
+        let pending = tokio::time::timeout(Duration::from_secs(2), accepts_rx.recv())
+            .await
+            .expect("no stream accepted")
+            .expect("accept channel closed");
+        let mut server_stream = MuxStream::new(
+            pending.stream_id,
+            session.shared.clone(),
+            pending.rx,
+            Role::Server,
+        );
+        let request = server_stream.read_request().await.expect("read request");
+        assert_eq!(request.network, NetworkType::Udp);
+
+        let dispatcher: Arc<dyn Dispatcher> = Arc::new(ImmediatePackets);
+        let meta = SessionMeta::new(
+            "127.0.0.1:0".parse().unwrap(),
+            request.destination.clone(),
+            "test",
+            NetworkType::Udp,
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            serve_udp_stream(server_stream, meta, dispatcher, false),
+        )
+        .await
+        .expect("the association must end when the dispatcher returns")
+        .expect("association");
+
+        assert_eq!(
+            session.shared.open_streams.load(Ordering::Relaxed),
+            0,
+            "the UDP association leaked its stream: its reader task outlived the association"
+        );
+        drop(client);
+    }
+
+    /// The whole preface, not just its first two bytes, must honour the
+    /// handshake timeout.
+    #[tokio::test]
+    async fn padded_preface_is_read_under_the_handshake_timeout() {
+        let (server_side, mut peer) = raw_pair(64 * 1024);
+        // Version 1 (padding aware) and then silence: the peer never sends the
+        // padding flag it promised.
+        peer.write_all(&[PREFACE_VERSION_1, PREFACE_PROTOCOL_SMUX])
+            .await
+            .expect("preface");
+        peer.flush().await.expect("flush");
+
+        let config = MuxConfig {
+            padding: true,
+            handshake_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(3), serve(server_side, &config, |_| {})).await;
+        let result = outcome.expect("the preface continuation must honour the handshake timeout");
+        assert!(result.is_err(), "an incomplete padded preface must fail");
+    }
+
+    /// `max_frame_size` must bound what the reader *buffers*, not only what we
+    /// emit: `queue_capacity` is derived from it, so a peer that ignores the
+    /// limit could otherwise multiply a stream's byte budget by 64x.
+    #[tokio::test]
+    async fn oversized_frames_are_rejected_instead_of_buffered() {
+        let config = MuxConfig {
+            max_buffered_bytes: 64 * 1024,
+            max_frame_size: 1024,
+            max_streams: 4,
+            ..Default::default()
+        };
+        // The byte budget is exactly depth * frame_size for any config.
+        assert!(
+            config.queue_capacity() * config.frame_size() <= config.max_buffered_bytes,
+            "queue depth {} * frame size {} exceeds the {} byte budget",
+            config.queue_capacity(),
+            config.frame_size(),
+            config.max_buffered_bytes
+        );
+
+        let (mut peer, server_raw) = tokio::io::duplex(1024 * 1024);
+        peer.write_all(&[PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX])
+            .await
+            .expect("preface");
+        let (session, mut accepts_rx) = manual_server_session(server_raw, &config).await;
+
+        // A stream and its request, both within the configured frame size.
+        let request = encode_stream_request(
+            &TargetAddress::domain("slow.example", 80),
+            NetworkType::Tcp,
+        );
+        peer.write_all(&FrameHeader::new(CMD_SYN, 3, 0).encode())
+            .await
+            .expect("syn");
+        peer.write_all(&FrameHeader::new(CMD_PSH, 3, request.len() as u16).encode())
+            .await
+            .expect("psh");
+        peer.write_all(&request).await.expect("request");
+        peer.flush().await.expect("flush");
+        let _pending = tokio::time::timeout(Duration::from_secs(2), accepts_rx.recv())
+            .await
+            .expect("no stream accepted")
+            .expect("accept channel closed");
+
+        // One maximum-length frame: four times the configured budget for a
+        // single buffer, so it must be a protocol violation, not a buffer.
+        let payload = vec![0xEEu8; u16::MAX as usize];
+        peer.write_all(&FrameHeader::new(CMD_PSH, 3, u16::MAX).encode())
+            .await
+            .expect("header");
+        peer.write_all(&payload).await.expect("payload");
+        peer.flush().await.expect("flush");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !session.shared.is_closed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a frame larger than max_frame_size was buffered instead of rejected"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            session.shared.streams.lock().is_empty(),
+            "the oversize frame must tear the session down"
+        );
+    }
+
+    /// A client session's `max_streams` is a pooling target; only the server
+    /// side enforces it as a hard cap. Otherwise a client fails instead of
+    /// reusing its least loaded session once the pool is full.
+    #[tokio::test]
+    async fn client_max_streams_is_a_pooling_hint_not_a_hard_cap() {
+        let (client_side, mut peer) = raw_pair(256 * 1024);
+        let config = MuxConfig {
+            max_streams: 2,
+            max_connections: 1,
+            ..Default::default()
+        };
+        let client = MuxSession::connect(client_side, config)
+            .await
+            .expect("client");
+
+        let mut held = Vec::new();
+        for i in 0..4u32 {
+            let stream = client
+                .open_stream()
+                .await
+                .unwrap_or_else(|e| panic!("client stream {i} was refused: {e}"));
+            held.push(stream);
+        }
+        drain_for(&mut peer, Duration::from_millis(100)).await;
+        drop(held);
+        drop(client);
+    }
+
+    /// Fuzz-style regression: random and mutated frames must never panic the
+    /// session decoder, and per-session state must stay bounded by the config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fuzz_mutated_frames_never_panic_and_keep_state_bounded() {
+        let config = MuxConfig {
+            max_streams: 4,
+            max_buffered_bytes: 8 * 1024,
+            max_frame_size: 256,
+            keepalive: None,
+            idle_timeout: Some(Duration::from_millis(100)),
+            handshake_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let mut rng = 0x243F_6A88_85A3_08D3u64;
+
+        // 1. The pure header decoder must be total.
+        for _ in 0..4096 {
+            let mut bytes = [0u8; FRAME_HEADER_LEN];
+            for byte in bytes.iter_mut() {
+                *byte = xorshift(&mut rng) as u8;
+            }
+            if let Ok(header) = FrameHeader::decode(&bytes) {
+                assert_eq!(header.encode(), bytes, "decode/encode must round trip");
+                assert!(header.cmd <= CMD_UPD);
+                assert_eq!(header.version, SMUX_VERSION);
+            }
+        }
+
+        // 2. Random/mutated frame streams must not panic the session reader and
+        //    must never leave more state behind than the config allows.
+        for round in 0..96u64 {
+            let (mut peer, server_raw) = tokio::io::duplex(64 * 1024);
+            peer.write_all(&[PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX])
+                .await
+                .expect("preface");
+            let (session, mut accepts_rx) = manual_server_session(server_raw, &config).await;
+
+            let frames = (xorshift(&mut rng) % 8) + 1;
+            let mut bytes = Vec::new();
+            for _ in 0..frames {
+                if xorshift(&mut rng).is_multiple_of(16) {
+                    // Pure garbage, not even a well-formed header.
+                    for _ in 0..(xorshift(&mut rng) % 12) {
+                        bytes.push(xorshift(&mut rng) as u8);
+                    }
+                    continue;
+                }
+                let cmd = (xorshift(&mut rng) % 6) as u8;
+                let stream_id = (xorshift(&mut rng) % 12) as u32;
+                let length = (xorshift(&mut rng) % 128) as u16;
+                let version = if xorshift(&mut rng).is_multiple_of(8) { 2 } else { 1 };
+                bytes.extend_from_slice(
+                    &FrameHeader {
+                        version,
+                        cmd,
+                        length,
+                        stream_id,
+                    }
+                    .encode(),
+                );
+                let declared = if xorshift(&mut rng).is_multiple_of(16) {
+                    // Truncated payload: this frame never completes.
+                    length as usize / 2
+                } else {
+                    length as usize
+                };
+                for _ in 0..declared {
+                    bytes.push(xorshift(&mut rng) as u8);
+                }
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(250), async {
+                let _ = peer.write_all(&bytes).await;
+                let _ = peer.flush().await;
+            })
+            .await;
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                session.shared.streams.lock().len() <= config.max_streams as usize,
+                "round {round}: stream map grew past max_streams"
+            );
+            assert!(
+                session.shared.open_streams.load(Ordering::Relaxed) <= config.max_streams as usize,
+                "round {round}: open stream counter grew past max_streams"
+            );
+            while let Ok(pending) = accepts_rx.try_recv() {
+                drop(pending);
+            }
+            session.shared.close("fuzz round finished");
+            let tasks: Vec<_> = session.tasks.lock().drain(..).collect();
+            for task in tasks {
+                match tokio::time::timeout(Duration::from_secs(1), task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => assert!(!e.is_panic(), "round {round}: session task panicked: {e}"),
+                    Err(_) => panic!("round {round}: session task did not stop"),
+                }
+            }
+            drop(peer);
+        }
+    }
+
+    /// Fuzz-style regression for the client half: random bytes after the stream
+    /// request are parsed by the status/varint state machine and must never
+    /// panic, hang, or buffer without bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fuzz_random_status_payloads_do_not_panic_the_client_handshake() {
+        let mut rng = 0x853C_49E6_748F_EA9Bu64;
+        for round in 0..48u64 {
+            let (client_side, mut peer) = raw_pair(64 * 1024);
+            let client = MuxSession::connect(client_side, MuxConfig::default())
+                .await
+                .expect("client");
+            let mut stream = client.open_stream().await.expect("open");
+            let stream_id = stream.id();
+            drain_for(&mut peer, Duration::from_millis(20)).await;
+
+            let len = (xorshift(&mut rng) % 300) as usize + 1;
+            let mut payload = vec![0u8; len];
+            for byte in payload.iter_mut() {
+                *byte = xorshift(&mut rng) as u8;
+            }
+            // Bias towards the interesting status bytes.
+            payload[0] = match round % 4 {
+                0 => 0,
+                1 => 1,
+                2 => 1,
+                _ => xorshift(&mut rng) as u8,
+            };
+            let mut frame = FrameHeader::new(CMD_PSH, stream_id, len as u16)
+                .encode()
+                .to_vec();
+            frame.extend_from_slice(&payload);
+            peer.write_all(&frame).await.expect("psh");
+            peer.flush().await.expect("flush");
+
+            let reader = tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                let mut total = 0usize;
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(200), stream.read(&mut buf))
+                        .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(n)) => {
+                            total += n;
+                            if total > 1 << 20 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                total
+            });
+            let joined = tokio::time::timeout(Duration::from_secs(2), reader)
+                .await
+                .expect("the client reader hung on a random status payload");
+            match joined {
+                Ok(_) => {}
+                Err(e) => assert!(!e.is_panic(), "round {round}: client read panicked: {e}"),
+            }
+            drop(peer);
+            drop(client);
         }
     }
 }
