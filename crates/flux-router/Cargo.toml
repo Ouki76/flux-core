@@ -1,6 +1,6 @@
 [package]
 name = "flux-router"
-version = "1.0.0"
+version = "1.2.1"
 license = "MIT"
 rust-version = "1.91"
 edition = "2024"

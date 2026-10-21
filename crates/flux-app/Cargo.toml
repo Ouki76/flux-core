@@ -1,6 +1,6 @@
 [package]
 name = "flux-app"
-version = "1.0.0"
+version = "1.2.1"
 license = "MIT"
 rust-version = "1.91"
 edition = "2024"
@@ -30,3 +30,6 @@ rcgen = { workspace = true }
 ipnet = { workspace = true }
 socket2 = { workspace = true }
 tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

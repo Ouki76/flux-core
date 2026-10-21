@@ -81,7 +81,7 @@ codegen-units = 1
 strip = true
 [package]
 name = "flux-core"
-version = "1.0.0"
+version = "1.2.1"
 license = "MIT"
 rust-version = "1.91"
 edition = "2024"
@@ -110,6 +110,7 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }
 sha1 = { workspace = true }
+sha2 = { workspace = true }
 x25519-dalek = { workspace = true }
 rand = { workspace = true }
 criterion = { workspace = true }
@@ -127,3 +128,7 @@ path = "examples/stress_bench.rs"
 [[example]]
 name = "bench_native"
 path = "examples/bench_native.rs"
+
+[[example]]
+name = "bench_udp"
+path = "examples/bench_udp.rs"

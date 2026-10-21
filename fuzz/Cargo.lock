@@ -377,7 +377,7 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "flux-app"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -407,13 +407,15 @@ dependencies = [
 
 [[package]]
 name = "flux-common"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
+ "blake2",
  "bytes",
  "dashmap",
  "flux-types",
  "libc",
  "parking_lot",
+ "rand 0.8.8",
  "socket2 0.5.10",
  "tokio",
  "tracing",
@@ -437,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "flux-dns"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "bytes",
  "dashmap",
@@ -458,12 +460,13 @@ dependencies = [
 
 [[package]]
 name = "flux-inbound"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "bytes",
  "dashmap",
  "flux-common",
+ "flux-dns",
  "flux-protocol",
  "flux-transport",
  "flux-types",
@@ -487,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "flux-outbound"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -516,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "flux-protocol"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -550,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "flux-router"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "flux-types",
  "ipnet",
@@ -562,11 +565,12 @@ dependencies = [
 
 [[package]]
 name = "flux-transport"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
  "base64",
+ "blake3",
  "bytes",
  "chacha20poly1305",
  "flux-common",
@@ -597,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "flux-types"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "async-trait",
  "bytes",

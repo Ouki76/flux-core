@@ -594,7 +594,7 @@ checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
 name = "flux-app"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -615,6 +615,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "socket2 0.5.10",
+ "tempfile",
  "tokio",
  "tokio-rustls",
  "tokio-util",
@@ -624,21 +625,24 @@ dependencies = [
 
 [[package]]
 name = "flux-common"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
+ "blake2",
  "bytes",
  "dashmap",
  "flux-types",
  "libc",
  "parking_lot",
+ "rand 0.8.8",
  "socket2 0.5.10",
+ "subtle",
  "tokio",
  "tracing",
 ]
 
 [[package]]
 name = "flux-core"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -660,6 +664,7 @@ dependencies = [
  "rcgen",
  "serde_json",
  "sha1",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",
@@ -670,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "flux-dns"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -691,12 +696,13 @@ dependencies = [
 
 [[package]]
 name = "flux-inbound"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "bytes",
  "dashmap",
  "flux-common",
+ "flux-dns",
  "flux-protocol",
  "flux-transport",
  "flux-types",
@@ -720,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "flux-outbound"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -749,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "flux-protocol"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -783,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "flux-router"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "flux-types",
  "ipnet",
@@ -795,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "flux-transport"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -833,7 +839,7 @@ dependencies = [
 
 [[package]]
 name = "flux-types"
-version = "1.0.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1720,9 +1726,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2277,14 +2283,14 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.9",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

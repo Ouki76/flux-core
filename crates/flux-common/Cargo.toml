@@ -1,6 +1,6 @@
 [package]
 name = "flux-common"
-version = "1.0.0"
+version = "1.2.1"
 license = "MIT"
 rust-version = "1.91"
 edition = "2024"
@@ -14,3 +14,6 @@ libc = { workspace = true }
 parking_lot = { workspace = true }
 socket2 = { workspace = true }
 dashmap = { workspace = true }
+blake2 = "0.10"
+rand = { workspace = true }
+subtle = "2.6"
