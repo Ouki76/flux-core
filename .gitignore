@@ -3,3 +3,7 @@
 *.pem
 *.key
 *.crt
+
+# Coverage artifacts (see docs/audit-log.md)
+cov-prof/
+target-cov/
