@@ -57,8 +57,12 @@ impl Outbound for VlessOutbound {
 
         let client_stream = flux_protocol::vless::VlessClientStream::new(stream);
         if self.flow.as_deref() == Some(flux_protocol::vision::VISION_FLOW) {
-            Ok(Box::new(flux_protocol::vision::VisionClientStream::new(
+            // Vision wraps the tunnel after the VLESS header: both directions are
+            // padded until the TLS handshake finishes, and the 16-byte frame
+            // prefix must be the user's UUID.
+            Ok(Box::new(flux_protocol::vision::VisionStream::new(
                 client_stream,
+                *self.uuid.as_bytes(),
             )))
         } else {
             Ok(Box::new(client_stream))

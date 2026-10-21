@@ -152,7 +152,12 @@ impl Inbound for VlessInbound {
                         );
 
                         let final_stream: BoxedStream = if req.is_vision {
-                            Box::new(flux_protocol::vision::VisionServerStream::new(stream))
+                            // The UUID comes from the (already authenticated) VLESS
+                            // header; the peer prefixes its first frame with it.
+                            Box::new(flux_protocol::vision::VisionStream::new(
+                                stream,
+                                *req.uuid.as_bytes(),
+                            ))
                         } else {
                             stream
                         };
