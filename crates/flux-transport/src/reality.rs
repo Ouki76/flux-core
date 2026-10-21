@@ -18,13 +18,13 @@
 //! References: github.com/XTLS/REALITY, github.com/metacubex/utls (reality.go),
 //! github.com/SagerNet/sing-box (common/tls/reality_*.go).
 
+use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes128Gcm, Aes256Gcm};
-use chacha20poly1305::ChaCha20Poly1305;
 use flux_types::{BoxedStream, FluxError, FluxResult};
 use hkdf::Hkdf;
 use rand::RngCore;
 use rand::rngs::OsRng;
+use ring::aead::{Aad, Algorithm, LessSafeKey, Nonce as RingNonce, UnboundKey};
 use sha2::{Digest, Sha256, Sha384};
 use std::io;
 use std::pin::Pin;
@@ -684,86 +684,60 @@ impl Tls13Suite {
         self.hkdf_expand_label(secret, label, transcript_hash, self.hash_len())
     }
 
-    fn encrypt(
-        &self,
-        key: &[u8],
-        nonce: &[u8; 12],
-        aad: &[u8],
-        plaintext: &[u8],
-    ) -> FluxResult<Vec<u8>> {
+    /// The `ring` AEAD algorithm for this suite.
+    fn ring_alg(&self) -> &'static Algorithm {
         match self {
-            Self::Aes128GcmSha256 => Aes128Gcm::new_from_slice(key)
-                .map_err(|e| crypto_err(e.to_string()))?
-                .encrypt(
-                    aes_gcm::Nonce::from_slice(nonce),
-                    Payload {
-                        msg: plaintext,
-                        aad,
-                    },
-                )
-                .map_err(|e| crypto_err(format!("tls13 aes128gcm encrypt: {}", e))),
-            Self::Aes256GcmSha384 => Aes256Gcm::new_from_slice(key)
-                .map_err(|e| crypto_err(e.to_string()))?
-                .encrypt(
-                    aes_gcm::Nonce::from_slice(nonce),
-                    Payload {
-                        msg: plaintext,
-                        aad,
-                    },
-                )
-                .map_err(|e| crypto_err(format!("tls13 aes256gcm encrypt: {}", e))),
-            Self::Chacha20Poly1305Sha256 => ChaCha20Poly1305::new_from_slice(key)
-                .map_err(|e| crypto_err(e.to_string()))?
-                .encrypt(
-                    chacha20poly1305::Nonce::from_slice(nonce),
-                    Payload {
-                        msg: plaintext,
-                        aad,
-                    },
-                )
-                .map_err(|e| crypto_err(format!("tls13 chacha encrypt: {}", e))),
+            Self::Aes128GcmSha256 => &ring::aead::AES_128_GCM,
+            Self::Aes256GcmSha384 => &ring::aead::AES_256_GCM,
+            Self::Chacha20Poly1305Sha256 => &ring::aead::CHACHA20_POLY1305,
         }
     }
 
-    fn decrypt(
+    /// Expands a traffic key into a sealing/opening key. `ring` keeps the whole
+    /// expanded key schedule, so this is done once per key, not per record.
+    fn new_key(&self, key: &[u8]) -> FluxResult<LessSafeKey> {
+        UnboundKey::new(self.ring_alg(), key)
+            .map(LessSafeKey::new)
+            .map_err(|_| crypto_err("tls13 aead: invalid key length"))
+    }
+
+    /// In-place AEAD seal: encrypts `buf` in place and returns the tag.
+    fn seal(
         &self,
-        key: &[u8],
+        cipher: &LessSafeKey,
         nonce: &[u8; 12],
         aad: &[u8],
-        ciphertext: &[u8],
-    ) -> FluxResult<Vec<u8>> {
-        match self {
-            Self::Aes128GcmSha256 => Aes128Gcm::new_from_slice(key)
-                .map_err(|e| crypto_err(e.to_string()))?
-                .decrypt(
-                    aes_gcm::Nonce::from_slice(nonce),
-                    Payload {
-                        msg: ciphertext,
-                        aad,
-                    },
-                )
-                .map_err(|e| crypto_err(format!("tls13 aes128gcm decrypt: {}", e))),
-            Self::Aes256GcmSha384 => Aes256Gcm::new_from_slice(key)
-                .map_err(|e| crypto_err(e.to_string()))?
-                .decrypt(
-                    aes_gcm::Nonce::from_slice(nonce),
-                    Payload {
-                        msg: ciphertext,
-                        aad,
-                    },
-                )
-                .map_err(|e| crypto_err(format!("tls13 aes256gcm decrypt: {}", e))),
-            Self::Chacha20Poly1305Sha256 => ChaCha20Poly1305::new_from_slice(key)
-                .map_err(|e| crypto_err(e.to_string()))?
-                .decrypt(
-                    chacha20poly1305::Nonce::from_slice(nonce),
-                    Payload {
-                        msg: ciphertext,
-                        aad,
-                    },
-                )
-                .map_err(|e| crypto_err(format!("tls13 chacha decrypt: {}", e))),
-        }
+        buf: &mut [u8],
+    ) -> FluxResult<[u8; 16]> {
+        let tag = cipher
+            .seal_in_place_separate_tag(
+                RingNonce::assume_unique_for_key(*nonce),
+                Aad::from(aad),
+                buf,
+            )
+            .map_err(|_| crypto_err("tls13 aead encrypt failed"))?;
+        let mut out = [0u8; 16];
+        out.copy_from_slice(tag.as_ref());
+        Ok(out)
+    }
+
+    /// In-place AEAD open: `buf` holds ciphertext followed by the 16-byte tag.
+    /// On success `buf` holds the plaintext and its length is returned.
+    fn open(
+        &self,
+        cipher: &LessSafeKey,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buf: &mut [u8],
+    ) -> FluxResult<usize> {
+        let plain = cipher
+            .open_in_place(
+                RingNonce::assume_unique_for_key(*nonce),
+                Aad::from(aad),
+                buf,
+            )
+            .map_err(|_| crypto_err("tls13 aead decrypt failed"))?;
+        Ok(plain.len())
     }
 }
 
@@ -775,6 +749,10 @@ struct TrafficState {
     suite: Tls13Suite,
     secret: Vec<u8>,
     key: Vec<u8>,
+    /// Expanded AEAD key schedule for `key`. Building this per record (as the
+    /// previous `aes-gcm` path did through `new_from_slice`) redoes the key
+    /// expansion once per 16 KiB of payload.
+    cipher: LessSafeKey,
     iv: [u8; 12],
     seq: u64,
 }
@@ -785,10 +763,12 @@ impl TrafficState {
         let iv_v = suite.hkdf_expand_label(&secret, "iv", &[], 12)?;
         let mut iv = [0u8; 12];
         iv.copy_from_slice(&iv_v);
+        let cipher = suite.new_key(&key)?;
         Ok(Self {
             suite,
             secret,
             key,
+            cipher,
             iv,
             seq: 0,
         })
@@ -815,36 +795,77 @@ impl TrafficState {
         data: &[u8],
         pad_len: usize,
     ) -> FluxResult<Vec<u8>> {
-        let mut inner = Vec::with_capacity(data.len() + 1 + pad_len);
-        inner.extend_from_slice(data);
-        inner.push(content_type);
-        inner.extend_from_slice(&vec![0u8; pad_len]);
+        let mut record = Vec::with_capacity(5 + data.len() + 1 + pad_len + 16);
+        record.extend_from_slice(&[0u8; 5]); // header, patched below
+        record.extend_from_slice(data);
+        record.push(content_type);
+        record.resize(record.len() + pad_len, 0);
+        let ct_len = record.len() - 5 + 16;
+        let header = [TLS_APPDATA, 0x03, 0x03, (ct_len >> 8) as u8, ct_len as u8];
         let nonce = self.nonce();
         self.seq += 1;
-        let ct_len = inner.len() + 16;
-        let mut record = Vec::with_capacity(5 + ct_len);
-        record.push(TLS_APPDATA);
-        record.extend_from_slice(&[0x03, 0x03]);
-        record.extend_from_slice(&(ct_len as u16).to_be_bytes());
-        let ct = self.suite.encrypt(&self.key, &nonce, &record, &inner)?;
-        record.extend_from_slice(&ct);
+        let tag = self
+            .suite
+            .seal(&self.cipher, &nonce, &header, &mut record[5..])?;
+        record.extend_from_slice(&tag);
+        record[..5].copy_from_slice(&header);
         Ok(record)
     }
 
-    fn decrypt_record(&mut self, header: &[u8; 5], body: &[u8]) -> FluxResult<(u8, Vec<u8>)> {
+    /// Seals one record into `out` (which the caller has cleared): header ‖
+    /// ciphertext ‖ tag. Zero allocation when `out` already has the capacity.
+    fn seal_into(&mut self, content_type: u8, data: &[u8], out: &mut Vec<u8>) -> FluxResult<()> {
+        out.reserve(5 + data.len() + 1 + 16);
+        out.extend_from_slice(&[0u8; 5]); // header, patched below
+        out.extend_from_slice(data);
+        out.push(content_type);
+        let ct_len = out.len() - 5 + 16;
+        let header = [TLS_APPDATA, 0x03, 0x03, (ct_len >> 8) as u8, ct_len as u8];
         let nonce = self.nonce();
         self.seq += 1;
-        let plain = self.suite.decrypt(&self.key, &nonce, header, body)?;
+        let tag = self
+            .suite
+            .seal(&self.cipher, &nonce, &header, &mut out[5..])?;
+        out.extend_from_slice(&tag);
+        out[..5].copy_from_slice(&header);
+        Ok(())
+    }
+
+    fn decrypt_record(&mut self, header: &[u8; 5], body: &[u8]) -> FluxResult<(u8, Vec<u8>)> {
+        let mut buf = body.to_vec();
+        let (ctype, plen) = self.decrypt_in_place(header, &mut buf)?;
+        buf.truncate(plen);
+        Ok((ctype, buf))
+    }
+
+    /// Decrypts one record body in place: `body` must hold the full ciphertext
+    /// including the 16-byte tag, and is left holding the TLSInnerPlaintext
+    /// (payload ‖ content type ‖ zero padding). No allocation, no copy.
+    ///
+    /// Returns the inner content type and the payload length inside `body`.
+    fn decrypt_in_place(&mut self, header: &[u8; 5], body: &mut [u8]) -> FluxResult<(u8, usize)> {
+        if body.len() < 16 {
+            return Err(crypto_err("tls13 record shorter than its tag"));
+        }
+        let nonce = self.nonce();
+        self.seq += 1;
+        let plen = self
+            .suite
+            .open(&self.cipher, &nonce, header, body)
+            .inspect_err(|_| {
+                // Never leave a partially-decrypted record behind.
+                body.fill(0);
+            })?;
+        let plain = &body[..plen];
         // Strip content type (and any zero padding before it).
-        let mut i = plain.len();
+        let mut i = plen;
         while i > 0 && plain[i - 1] == 0 {
             i -= 1;
         }
         if i == 0 {
             return Err(crypto_err("tls13 record without content type"));
         }
-        let content_type = plain[i - 1];
-        Ok((content_type, plain[..i - 1].to_vec()))
+        Ok((plain[i - 1], i - 1))
     }
 
     /// RFC 8446 §7.2 traffic key update.
@@ -858,6 +879,7 @@ impl TrafficState {
         self.key = self
             .suite
             .hkdf_expand_label(&self.secret, "key", &[], self.suite.key_len())?;
+        self.cipher = self.suite.new_key(&self.key)?;
         let iv_v = self.suite.hkdf_expand_label(&self.secret, "iv", &[], 12)?;
         self.iv.copy_from_slice(&iv_v);
         self.seq = 0;
@@ -877,14 +899,22 @@ pub struct Tls13Stream<S> {
     suite: Tls13Suite,
     read_state: TrafficState,
     write_state: TrafficState,
-    /// Decrypted application data awaiting consumption.
-    read_buf: Vec<u8>,
+    /// Start/length of decrypted application data awaiting consumption. The
+    /// plaintext lives *inside* `body_buf` (decrypted in place), so a received
+    /// record never needs an allocation or a copy of its payload.
     read_pos: usize,
+    read_len: usize,
     /// Partial inbound record assembly.
     hdr_buf: [u8; 5],
     hdr_len: usize,
+    /// Record ciphertext (or, once decrypted, its plaintext). Kept at its high
+    /// water mark and never `clear()`ed: a `len()`-based reuse check silently
+    /// reallocated and re-zeroed 16 KiB per record.
     body_buf: Vec<u8>,
     body_len: usize,
+    /// Reusable staging buffer for one outgoing record (header ‖ ciphertext ‖ tag).
+    /// Allocated once per connection; a record costs no allocation at all.
+    tx_buf: Vec<u8>,
     /// Encrypted records awaiting write to the underlying stream.
     pending_write: Vec<u8>,
     pending_write_pos: usize,
@@ -1287,12 +1317,13 @@ impl Tls13Client {
             suite,
             read_state: TrafficState::new(suite, s_ap)?,
             write_state: TrafficState::new(suite, c_ap)?,
-            read_buf: Vec::new(),
             read_pos: 0,
+            read_len: 0,
             hdr_buf: [0u8; 5],
             hdr_len: 0,
             body_buf: Vec::new(),
             body_len: 0,
+            tx_buf: Vec::new(),
             pending_write: Vec::new(),
             pending_write_pos: 0,
             pending_unacked: 0,
@@ -1411,13 +1442,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
                 )));
             }
 
-            // 2. Read the record body.
-            if self.body_buf.len() != len {
-                self.body_buf = vec![0u8; len];
-                self.body_len = 0;
+            // 2. Read the record body. `body_buf` keeps its high-water-mark
+            // length (it is never cleared), so in steady state this is a pure
+            // buffer reuse: no allocation and no re-zeroing per record.
+            if self.body_buf.len() < len {
+                self.body_buf.resize(len, 0);
             }
             while self.body_len < len {
-                let mut rb = ReadBuf::new(&mut self.body_buf[self.body_len..]);
+                let mut rb = ReadBuf::new(&mut self.body_buf[self.body_len..len]);
                 match Pin::new(&mut self.inner).poll_read(cx, &mut rb) {
                     Poll::Ready(Ok(())) => {
                         let n = rb.filled().len();
@@ -1435,21 +1467,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
             }
 
             // 3. Full record assembled: reset partial state and process.
-            //
-            // The body buffer is reused: taking it out (`mem::take`) forced a fresh
-            // zeroed allocation for every received record, i.e. once per ~16 KiB of
-            // tunnel traffic on the hottest path.
             self.hdr_len = 0;
             self.body_len = 0;
-            // Lend the buffer to `process_record` and take it back afterwards: it
-            // keeps its allocation, so steady-state record processing performs no
-            // allocation at all (taking it and dropping it forced a fresh zeroed
-            // 16 KiB `Vec` per record).
-            let mut body = std::mem::take(&mut self.body_buf);
-            let processed = self.process_record(header, &body);
-            body.clear();
-            self.body_buf = body;
-            match processed {
+            match self.process_record(header, len) {
                 Ok(Some(())) => return Poll::Ready(Ok(())),
                 Ok(None) => continue,
                 Err(e) => return Poll::Ready(Err(e)),
@@ -1457,23 +1477,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
         }
     }
 
-    /// Processes one full record. Returns Ok(Some(())) when application data
-    /// was placed into read_buf; Ok(None) to continue the loop.
-    fn process_record(&mut self, header: [u8; 5], body: &[u8]) -> io::Result<Option<()>> {
+    /// Processes one full record of `len` body bytes sitting in `body_buf`.
+    /// Returns Ok(Some(())) when application data was decrypted in place;
+    /// Ok(None) to continue the loop.
+    fn process_record(&mut self, header: [u8; 5], len: usize) -> io::Result<Option<()>> {
         match header[0] {
             TLS_CCS => Ok(None),
             TLS_APPDATA => {
-                let (ctype, plain) = self
+                let (ctype, plen) = self
                     .read_state
-                    .decrypt_record(&header, body)
+                    .decrypt_in_place(&header, &mut self.body_buf[..len])
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 match ctype {
                     23 => {
-                        self.read_buf = plain;
+                        // Plaintext is already in `body_buf [0..plen]`.
                         self.read_pos = 0;
+                        self.read_len = plen;
                         Ok(Some(()))
                     }
                     TLS_HANDSHAKE => {
+                        let plain = &self.body_buf[..plen];
                         let mut pos = 0;
                         while pos + 4 <= plain.len() {
                             let mtype = plain[pos];
@@ -1507,6 +1530,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
                         Ok(None)
                     }
                     TLS_ALERT => {
+                        let plain = &self.body_buf[..plen];
                         if plain.len() >= 2 && plain[1] == 0 {
                             self.closed = true;
                             return Err(io::Error::new(
@@ -1546,32 +1570,60 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if self.read_pos < self.read_buf.len() {
-            let avail = &self.read_buf[self.read_pos..];
-            let n = avail.len().min(buf.remaining());
-            buf.put_slice(&avail[..n]);
-            self.read_pos += n;
-            if self.read_pos >= self.read_buf.len() {
-                self.read_buf.clear();
-                self.read_pos = 0;
-            }
-            return Poll::Ready(Ok(()));
-        }
-        match self.poll_next_record(cx) {
-            Poll::Ready(Ok(())) => {
-                // Got a fresh plaintext record; serve from buffer.
-                let avail = &self.read_buf[self.read_pos..];
-                let n = avail.len().min(buf.remaining());
-                buf.put_slice(&avail[..n]);
+        loop {
+            if self.read_pos < self.read_len {
+                // Serve straight out of the record buffer the plaintext was
+                // decrypted into: one copy, into the caller, and nothing else.
+                let n = (self.read_len - self.read_pos).min(buf.remaining());
+                if n == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                let start = self.read_pos;
+                buf.put_slice(&self.body_buf[start..start + n]);
                 self.read_pos += n;
-                Poll::Ready(Ok(()))
+                return Poll::Ready(Ok(()));
             }
-            Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                Poll::Ready(Ok(())) // close_notify / clean EOF → EOF for the reader
+            match self.poll_next_record(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Poll::Ready(Ok(())); // close_notify / clean EOF → EOF
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
+    /// Pushes buffered ciphertext to the underlying stream, retaining progress
+    /// across polls. `Ok(false)` means the transport returned `Pending`.
+    fn poll_flush_pending(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        let Self {
+            pending_write,
+            pending_write_pos,
+            inner,
+            ..
+        } = self;
+        while *pending_write_pos < pending_write.len() {
+            let end = pending_write.len().min(*pending_write_pos + 65536);
+            // Slice the buffer directly: copying each chunk out (`to_vec`) was a
+            // 64 KiB allocation + copy per flushed chunk.
+            match Pin::new(&mut *inner).poll_write(cx, &pending_write[*pending_write_pos..end]) {
+                Poll::Ready(Ok(0)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "tls13 underlying write returned 0",
+                    ));
+                }
+                Poll::Ready(Ok(n)) => *pending_write_pos += n,
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Pending => return Ok(false),
+            }
+        }
+        pending_write.clear();
+        *pending_write_pos = 0;
+        Ok(true)
     }
 }
 
@@ -1581,26 +1633,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+
         // 1. Flush any pending encrypted data first (preserves record order).
-        while self.pending_write_pos < self.pending_write.len() {
-            let remaining = self.pending_write.len() - self.pending_write_pos;
-            let chunk: Vec<u8> = self.pending_write
-                [self.pending_write_pos..self.pending_write_pos + remaining.min(65536)]
-                .to_vec();
-            match Pin::new(&mut self.inner).poll_write(cx, &chunk) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "tls13 underlying write returned 0",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => self.pending_write_pos += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        match this.poll_flush_pending(cx) {
+            Ok(true) => {}
+            Ok(false) => return Poll::Pending,
+            Err(e) => return Poll::Ready(Err(e)),
         }
-        self.pending_write.clear();
-        self.pending_write_pos = 0;
 
         // A record that was buffered because the transport returned `Pending` was
         // never acknowledged to the caller: `write_all` will retry with the same
@@ -1608,29 +1648,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
         // through would encrypt the very same plaintext a second time, which is
         // exactly the duplicate-data corruption that showed up as a position
         // mismatch in sustained transfers.
-        if self.pending_unacked > 0 {
-            let acknowledged = self.pending_unacked.min(buf.len());
-            self.pending_unacked = 0;
+        if this.pending_unacked > 0 {
+            let acknowledged = this.pending_unacked.min(buf.len());
+            this.pending_unacked = 0;
             return Poll::Ready(Ok(acknowledged));
         }
 
-        // 2. Encrypt and write one record worth of plaintext.
+        // 2. Encrypt one record worth of plaintext into the reusable staging
+        //    buffer (no allocation in steady state) and hand it to the transport.
         let n = buf.len().min(MAX_TLS_RECORD);
-        let rec = match self.write_state.encrypt_record(23, &buf[..n]) {
-            Ok(r) => r,
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    e.to_string(),
-                )));
-            }
-        };
-        match Pin::new(&mut self.inner).poll_write(cx, &rec) {
-            Poll::Ready(Ok(written)) if written < rec.len() => {
+        this.tx_buf.clear();
+        if let Err(e) = this.write_state.seal_into(23, &buf[..n], &mut this.tx_buf) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                e.to_string(),
+            )));
+        }
+
+        let Self {
+            tx_buf,
+            inner,
+            pending_write,
+            pending_unacked,
+            ..
+        } = this;
+        let rec_len = tx_buf.len();
+        match Pin::new(&mut *inner).poll_write(cx, tx_buf) {
+            Poll::Ready(Ok(written)) if written < rec_len => {
                 // `written` bytes are on the wire and the plaintext they encode is
                 // acknowledged now; only the tail stays buffered.
-                self.pending_write.extend_from_slice(&rec[written..]);
-                self.pending_unacked = 0;
+                pending_write.extend_from_slice(&tx_buf[written..]);
+                *pending_unacked = 0;
                 Poll::Ready(Ok(n))
             }
             Poll::Ready(Ok(_)) => Poll::Ready(Ok(n)),
@@ -1639,47 +1687,47 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
                 // Nothing was written and nothing is acknowledged: buffer the whole
                 // record and remember that `n` plaintext bytes are still pending
                 // from the caller's point of view.
-                self.pending_write.extend_from_slice(&rec);
-                self.pending_unacked = n;
+                pending_write.extend_from_slice(tx_buf);
+                *pending_unacked = n;
                 Poll::Pending
             }
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        while self.pending_write_pos < self.pending_write.len() {
-            let remaining = self.pending_write.len() - self.pending_write_pos;
-            let chunk: Vec<u8> = self.pending_write
-                [self.pending_write_pos..self.pending_write_pos + remaining.min(65536)]
-                .to_vec();
-            match Pin::new(&mut self.inner).poll_write(cx, &chunk) {
-                Poll::Ready(Ok(0)) => {
-                    return Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "tls13 underlying write returned 0",
-                    )));
-                }
-                Poll::Ready(Ok(n)) => self.pending_write_pos += n,
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        let this = self.as_mut().get_mut();
+        match this.poll_flush_pending(cx) {
+            Ok(true) => Pin::new(&mut this.inner).poll_flush(cx),
+            Ok(false) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(e)),
         }
-        self.pending_write.clear();
-        self.pending_write_pos = 0;
-        Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.closed {
-            self.closed = true;
+        let this = self.as_mut().get_mut();
+        if !this.closed {
+            this.closed = true;
             // close_notify alert: level=warning(1), description=close_notify(0)
-            if let Ok(rec) = self.write_state.encrypt_record(TLS_ALERT, &[0x01, 0x00]) {
-                self.pending_write.extend_from_slice(&rec);
+            this.tx_buf.clear();
+            if this
+                .write_state
+                .seal_into(TLS_ALERT, &[0x01, 0x00], &mut this.tx_buf)
+                .is_ok()
+            {
+                let Self {
+                    tx_buf,
+                    pending_write,
+                    ..
+                } = this;
+                pending_write.extend_from_slice(tx_buf);
+            } else {
+                this.tx_buf.clear();
             }
         }
-        match self.as_mut().poll_flush(cx) {
-            Poll::Ready(Ok(())) => Pin::new(&mut self.inner).poll_shutdown(cx),
-            other => other,
+        match this.poll_flush_pending(cx) {
+            Ok(true) => Pin::new(&mut this.inner).poll_shutdown(cx),
+            Ok(false) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
 }
@@ -2112,12 +2160,13 @@ impl Tls13Server {
             suite,
             read_state: TrafficState::new(suite, c_ap)?,
             write_state: TrafficState::new(suite, s_ap)?,
-            read_buf: Vec::new(),
             read_pos: 0,
+            read_len: 0,
             hdr_buf: [0u8; 5],
             hdr_len: 0,
             body_buf: Vec::new(),
             body_len: 0,
+            tx_buf: Vec::new(),
             pending_write: Vec::new(),
             pending_write_pos: 0,
             pending_unacked: 0,
@@ -2259,7 +2308,7 @@ mod tests {
             short_id: vec![0x01, 0x02, 0x03, 0x04],
         };
 
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server =
             tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
         let client =
@@ -2437,7 +2486,7 @@ mod tests {
             short_id: vec![0x01, 0x02, 0x03, 0x04],
         };
 
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server =
             tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
@@ -2472,7 +2521,7 @@ mod tests {
             short_id: vec![0xde, 0xad, 0xbe, 0xef], // not allowed
         };
 
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server =
             tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
         let client =
@@ -2599,6 +2648,166 @@ mod cert_parse_tests {
         let mut full = OID.to_vec();
         full.extend_from_slice(&[0xABu8; 32]);
         assert_eq!(extract_ed25519_pubkey(&full), Some(&[0xABu8; 32]));
+    }
+}
+
+#[cfg(test)]
+mod hostile_transport_tests {
+    use super::tests::server_cfg;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A transport that is deliberately hostile to the record layer: every third
+    /// poll returns `Pending` (after waking itself, like a socket with no data
+    /// yet) and it moves at most 777 bytes per read / 1000 bytes per write.
+    ///
+    /// This forces partial record assembly and partial writes, i.e. exactly the
+    /// `pending_write` / `pending_unacked` accounting that has regressed twice
+    /// (duplicate record on retry after `Pending`, and a shifted record slot).
+    struct Flaky<S> {
+        inner: S,
+        polls: usize,
+    }
+
+    impl<S> Flaky<S> {
+        fn new(inner: S) -> Self {
+            Self { inner, polls: 0 }
+        }
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for Flaky<S> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.as_mut().get_mut();
+            this.polls += 1;
+            if this.polls.is_multiple_of(3) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let cap = buf.remaining().min(777);
+            let mut limited = buf.take(cap);
+            match Pin::new(&mut this.inner).poll_read(cx, &mut limited) {
+                Poll::Ready(Ok(())) => {
+                    let n = limited.filled().len();
+                    buf.advance(n);
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Flaky<S> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.as_mut().get_mut();
+            this.polls += 1;
+            if this.polls.is_multiple_of(3) {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            let n = buf.len().min(1000);
+            Pin::new(&mut this.inner).poll_write(cx, &buf[..n])
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.as_mut().get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let inner = &mut self.as_mut().get_mut().inner;
+            match Pin::new(&mut *inner).poll_flush(cx) {
+                Poll::Ready(Ok(())) => Pin::new(&mut *inner).poll_shutdown(cx),
+                other => other,
+            }
+        }
+    }
+
+    /// Sustained transfer over a stuttering, byte-dribbling transport must still
+    /// be byte-exact in both directions: no dropped, duplicated or shifted bytes.
+    #[tokio::test]
+    async fn stuttering_transport_stays_byte_exact() {
+        const TOTAL: usize = 256 * 1024;
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = X25519PublicKey::from(&server_secret);
+        let scfg = server_cfg(server_secret.to_bytes());
+        let ccfg = RealityClientConfig {
+            server_name: "www.microsoft.com".into(),
+            public_key: server_public.to_bytes(),
+            short_id: vec![0x01, 0x02, 0x03, 0x04],
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server = tokio::spawn(async move {
+            RealityHandshake::server_handshake(Flaky::new(server_io), &scfg).await
+        });
+        let client = tokio::spawn(async move {
+            RealityHandshake::client_handshake(Flaky::new(client_io), &ccfg).await
+        });
+        let mut s = server.await.unwrap().unwrap();
+        let mut c = client.await.unwrap().unwrap();
+
+        let payload: Vec<u8> = (0..TOTAL)
+            .map(|i| (i.wrapping_mul(131) ^ (i >> 5)) as u8)
+            .collect();
+
+        let expect = payload.clone();
+        let echo = tokio::spawn(async move {
+            let mut got = Vec::with_capacity(TOTAL);
+            let mut buf = vec![0u8; 64 * 1024];
+            while got.len() < TOTAL {
+                let n = s.read(&mut buf).await.expect("server read");
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&buf[..n]).await.expect("server write");
+                got.extend_from_slice(&buf[..n]);
+            }
+            let _ = s.flush().await;
+            got
+        });
+
+        let writer = {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                for chunk in payload.chunks(16 * 1024) {
+                    c.write_all(chunk).await.expect("client write");
+                }
+                c.flush().await.expect("client flush");
+                let mut back = vec![0u8; TOTAL];
+                let mut filled = 0;
+                while filled < TOTAL {
+                    let n = c.read(&mut back[filled..]).await.expect("client read");
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                back.truncate(filled);
+                back
+            })
+        };
+
+        let (received, got) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            (writer.await.unwrap(), echo.await.unwrap())
+        })
+        .await
+        .expect("transfer stalled on a stuttering transport");
+
+        assert_eq!(got.len(), expect.len(), "server received a short stream");
+        assert_eq!(got, expect, "server received corrupted bytes");
+        assert_eq!(
+            received.len(),
+            expect.len(),
+            "client received a short stream"
+        );
+        assert_eq!(received, expect, "client received corrupted bytes");
     }
 }
 
