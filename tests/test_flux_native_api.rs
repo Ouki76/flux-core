@@ -138,10 +138,28 @@ async fn test_flux_native_api_and_route_tracer() {
         assert!(resp.contains("candidates"));
     }
 
-    // 4. Test POST /api/v1/outbounds/my-selector/select
+    // 4. Test PUT /api/v1/outbounds/my-selector/select (the documented route).
     {
         let mut stream = TcpStream::connect(&api_addr).await.unwrap();
         let req_body = r#"{"name": "direct-node"}"#;
+        let req = format!(
+            "PUT /api/v1/outbounds/my-selector/select HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer native-flux-secret\r\nContent-Length: {}\r\n\r\n{}",
+            req_body.len(),
+            req_body
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = stream.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.contains("204 No Content"), "got: {resp}");
+    }
+
+    // 4b. The bare `/outbounds/<tag>` path must NOT mutate state: only the
+    //     documented `/select` suffix selects, so a future sibling action route
+    //     cannot silently act as "select".
+    {
+        let mut stream = TcpStream::connect(&api_addr).await.unwrap();
+        let req_body = r#"{"name": "reject-node"}"#;
         let req = format!(
             "PUT /api/v1/outbounds/my-selector HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer native-flux-secret\r\nContent-Length: {}\r\n\r\n{}",
             req_body.len(),
@@ -151,7 +169,10 @@ async fn test_flux_native_api_and_route_tracer() {
         let mut buf = vec![0u8; 1024];
         let n = stream.read(&mut buf).await.unwrap();
         let resp = String::from_utf8_lossy(&buf[..n]);
-        assert!(resp.contains("204 No Content"));
+        assert!(
+            !resp.contains("204 No Content"),
+            "bare /outbounds/<tag> must not select: {resp}"
+        );
     }
 
     // Verify route tracer now reflects that my-selector switched to "direct-node"

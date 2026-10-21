@@ -194,3 +194,130 @@ fn fuzz_config_json_parsing() {
         let _ = flux_app::Config::from_json_str(&mutated);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Parsers added in 1.1.0 / 1.2.0
+// ---------------------------------------------------------------------------
+
+/// The Vision reader must consume arbitrary byte streams without panicking,
+/// hanging, or growing memory without bound.
+#[tokio::test]
+async fn fuzz_vision_stream_reader() {
+    use flux_protocol::vision::VisionStream;
+    use tokio::io::AsyncReadExt;
+
+    let uuid = [0x11u8; 16];
+    let mut rng = Rng(0xfeed_face_dead_0002);
+
+    for _ in 0..300 {
+        let len = (rng.next() % 512) as usize;
+        let mut data = rng.bytes(len);
+        // Half the cases start with the real UUID so the frame parser is reached.
+        if rng.next().is_multiple_of(2) {
+            let mut with_uuid = uuid.to_vec();
+            with_uuid.extend_from_slice(&data);
+            data = with_uuid;
+        }
+        let (mut peer, our_side) = tokio::io::duplex(64 * 1024);
+        let mut stream = VisionStream::new(our_side, uuid);
+        let payload = data.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = peer.write_all(&payload).await;
+            let _ = peer.shutdown().await;
+        });
+
+        let mut out = Vec::new();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut out),
+        )
+        .await;
+        assert!(res.is_ok(), "vision reader hung on input {data:02x?}");
+        // Reading either succeeds (pass-through) or errors; it must not panic.
+        let _ = res.unwrap();
+        assert!(
+            out.len() < 1024 * 1024,
+            "vision reader produced unbounded output from {} input bytes",
+            data.len()
+        );
+    }
+}
+
+/// Salamander deobfuscation must reject nothing it can panic on.
+#[test]
+fn fuzz_salamander_deobfuscate() {
+    use flux_common::Salamander;
+    let obfs = Salamander::new("fuzz-password").unwrap();
+    let mut rng = Rng(0xfeed_face_dead_0003);
+    for _ in 0..5000 {
+        let len = (rng.next() % 256) as usize;
+        let data = rng.bytes(len);
+        if let Some(plain) = obfs.deobfuscate(&data) {
+            assert_eq!(
+                plain.len(),
+                data.len().saturating_sub(flux_common::SALAMANDER_SALT_LEN)
+            );
+        }
+    }
+    // Round-trip must be exact for arbitrary payloads.
+    for len in [0usize, 1, 7, 8, 15, 16, 63, 1500] {
+        let plain = rng.bytes(len);
+        let wire = obfs.obfuscate(&plain);
+        assert_eq!(obfs.deobfuscate(&wire).unwrap(), plain);
+    }
+}
+
+/// The DNS question parser is network-reachable and must not panic.
+#[test]
+fn fuzz_dns_question_parser() {
+    use flux_dns::wire::DnsMessage;
+    let mut rng = Rng(0xfeed_face_dead_0004);
+    for _ in 0..5000 {
+        let len = (rng.next() % 600) as usize;
+        let data = rng.bytes(len);
+        if let Some((_, _, name, _, end)) = DnsMessage::parse_question(&data) {
+            assert!(end <= data.len(), "question end past the packet");
+            assert!(name.len() <= 255, "name longer than the DNS limit");
+        }
+        let _ = DnsMessage::build_response(&data, Some(std::net::Ipv4Addr::LOCALHOST));
+    }
+}
+
+/// HPACK Huffman decoding must not panic on arbitrary input.
+#[test]
+fn fuzz_huffman_decode() {
+    use flux_transport::h3_lite::huffman_decode;
+    let mut rng = Rng(0xfeed_face_dead_0005);
+    for _ in 0..5000 {
+        let len = (rng.next() % 128) as usize;
+        let data = rng.bytes(len);
+        let _ = huffman_decode(&data);
+    }
+}
+
+/// SS-2022 UDP decryption must reject garbage without panicking.
+#[tokio::test]
+async fn fuzz_ss2022_udp_decrypt() {
+    use flux_protocol::shadowsocks2022::{Ss2022CipherMethod, Ss2022UdpPacketCipher};
+    let cipher = Ss2022UdpPacketCipher::new(Ss2022CipherMethod::Blake3Aes128Gcm, &[3u8; 16]);
+    let mut rng = Rng(0xfeed_face_dead_0006);
+    for _ in 0..2000 {
+        let len = (rng.next() % 200) as usize;
+        let data = rng.bytes(len);
+        let _ = cipher.decrypt_packet(&data).await;
+    }
+}
+
+/// The TUIC stream AUTH frame parser must not panic and must reject short frames.
+#[test]
+fn fuzz_tuic_stream_auth() {
+    use flux_protocol::tuic::TuicV5Protocol;
+    let mut rng = Rng(0xfeed_face_dead_0007);
+    for _ in 0..3000 {
+        let len = (rng.next() % 80) as usize;
+        let data = rng.bytes(len);
+        let _ = TuicV5Protocol::parse_stream_auth_frame(&data);
+        let _ = TuicV5Protocol::parse_auth_frame(&data);
+    }
+}

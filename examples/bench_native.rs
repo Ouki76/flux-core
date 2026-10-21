@@ -1,195 +1,531 @@
+//! Native throughput / CPU-cost benchmark.
+//!
+//! Measures a pipelined TCP echo transfer through:
+//!   1. a direct loopback connection (baseline),
+//!   2. `flux-core` (SOCKS5 inbound → direct outbound),
+//!   3. `sing-box` (SOCKS inbound → direct outbound), when installed.
+//!
+//! Unlike a single-shot timing run, measurements are **interleaved across
+//! rounds** and summarised by median (plus min/max). Loopback throughput on a
+//! busy machine drifts by >10% between runs, so a one-shot number is not a
+//! basis for comparing implementations — a median over interleaved rounds is.
+//!
+//! For every proxy the harness also reports the cost side: CPU seconds burned
+//! per GB moved (from `/proc/<pid>/stat`) and peak RSS (from `/proc/<pid>/status`).
+//!
+//! Usage:
+//!   cargo run --release --example bench_native -- [options]
+//!
+//! Options:
+//!   --rounds N     interleaved measurement rounds (default 5)
+//!   --mb N         megabytes per measurement (default 300)
+//!   --streams N    concurrent connections per measurement (default 1)
+//!   --no-singbox   skip the sing-box comparison
+//!   --flux PATH    flux-core binary (default ./target/release/flux-core)
+//!   --singbox PATH sing-box binary (default from PATH / ~/.local/bin)
+
 use std::net::SocketAddr;
-use std::process::Command;
-use std::time::Instant;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // 1. Start Fast Echo Server
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let echo_addr = echo_listener.local_addr()?;
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+struct Args {
+    rounds: usize,
+    mb: usize,
+    streams: usize,
+    with_singbox: bool,
+    flux_bin: PathBuf,
+    singbox_bin: Option<PathBuf>,
+}
+
+impl Args {
+    fn parse() -> Result<Self, String> {
+        let mut args = Self {
+            rounds: 5,
+            mb: 300,
+            streams: 1,
+            with_singbox: true,
+            flux_bin: PathBuf::from("./target/release/flux-core"),
+            singbox_bin: find_in_path("sing-box"),
+        };
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        let mut i = 0;
+        while i < argv.len() {
+            let take = |i: &mut usize| -> Result<String, String> {
+                *i += 1;
+                argv.get(*i)
+                    .cloned()
+                    .ok_or_else(|| format!("missing value for {}", argv[*i - 1]))
+            };
+            match argv[i].as_str() {
+                "--rounds" => args.rounds = take(&mut i)?.parse().map_err(|e| format!("{e}"))?,
+                "--mb" => args.mb = take(&mut i)?.parse().map_err(|e| format!("{e}"))?,
+                "--streams" => args.streams = take(&mut i)?.parse().map_err(|e| format!("{e}"))?,
+                "--no-singbox" => args.with_singbox = false,
+                "--flux" => args.flux_bin = PathBuf::from(take(&mut i)?),
+                "--singbox" => args.singbox_bin = Some(PathBuf::from(take(&mut i)?)),
+                "--help" | "-h" => {
+                    println!("{}", Self::usage());
+                    std::process::exit(0);
+                }
+                other => return Err(format!("unknown argument: {other}")),
+            }
+            i += 1;
+        }
+        if args.rounds == 0 || args.streams == 0 || args.mb == 0 {
+            return Err("--rounds, --streams and --mb must be >= 1".into());
+        }
+        Ok(args)
+    }
+
+    fn usage() -> &'static str {
+        "usage: bench_native [--rounds N] [--mb N] [--streams N] [--no-singbox] \
+         [--flux PATH] [--singbox PATH]"
+    }
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|p| p.join(name))
+        .find(|p| p.is_file())
+        .or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            let p = PathBuf::from(home).join(".local/bin").join(name);
+            p.is_file().then_some(p)
+        })
+}
+
+// ---------------------------------------------------------------------------
+// Process accounting
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Clone, Copy)]
+struct ProcCost {
+    cpu_secs: f64,
+    peak_rss_kb: u64,
+}
+
+fn clock_ticks_per_sec() -> f64 {
+    // USER_HZ is 100 on all supported Linux configurations.
+    100.0
+}
+
+fn read_proc_cost(pid: u32) -> Option<ProcCost> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 14/15 are utime/stime, but comm may contain spaces/parens: split after ')'
+    let rest = stat.rsplit_once(')')?.1;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap_or_default();
+    let peak_rss_kb = status
+        .lines()
+        .find(|l| l.starts_with("VmHWM:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    Some(ProcCost {
+        cpu_secs: (utime + stime) as f64 / clock_ticks_per_sec(),
+        peak_rss_kb,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Measurement
+// ---------------------------------------------------------------------------
+
+struct Stats {
+    median: f64,
+    min: f64,
+    max: f64,
+    cpu_secs: Option<f64>,
+    peak_rss_kb: Option<u64>,
+}
+
+impl Stats {
+    fn from_samples(mut v: Vec<f64>) -> (f64, f64, f64) {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = v.len();
+        let median = if n % 2 == 1 {
+            v[n / 2]
+        } else {
+            (v[n / 2 - 1] + v[n / 2]) / 2.0
+        };
+        (median, v[0], v[n - 1])
+    }
+}
+
+async fn get_free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    port
+}
+
+/// Waits until `addr` accepts TCP connections (or times out), so benchmarks do
+/// not silently measure a proxy that has not finished starting.
+async fn wait_for_listener(addr: SocketAddr, what: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if TcpStream::connect(addr).await.is_ok() {
+            return;
+        }
+        if Instant::now() > deadline {
+            panic!("{what} did not start listening on {addr} within {timeout:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Start a real async echo server and return its address.
+async fn start_echo_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        while let Ok((socket, _)) = echo_listener.accept().await {
+        while let Ok((socket, _)) = listener.accept().await {
             let _ = socket.set_nodelay(true);
             tokio::spawn(async move {
                 let (mut r, mut w) = socket.into_split();
                 let mut buf = vec![0u8; 128 * 1024];
                 loop {
                     match r.read(&mut buf).await {
-                        Ok(0) => break,
+                        Ok(0) | Err(_) => break,
                         Ok(n) => {
                             if w.write_all(&buf[..n]).await.is_err() {
                                 break;
                             }
                         }
-                        Err(_) => break,
                     }
                 }
             });
         }
     });
+    addr
+}
 
-    println!("Target Echo Server listening on {}", echo_addr);
+/// One pipelined transfer of `total_bytes` over a single connection.
+async fn transfer_once(addr: SocketAddr, target: Option<SocketAddr>, total_bytes: usize) -> usize {
+    let mut s = TcpStream::connect(addr).await.unwrap();
+    let _ = s.set_nodelay(true);
 
-    // 2. Measure Direct Baseline (No proxy)
-    let direct_speed = measure_transfer("Direct TCP Loopback (No Proxy)", echo_addr, None).await?;
+    if let Some(echo) = target {
+        // SOCKS5 no-auth CONNECT
+        s.write_all(b"\x05\x01\x00").await.unwrap();
+        let mut resp = [0u8; 2];
+        s.read_exact(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"\x05\x00", "SOCKS5 method negotiation failed");
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        match echo {
+            SocketAddr::V4(v4) => {
+                req.extend_from_slice(&v4.ip().octets());
+                req.extend_from_slice(&v4.port().to_be_bytes());
+            }
+            SocketAddr::V6(_) => panic!("echo server must be IPv4"),
+        }
+        s.write_all(&req).await.unwrap();
+        let mut reply = [0u8; 10];
+        s.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x00, "SOCKS5 CONNECT was rejected");
+    }
 
-    // 3. Start flux-core
+    let (mut r, mut w) = s.into_split();
+    let payload = vec![0xAAu8; 128 * 1024];
+    let chunk = payload.len();
+    let chunks = total_bytes.div_ceil(chunk);
+
+    let writer = tokio::spawn(async move {
+        for _ in 0..chunks {
+            if w.write_all(&payload).await.is_err() {
+                return;
+            }
+        }
+    });
+    let mut received = 0usize;
+    let mut buf = vec![0u8; chunk];
+    while received < total_bytes {
+        match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => received += n,
+        }
+    }
+    let _ = writer.await;
+    received
+}
+
+/// `streams` concurrent transfers; returns aggregate MB/s.
+async fn measure(
+    addr: SocketAddr,
+    target: Option<SocketAddr>,
+    total_bytes: usize,
+    streams: usize,
+) -> f64 {
+    let t0 = Instant::now();
+    let per = total_bytes / streams;
+    let mut handles = Vec::with_capacity(streams);
+    for _ in 0..streams {
+        handles.push(tokio::spawn(transfer_once(addr, target, per)));
+    }
+    let mut received = 0usize;
+    for h in handles {
+        received += h.await.unwrap();
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    assert_eq!(
+        received,
+        per * streams,
+        "transfer was truncated: proxy dropped the connection"
+    );
+    (received as f64 / 1_048_576.0) / elapsed
+}
+
+struct ProxyProc {
+    child: Child,
+    pid: u32,
+    addr: SocketAddr,
+}
+
+impl Drop for ProxyProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn_proxy(bin: &PathBuf, config: &str, label: &'static str, extra_args: &[&str]) -> ProxyProc {
+    assert!(
+        bin.is_file(),
+        "proxy binary not found: {} (build it first, e.g. `cargo build --release -p flux-core`)",
+        bin.display()
+    );
+    let cfg_path = std::env::temp_dir().join(format!("bench_{label}.json"));
+    std::fs::write(&cfg_path, config).unwrap();
+    let child = Command::new(bin)
+        .args(["run", "-c", cfg_path.to_str().unwrap()])
+        .args(extra_args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin.display()));
+    let pid = child.id();
+    ProxyProc {
+        child,
+        pid,
+        addr: "127.0.0.1:0".parse().unwrap(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = match Args::parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}\n{}", Args::usage());
+            std::process::exit(2);
+        }
+    };
+
+    let echo = start_echo_server().await;
+    println!("echo server:            {echo}");
+    println!(
+        "payload:                {} MB per measurement, {} concurrent stream(s), {} interleaved rounds",
+        args.mb, args.streams, args.rounds
+    );
+
+    // ---- flux-core ----
     let flux_port = get_free_port().await;
     let flux_cfg = format!(
         r#"{{
-            "inbounds": [{{ "tag": "in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }}, "protocol": {{ "type": "socks" }} }}],
+            "inbounds": [{{ "tag": "in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {flux_port} }}, "protocol": {{ "type": "socks" }} }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}]
-        }}"#,
-        flux_port
+        }}"#
     );
-    std::fs::write("/tmp/bench_flux.json", flux_cfg)?;
-    let mut flux_proc = Command::new("./target/release/flux-core")
-        .args(["run", "-c", "/tmp/bench_flux.json", "-f", "json"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let flux_addr: SocketAddr = format!("127.0.0.1:{}", flux_port).parse()?;
-    let flux_speed = measure_transfer("flux-core (Rust 2024)", echo_addr, Some(flux_addr)).await?;
-    let _ = flux_proc.kill();
+    let mut flux = spawn_proxy(&args.flux_bin, &flux_cfg, "flux", &["-f", "json"]);
+    flux.addr = format!("127.0.0.1:{flux_port}").parse()?;
+    wait_for_listener(flux.addr, "flux-core", Duration::from_secs(15)).await;
 
-    // 4. Start sing-box
-    let sing_port = get_free_port().await;
-    let sing_cfg = format!(
-        r#"{{
-            "inbounds": [{{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": {} }}],
-            "outbounds": [{{ "type": "direct", "tag": "direct" }}]
-        }}"#,
-        sing_port
-    );
-    std::fs::write("/tmp/bench_singbox.json", sing_cfg)?;
-    let mut sing_proc = Command::new("/home/ouki/.local/bin/sing-box")
-        .args(["run", "-c", "/tmp/bench_singbox.json"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let sing_addr: SocketAddr = format!("127.0.0.1:{}", sing_port).parse()?;
-    let sing_speed = measure_transfer("sing-box (Go 1.24)", echo_addr, Some(sing_addr)).await?;
-    let _ = sing_proc.kill();
-
-    println!("\n================================================================================");
-    println!("NATIVE THROUGHPUT BENCHMARK (Pure Compiled Speed, No Python GIL)");
-    println!("================================================================================");
-    println!(
-        "{:<32} | {:<18} | {:<16}",
-        "Target", "Speed (MB/s)", "Bandwidth (Gbps)"
-    );
-    println!("--------------------------------------------------------------------------------");
-    println!(
-        "{:<32} | {:<18.1} | {:<16.2}",
-        "Direct TCP Loopback (Baseline)",
-        direct_speed,
-        direct_speed * 8.0 / 1000.0
-    );
-    println!(
-        "{:<32} | {:<18.1} | {:<16.2}",
-        "flux-core (Rust 2024)",
-        flux_speed,
-        flux_speed * 8.0 / 1000.0
-    );
-    println!(
-        "{:<32} | {:<18.1} | {:<16.2}",
-        "sing-box (Go 1.24)",
-        sing_speed,
-        sing_speed * 8.0 / 1000.0
-    );
-    println!("================================================================================");
-    if flux_speed > sing_speed {
-        println!(
-            "\x1b[1;32m✔ flux-core is {:.1}% faster than sing-box!\x1b[0m\n",
-            (flux_speed / sing_speed - 1.0) * 100.0
-        );
-    } else {
-        println!(
-            "flux-core is at {:.1}% of sing-box speed.\n",
-            flux_speed / sing_speed * 100.0
-        );
-    }
-
-    Ok(())
-}
-
-async fn get_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
-}
-
-async fn measure_transfer(
-    label: &str,
-    echo_addr: SocketAddr,
-    proxy: Option<SocketAddr>,
-) -> anyhow::Result<f64> {
-    let total_bytes: usize = 300 * 1024 * 1024; // 300 MB
-    let chunk_size = 128 * 1024; // 128 KB chunks
-    let total_chunks = total_bytes / chunk_size;
-
-    let stream = if let Some(proxy_addr) = proxy {
-        let mut s = TcpStream::connect(proxy_addr).await?;
-        let _ = s.set_nodelay(true);
-        // SOCKS5 handshake
-        s.write_all(b"\x05\x01\x00").await?;
-        let mut resp = [0u8; 2];
-        s.read_exact(&mut resp).await?;
-        assert_eq!(&resp, b"\x05\x00");
-
-        // CONNECT
-        let mut req = vec![0x05, 0x01, 0x00, 0x01];
-        if let SocketAddr::V4(v4) = echo_addr {
-            req.extend_from_slice(&v4.ip().octets());
-            req.extend_from_slice(&v4.port().to_be_bytes());
+    // ---- sing-box ----
+    let singbox = if args.with_singbox {
+        match args.singbox_bin.clone() {
+            Some(bin) if bin.is_file() => {
+                let port = get_free_port().await;
+                let cfg = format!(
+                    r#"{{"log": {{"level": "error"}},
+                        "inbounds": [{{ "type": "socks", "tag": "in", "listen": "127.0.0.1", "listen_port": {port} }}],
+                        "outbounds": [{{ "type": "direct", "tag": "direct" }}]}}"#
+                );
+                let mut p = spawn_proxy(&bin, &cfg, "singbox", &[]);
+                p.addr = format!("127.0.0.1:{port}").parse()?;
+                wait_for_listener(p.addr, "sing-box", Duration::from_secs(15)).await;
+                Some(p)
+            }
+            _ => {
+                println!("sing-box:               not found, comparison skipped");
+                None
+            }
         }
-        s.write_all(&req).await?;
-        let mut reply = [0u8; 10];
-        s.read_exact(&mut reply).await?;
-        assert_eq!(reply[1], 0x00);
-        s
     } else {
-        let s = TcpStream::connect(echo_addr).await?;
-        let _ = s.set_nodelay(true);
-        s
+        None
     };
 
-    let (mut r, mut w) = stream.into_split();
-    let payload = std::sync::Arc::new(vec![0xAAu8; chunk_size]);
-    let payload_writer = payload.clone();
+    let total_bytes = args.mb * 1024 * 1024;
+    let streams = args.streams;
 
-    let t0 = Instant::now();
-    let write_task = tokio::spawn(async move {
-        for _ in 0..total_chunks {
-            w.write_all(&payload_writer).await.unwrap();
+    // Warm-up (page cache, connection pools, JIT-less but still: task warm-up).
+    let _ = measure(echo, None, 16 * 1024 * 1024, streams).await;
+    let _ = measure(flux.addr, Some(echo), 16 * 1024 * 1024, streams).await;
+    if let Some(sb) = &singbox {
+        let _ = measure(sb.addr, Some(echo), 16 * 1024 * 1024, streams).await;
+    }
+
+    let mut direct_samples = Vec::with_capacity(args.rounds);
+    let mut flux_samples = Vec::with_capacity(args.rounds);
+    let mut singbox_samples = Vec::with_capacity(args.rounds);
+    let mut flux_cpu = 0.0f64;
+    let mut singbox_cpu = 0.0f64;
+
+    let flux_cost_before = read_proc_cost(flux.pid);
+    let singbox_cost_before = singbox.as_ref().and_then(|p| read_proc_cost(p.pid));
+
+    for round in 1..=args.rounds {
+        let d = measure(echo, None, total_bytes, streams).await;
+        let f = measure(flux.addr, Some(echo), total_bytes, streams).await;
+        flux_cpu += read_proc_cost(flux.pid).map(|c| c.cpu_secs).unwrap_or(0.0)
+            - flux_cost_before.map(|c| c.cpu_secs).unwrap_or(0.0);
+        let s = if let Some(sb) = &singbox {
+            Some(measure(sb.addr, Some(echo), total_bytes, streams).await)
+        } else {
+            None
+        };
+        if let (Some(c), Some(sb)) = (singbox_cost_before, &singbox) {
+            singbox_cpu += read_proc_cost(sb.pid).map(|x| x.cpu_secs).unwrap_or(0.0) - c.cpu_secs;
         }
-    });
-
-    let read_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; chunk_size];
-        let mut received = 0;
-        while received < total_bytes {
-            let n = r.read(&mut buf).await.unwrap();
-            if n == 0 {
-                break;
-            }
-            received += n;
+        print!("  round {round}: direct {d:7.1}  flux {f:7.1}");
+        if let Some(s) = s {
+            print!("  sing-box {s:7.1}");
         }
-        received
-    });
+        println!("  (MB/s)");
+        direct_samples.push(d);
+        flux_samples.push(f);
+        if let Some(s) = s {
+            singbox_samples.push(s);
+        }
+    }
 
-    let (_, rec) = tokio::join!(write_task, read_task);
-    let elapsed = t0.elapsed();
-    let received = rec.unwrap();
-    assert_eq!(received, total_bytes);
+    let (d_med, d_min, d_max) = Stats::from_samples(direct_samples);
+    let (f_med, f_min, f_max) = Stats::from_samples(flux_samples);
+    let flux_peak_rss = read_proc_cost(flux.pid).map(|c| c.peak_rss_kb);
 
-    let speed_mb_s = (total_bytes as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64();
+    let mut rows: Vec<(String, Stats)> = vec![
+        (
+            "Direct TCP loopback (baseline)".into(),
+            Stats {
+                median: d_med,
+                min: d_min,
+                max: d_max,
+                cpu_secs: None,
+                peak_rss_kb: None,
+            },
+        ),
+        (
+            "flux-core".into(),
+            Stats {
+                median: f_med,
+                min: f_min,
+                max: f_max,
+                cpu_secs: Some(flux_cpu),
+                peak_rss_kb: flux_peak_rss,
+            },
+        ),
+    ];
+
+    if !singbox_samples.is_empty() {
+        let (s_med, s_min, s_max) = Stats::from_samples(singbox_samples);
+        let rss = singbox
+            .as_ref()
+            .and_then(|p| read_proc_cost(p.pid))
+            .map(|c| c.peak_rss_kb);
+        rows.push((
+            "sing-box".into(),
+            Stats {
+                median: s_med,
+                min: s_min,
+                max: s_max,
+                cpu_secs: Some(singbox_cpu),
+                peak_rss_kb: rss,
+            },
+        ));
+    }
+
+    println!("\n{}", "=".repeat(96));
     println!(
-        "  [{}] transferred 300 MB in {:?} -> {:.1} MB/s",
-        label, elapsed, speed_mb_s
+        "THROUGHPUT — median of {} interleaved rounds, {} MB / {} stream(s)",
+        args.rounds, args.mb, args.streams
     );
-    Ok(speed_mb_s)
+    println!("{}", "=".repeat(96));
+    println!(
+        "{:<32} {:>10} {:>10} {:>10} {:>12} {:>10}",
+        "Target", "median", "min", "max", "MB moved", "CPU s/GB"
+    );
+    println!("{}", "-".repeat(96));
+    let gb = (args.rounds * args.mb) as f64 / 1024.0;
+    for (label, s) in &rows {
+        let cpu_per_gb = s
+            .cpu_secs
+            .map(|c| format!("{:.2}", c / gb))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<32} {:>10.1} {:>10.1} {:>10.1} {:>12} {:>10}",
+            label,
+            s.median,
+            s.min,
+            s.max,
+            format!("{:.0} MB", args.rounds as f64 * args.mb as f64),
+            cpu_per_gb
+        );
+    }
+    println!("{}", "-".repeat(96));
+
+    let flux_pct = (f_med / d_med - 1.0) * 100.0;
+    println!(
+        "flux-core vs direct baseline: {:+.1}%  ({:.1} MB/s of {:.1} MB/s)",
+        flux_pct, f_med, d_med
+    );
+    if let Some(sb) = rows.iter().find(|(l, _)| l == "sing-box") {
+        let vs = (f_med / sb.1.median - 1.0) * 100.0;
+        println!(
+            "flux-core vs sing-box:        {:+.1}%  ({:.1} vs {:.1} MB/s)",
+            vs, f_med, sb.1.median
+        );
+        if let (Some(fc), Some(sc)) = (rows[1].1.cpu_secs, sb.1.cpu_secs)
+            && fc > 0.0
+            && sc > 0.0
+        {
+            println!(
+                "CPU cost per GB (lower is better): flux-core {:.2}s, sing-box {:.2}s ({:+.1}%)",
+                fc / gb,
+                sc / gb,
+                (fc / sc - 1.0) * 100.0
+            );
+        }
+        if let (Some(fr), Some(sr)) = (rows[1].1.peak_rss_kb, sb.1.peak_rss_kb) {
+            println!(
+                "Peak RSS:                      flux-core {} MiB, sing-box {} MiB",
+                fr / 1024,
+                sr / 1024
+            );
+        }
+    }
+    println!("{}", "=".repeat(96));
+    Ok(())
 }

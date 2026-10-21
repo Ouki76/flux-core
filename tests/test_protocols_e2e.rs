@@ -1172,6 +1172,7 @@ async fn test_20_tuic_v5_inbound_server_e2e() {
             "outbounds": [{{
                 "tag": "tuic-out",
                 "carrier": {{ "type": "udp", "address": "127.0.0.1:{}" }},
+                "security": {{ "type": "tls", "sni": "localhost", "insecure": true }},
                 "protocol": {{
                     "type": "tuic",
                     "uuid": "{}",
@@ -1233,6 +1234,7 @@ async fn test_21_hysteria2_inbound_server_e2e() {
             "outbounds": [{{
                 "tag": "hy2-out",
                 "carrier": {{ "type": "udp", "address": "127.0.0.1:{}" }},
+                "security": {{ "type": "tls", "sni": "localhost", "insecure": true }},
                 "protocol": {{
                     "type": "hysteria2",
                     "password": "{}"

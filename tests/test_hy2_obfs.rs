@@ -25,6 +25,7 @@ fn hy2_config(
                 "outbounds": [{{
                     "tag": "hy2-out",
                     "carrier": {{ "type": "udp", "address": "127.0.0.1:{}" }},
+                    "security": {{ "type": "tls", "sni": "localhost", "insecure": true }},
                     "protocol": {{ "type": "hysteria2", "password": "{}"{} }}
                 }}]
             }}"#,

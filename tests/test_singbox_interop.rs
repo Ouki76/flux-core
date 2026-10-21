@@ -10,14 +10,92 @@ use flux_types::{NetworkType, SessionMeta, TargetAddress, UdpPacket};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
+/// Caps how many sing-box daemons may run at once.
+///
+/// The suite has one daemon per test and the test harness runs tests in
+/// parallel (`nproc` threads), so a full run used to start 35+ daemons plus
+/// their in-process flux peers simultaneously. Under that load startup timing
+/// and port binding intermittently failed, which showed up as random
+/// "Connection refused" flakes. Gating daemon creation keeps the suite
+/// parallel while bounding peak load. Override with `SINGBOX_TEST_PARALLELISM`.
+static DAEMONS_RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+fn max_concurrent_daemons() -> usize {
+    std::env::var("SINGBOX_TEST_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(6)
+}
+
+// Per-thread count of daemons this thread already owns.
+thread_local! {
+    static SLOTS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII slot in the daemon gate; released when the process handle is dropped.
+struct DaemonSlot {
+    /// Whether this slot counts against the global limit.
+    gated: bool,
+}
+
+impl Drop for DaemonSlot {
+    fn drop(&mut self) {
+        SLOTS_HELD.with(|h| h.set(h.get().saturating_sub(1)));
+        if self.gated {
+            DAEMONS_RUNNING.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
+    }
+}
+
+/// Takes a gate slot, waiting while the limit is reached.
+///
+/// Slots are **reentrant per thread**: a test that starts a second daemon while
+/// already holding one gets it immediately. Without that, N tests each waiting
+/// for their *second* daemon while every global slot is held by a *first*
+/// daemon deadlocks the whole suite.
+fn acquire_daemon_slot() -> DaemonSlot {
+    if SLOTS_HELD.with(|h| {
+        let n = h.get();
+        h.set(n + 1);
+        n > 0
+    }) {
+        return DaemonSlot { gated: false };
+    }
+
+    let limit = max_concurrent_daemons();
+    let mut spins = 0u32;
+    loop {
+        let current = DAEMONS_RUNNING.load(AtomicOrdering::SeqCst);
+        if current < limit
+            && DAEMONS_RUNNING
+                .compare_exchange(
+                    current,
+                    current + 1,
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                )
+                .is_ok()
+        {
+            return DaemonSlot { gated: true };
+        }
+        spins += 1;
+        std::thread::sleep(Duration::from_millis(if spins < 100 { 2 } else { 10 }));
+    }
+}
+
 pub struct SingboxProcess {
     child: Child,
     _dir: TempDir,
+    stderr_path: PathBuf,
+    /// Held for the lifetime of the daemon; see [`acquire_daemon_slot`].
+    _slot: DaemonSlot,
 }
 
 impl SingboxProcess {
@@ -25,19 +103,30 @@ impl SingboxProcess {
     /// (interop tests degrade to a graceful skip instead of a hard failure).
     pub fn start(config_json: &str) -> Option<(Self, PathBuf)> {
         let bin = get_singbox_bin()?;
+        // Take a gate slot only once we know a daemon will actually be started.
+        let slot = acquire_daemon_slot();
         let dir = TempDir::new().expect("failed to create tempdir");
         let cfg_path = dir.path().join("config.json");
         fs::write(&cfg_path, config_json).expect("failed to write sing-box config");
 
-        let (stdout_cfg, stderr_cfg) = if std::env::var("SINGBOX_LOG").is_ok() {
-            (Stdio::inherit(), Stdio::inherit())
+        // Always capture sing-box stderr into a file: when a test fails because the
+        // daemon died, the panic message can quote the real reason instead of being
+        // an opaque "Connection refused".
+        let stderr_path = dir.path().join("sing-box.stderr.log");
+        let inherit_logs = std::env::var("SINGBOX_LOG").is_ok();
+        let stderr_cfg = if inherit_logs {
+            Stdio::inherit()
         } else {
-            (Stdio::null(), Stdio::null())
+            Stdio::from(fs::File::create(&stderr_path).expect("failed to create stderr log"))
         };
 
-        let child = Command::new(&bin)
+        let mut child = Command::new(&bin)
             .args(["run", "-c", cfg_path.to_str().unwrap()])
-            .stdout(stdout_cfg)
+            .stdout(if inherit_logs {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .stderr(stderr_cfg)
             .spawn()
             .expect("failed to spawn sing-box");
@@ -64,21 +153,77 @@ impl SingboxProcess {
             v
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        for port in tcp_ports {
+        for port in &tcp_ports {
             loop {
-                if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
-                    break;
+                let err = match std::net::TcpStream::connect(format!("127.0.0.1:{}", port)) {
+                    Ok(_) => break,
+                    Err(e) => e,
+                };
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!(
+                        "sing-box exited with {status} before binding 127.0.0.1:{port}\n\
+                         --- sing-box stderr ---\n{}",
+                        read_stderr(&stderr_path)
+                    );
                 }
                 if std::time::Instant::now() > deadline {
-                    panic!("sing-box did not bind port {} within 10s", port);
+                    panic!(
+                        "sing-box did not bind port {port} within 10s (last error: {err:?})\n\
+                         --- sing-box stderr ---\n{}",
+                        read_stderr(&stderr_path)
+                    );
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
-        // Small grace period for QUIC listeners and internal wiring.
-        std::thread::sleep(Duration::from_millis(200));
+        // Grace period for QUIC listeners and internal wiring, followed by a final
+        // liveness + reachability check: a daemon that died right after binding
+        // (e.g. a racing test stole a port, or a later inbound in the same config
+        // failed) then surfaces here with diagnostics instead of as a downstream
+        // "Connection refused".
+        std::thread::sleep(Duration::from_millis(400));
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!(
+                "sing-box exited with {status} right after starting\n\
+                 --- sing-box stderr ---\n{}",
+                read_stderr(&stderr_path)
+            );
+        }
+        for port in &tcp_ports {
+            if let Err(e) = std::net::TcpStream::connect(format!("127.0.0.1:{}", port)) {
+                panic!(
+                    "sing-box stopped listening on 127.0.0.1:{port}: {e}\n\
+                     --- sing-box stderr ---\n{}",
+                    read_stderr(&stderr_path)
+                );
+            }
+        }
 
-        Some((Self { child, _dir: dir }, cfg_path))
+        Some((
+            Self {
+                child,
+                _dir: dir,
+                stderr_path,
+                _slot: slot,
+            },
+            cfg_path,
+        ))
+    }
+}
+
+fn read_stderr(path: &Path) -> String {
+    match fs::read_to_string(path) {
+        Ok(s) if s.trim().is_empty() => "<empty>".to_string(),
+        Ok(s) => s,
+        Err(e) => format!("<could not read stderr: {e}>"),
+    }
+}
+
+impl SingboxProcess {
+    /// sing-box's captured stderr, for assertions / failure diagnostics.
+    #[allow(dead_code)]
+    pub fn stderr(&self) -> String {
+        read_stderr(&self.stderr_path)
     }
 }
 
@@ -109,6 +254,20 @@ fn which(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// SHA-256 of a PEM certificate's DER encoding, hex-encoded, as Xray's
+/// `pinnedPeerCertSha256` expects it.
+pub fn cert_sha256_hex(cert_pem_path: &Path) -> String {
+    use sha2::Digest;
+    let pem = fs::read_to_string(cert_pem_path).expect("read cert pem");
+    let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .expect("decode cert der");
+    let mut h = sha2::Sha256::new();
+    h.update(&der);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn generate_self_signed_cert(dir: &Path) -> (PathBuf, PathBuf) {
@@ -3915,4 +4074,441 @@ outbounds:
     let mut buf = vec![0u8; payload.len()];
     stream.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, payload);
+}
+
+/// Salamander obfuscation interop: sing-box Hysteria2 client **with obfs**
+/// → flux-core Hysteria2 inbound with the same `obfs` password.
+///
+/// This is the only test that can catch a wrong Salamander wire format: the
+/// in-tree obfs tests are flux↔flux and would happily agree with a private
+/// cipher (salt length, KDF) that no other implementation understands.
+#[tokio::test]
+async fn test_interop_hysteria2_salamander_obfs_singbox_to_flux() {
+    let echo = start_tcp_echo_server().await;
+    let flux_port = get_free_tcp_port().await;
+    let sbox_socks_port = get_free_tcp_port().await;
+    let password = "hy2-obfs-secret";
+    let obfs_password = "salamander-interop-psk";
+
+    let flux_cfg = format!(
+        r#"
+inbounds:
+  - tag: hy2-in
+    carrier:
+      type: udp
+      listen: "127.0.0.1"
+      listen_port: {flux_port}
+    protocol:
+      type: hysteria2
+      password: "{password}"
+      obfs: salamander
+      obfs_password: "{obfs_password}"
+outbounds:
+  - type: direct
+    tag: direct
+"#
+    );
+    let flux_inst = Instance::new(Config::from_yaml_str(&flux_cfg).unwrap()).unwrap();
+    flux_inst.start().await.unwrap();
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "socks", "tag": "in",
+                "listen": "127.0.0.1", "listen_port": {sbox_socks_port}
+            }}],
+            "outbounds": [{{
+                "type": "hysteria2",
+                "tag": "out",
+                "server": "127.0.0.1",
+                "server_port": {flux_port},
+                "password": "{password}",
+                "obfs": {{ "type": "salamander", "password": "{obfs_password}" }},
+                "tls": {{"enabled": true, "insecure": true, "server_name": "localhost", "alpn": ["h3"]}}
+            }}]
+        }}"#
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", sbox_socks_port))
+        .await
+        .unwrap();
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, [0x05, 0x00]);
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    match echo.ip() {
+        std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
+        _ => panic!("echo server must be IPv4"),
+    }
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+    let mut resp = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut resp))
+        .await
+        .expect("sing-box hy2+salamander connect to flux timed out")
+        .unwrap();
+    assert_eq!(
+        resp[1], 0x00,
+        "sing-box hy2+salamander connect must succeed"
+    );
+
+    let payload = b"Hysteria2 + Salamander obfs: sing-box -> flux-core verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut got))
+        .await
+        .expect("hy2+salamander echo timed out")
+        .unwrap();
+    assert_eq!(&got, payload);
+
+    flux_inst.stop().await.unwrap();
+}
+
+/// Same as above in the opposite direction: flux-core Hysteria2 **outbound**
+/// with Salamander obfs → sing-box Hysteria2 inbound with the same obfs.
+#[tokio::test]
+async fn test_interop_hysteria2_salamander_obfs_flux_to_singbox() {
+    let echo = start_tcp_echo_server().await;
+    let sbox_port = get_free_tcp_port().await;
+    let password = "hy2-obfs-secret-2";
+    let obfs_password = "salamander-interop-psk-2";
+
+    let temp_dir = TempDir::new().unwrap();
+    let (cert_path, key_path) = generate_self_signed_cert(temp_dir.path());
+
+    let sbox_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "type": "hysteria2",
+                "tag": "hy2-in",
+                "listen": "127.0.0.1",
+                "listen_port": {sbox_port},
+                "users": [{{"password": "{password}"}}],
+                "obfs": {{ "type": "salamander", "password": "{obfs_password}" }},
+                "tls": {{
+                    "enabled": true,
+                    "certificate_path": "{}",
+                    "key_path": "{}"
+                }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        cert_path.display(),
+        key_path.display()
+    );
+    let Some((_sbox, _)) = SingboxProcess::start(&sbox_cfg) else {
+        eprintln!("skipping interop test: sing-box binary not found (set SINGBOX_BIN)");
+        return;
+    };
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "hy2-obfs-node",
+                "carrier": {{ "type": "udp", "address": "127.0.0.1:{sbox_port}" }},
+                "security": {{ "type": "tls", "sni": "localhost", "insecure": true }},
+                "protocol": {{
+                    "type": "hysteria2", "password": "{password}",
+                    "obfs": "salamander", "obfs_password": "{obfs_password}",
+                    "alpn": ["h3"]
+                }}
+            }}]
+        }}"#
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst.registry.get_outbound("hy2-obfs-node").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream = tokio::time::timeout(Duration::from_secs(15), outbound.dial_stream(&meta))
+        .await
+        .expect("flux hy2+salamander dial to sing-box timed out")
+        .unwrap();
+    let payload = b"Hysteria2 + Salamander obfs: flux-core -> sing-box verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut got))
+        .await
+        .expect("flux hy2+salamander echo timed out")
+        .unwrap();
+    assert_eq!(&got, payload);
+}
+
+// ---------------------------------------------------------------------------
+// Xray interop (XTLS Vision flow)
+// ---------------------------------------------------------------------------
+
+/// Locates the Xray binary (`XRAY_BIN`, then `xray` on PATH).
+fn get_xray_bin() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("XRAY_BIN") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    which("xray")
+}
+
+/// A running Xray process; killed on drop.
+struct XrayProcess {
+    child: Child,
+    _dir: TempDir,
+    stderr_path: PathBuf,
+}
+
+impl XrayProcess {
+    fn start(config_json: &str) -> Option<Self> {
+        let bin = get_xray_bin()?;
+        let dir = TempDir::new().expect("tempdir");
+        let cfg_path = dir.path().join("config.json");
+        fs::write(&cfg_path, config_json).expect("write xray config");
+        let stderr_path = dir.path().join("xray.stderr.log");
+        // Xray logs to stdout, so capture both into one file for diagnostics.
+        let log = fs::File::create(&stderr_path).expect("xray log");
+        let log2 = log.try_clone().expect("xray log clone");
+        let child = Command::new(&bin)
+            .args(["run", "-c", cfg_path.to_str().unwrap()])
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log2))
+            .spawn()
+            .expect("failed to spawn xray");
+        Some(Self {
+            child,
+            _dir: dir,
+            stderr_path,
+        })
+    }
+
+    fn stderr(&self) -> String {
+        fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+}
+
+impl Drop for XrayProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Waits for `port` to accept connections, reporting the daemon's stderr (and
+/// whether it already exited) instead of a bare timeout.
+async fn wait_for_xray(xray: &XrayProcess, port: u16, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "{what} did not listen on {port} within 15s\n--- xray stderr ---\n{}",
+                xray.stderr()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
+/// XTLS Vision interop, flux-core client → Xray server.
+///
+/// Vision is Xray's own flow: the padding/framing on the wire must match
+/// `xtls-rprx-vision` exactly, which only a real Xray peer can prove.
+#[tokio::test]
+async fn test_interop_vision_flux_to_xray() {
+    let echo = start_tcp_echo_server().await;
+    let xray_port = get_free_tcp_port().await;
+    let uuid = "11111111-2222-3333-4444-555555555555";
+    let temp_dir = TempDir::new().unwrap();
+    let (cert_path, key_path) = generate_self_signed_cert(temp_dir.path());
+
+    let xray_cfg = format!(
+        r#"{{
+            "log": {{ "loglevel": "warning" }},
+            "inbounds": [{{
+                "listen": "127.0.0.1",
+                "port": {xray_port},
+                "protocol": "vless",
+                "settings": {{
+                    "clients": [{{ "id": "{uuid}", "flow": "xtls-rprx-vision" }}],
+                    "decryption": "none"
+                }},
+                "streamSettings": {{
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {{
+                        "certificates": [{{
+                            "certificateFile": "{cert}",
+                            "keyFile": "{key}"
+                        }}]
+                    }}
+                }}
+            }}],
+            "outbounds": [{{ "protocol": "freedom" }}]
+        }}"#,
+        cert = cert_path.display(),
+        key = key_path.display()
+    );
+    let Some(xray) = XrayProcess::start(&xray_cfg) else {
+        eprintln!("skipping interop test: xray binary not found (set XRAY_BIN)");
+        return;
+    };
+    wait_for_xray(&xray, xray_port, "xray vless+vision").await;
+
+    let flux_cfg = format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "xray-vision",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:{xray_port}" }},
+                "security": {{ "type": "tls", "sni": "localhost", "insecure": true }},
+                "protocol": {{ "type": "vless", "uuid": "{uuid}", "flow": "xtls-rprx-vision" }}
+            }}]
+        }}"#
+    );
+    let flux_inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    let outbound = flux_inst.registry.get_outbound("xray-vision").unwrap();
+
+    let meta = SessionMeta::new(
+        "127.0.0.1:0".parse().unwrap(),
+        TargetAddress::Ip(echo),
+        "test",
+        NetworkType::Tcp,
+    );
+    let mut stream =
+        match tokio::time::timeout(Duration::from_secs(15), outbound.dial_stream(&meta)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => panic!(
+                "flux vision dial to xray failed: {e}\n--- xray stderr ---\n{}",
+                xray.stderr()
+            ),
+            Err(_) => panic!(
+                "flux vision dial to xray timed out\n--- xray stderr ---\n{}",
+                xray.stderr()
+            ),
+        };
+
+    let payload = b"XTLS Vision: flux-core -> Xray verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut got))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "vision echo timed out\n--- xray stderr ---\n{}",
+                xray.stderr()
+            )
+        })
+        .unwrap();
+    assert_eq!(&got, payload);
+}
+
+/// XTLS Vision interop in the other direction: Xray client → flux-core server.
+#[tokio::test]
+async fn test_interop_vision_xray_to_flux() {
+    let echo = start_tcp_echo_server().await;
+    let flux_port = get_free_tcp_port().await;
+    let xray_socks_port = get_free_tcp_port().await;
+    let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    let temp_dir = TempDir::new().unwrap();
+    let (cert_path, key_path) = generate_self_signed_cert(temp_dir.path());
+    let flux_cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "tag": "vision-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {flux_port} }},
+                "security": {{ "type": "tls", "certificate_path": "{}", "key_path": "{}" }},
+                "protocol": {{ "type": "vless", "uuid": "{uuid}", "flow": "xtls-rprx-vision" }}
+            }}],
+            "outbounds": [{{ "type": "direct", "tag": "direct" }}]
+        }}"#,
+        cert_path.display(),
+        key_path.display()
+    );
+    let inst = Instance::new(Config::from_json_str(&flux_cfg).unwrap()).unwrap();
+    inst.start().await.unwrap();
+
+    let xray_cfg = format!(
+        r#"{{
+            "log": {{ "loglevel": "warning" }},
+            "inbounds": [{{
+                "listen": "127.0.0.1", "port": {xray_socks_port}, "protocol": "socks",
+                "settings": {{ "auth": "noauth", "udp": false }}
+            }}],
+            "outbounds": [{{
+                "protocol": "vless",
+                "settings": {{
+                    "vnext": [{{
+                        "address": "127.0.0.1",
+                        "port": {flux_port},
+                        "users": [{{ "id": "{uuid}", "flow": "xtls-rprx-vision", "encryption": "none" }}]
+                    }}]
+                }},
+                "streamSettings": {{
+                    "network": "tcp",
+                    "security": "tls",
+                    "tlsSettings": {{
+                        "serverName": "localhost",
+                        // Xray 26 removed `allowInsecure`: a self-signed peer is
+                        // trusted by pinning the certificate hash instead.
+                        "pinnedPeerCertSha256": "{pin}"
+                    }}
+                }}
+            }}]
+        }}"#,
+        pin = cert_sha256_hex(&cert_path)
+    );
+    let Some(xray) = XrayProcess::start(&xray_cfg) else {
+        eprintln!("skipping interop test: xray binary not found (set XRAY_BIN)");
+        return;
+    };
+    wait_for_xray(&xray, xray_socks_port, "xray socks inbound").await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{xray_socks_port}"))
+        .await
+        .unwrap();
+    stream.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut buf = [0u8; 2];
+    stream.read_exact(&mut buf).await.unwrap();
+    assert_eq!(buf, [0x05, 0x00]);
+    let mut req = vec![0x05, 0x01, 0x00, 0x01];
+    match echo.ip() {
+        std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
+        _ => panic!("echo server must be IPv4"),
+    }
+    req.extend_from_slice(&echo.port().to_be_bytes());
+    stream.write_all(&req).await.unwrap();
+    let mut resp = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut resp))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "xray vision connect to flux timed out\n--- xray stderr ---\n{}",
+                xray.stderr()
+            )
+        })
+        .unwrap();
+    assert_eq!(resp[1], 0x00, "xray vision connect must succeed");
+
+    let payload = b"XTLS Vision: Xray -> flux-core verified!";
+    stream.write_all(payload).await.unwrap();
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut got))
+        .await
+        .expect("xray vision echo timed out")
+        .unwrap();
+    assert_eq!(&got, payload);
+
+    inst.stop().await.unwrap();
 }

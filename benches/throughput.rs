@@ -137,5 +137,74 @@ fn bench_proxy_throughput(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_router, bench_proxy_throughput);
+/// Cost of the pooled-buffer lifecycle on the datagram hot path.
+///
+/// The pool used to scrub every released buffer (`Vec::fill(0)`), i.e. a full
+/// `memset` of the buffer — for the 64 KiB packet pool that is one memset *per
+/// UDP datagram*. This measures the current lifecycle against that old
+/// behaviour so the saving is a concrete, reproducible number rather than a
+/// claim.
+fn bench_buffer_pool(c: &mut Criterion) {
+    use flux_common::BufferPool;
+
+    let mut group = c.benchmark_group("buffer_pool_64k");
+    group.throughput(Throughput::Bytes(65_536));
+
+    group.bench_function("acquire_release", |b| {
+        let pool = BufferPool::packet_pool();
+        b.iter(|| {
+            let buf = pool.acquire();
+            pool.release(buf);
+        })
+    });
+
+    group.bench_function("acquire_release_with_scrub_legacy", |b| {
+        // Baseline for the removed behaviour: scrub before returning.
+        let pool = BufferPool::packet_pool();
+        b.iter(|| {
+            let mut buf = pool.acquire();
+            buf.fill(0);
+            pool.release(buf);
+        })
+    });
+
+    group.finish();
+}
+
+/// Cost of building a TLS client connector, cached vs. cold.
+///
+/// The connector embeds a `CryptoProvider` (cipher-suite / key-exchange tables)
+/// and a ~150-entry root certificate store; both used to be rebuilt on every
+/// dial. A cache miss is emulated with a unique ALPN list.
+fn bench_tls_connector(c: &mut Criterion) {
+    use flux_transport::tls::{TlsClientConfig, TlsTransport};
+
+    let mut group = c.benchmark_group("tls_client_connector");
+
+    let warm = TlsClientConfig::new("example.com");
+    let _ = TlsTransport::create_client_connector(&warm).unwrap();
+    group.bench_function("cached_hit", |b| {
+        b.iter(|| TlsTransport::create_client_connector(&warm).unwrap())
+    });
+
+    let mut counter = 0u32;
+    group.bench_function("cache_miss", |b| {
+        b.iter(|| {
+            counter = counter.wrapping_add(1);
+            let mut cfg = TlsClientConfig::new("example.com");
+            cfg.alpn = vec![format!("proto-{counter}").into_bytes()];
+            TlsTransport::create_client_connector(&cfg).unwrap()
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_router,
+    bench_buffer_pool,
+    bench_tls_connector,
+    bench_proxy_throughput
+);
 criterion_main!(benches);

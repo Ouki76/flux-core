@@ -4,15 +4,26 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 
-static NEXT_TCP_PORT: AtomicU16 = AtomicU16::new(21000);
+/// First port handed out by [`get_free_tcp_port`].
+///
+/// The whole test range deliberately stays **below** the kernel's ephemeral
+/// range (`/proc/sys/net/ipv4/ip_local_port_range`, typically 32768-60999):
+/// any listener the OS assigns for us via `bind(":0")` (echo servers, internal
+/// detour inbounds, …) therefore can never steal a port that a test reserved
+/// for an external process such as sing-box. Staying below the ephemeral range
+/// is what makes the interop suite deterministic under parallel execution.
+const TEST_PORT_BASE: u16 = 12_000;
+const TEST_PORT_MAX: u16 = 32_000;
 
-/// Returns a unique, non-colliding TCP port.
+static NEXT_TCP_PORT: AtomicU16 = AtomicU16::new(TEST_PORT_BASE);
+
+/// Returns a unique, non-colliding TCP port below the ephemeral port range.
 #[allow(dead_code)]
 pub async fn get_free_tcp_port() -> u16 {
     loop {
         let port = NEXT_TCP_PORT.fetch_add(1, Ordering::Relaxed);
-        if !(21000..=64000).contains(&port) {
-            NEXT_TCP_PORT.store(21000, Ordering::Relaxed);
+        if !(TEST_PORT_BASE..TEST_PORT_MAX).contains(&port) {
+            NEXT_TCP_PORT.store(TEST_PORT_BASE, Ordering::Relaxed);
             continue;
         }
         if let Ok(listener) = TcpListener::bind(format!("127.0.0.1:{}", port)).await
