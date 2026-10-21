@@ -81,7 +81,7 @@ codegen-units = 1
 strip = true
 [package]
 name = "flux-core"
-version = "1.2.1"
+version = "1.3.0"
 license = "MIT"
 rust-version = "1.91"
 edition = "2024"
@@ -132,3 +132,41 @@ path = "examples/bench_native.rs"
 [[example]]
 name = "bench_udp"
 path = "examples/bench_udp.rs"
+
+# ---------------------------------------------------------------------------
+# Quality metadata
+#
+# Descriptive only: nothing here is read at build time. It exists so tooling and
+# reviewers can find the standard and its enforcement points from the manifest
+# instead of grepping the repository. No thresholds are duplicated here on
+# purpose — the benchmark threshold lives next to the baseline it applies to
+# (benches/baseline.json "policy"), so there is exactly one source of truth.
+# See docs/quality.md.
+# ---------------------------------------------------------------------------
+
+[workspace.metadata.quality]
+standard = "docs/quality.md"
+contributing = "CONTRIBUTING.md"
+security = "SECURITY.md"
+ci = ".github/workflows/ci.yml"
+benchmark_workflow = ".github/workflows/bench.yml"
+benchmark_baseline = "benches/baseline.json"
+coverage_workflow = ".github/workflows/coverage.yml"
+coverage_script = "scripts/coverage.sh"
+metrics_script = "scripts/quality_metrics.sh"
+msrv = "1.91"
+# The stable features this project deliberately does not use: nightly-only
+# facilities (cargo-fuzz, -Z flags) are out of scope, see docs/quality.md §7.
+requires_nightly = false
+
+[workspace.metadata.release]
+# Tag convention enforced by .github/workflows/release.yml (preflight job):
+# the tag must be exactly `v` + the root package version above.
+tag_prefix = "v"
+workflow = ".github/workflows/release.yml"
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+# aarch64 is built through `cross` and is best effort: if it fails, the x86_64
+# artefacts are still published and the failure is visible in the run.
+best_effort_targets = ["aarch64-unknown-linux-gnu"]
+checksums = "SHA256SUMS"
+signed = false
