@@ -1,6 +1,6 @@
-use crate::wire::DnsMessage;
+use crate::wire::{Answer, DnsMessage, Name, QueryError};
 use flux_types::{FluxError, FluxResult};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,84 +105,96 @@ impl DoqClient {
     }
 
     /// Queries DNS-over-QUIC (RFC 9250) server.
+    ///
+    /// Returns the parsed [`Answer`] so the caller can follow a CNAME that came
+    /// back without its target record and distinguish a clean NODATA from a
+    /// transport failure (which decides negative caching).
     pub async fn query_doq(
         &self,
-        domain: &str,
+        name: &Name,
         ecs: Option<ipnet::IpNet>,
         qtype: u16,
-    ) -> FluxResult<(IpAddr, u32)> {
+    ) -> Result<Answer, QueryError> {
         let connect_addr: SocketAddr = if let Ok(ip) = self.server_host.parse() {
             SocketAddr::new(ip, self.server_port)
         } else {
             let addr_str = format!("{}:{}", self.server_host, self.server_port);
             let mut addrs = tokio::net::lookup_host(&addr_str)
                 .await
-                .map_err(FluxError::Io)?;
+                .map_err(|e| QueryError::Transport(FluxError::Io(e)))?;
             addrs.next().ok_or_else(|| {
-                FluxError::Dns(format!(
+                QueryError::Transport(FluxError::Dns(format!(
                     "failed to resolve DoQ server host '{}'",
                     self.server_host
-                ))
+                )))
             })?
         };
 
         tokio::time::timeout(
             DOQ_IO_TIMEOUT,
-            self.query_doq_inner(connect_addr, domain, ecs, qtype),
+            self.query_doq_inner(connect_addr, name, ecs, qtype),
         )
         .await
         .map_err(|_| {
-            FluxError::Timeout(format!(
+            QueryError::Transport(FluxError::Timeout(format!(
                 "DoQ query to {} timed out after {:?}",
                 self.server_host, DOQ_IO_TIMEOUT
-            ))
+            )))
         })?
     }
 
     async fn query_doq_inner(
         &self,
         connect_addr: SocketAddr,
-        domain: &str,
+        name: &Name,
         ecs: Option<ipnet::IpNet>,
         qtype: u16,
-    ) -> FluxResult<(IpAddr, u32)> {
-        let connection = self.get_connection(connect_addr).await?;
+    ) -> Result<Answer, QueryError> {
+        let connection = self
+            .get_connection(connect_addr)
+            .await
+            .map_err(QueryError::Transport)?;
         let (mut send_stream, mut recv_stream) = match connection.open_bi().await {
             Ok(streams) => streams,
             Err(_) => {
                 // If stream open failed (connection stale), clear cached connection and force reconnect
                 *self.connection.lock().await = None;
-                let connection = self.get_connection(connect_addr).await?;
-                connection
-                    .open_bi()
+                let connection = self
+                    .get_connection(connect_addr)
                     .await
-                    .map_err(|e| FluxError::Network(format!("failed to open DoQ stream: {}", e)))?
+                    .map_err(QueryError::Transport)?;
+                connection.open_bi().await.map_err(|e| {
+                    QueryError::Transport(FluxError::Network(format!(
+                        "failed to open DoQ stream: {}",
+                        e
+                    )))
+                })?
             }
         };
 
-        let query = DnsMessage::build_query_with_ecs(domain, qtype, ecs);
+        let query = DnsMessage::build_query_for_name(name, qtype, ecs, rand::random::<u16>());
         let len_bytes = (query.len() as u16).to_be_bytes();
 
         send_stream
             .write_all(&len_bytes)
             .await
-            .map_err(|e| FluxError::Network(e.to_string()))?;
+            .map_err(|e| QueryError::Transport(FluxError::Network(e.to_string())))?;
         send_stream
             .write_all(&query)
             .await
-            .map_err(|e| FluxError::Network(e.to_string()))?;
-        send_stream
-            .finish()
-            .map_err(|e| FluxError::Network(format!("DoQ finish failed: {}", e)))?;
+            .map_err(|e| QueryError::Transport(FluxError::Network(e.to_string())))?;
+        send_stream.finish().map_err(|e| {
+            QueryError::Transport(FluxError::Network(format!("DoQ finish failed: {}", e)))
+        })?;
 
         let mut len_buf = [0u8; 2];
         recv_stream
             .read_exact(&mut len_buf)
             .await
-            .map_err(|e| FluxError::Network(e.to_string()))?;
+            .map_err(|e| QueryError::Transport(FluxError::Network(e.to_string())))?;
         let resp_len = u16::from_be_bytes(len_buf) as usize;
         if resp_len > 4096 {
-            return Err(FluxError::Dns(format!(
+            return Err(QueryError::Malformed(format!(
                 "DoQ response size {} exceeds 4096 bytes",
                 resp_len
             )));
@@ -192,9 +204,9 @@ impl DoqClient {
         recv_stream
             .read_exact(&mut resp_buf)
             .await
-            .map_err(|e| FluxError::Network(e.to_string()))?;
+            .map_err(|e| QueryError::Transport(FluxError::Network(e.to_string())))?;
 
-        DnsMessage::parse_specific_record_with_ttl(&resp_buf, qtype)
+        DnsMessage::parse_response(&resp_buf, name, qtype)
     }
 }
 

@@ -1,8 +1,9 @@
-use crate::wire::{DnsMessage, QTYPE_A};
+use crate::wire::{Answer, DnsMessage, Name, QTYPE_A, QueryError};
 use flux_transport::tcp::TcpTransport;
 use flux_transport::tls::{TlsClientConfig, TlsTransport};
 use flux_types::{BoxedStream, FluxError, FluxResult};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -131,11 +132,14 @@ impl DohClient {
         }
     }
 
-    /// Connects to the DoH server with connection reuse and resolves domain name to an IP.
-    /// Queries the DoH server for the given record type, returning the first
-    /// matching address together with its real TTL from the response.
-    pub async fn query_doh(&self, domain: &str, qtype: u16) -> FluxResult<(IpAddr, u32)> {
-        let query_wire = DnsMessage::build_query(domain, qtype);
+    /// Connects to the DoH server with connection reuse and queries `name` for
+    /// `qtype`.
+    ///
+    /// Returns the parsed [`Answer`] rather than an address so the caller can
+    /// follow a CNAME returned without its target record and can tell a clean
+    /// NODATA from a transport failure (which decides negative caching).
+    pub async fn query_doh(&self, name: &Name, qtype: u16) -> Result<Answer, QueryError> {
+        let query_wire = DnsMessage::build_query_for_name(name, qtype, None, rand::random::<u16>());
 
         let req = format!(
             "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
@@ -158,16 +162,16 @@ impl DohClient {
                 match connect {
                     Err(_) => {
                         if attempt == 1 {
-                            return Err(FluxError::Timeout(format!(
+                            return Err(QueryError::Transport(FluxError::Timeout(format!(
                                 "DoH connect to {} timed out",
                                 self.server_ip
-                            )));
+                            ))));
                         }
                         continue;
                     }
                     Ok(Err(e)) => {
                         if attempt == 1 {
-                            return Err(e);
+                            return Err(QueryError::Transport(e));
                         }
                         continue;
                     }
@@ -308,7 +312,9 @@ impl DohClient {
 
             match query_res {
                 Ok(body) => {
-                    return DnsMessage::parse_specific_record_with_ttl(&body, qtype);
+                    // A malformed body is reported by `parse_response`; the
+                    // connection itself is still healthy, so it is kept.
+                    return DnsMessage::parse_response(&body, name, qtype);
                 }
                 Err(_) => {
                     *guard = None;
@@ -316,19 +322,29 @@ impl DohClient {
             }
         }
 
-        Err(FluxError::Dns(format!(
+        Err(QueryError::Transport(FluxError::Dns(format!(
             "DoH query to {} failed after reconnect",
             self.server_ip
-        )))
+        ))))
     }
 
     /// Queries the DoH server and returns IPv4.
     pub async fn resolve_ipv4(&self, domain: &str) -> FluxResult<Ipv4Addr> {
-        match self.query_doh(domain, QTYPE_A).await?.0 {
-            IpAddr::V4(v4) => Ok(v4),
-            IpAddr::V6(_) => Err(FluxError::Dns(
+        let name = Name::from_str(domain).map_err(|e| FluxError::Dns(e.to_string()))?;
+        match self
+            .query_doh(&name, QTYPE_A)
+            .await
+            .map_err(QueryError::into_flux)?
+        {
+            Answer::Address {
+                ip: IpAddr::V4(v4), ..
+            } => Ok(v4),
+            Answer::Address { .. } => Err(FluxError::Dns(
                 "expected IPv4 address from DoH, got IPv6".into(),
             )),
+            other => Err(FluxError::Dns(format!(
+                "DoH returned no A record for {domain}: {other:?}"
+            ))),
         }
     }
 }
@@ -392,12 +408,18 @@ mod tests {
         let doh = DohClient::new(&url);
 
         // Perform multiple parallel queries and verify round-robin rotation
-        let (ip1, ttl1) = doh.query_doh("example.com", QTYPE_A).await.unwrap();
-        assert_eq!(ip1, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
-        assert_eq!(ttl1, 300);
+        let name = Name::from_str("example.com").unwrap();
+        let ans1 = doh.query_doh(&name, QTYPE_A).await.unwrap();
+        assert_eq!(
+            ans1,
+            Answer::Address {
+                ip: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+                ttl: 300,
+            }
+        );
 
-        let (ip2, _) = doh.query_doh("example.com", QTYPE_A).await.unwrap();
-        assert_eq!(ip2, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        let ans2 = doh.query_doh(&name, QTYPE_A).await.unwrap();
+        assert_eq!(ans2, ans1);
 
         assert!(doh.counter.load(Ordering::Relaxed) >= 2);
     }

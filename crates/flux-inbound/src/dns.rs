@@ -1,30 +1,29 @@
 //! DNS inbound with fake-IP allocation.
 //!
-//! Answers `A` queries from the fake-IP pool so that clients connect to a
-//! synthetic address inside the pool range; [`crate::dns::FakeIpPool`]'s reverse
-//! mapping then turns that address back into the domain name in the dispatcher,
-//! which is what makes domain-based routing work for applications that resolve
-//! names themselves (browsers, TLS stacks, anything that does not use a SOCKS5
-//! domain request).
+//! Answers `A` (and, when the pool has a v6 range, `AAAA`) queries from the
+//! fake-IP pool so that clients connect to a synthetic address inside the pool
+//! range; [`FakeIpPool`]'s reverse mapping then turns that address back into the
+//! domain name in the dispatcher, which is what makes domain-based routing work
+//! for applications that resolve names themselves (browsers, TLS stacks,
+//! anything that does not use a SOCKS5 domain request).
 //!
-//! Without this inbound the pool, the reverse mapping and `dns.fakeip.enabled`
-//! were inert: nothing ever allocated a fake address.
+//! Everything the pool does not synthesise is either reverse-mapped from it
+//! (`PTR`) or relayed verbatim to a plain-UDP upstream, so record types the
+//! proxy does not model (TXT, MX, HTTPS/SVCB, DNSSEC, ...) are answered for real
+//! instead of being dropped. Anything that cannot be answered is answered with
+//! NODATA — a prompt, valid answer — never SERVFAIL and never a silent drop.
 
 use async_trait::async_trait;
 use flux_dns::fakeip::FakeIpPool;
 use flux_dns::resolver::DnsResolver;
-use flux_dns::wire::DnsMessage;
+use flux_dns::wire::{DnsMessage, Name, QTYPE_A, QTYPE_AAAA, QTYPE_PTR, ptr_name_to_ip};
 use flux_types::{Dispatcher, FluxError, FluxResult, Inbound};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
-
-/// DNS record type A.
-const QTYPE_A: u16 = 1;
-/// DNS record type AAAA.
-const QTYPE_AAAA: u16 = 28;
 
 /// Maximum number of queries handled concurrently by one DNS inbound.
 const MAX_INFLIGHT_QUERIES: usize = 256;
@@ -67,8 +66,13 @@ impl DnsInbound {
     }
 }
 
-/// Answers one DNS query: fake-IP for `A`, NODATA for `AAAA` while fake-IP is on,
-/// upstream resolution otherwise.
+/// Answers one DNS query.
+///
+/// * `A` / `AAAA` with a fake-IP pool: synthetic address (v6 only when the pool
+///   was configured with a v6 range, otherwise NODATA so the client falls back).
+/// * `PTR` of a fake address: the domain the address was handed out for.
+/// * Everything else: relayed to the upstream, or NODATA when there is nothing
+///   to relay to.
 async fn answer_query(
     query: &[u8],
     resolver: &Arc<DnsResolver>,
@@ -91,38 +95,74 @@ async fn answer_query(
     }
 
     match qtype {
-        QTYPE_A => {
-            if let Some(pool) = fake_ip {
-                // Allocate (or reuse) a synthetic address for this name.
-                let ip = pool.allocate(&qname);
-                return DnsMessage::build_response(query, Some(ip));
+        QTYPE_A => match fake_ip {
+            // Allocate (or reuse) a synthetic IPv4 address for this name.
+            Some(pool) => {
+                DnsMessage::build_response_ip(query, Some(IpAddr::V4(pool.allocate(&qname))))
             }
-            // No pool: answer with the real address when it is IPv4.
-            match resolver.resolve_domain(&qname, 443).await {
-                Ok(addr) => match addr.ip() {
-                    std::net::IpAddr::V4(v4) => DnsMessage::build_response(query, Some(v4)),
-                    std::net::IpAddr::V6(_) => DnsMessage::build_response(query, None),
+            None => answer_forwarded(query, resolver, &qname, qtype).await,
+        },
+        QTYPE_AAAA => match fake_ip {
+            Some(pool) => match pool.allocate_v6(&qname) {
+                Some(v6) => DnsMessage::build_response_ip(query, Some(IpAddr::V6(v6))),
+                // No v6 range configured: NODATA is the correct, honest answer —
+                // the client falls back to A immediately instead of waiting, and
+                // no real IPv6 address leaks past the fake-IP model.
+                None => DnsMessage::build_response(query, None),
+            },
+            None => answer_forwarded(query, resolver, &qname, qtype).await,
+        },
+        QTYPE_PTR => {
+            // Reverse-map a fake address back to the name it was allocated for.
+            let target = fake_ip.and_then(|pool| {
+                let ip = ptr_name_to_ip(&Name::from_str(&qname).ok()?)?;
+                pool.lookup_domain(&ip)
+            });
+            match target {
+                Some(domain) => match Name::from_str(&domain) {
+                    Ok(name) => DnsMessage::build_response_ptr(query, &name),
+                    Err(_) => DnsMessage::build_response(query, None),
                 },
-                Err(_) => DnsMessage::build_response(query, None),
+                // Not one of our addresses: ask the upstream what it knows.
+                None => answer_forwarded(query, resolver, &qname, qtype).await,
             }
         }
-        QTYPE_AAAA => {
-            // Fake-IP is an IPv4 pool: answer NODATA so the client falls back to A
-            // immediately instead of waiting for a timeout.
-            if fake_ip.is_some() {
-                return DnsMessage::build_response(query, None);
-            }
-            match resolver.resolve_domain(&qname, 443).await {
-                Ok(addr) => match addr.ip() {
-                    std::net::IpAddr::V4(v4) => DnsMessage::build_response(query, Some(v4)),
-                    std::net::IpAddr::V6(_) => DnsMessage::build_response(query, None),
-                },
-                Err(_) => DnsMessage::build_response(query, None),
-            }
+        // TXT, MX, HTTPS/SVCB, SRV, DNSSEC types, ...: relayed verbatim so the
+        // record survives instead of being dropped or re-encoded.
+        _ => answer_forwarded(query, resolver, &qname, qtype).await,
+    }
+}
+
+/// Relays the query to a plain-UDP upstream; falls back to the resolver for
+/// address queries so a DoH/DoT/DoQ-only upstream configuration still answers
+/// `A`/`AAAA`.
+async fn answer_forwarded(
+    query: &[u8],
+    resolver: &Arc<DnsResolver>,
+    qname: &str,
+    qtype: u16,
+) -> Option<Vec<u8>> {
+    match resolver.forward_query(query).await {
+        Ok(resp) => return Some(resp),
+        Err(e) => {
+            debug!("DNS passthrough unavailable for '{}': {}", qname, e);
         }
-        // A response builder for other types is out of scope: NODATA is a valid,
-        // prompt answer and better than SERVFAIL.
-        _ => DnsMessage::build_response(query, None),
+    }
+
+    if qtype != QTYPE_A && qtype != QTYPE_AAAA {
+        return DnsMessage::build_response(query, None);
+    }
+
+    // Only an answer of the *requested* family may be returned: putting an A
+    // record in an AAAA response (or the reverse) is a protocol error that makes
+    // strict clients discard the whole message.
+    match resolver.resolve_domain(qname, 443).await {
+        Ok(addr) => match (qtype == QTYPE_AAAA, addr.ip()) {
+            (false, IpAddr::V4(v4)) => DnsMessage::build_response_ip(query, Some(IpAddr::V4(v4))),
+            (true, IpAddr::V6(v6)) => DnsMessage::build_response_ip(query, Some(IpAddr::V6(v6))),
+            _ => DnsMessage::build_response(query, None),
+        },
+        Err(_) => DnsMessage::build_response(query, None),
     }
 }
 
@@ -174,13 +214,17 @@ impl Inbound for DnsInbound {
         self.running.store(true, Ordering::SeqCst);
 
         info!(
-            "[{}] DNS inbound listening on {} (fake-IP: {})",
+            "[{}] DNS inbound listening on {} (fake-IP: {}, inet6: {})",
             self.tag,
             self.listen_addr,
             if self.fake_ip.is_some() {
                 "enabled"
             } else {
                 "disabled"
+            },
+            match self.fake_ip.as_ref().and_then(|p| p.inet6_network()) {
+                Some(net) => net.to_string(),
+                None => "disabled".into(),
             }
         );
 
@@ -246,17 +290,35 @@ impl Inbound for DnsInbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_dns::fakeip::DEFAULT_INET4_RANGE;
+    use flux_dns::wire::{Message, RData};
+
+    fn pool_v4() -> Arc<FakeIpPool> {
+        Arc::new(FakeIpPool::new("198.18.0.0/15", 128).unwrap())
+    }
+
+    fn pool_dual() -> Arc<FakeIpPool> {
+        Arc::new(
+            FakeIpPool::new(DEFAULT_INET4_RANGE, 128)
+                .unwrap()
+                .with_inet6(flux_dns::fakeip::DEFAULT_INET6_RANGE, 128)
+                .unwrap(),
+        )
+    }
+
+    fn inbound(pool: Option<Arc<FakeIpPool>>) -> DnsInbound {
+        DnsInbound::new(
+            "dns-in",
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::new(DnsResolver::new(None)),
+            pool,
+        )
+    }
 
     #[tokio::test]
     async fn answers_a_queries_from_the_fake_ip_pool() {
-        let pool = Arc::new(FakeIpPool::new("198.18.0.0/15", 128).unwrap());
-        let resolver = Arc::new(DnsResolver::new(None));
-        let inbound = DnsInbound::new(
-            "dns-in",
-            "127.0.0.1:0".parse().unwrap(),
-            resolver,
-            Some(pool.clone()),
-        );
+        let pool = pool_v4();
+        let inbound = inbound(Some(pool.clone()));
 
         let query = DnsMessage::build_query("example.com", QTYPE_A);
         let resp = inbound.answer(&query).await.expect("must answer");
@@ -266,7 +328,7 @@ mod tests {
             "answer {ip} must come from the 198.18.0.0/15 pool"
         );
         assert_eq!(
-            pool.lookup_domain(&std::net::IpAddr::V4(ip)).as_deref(),
+            pool.lookup_domain(&IpAddr::V4(ip)).as_deref(),
             Some("example.com"),
             "the reverse mapping must resolve back to the name"
         );
@@ -277,24 +339,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aaaa_queries_get_nodata_with_fake_ip() {
-        let pool = Arc::new(FakeIpPool::new("198.18.0.0/15", 16).unwrap());
-        let resolver = Arc::new(DnsResolver::new(None));
-        let inbound = DnsInbound::new(
-            "dns-in",
-            "127.0.0.1:0".parse().unwrap(),
-            resolver,
-            Some(pool),
-        );
+    async fn aaaa_queries_get_nodata_with_a_v4_only_pool() {
+        let inbound = inbound(Some(pool_v4()));
         let query = DnsMessage::build_query("example.com", QTYPE_AAAA);
         let resp = inbound.answer(&query).await.expect("must answer");
         assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "no answers");
     }
 
     #[tokio::test]
+    async fn aaaa_queries_get_a_fake_v6_address_when_the_pool_has_one() {
+        let pool = pool_dual();
+        let inbound = inbound(Some(pool.clone()));
+
+        let query = DnsMessage::build_query("example.com", QTYPE_AAAA);
+        let resp = inbound.answer(&query).await.expect("must answer");
+        let answer = Message::parse(&resp).unwrap();
+        assert_eq!(answer.answers.len(), 1);
+        assert_eq!(
+            answer.answers[0].rtype, QTYPE_AAAA,
+            "the record type must match the question type"
+        );
+        let RData::Aaaa(v6) = answer.answers[0].rdata else {
+            panic!("expected an AAAA record, got {:?}", answer.answers[0]);
+        };
+        assert!(
+            v6.is_unique_local(),
+            "fake v6 addresses stay inside fc00::/7"
+        );
+        assert_eq!(
+            pool.lookup_domain(&IpAddr::V6(v6)).as_deref(),
+            Some("example.com")
+        );
+
+        // Stable across queries, and distinct per name.
+        let resp2 = inbound.answer(&query).await.unwrap();
+        assert_eq!(DnsMessage::parse_aaaa_record(&resp2).unwrap(), v6);
+        let other = inbound
+            .answer(&DnsMessage::build_query("other.example", QTYPE_AAAA))
+            .await
+            .unwrap();
+        assert_ne!(DnsMessage::parse_aaaa_record(&other).unwrap(), v6);
+    }
+
+    #[tokio::test]
+    async fn ptr_queries_reverse_map_fake_addresses() {
+        let pool = pool_dual();
+        let inbound = inbound(Some(pool.clone()));
+
+        // IPv4
+        let v4 = pool.allocate("v4.example");
+        let q = DnsMessage::build_query(
+            &flux_dns::wire::ip_to_ptr_name(&IpAddr::V4(v4)).to_string(),
+            QTYPE_PTR,
+        );
+        let resp = inbound.answer(&q).await.expect("must answer");
+        let msg = Message::parse(&resp).unwrap();
+        assert_eq!(msg.answers.len(), 1);
+        assert_eq!(
+            msg.answers[0].rdata,
+            RData::Ptr("v4.example".parse().unwrap())
+        );
+
+        // IPv6
+        let v6 = pool.allocate_v6("v6.example").unwrap();
+        let q6 = DnsMessage::build_query(
+            &flux_dns::wire::ip_to_ptr_name(&IpAddr::V6(v6)).to_string(),
+            QTYPE_PTR,
+        );
+        let resp6 = inbound.answer(&q6).await.expect("must answer");
+        let msg6 = Message::parse(&resp6).unwrap();
+        assert_eq!(
+            msg6.answers[0].rdata,
+            RData::Ptr("v6.example".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn ptr_for_a_foreign_address_is_nodata_without_an_upstream() {
+        let inbound = inbound(Some(pool_v4()));
+        let q = DnsMessage::build_query("1.0.0.127.in-addr.arpa", QTYPE_PTR);
+        let resp = inbound.answer(&q).await.expect("must answer");
+        // No upstream is configured, so there is nothing to relay: NODATA, not a
+        // dropped packet and not SERVFAIL.
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0);
+    }
+
+    #[tokio::test]
+    async fn unmodelled_record_types_get_a_prompt_nodata() {
+        let inbound = inbound(Some(pool_v4()));
+        for qtype in [15u16, 16, 65, 255] {
+            let q = DnsMessage::build_query("example.com", qtype);
+            let resp = inbound.answer(&q).await.expect("must answer");
+            let msg = Message::parse(&resp).unwrap();
+            assert_eq!(msg.rcode(), 0, "NODATA is NOERROR with no answers");
+            assert!(msg.answers.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn garbage_packets_get_no_response() {
-        let resolver = Arc::new(DnsResolver::new(None));
-        let inbound = DnsInbound::new("dns-in", "127.0.0.1:0".parse().unwrap(), resolver, None);
+        let inbound = inbound(None);
         assert!(inbound.answer(b"not dns").await.is_none());
+        // A response-shaped packet must not be re-answered.
+        let q = DnsMessage::build_query("example.com", QTYPE_A);
+        let mut response_shaped = q.clone();
+        response_shaped[2] |= 0x80;
+        assert!(inbound.answer(&response_shaped).await.is_none());
     }
 }

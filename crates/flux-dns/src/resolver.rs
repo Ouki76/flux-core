@@ -2,13 +2,14 @@ use crate::doh::DohClient;
 use crate::doq::DoqClient;
 use crate::dot::DotClient;
 use crate::fakeip::FakeIpPool;
-use crate::wire::{DnsMessage, QTYPE_A, QTYPE_AAAA};
+use crate::wire::{Answer, DnsMessage, MAX_CNAME_CHAIN, Name, QTYPE_A, QTYPE_AAAA, QueryError};
 use flux_types::{FluxError, FluxResult, TargetAddress};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -26,8 +27,11 @@ const SHARD_DNS_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
 const DEFAULT_DNS_TTL: Duration = Duration::from_secs(300);
 const MIN_DNS_TTL_SECS: u32 = 10;
 const MAX_DNS_TTL_SECS: u32 = 86400;
-/// How long a failed lookup (NXDOMAIN / no records) is remembered.
-const NEGATIVE_DNS_TTL: Duration = Duration::from_secs(10);
+/// Negative-caching TTL used when the upstream sent no SOA record.
+const NEGATIVE_DNS_TTL_SECS: u32 = 10;
+/// Upper bound for a negative entry taken from SOA MINIMUM (RFC 2308 §5 allows
+/// a longer value, but a bogus SOA must not pin "does not resolve" for hours).
+const MAX_NEGATIVE_TTL_SECS: u32 = 3600;
 const UDP_POOL_SIZE: usize = 16;
 
 // Thread-local scratch buffer for DNS responses (4 KiB is the classic EDNS size).
@@ -150,7 +154,11 @@ impl CompiledDnsRule {
 }
 
 /// Result of an upstream query shared between all concurrent waiters (single-flight).
-type SharedQuery = Shared<BoxFuture<'static, Result<(IpAddr, u32), Arc<FluxError>>>>;
+///
+/// The error keeps its [`QueryError`] shape so the cache can tell a clean
+/// negative (cacheable, with an SOA-derived TTL) from a transport failure
+/// (never cacheable).
+type SharedQuery = Shared<BoxFuture<'static, Result<(IpAddr, u32), Arc<QueryError>>>>;
 
 #[derive(Clone)]
 struct ResolverInner {
@@ -260,6 +268,26 @@ impl DnsResolver {
         }
     }
 
+    /// Remaining lifetime of the cache entry for `domain`, if any.
+    ///
+    /// Covers both positive and negative entries. Exposed for tests (the
+    /// SOA-derived negative TTL is observable here) and for cache introspection.
+    pub fn cached_ttl_remaining(&self, domain: &str) -> Option<Duration> {
+        let domain_lower = domain.to_ascii_lowercase();
+        let idx = self.cache_shard_index(&domain_lower);
+        let mut cache = self.inner.cache_shards[idx].lock();
+        let (_, expires_at) = cache
+            .get(&domain_lower)
+            .map(|e| (e.ip.is_some(), e.expires_at))?;
+        let now = Instant::now();
+        if now < expires_at {
+            Some(expires_at - now)
+        } else {
+            cache.pop(&domain_lower);
+            None
+        }
+    }
+
     pub async fn resolve_domain(&self, domain: &str, port: u16) -> FluxResult<SocketAddr> {
         // Reject invalid names up front: the wire encoder cannot represent them,
         // and silently compiling a *different* name would resolve (and cache) the
@@ -336,23 +364,27 @@ impl DnsResolver {
 
         let (ip, ttl) = match result.map_err(|arc_err| match Arc::try_unwrap(arc_err) {
             Ok(e) => e,
-            Err(arc) => FluxError::Dns(arc.to_string()),
+            Err(arc) => QueryError::Malformed(arc.to_string()),
         }) {
             Ok(v) => v,
             Err(e) => {
-                // Cache "this name does not resolve" briefly, but never cache
-                // transport failures (timeouts, I/O): those are transient and the
-                // next attempt may well succeed.
-                if matches!(e, FluxError::Dns(_)) {
+                // Only a *clean* negative answer may be cached ("this name does
+                // not resolve"), and only for as long as the upstream's SOA says.
+                // Transport failures and malformed responses are transient or
+                // suspicious: caching them would pin the failure.
+                if let QueryError::Negative { ttl, .. } = &e {
+                    let secs = ttl
+                        .unwrap_or(NEGATIVE_DNS_TTL_SECS)
+                        .clamp(1, MAX_NEGATIVE_TTL_SECS);
                     self.inner.cache_shards[shard_idx].lock().put(
                         domain_lower,
                         CachedDnsEntry {
                             ip: None,
-                            expires_at: Instant::now() + NEGATIVE_DNS_TTL,
+                            expires_at: Instant::now() + Duration::from_secs(u64::from(secs)),
                         },
                     );
                 }
-                return Err(e);
+                return Err(e.into_flux());
             }
         };
 
@@ -368,27 +400,37 @@ impl DnsResolver {
         Ok(SocketAddr::new(ip, port))
     }
 
-    /// Performs the actual upstream resolution for a cache-missed domain.
-    async fn query_uncached(&self, domain_lower: &str) -> FluxResult<(IpAddr, u32)> {
-        // 1. Determine target upstream servers via precompiled Split-DNS routing rules.
-        let mut target_servers = &self.inner.upstream_servers;
-        let mut target_ecs = self.inner.client_subnet;
-
+    /// Selects the upstream servers (and ECS) for a lowercased domain.
+    ///
+    /// A rule that matches without its own servers falls back to the global
+    /// upstream list — never silently to the system resolver (leak prevention).
+    fn route(&self, domain_lower: &str) -> (&[String], Option<ipnet::IpNet>) {
         for rule in &self.inner.rules {
             if rule.matches(domain_lower) {
-                // A matched rule with no servers of its own falls back to the global
-                // upstream list — never silently to the system resolver (leak prevention).
-                if !rule.servers.is_empty() {
-                    target_servers = &rule.servers;
-                    if rule.client_subnet.is_some() {
-                        target_ecs = rule.client_subnet;
-                    }
-                }
-                break;
+                // First match wins. A rule with no servers of its own keeps the
+                // global list instead of falling through to a later rule.
+                let (servers, ecs) = if rule.servers.is_empty() {
+                    (
+                        self.inner.upstream_servers.as_slice(),
+                        self.inner.client_subnet,
+                    )
+                } else {
+                    (
+                        rule.servers.as_slice(),
+                        rule.client_subnet.or(self.inner.client_subnet),
+                    )
+                };
+                return (servers, ecs);
             }
         }
+        (&self.inner.upstream_servers, self.inner.client_subnet)
+    }
 
-        // 2. Race configured upstream servers concurrently (Fastest DNS).
+    /// Performs the actual upstream resolution for a cache-missed domain.
+    async fn query_uncached(&self, domain_lower: &str) -> Result<(IpAddr, u32), QueryError> {
+        let (target_servers, target_ecs) = self.route(domain_lower);
+
+        // Race configured upstream servers concurrently (Fastest DNS).
         if !target_servers.is_empty() {
             use futures_util::stream::{FuturesUnordered, StreamExt};
             let mut futures = FuturesUnordered::new();
@@ -402,51 +444,54 @@ impl DnsResolver {
                 futures.push(async move { this.query_server_dual(&s, &d, ecs).await });
             }
 
-            // Remember a transport-level failure separately: those are transient
-            // and must not be cached as "this name does not exist".
-            let mut transport_err: Option<FluxError> = None;
-            let mut last_err: Option<FluxError> = None;
+            // Transport failures and clean negatives are kept apart: the former
+            // must never be cached as "this name does not exist", and they win
+            // the report because a retry may well succeed.
+            let mut transport: Option<FluxError> = None;
+            let mut negative: Option<QueryError> = None;
+            let mut other: Option<QueryError> = None;
 
             while let Some(res) = futures.next().await {
                 match res {
                     Ok(v) => return Ok(v),
-                    Err(e) => {
-                        if matches!(
-                            e,
-                            FluxError::Timeout(_) | FluxError::Io(_) | FluxError::Network(_)
-                        ) && transport_err.is_none()
-                        {
-                            transport_err = Some(match &e {
-                                FluxError::Timeout(m) => FluxError::Timeout(m.clone()),
-                                FluxError::Io(err) => {
-                                    FluxError::Io(std::io::Error::new(err.kind(), err.to_string()))
-                                }
-                                FluxError::Network(m) => FluxError::Network(m.clone()),
-                                other => FluxError::Dns(other.to_string()),
-                            });
+                    Err(QueryError::Transport(e)) => {
+                        if transport.is_none() {
+                            transport = Some(clone_flux_error(&e));
                         }
-                        last_err = Some(e);
+                    }
+                    Err(e @ QueryError::Negative { .. }) => {
+                        if negative.is_none() {
+                            negative = Some(e);
+                        }
+                    }
+                    Err(e) => {
+                        if other.is_none() {
+                            other = Some(e);
+                        }
                     }
                 }
             }
 
-            // Surface the transport failure when there was one: `resolve_domain`
-            // only caches `FluxError::Dns` as a negative answer, so collapsing a
-            // timeout into `Dns` would pin "does not resolve" for the whole
-            // negative TTL against its own contract.
-            if let Some(e) = transport_err {
+            if let Some(e) = transport {
+                return Err(QueryError::Transport(e));
+            }
+            if let Some(e) = negative {
                 return Err(e);
             }
-            return Err(FluxError::Dns(format!(
-                "all configured upstream DNS servers failed to resolve '{}': {} (prevented DNS leak to system resolver)",
-                domain_lower,
-                last_err
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "no upstream responded".into())
-            )));
+            return Err(match other {
+                Some(QueryError::Malformed(m)) => QueryError::Malformed(format!(
+                    "all configured upstream DNS servers failed to resolve '{}': {} (prevented DNS leak to system resolver)",
+                    domain_lower, m
+                )),
+                Some(e) => e,
+                None => QueryError::Malformed(format!(
+                    "no upstream responded for '{}' (prevented DNS leak to system resolver)",
+                    domain_lower
+                )),
+            });
         }
 
-        // 3. System DNS resolution fallback (only when no custom upstream servers are configured).
+        // System DNS resolution fallback (only when no custom upstream servers are configured).
         self.query_system(domain_lower).await
     }
 
@@ -457,25 +502,113 @@ impl DnsResolver {
         server: &str,
         domain: &str,
         ecs: Option<ipnet::IpNet>,
-    ) -> FluxResult<(IpAddr, u32)> {
+    ) -> Result<(IpAddr, u32), QueryError> {
         let (res_a, res_aaaa) = tokio::join!(
             self.query_server(server, domain, ecs, QTYPE_A),
             self.query_server(server, domain, ecs, QTYPE_AAAA)
         );
         match (res_a, res_aaaa) {
             (Ok(v4), _) => Ok(v4),
-            (Err(_), Ok(v6)) => Ok(v6),
-            (Err(e), Err(_)) => Err(e),
+            (_, Ok(v6)) => Ok(v6),
+            (Err(a), Err(b)) => Err(match (a, b) {
+                // A transport failure must stay a transport failure (uncached).
+                (QueryError::Transport(e), _) | (_, QueryError::Transport(e)) => {
+                    QueryError::Transport(e)
+                }
+                // Only a negative both families agree on is safe to remember.
+                (QueryError::Negative { ttl, message }, QueryError::Negative { .. }) => {
+                    QueryError::Negative { ttl, message }
+                }
+                (a, _) => a,
+            }),
         }
     }
 
+    /// Resolves `name`/`qtype` against one server, following CNAME chains.
+    ///
+    /// A response that carries a CNAME but no record of the requested type means
+    /// the server wants us to ask again for the canonical name; the chain is
+    /// followed here, bounded by [`MAX_CNAME_CHAIN`] and loop-checked, and the
+    /// cached TTL is the minimum over every link.
     async fn query_server(
         &self,
         server: &str,
         domain: &str,
         ecs: Option<ipnet::IpNet>,
         qtype: u16,
-    ) -> FluxResult<(IpAddr, u32)> {
+    ) -> Result<(IpAddr, u32), QueryError> {
+        let mut name = Name::from_str(domain)
+            .map_err(|e| QueryError::Malformed(format!("invalid DNS name '{domain}': {e}")))?;
+        let mut visited = vec![name.clone()];
+        let mut chain_ttl: Option<u32> = None;
+
+        loop {
+            let answer = self.exchange(server, &name, ecs, qtype).await?;
+            match answer {
+                Answer::Address { ip, ttl } => {
+                    return Ok((ip, chain_ttl.map_or(ttl, |c| c.min(ttl))));
+                }
+                Answer::Alias { target, ttl } => {
+                    chain_ttl = Some(chain_ttl.map_or(ttl, |c| c.min(ttl)));
+                    if visited.iter().any(|n| n.eq_ignore_ascii_case(&target)) {
+                        return Err(QueryError::Malformed(format!(
+                            "CNAME loop while resolving '{domain}' ({} -> {})",
+                            name, target
+                        )));
+                    }
+                    if visited.len() > MAX_CNAME_CHAIN {
+                        return Err(QueryError::Malformed(format!(
+                            "CNAME chain for '{domain}' exceeds {} hops",
+                            MAX_CNAME_CHAIN
+                        )));
+                    }
+                    tracing::trace!("following CNAME {} -> {}", name, target);
+                    visited.push(target.clone());
+                    name = target;
+                }
+                Answer::Negative { rcode, ttl } => {
+                    return Err(QueryError::Negative {
+                        ttl,
+                        message: format!(
+                            "no {} record for '{}' ({}){}{}",
+                            qtype_name(qtype),
+                            name,
+                            server,
+                            if rcode == crate::wire::RCODE_NXDOMAIN {
+                                ", NXDOMAIN"
+                            } else {
+                                ""
+                            },
+                            match ttl {
+                                Some(t) => format!(", negative TTL {t}s"),
+                                None => String::new(),
+                            }
+                        ),
+                    });
+                }
+                Answer::CnameLoop { chain } => {
+                    return Err(QueryError::Malformed(format!(
+                        "CNAME loop in the response for '{}': {}",
+                        name,
+                        chain
+                            .iter()
+                            .map(|n| n.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" -> ")
+                    )));
+                }
+            }
+        }
+    }
+
+    /// One round trip against `server` for `name`/`qtype`.
+    async fn exchange(
+        &self,
+        server: &str,
+        name: &Name,
+        ecs: Option<ipnet::IpNet>,
+        qtype: u16,
+    ) -> Result<Answer, QueryError> {
         if server.starts_with("https://") || server.starts_with("http://") {
             let doh = self
                 .inner
@@ -483,7 +616,7 @@ impl DnsResolver {
                 .entry(server.to_string())
                 .or_insert_with(|| Arc::new(DohClient::new(server)))
                 .clone();
-            doh.query_doh(domain, qtype).await
+            doh.query_doh(name, qtype).await
         } else if server.starts_with("tls://") || server.starts_with("dot://") {
             let dot = self
                 .inner
@@ -491,7 +624,7 @@ impl DnsResolver {
                 .entry(server.to_string())
                 .or_insert_with(|| Arc::new(DotClient::new(server)))
                 .clone();
-            dot.query_dot(domain, ecs, qtype).await
+            dot.query_dot(name, ecs, qtype).await
         } else if server.starts_with("quic://") || server.starts_with("doq://") {
             let doq = self
                 .inner
@@ -499,38 +632,44 @@ impl DnsResolver {
                 .entry(server.to_string())
                 .or_insert_with(|| Arc::new(DoqClient::new(server)))
                 .clone();
-            doq.query_doq(domain, ecs, qtype).await
+            doq.query_doq(name, ecs, qtype).await
         } else {
-            let default_dns = SocketAddr::from(([1, 1, 1, 1], 53));
-            let parsed: Option<SocketAddr> = if server.contains(':') {
-                server.parse().ok()
-            } else {
-                format!("{}:53", server).parse().ok()
-            };
-            let srv_addr = match parsed {
-                Some(a) => a,
-                None => {
-                    // Never silently reroute DNS to a hardcoded resolver: misconfiguration
-                    // must be visible instead of leaking queries to an unexpected upstream.
-                    tracing::error!(
-                        "invalid upstream DNS server address '{}'; refusing silent fallback to {}",
-                        server,
-                        default_dns
-                    );
-                    return Err(FluxError::Config(format!(
-                        "invalid upstream DNS server address: '{}'",
-                        server
-                    )));
-                }
-            };
-            self.query_upstream_udp(srv_addr, domain, ecs, qtype).await
+            let srv_addr = self.parse_udp_server(server)?;
+            self.query_upstream_udp(srv_addr, name, ecs, qtype).await
         }
     }
 
-    async fn query_system(&self, domain_lower: &str) -> FluxResult<(IpAddr, u32)> {
+    /// Parses `ip[:port]` / `[v6]:port` into a socket address.
+    ///
+    /// Never silently reroutes DNS to a hardcoded resolver: a misconfiguration
+    /// must be visible instead of leaking queries to an unexpected upstream.
+    fn parse_udp_server(&self, server: &str) -> Result<SocketAddr, QueryError> {
+        let parsed: Option<SocketAddr> = if server.contains(':') {
+            server.parse().ok()
+        } else {
+            format!("{}:53", server).parse().ok()
+        };
+        parsed.ok_or_else(|| {
+            tracing::error!(
+                "invalid upstream DNS server address '{}'; refusing silent fallback",
+                server
+            );
+            QueryError::Transport(FluxError::Config(format!(
+                "invalid upstream DNS server address: '{}'",
+                server
+            )))
+        })
+    }
+
+    async fn query_system(&self, domain_lower: &str) -> Result<(IpAddr, u32), QueryError> {
         let addrs = tokio::net::lookup_host((domain_lower, 0))
             .await
-            .map_err(|e| FluxError::Dns(format!("failed to resolve {}: {}", domain_lower, e)))?;
+            .map_err(|e| {
+                QueryError::Transport(FluxError::Dns(format!(
+                    "failed to resolve {}: {}",
+                    domain_lower, e
+                )))
+            })?;
 
         let list: Vec<SocketAddr> = addrs.collect();
         if let Some(&v4) = list.iter().find(|a| a.is_ipv4()) {
@@ -539,19 +678,23 @@ impl DnsResolver {
         if let Some(first) = list.into_iter().next() {
             return Ok((first.ip(), DEFAULT_DNS_TTL.as_secs() as u32));
         }
-        Err(FluxError::Dns(format!(
-            "no IP addresses found for {}",
-            domain_lower
-        )))
+        Err(QueryError::Negative {
+            ttl: None,
+            message: format!("no IP addresses found for {}", domain_lower),
+        })
     }
 
-    async fn query_upstream_udp(
+    /// Sends `query` to `server` and returns the validated raw response bytes.
+    ///
+    /// This is the single UDP exchange used by both the resolving path and the
+    /// passthrough path, so socket pooling, spoofing checks and the transaction
+    /// ID check cannot drift apart.
+    async fn udp_exchange(
         &self,
         server: SocketAddr,
-        domain: &str,
-        ecs: Option<ipnet::IpNet>,
-        qtype: u16,
-    ) -> FluxResult<(IpAddr, u32)> {
+        query: &[u8],
+        tx_id: u16,
+    ) -> FluxResult<Vec<u8>> {
         let idx = self.inner.socket_counter.fetch_add(1, Ordering::Relaxed) % UDP_POOL_SIZE;
         let mut guard = self.inner.udp_socket_pool[idx].lock().await;
 
@@ -583,10 +726,7 @@ impl DnsResolver {
             }
         };
 
-        let tx_id = rand::random::<u16>();
-        let query = DnsMessage::build_query_with_ecs_id(domain, qtype, ecs, tx_id);
-
-        timeout(DNS_QUERY_TIMEOUT, socket.send_to(&query, server))
+        timeout(DNS_QUERY_TIMEOUT, socket.send_to(query, server))
             .await
             .map_err(|_| FluxError::Timeout(format!("DNS query to {} timed out", server)))?
             .map_err(FluxError::Io)?;
@@ -621,14 +761,97 @@ impl DnsResolver {
                 continue;
             }
 
-            // 2. Validate Transaction ID and response flags to prevent DNS poisoning / desync
-            if DnsMessage::validate_response(&buf[..len], tx_id).is_err() {
+            // 2. Validate Transaction ID and response flags to prevent DNS poisoning / desync.
+            //    An error RCODE is accepted here: it is a real answer (NXDOMAIN /
+            //    NODATA) that the parser turns into a cacheable negative.
+            if DnsMessage::validate_response_header(&buf[..len], tx_id).is_err() {
                 tracing::debug!("discarding stale or mismatched DNS packet (tx_id mismatch)");
                 continue;
             }
 
-            return DnsMessage::parse_specific_record_with_ttl(&buf[..len], qtype);
+            return Ok(buf[..len].to_vec());
         }
+    }
+
+    async fn query_upstream_udp(
+        &self,
+        server: SocketAddr,
+        name: &Name,
+        ecs: Option<ipnet::IpNet>,
+        qtype: u16,
+    ) -> Result<Answer, QueryError> {
+        let tx_id = rand::random::<u16>();
+        let query = DnsMessage::build_query_for_name(name, qtype, ecs, tx_id);
+        let resp = self
+            .udp_exchange(server, &query, tx_id)
+            .await
+            .map_err(QueryError::Transport)?;
+        DnsMessage::parse_response(&resp, name, qtype)
+    }
+
+    /// Forwards a client's already-encoded query to a plain-UDP upstream and
+    /// returns the raw response bytes with the client's transaction ID restored.
+    ///
+    /// This is what makes the DNS listener a real resolver for the record types
+    /// the proxy does not synthesise itself (TXT, MX, HTTPS/SVCB, PTR, DNSSEC
+    /// records, ...): the answer is relayed verbatim instead of being re-encoded
+    /// or dropped. Only plain-UDP upstreams are used — a DoH/DoT/DoQ-only
+    /// configuration has no wire-format passthrough and reports an error, which
+    /// the caller turns into a clean NODATA.
+    pub async fn forward_query(&self, query: &[u8]) -> FluxResult<Vec<u8>> {
+        let (client_id, _flags, qname, _qtype, _end) = DnsMessage::parse_question(query)
+            .ok_or_else(|| FluxError::Dns("malformed DNS query".into()))?;
+        let domain_lower = qname.to_ascii_lowercase();
+        let (servers, _) = self.route(&domain_lower);
+
+        let mut last_err: Option<FluxError> = None;
+        for server in servers {
+            let Ok(addr) = self.parse_udp_server(server) else {
+                continue;
+            };
+            let tx_id = rand::random::<u16>();
+            let mut forwarded = query.to_vec();
+            forwarded[0..2].copy_from_slice(&tx_id.to_be_bytes());
+            match self.udp_exchange(addr, &forwarded, tx_id).await {
+                Ok(mut resp) => {
+                    // Restore the client's ID: everything else (question, answer,
+                    // rcode, EDNS) is relayed untouched.
+                    resp[0..2].copy_from_slice(&client_id.to_be_bytes());
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    tracing::debug!("DNS passthrough to {} failed: {}", addr, e);
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            FluxError::Dns(
+                "no plain-UDP upstream DNS server configured for query passthrough".into(),
+            )
+        }))
+    }
+}
+
+/// Human-readable record type for error messages.
+fn qtype_name(qtype: u16) -> String {
+    match qtype {
+        QTYPE_A => "A".into(),
+        QTYPE_AAAA => "AAAA".into(),
+        other => format!("type {other}"),
+    }
+}
+
+/// Recreates a [`FluxError`] (it is not `Clone` because `io::Error` is not).
+fn clone_flux_error(e: &FluxError) -> FluxError {
+    match e {
+        FluxError::Timeout(m) => FluxError::Timeout(m.clone()),
+        FluxError::Network(m) => FluxError::Network(m.clone()),
+        FluxError::Dns(m) => FluxError::Dns(m.clone()),
+        FluxError::Config(m) => FluxError::Config(m.clone()),
+        FluxError::Io(err) => FluxError::Io(std::io::Error::new(err.kind(), err.to_string())),
+        other => FluxError::Dns(other.to_string()),
     }
 }
 

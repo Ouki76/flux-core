@@ -1,8 +1,8 @@
-use crate::wire::DnsMessage;
+use crate::wire::{Answer, DnsMessage, Name, QueryError};
 use flux_transport::tcp::TcpTransport;
 use flux_transport::tls::{TlsClientConfig, TlsTransport};
 use flux_types::{BoxedStream, FluxError, FluxResult};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -72,14 +72,18 @@ impl DotClient {
     }
 
     /// Queries DNS-over-TLS (RFC 7858) server with connection reuse across queries.
+    ///
+    /// Returns the parsed [`Answer`] so the caller can follow a CNAME that came
+    /// back without its target record and distinguish a clean NODATA from a
+    /// transport failure (which decides negative caching).
     pub async fn query_dot(
         &self,
-        domain: &str,
+        name: &Name,
         ecs: Option<ipnet::IpNet>,
         qtype: u16,
-    ) -> FluxResult<(IpAddr, u32)> {
+    ) -> Result<Answer, QueryError> {
         let tx_id = rand::random::<u16>();
-        let query = DnsMessage::build_query_with_ecs_id(domain, qtype, ecs, tx_id);
+        let query = DnsMessage::build_query_for_name(name, qtype, ecs, tx_id);
         let len_bytes = (query.len() as u16).to_be_bytes();
 
         let mut guard = self.stream.lock().await;
@@ -92,16 +96,16 @@ impl DotClient {
                     Ok(Ok(s)) => *guard = Some(s),
                     Ok(Err(e)) => {
                         if attempt == 1 {
-                            return Err(e);
+                            return Err(QueryError::Transport(e));
                         }
                         continue;
                     }
                     Err(_) => {
                         if attempt == 1 {
-                            return Err(FluxError::Timeout(format!(
+                            return Err(QueryError::Transport(FluxError::Timeout(format!(
                                 "DoT connect to {} timed out",
                                 self.server_host
-                            )));
+                            ))));
                         }
                         continue;
                     }
@@ -155,8 +159,11 @@ impl DotClient {
 
             match read_res {
                 Ok(resp_buf) => {
-                    DnsMessage::validate_response(&resp_buf, tx_id)?;
-                    return DnsMessage::parse_specific_record_with_ttl(&resp_buf, qtype);
+                    // An error RCODE (NXDOMAIN/NODATA) is a valid answer, not a
+                    // broken connection: only the header is checked here.
+                    DnsMessage::validate_response_header(&resp_buf, tx_id)
+                        .map_err(QueryError::Transport)?;
+                    return DnsMessage::parse_response(&resp_buf, name, qtype);
                 }
                 Err(_) => {
                     *guard = None;
@@ -164,9 +171,9 @@ impl DotClient {
             }
         }
 
-        Err(FluxError::Dns(format!(
+        Err(QueryError::Transport(FluxError::Dns(format!(
             "DoT query to {} failed after reconnect",
             self.server_host
-        )))
+        ))))
     }
 }
