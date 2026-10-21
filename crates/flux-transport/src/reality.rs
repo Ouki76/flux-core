@@ -388,8 +388,12 @@ impl RealityCertMaterial {
         mac.update(&self.ed25519_pub);
         let tag = mac.finalize().into_bytes();
         let mut der = self.cert_der.clone();
-        let n = der.len();
-        der[n - 64..].copy_from_slice(&tag);
+        // The certificate is generated in-process by `rcgen` and always carries
+        // a 64-byte Ed25519 signature, but keep the slice total anyway so a
+        // future shorter certificate cannot panic the handshake path.
+        if let Some(sig) = der.len().checked_sub(64).and_then(|n| der.get_mut(n..)) {
+            sig.copy_from_slice(&tag);
+        }
         der
     }
 }
@@ -1345,9 +1349,15 @@ impl Tls13Client {
 /// Ed25519 OID (1.3.101.112) followed by the BIT STRING with the 32-byte key.
 fn extract_ed25519_pubkey(cert: &[u8]) -> Option<&[u8; 32]> {
     const OID_ED25519_WITH_BITSTRING: [u8; 8] = [0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00];
-    cert.windows(8)
-        .position(|w| w == OID_ED25519_WITH_BITSTRING)
-        .and_then(|i| cert[i + 8..i + 8 + 32].try_into().ok())
+    // `windows(8)` only guarantees that the *match start* is in bounds, so the
+    // 32 key bytes after it must be bounds-checked separately: the certificate
+    // comes from the network (fallback target / on-path box) and is fully
+    // attacker-controlled at this point.
+    let start = cert
+        .windows(OID_ED25519_WITH_BITSTRING.len())
+        .position(|w| w == OID_ED25519_WITH_BITSTRING)?;
+    let key = cert.get(start + 8..start + 8 + 32)?;
+    key.try_into().ok()
 }
 
 /// Extracts the trailing 64-byte signature of a DER X.509 certificate.
@@ -1421,10 +1431,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
             }
 
             // 3. Full record assembled: reset partial state and process.
+            //
+            // The body buffer is reused: taking it out (`mem::take`) forced a fresh
+            // zeroed allocation for every received record, i.e. once per ~16 KiB of
+            // tunnel traffic on the hottest path.
             self.hdr_len = 0;
             self.body_len = 0;
-            let body = std::mem::take(&mut self.body_buf);
-            match self.process_record(header, body) {
+            // Lend the buffer to `process_record` and take it back afterwards: it
+            // keeps its allocation, so steady-state record processing performs no
+            // allocation at all (taking it and dropping it forced a fresh zeroed
+            // 16 KiB `Vec` per record).
+            let mut body = std::mem::take(&mut self.body_buf);
+            let processed = self.process_record(header, &body);
+            body.clear();
+            self.body_buf = body;
+            match processed {
                 Ok(Some(())) => return Poll::Ready(Ok(())),
                 Ok(None) => continue,
                 Err(e) => return Poll::Ready(Err(e)),
@@ -1434,13 +1455,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
 
     /// Processes one full record. Returns Ok(Some(())) when application data
     /// was placed into read_buf; Ok(None) to continue the loop.
-    fn process_record(&mut self, header: [u8; 5], body: Vec<u8>) -> io::Result<Option<()>> {
+    fn process_record(&mut self, header: [u8; 5], body: &[u8]) -> io::Result<Option<()>> {
         match header[0] {
             TLS_CCS => Ok(None),
             TLS_APPDATA => {
                 let (ctype, plain) = self
                     .read_state
-                    .decrypt_record(&header, &body)
+                    .decrypt_record(&header, body)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
                 match ctype {
                     23 => {
@@ -1695,6 +1716,13 @@ async fn probe_target_handshake(dest: &str, ch_record: &[u8]) -> FluxResult<Targ
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
 
     // Read records: SH, optional CCS, then encrypted EE/Cert/CV/Fin (+ optional NST).
+    //
+    // `record_sizes` slots are fixed: [0]=ServerHello, [1]=CCS, [2]=EE,
+    // [3]=Certificate, [4]=CertificateVerify, [5]=Finished. A CCS must therefore
+    // not advance the slot cursor, and EE must always land in slot 2 whether or
+    // not a CCS was sent — indexing by the loop counter shifted every size by one
+    // record when the target omitted CCS, defeating the mimicry.
+    let mut app_slot: usize = 2;
     for i in 0..7 {
         let mut hdr = [0u8; 5];
         let read = tokio::time::timeout_at(deadline, target.read_exact(&mut hdr)).await;
@@ -1783,7 +1811,8 @@ async fn probe_target_handshake(dest: &str, ch_record: &[u8]) -> FluxResult<Targ
                     mimicry.record_sizes[1] = 5 + len;
                 } else if hdr[0] == TLS_APPDATA {
                     // No CCS: this record is EncryptedExtensions.
-                    mimicry.record_sizes[2] = 5 + len;
+                    mimicry.record_sizes[app_slot] = 5 + len;
+                    app_slot += 1;
                 } else {
                     return Err(crypto_err(
                         "reality target: unexpected record after ServerHello",
@@ -1794,7 +1823,10 @@ async fn probe_target_handshake(dest: &str, ch_record: &[u8]) -> FluxResult<Targ
                 if hdr[0] != TLS_APPDATA {
                     return Err(crypto_err("reality target: expected encrypted record"));
                 }
-                mimicry.record_sizes[i] = 5 + len;
+                if app_slot < mimicry.record_sizes.len() {
+                    mimicry.record_sizes[app_slot] = 5 + len;
+                }
+                app_slot += 1;
                 // Finished record ends the flight: we can't reliably distinguish
                 // NST without decrypting, so we stop after the 5th flight record
                 // (SH, CCS?, EE, Cert, CV, Fin) — extra NST records (if any) are
@@ -2219,6 +2251,92 @@ mod tests {
         assert_eq!(&buf, b"mimicry works");
     }
 
+    /// Regression: when the target sends **no** CCS, every recorded size must
+    /// still land in its fixed slot ([2]=EE, [3]=Cert, [4]=CV, [5]=Fin). The
+    /// parser used to index by loop counter, so EE's slot was overwritten by the
+    /// Certificate and the whole flight was padded with the wrong sizes — the
+    /// mimicry silently stopped matching the target.
+    #[tokio::test]
+    async fn test_reality_mimicry_slots_without_ccs() {
+        /// Builds a syntactically valid TLS 1.3 ServerHello record body.
+        fn server_hello() -> Vec<u8> {
+            let mut b = Vec::new();
+            b.push(HS_SERVER_HELLO); // handshake type
+            b.extend_from_slice(&[0x00, 0x00, 0x00]); // handshake length (unchecked)
+            b.extend_from_slice(&[0x03, 0x03]); // legacy_version
+            b.extend_from_slice(&[0x11u8; 32]); // random
+            b.push(0x00); // session_id length
+            b.extend_from_slice(&[0x13, 0x01]); // cipher_suite
+            b.push(0x00); // compression
+            let mut exts = Vec::new();
+            // supported_versions = TLS 1.3
+            exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+            // key_share: X25519 with a 32-byte key
+            exts.extend_from_slice(&[0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
+            exts.extend_from_slice(&[0x22u8; 32]);
+            b.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+            b.extend_from_slice(&exts);
+            b
+        }
+
+        fn record(content_type: u8, payload: &[u8]) -> Vec<u8> {
+            let mut r = vec![content_type, 0x03, 0x03];
+            r.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            r.extend_from_slice(payload);
+            r
+        }
+
+        let sh = server_hello();
+        let ee = vec![0xAAu8; 40];
+        let cert = vec![0xBBu8; 900];
+        let cv = vec![0xCCu8; 70];
+        let fin = vec![0xDDu8; 36];
+        let expected = [
+            record(TLS_HANDSHAKE, &sh).len(),
+            0, // no CCS
+            record(TLS_APPDATA, &ee).len(),
+            record(TLS_APPDATA, &cert).len(),
+            record(TLS_APPDATA, &cv).len(),
+            record(TLS_APPDATA, &fin).len(),
+            0,
+        ];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&record(TLS_HANDSHAKE, &sh));
+        flight.extend_from_slice(&record(TLS_APPDATA, &ee));
+        flight.extend_from_slice(&record(TLS_APPDATA, &cert));
+        flight.extend_from_slice(&record(TLS_APPDATA, &cv));
+        flight.extend_from_slice(&record(TLS_APPDATA, &fin));
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                // Drain whatever ClientHello the prober writes, then reply.
+                let mut junk = [0u8; 4096];
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    sock.read(&mut junk),
+                )
+                .await;
+                let _ = sock.write_all(&flight).await;
+                let _ = sock.flush().await;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        });
+
+        let mimicry = probe_target_handshake(&addr.to_string(), b"fake-clienthello")
+            .await
+            .expect("probe must parse the scripted flight");
+        assert_eq!(
+            mimicry.record_sizes, expected,
+            "record sizes must land in their fixed slots even without a CCS"
+        );
+        // The slot accessor used for padding must agree.
+        assert_eq!(mimicry.size(2), Some(expected[2]));
+        assert_eq!(mimicry.size(3), Some(expected[3]));
+        assert_eq!(mimicry.size(1), None, "no CCS means slot 1 stays empty");
+    }
+
     #[tokio::test]
     async fn test_reality_spider_mode_on_real_tls_server() {
         // A real (non-REALITY) TLS 1.3 server behind the port: handshake completes,
@@ -2432,5 +2550,30 @@ mod gcm_vector_tests {
             hexstr, "27c6357af4faa968dd06bf5e2bc28cb3b41e80e80a42bf2ce96a430165073ba9",
             "must match python AESGCM reference"
         );
+    }
+}
+
+#[cfg(test)]
+mod cert_parse_tests {
+    use super::*;
+
+    /// Regression: a hostile "certificate" whose DER ends exactly on the
+    /// Ed25519 OID prefix must not panic `extract_ed25519_pubkey`.
+    #[test]
+    fn extract_ed25519_pubkey_tolerates_truncated_input() {
+        const OID: [u8; 8] = [0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00];
+        // OID at the very end: 8 bytes total, no key material follows.
+        assert!(extract_ed25519_pubkey(&OID).is_none());
+        // OID plus a few of the 32 key bytes.
+        let mut partial = OID.to_vec();
+        partial.extend_from_slice(&[1, 2, 3]);
+        assert!(extract_ed25519_pubkey(&partial).is_none());
+        // Shorter than the OID.
+        assert!(extract_ed25519_pubkey(&[0x30, 0x82]).is_none());
+        assert!(extract_ed25519_pubkey(&[]).is_none());
+        // Complete: OID followed by a full 32-byte key.
+        let mut full = OID.to_vec();
+        full.extend_from_slice(&[0xABu8; 32]);
+        assert_eq!(extract_ed25519_pubkey(&full), Some(&[0xABu8; 32]));
     }
 }

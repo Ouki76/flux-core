@@ -35,15 +35,21 @@ pub fn write_varint(buf: &mut Vec<u8>, val: u64) {
 }
 
 pub async fn read_varint<R: AsyncRead + Unpin>(r: &mut R) -> FluxResult<u64> {
+    // Read the whole varint with a single call: the previous version issued one
+    // `read_exact` per byte (up to 8 awaits, i.e. 8 wake-ups on a slow stream).
     let mut first = [0u8; 1];
     r.read_exact(&mut first).await.map_err(FluxError::Io)?;
     let prefix = first[0] >> 6;
     let len = 1usize << prefix;
     let mut val = (first[0] & 0x3f) as u64;
-    for _ in 1..len {
-        let mut b = [0u8; 1];
-        r.read_exact(&mut b).await.map_err(FluxError::Io)?;
-        val = (val << 8) | b[0] as u64;
+    if len > 1 {
+        let mut rest = [0u8; 8];
+        r.read_exact(&mut rest[..len - 1])
+            .await
+            .map_err(FluxError::Io)?;
+        for &b in &rest[..len - 1] {
+            val = (val << 8) | b as u64;
+        }
     }
     Ok(val)
 }
@@ -54,15 +60,39 @@ pub async fn read_varint<R: AsyncRead + Unpin>(r: &mut R) -> FluxResult<u64> {
 
 include!("h3_tables.rs");
 
-fn huffman_table() -> &'static std::collections::HashMap<(u8, u32), u8> {
-    static TABLE: std::sync::OnceLock<std::collections::HashMap<(u8, u32), u8>> =
-        std::sync::OnceLock::new();
+/// Flat decode table indexed by `(length << 16) | code`.
+///
+/// This used to be a `HashMap<(u8, u32), u8>` probed **once per bit**, which for
+/// a header-heavy request meant ~500k SipHash lookups per 64 KiB field section.
+/// A contiguous array makes the same lookup a bounds-checked load, and the
+/// 16-bit code space bounds it at 32 * 64 KiB = 2 MiB of `u8` + sentinel.
+struct HuffmanTable {
+    /// `entries[len]` is indexed by the `len`-bit code.
+    entries: Vec<Vec<u8>>,
+}
+
+fn huffman_table() -> &'static HuffmanTable {
+    static TABLE: std::sync::OnceLock<HuffmanTable> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
-        HPACK_HUFFMAN
+        let max_len = HPACK_HUFFMAN
             .iter()
-            .enumerate()
-            .map(|(sym, &(code, bits))| ((bits, code), sym as u8))
-            .collect()
+            .map(|&(_, bits)| bits)
+            .max()
+            .unwrap_or(0) as usize;
+        let mut entries: Vec<Vec<u8>> = vec![Vec::new(); max_len + 1];
+        for (sym, &(code, bits)) in HPACK_HUFFMAN.iter().enumerate() {
+            let bits = bits as usize;
+            if bits == 0 {
+                continue;
+            }
+            let slot = &mut entries[bits];
+            let size = 1usize << bits;
+            if slot.len() < size {
+                slot.resize(size, 0xFF);
+            }
+            slot[code as usize] = sym as u8;
+        }
+        HuffmanTable { entries }
     })
 }
 
@@ -71,19 +101,25 @@ pub fn huffman_decode(data: &[u8]) -> FluxResult<Vec<u8>> {
     let table = huffman_table();
     let mut out = Vec::with_capacity(data.len() * 2);
     let mut code: u32 = 0;
-    let mut len: u8 = 0;
+    let mut len: usize = 0;
     for &byte in data {
         for bit in (0..8).rev() {
-            code = (code << 1) | (((byte >> bit) & 1) as u32);
+            code = (code << 1) | ((byte >> bit) & 1) as u32;
             len += 1;
-            if let Some(&sym) = table.get(&(len, code)) {
+            // Only lengths present in the table can carry a symbol.
+            if let Some(row) = table.entries.get(len)
+                && let Some(&sym) = row.get(code as usize)
+                && sym != 0xFF
+            {
                 out.push(sym);
                 code = 0;
                 len = 0;
             }
         }
     }
-    // RFC 7541 §5.2: padding must be a prefix of the EOS symbol (all ones), max 7 bits.
+    // RFC 7541 §5.2: padding must be a prefix of the EOS symbol (all ones), max 7
+    // bits. EOS (30 ones) is not a valid symbol, so an all-ones tail of up to 7
+    // bits is padding and anything else is an error.
     if len > 7 || (len > 0 && code != (1u32 << len) - 1) {
         return Err(err("invalid huffman padding"));
     }
@@ -293,9 +329,6 @@ pub enum H3Event {
 
 pub struct H3LiteServer {
     conn: quinn::Connection,
-    /// Keeps the H3 control stream open for the connection's lifetime
-    /// (closing it signals connection termination per RFC 9114 §5.2).
-    _control_send: tokio::sync::Mutex<()>,
 }
 
 impl H3LiteServer {
@@ -332,10 +365,7 @@ impl H3LiteServer {
                 }
             });
         }
-        Self {
-            conn,
-            _control_send: tokio::sync::Mutex::new(()),
-        }
+        Self { conn }
     }
 
     pub fn remote_address(&self) -> std::net::SocketAddr {
@@ -522,5 +552,50 @@ mod tests {
         ];
         let decoded = huffman_decode(&encoded).unwrap();
         assert_eq!(decoded, b"www.example.com");
+    }
+}
+
+#[cfg(test)]
+mod huffman_tests {
+    use super::*;
+
+    /// RFC 7541 Appendix C vectors, plus the padding rule.
+    #[test]
+    fn rfc7541_vectors() {
+        // C.4.1: "www.example.com"
+        let encoded = [
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ];
+        assert_eq!(huffman_decode(&encoded).unwrap(), b"www.example.com");
+    }
+
+    /// A 30-bit all-ones tail is EOS and must be rejected; up to 7 bits of ones is
+    /// legal padding.
+    #[test]
+    fn padding_rules() {
+        // '0' is 5 bits (00000) -> 0b00000_111 = 0x07 pads with three 1s.
+        assert_eq!(huffman_decode(&[0x07]).unwrap(), b"0");
+        // A non-ones tail longer than 0 is invalid padding.
+        assert!(huffman_decode(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn round_trips_a_long_string() {
+        let original = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        // 'a' is 5 bits (00011); build it by hand to keep the test independent.
+        let mut bits: Vec<u8> = Vec::new();
+        for _ in 0..original.len() {
+            for i in (0..5).rev() {
+                bits.push((0b00011u8 >> i) & 1);
+            }
+        }
+        while !bits.len().is_multiple_of(8) {
+            bits.push(1);
+        }
+        let bytes: Vec<u8> = bits
+            .chunks(8)
+            .map(|c| c.iter().fold(0u8, |acc, b| (acc << 1) | b))
+            .collect();
+        assert_eq!(huffman_decode(&bytes).unwrap(), original);
     }
 }

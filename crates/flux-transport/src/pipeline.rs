@@ -210,51 +210,7 @@ pub enum ServerFramingLayer {
 
 pub struct ServerLayeredTransportPipeline;
 
-impl ServerLayeredTransportPipeline {
-    pub async fn unwrap_server_stream(
-        stream: BoxedStream,
-        security: &ServerSecurityLayer,
-        framing: &ServerFramingLayer,
-    ) -> FluxResult<BoxedStream> {
-        // 1. Unwrap security layer
-        let secure_stream: BoxedStream = match security {
-            ServerSecurityLayer::None => stream,
-            ServerSecurityLayer::Tls(acceptor) => {
-                let s = acceptor.accept(stream).await.map_err(FluxError::Io)?;
-                Box::new(s)
-            }
-            ServerSecurityLayer::Reality(cfg) => {
-                let s = RealityHandshake::server_handshake(stream, cfg).await?;
-                Box::new(s)
-            }
-            ServerSecurityLayer::ShadowTls(cfg) => {
-                ShadowTlsHandshake::server_handshake(stream, cfg).await?
-            }
-        };
-
-        // 2. Unwrap framing layer
-        let framed_stream: BoxedStream = match framing {
-            ServerFramingLayer::Raw => secure_stream,
-            ServerFramingLayer::WebSocket { path } => {
-                let ws = crate::websocket::server_handshake(secure_stream, path.as_deref()).await?;
-                Box::new(ws)
-            }
-            ServerFramingLayer::HttpUpgrade { path } => {
-                crate::httpupgrade::server_handshake(secure_stream, path.as_deref()).await?
-            }
-            ServerFramingLayer::Http2 => {
-                let h2 = crate::h2::H2Transport::server_handshake(secure_stream).await?;
-                Box::new(h2)
-            }
-            ServerFramingLayer::Grpc => {
-                let grpc = crate::grpc::GrpcTransport::server_handshake(secure_stream).await?;
-                Box::new(grpc)
-            }
-        };
-
-        Ok(framed_stream)
-    }
-}
+impl ServerLayeredTransportPipeline {}
 
 #[derive(Clone)]
 pub struct ServerTransportPipeline {

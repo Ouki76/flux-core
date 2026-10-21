@@ -1,4 +1,5 @@
 use flux_types::{AsyncStream, BoxedStream, FluxError, FluxResult};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
@@ -85,19 +86,57 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 }
 
+/// Cache of built client connectors, keyed by
+/// `(fingerprint, insecure, alpn)`. Bounded by the number of distinct
+/// combinations a configuration can express (fingerprint × insecure × alpn sets),
+/// which is tiny in practice; no eviction is needed.
+type ConnectorKey = (TlsFingerprint, bool, Vec<Vec<u8>>);
+
+fn client_connector_cache() -> &'static parking_lot::Mutex<HashMap<ConnectorKey, TlsConnector>> {
+    static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<ConnectorKey, TlsConnector>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
 pub struct TlsTransport;
 
 impl TlsTransport {
+    /// Builds (and caches) a client connector.
+    ///
+    /// Both the `CryptoProvider` (cipher-suite and key-exchange tables) and the
+    /// ~150-entry `RootCertStore` used to be rebuilt on **every dial** — i.e. on
+    /// every DoT/DoH query, latency probe and ruleset fetch. They are immutable
+    /// for a given `(fingerprint, insecure, alpn)` triple, so the resulting
+    /// `ClientConfig` is cached and only the cheap `Arc` clone is returned.
+    /// `Random` resolves to a concrete profile per call and then uses that
+    /// profile's cache entry, so it still varies per dial.
     pub fn create_client_connector(cfg: &TlsClientConfig) -> FluxResult<TlsConnector> {
-        let provider = match cfg.fingerprint.unwrap_or_default() {
-            TlsFingerprint::Chrome => crate::fingerprint::create_chrome_provider(),
+        let fingerprint = match cfg.fingerprint.unwrap_or_default() {
+            TlsFingerprint::Random => match rand::random::<u8>() % 3 {
+                0 => TlsFingerprint::Chrome,
+                1 => TlsFingerprint::Firefox,
+                _ => TlsFingerprint::Safari,
+            },
+            other => other,
+        };
+
+        let alpn: Vec<Vec<u8>> = if cfg.alpn.is_empty() {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        } else {
+            cfg.alpn.clone()
+        };
+
+        let key = (fingerprint, cfg.insecure, alpn);
+        if let Some(cached) = client_connector_cache().lock().get(&key).cloned() {
+            return Ok(cached);
+        }
+
+        let provider = match fingerprint {
+            TlsFingerprint::Chrome | TlsFingerprint::Random => {
+                crate::fingerprint::create_chrome_provider()
+            }
             TlsFingerprint::Firefox => crate::fingerprint::create_firefox_provider(),
             TlsFingerprint::Safari => crate::fingerprint::create_safari_provider(),
-            TlsFingerprint::Random => match rand::random::<u8>() % 3 {
-                0 => crate::fingerprint::create_chrome_provider(),
-                1 => crate::fingerprint::create_firefox_provider(),
-                _ => crate::fingerprint::create_safari_provider(),
-            },
         };
 
         let mut root_store = RootCertStore::empty();
@@ -119,13 +158,12 @@ impl TlsTransport {
         };
 
         let mut config = client_config;
-        if !cfg.alpn.is_empty() {
-            config.alpn_protocols = cfg.alpn.clone();
-        } else {
-            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        }
-
-        Ok(TlsConnector::from(Arc::new(config)))
+        config.alpn_protocols = key.2.clone();
+        let connector = TlsConnector::from(Arc::new(config));
+        client_connector_cache()
+            .lock()
+            .insert(key, connector.clone());
+        Ok(connector)
     }
 
     pub fn create_server_acceptor(
@@ -244,5 +282,45 @@ mod tests {
 
         srv_task.await.unwrap();
         cli_task.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod connector_cache_tests {
+    use super::*;
+
+    #[test]
+    fn client_connector_is_cached() {
+        let cfg = TlsClientConfig::new("example.com");
+        let a = TlsTransport::create_client_connector(&cfg).unwrap();
+        let b = TlsTransport::create_client_connector(&cfg).unwrap();
+        assert!(
+            Arc::ptr_eq(&a.config().clone(), &b.config().clone()),
+            "an identical config must reuse the cached ClientConfig"
+        );
+    }
+
+    #[test]
+    fn distinct_configs_get_distinct_connectors() {
+        let mut a_cfg = TlsClientConfig::new("example.com");
+        a_cfg.alpn = vec![b"h2".to_vec()];
+        let mut b_cfg = TlsClientConfig::new("example.com");
+        b_cfg.alpn = vec![b"http/1.1".to_vec()];
+        let a = TlsTransport::create_client_connector(&a_cfg).unwrap();
+        let b = TlsTransport::create_client_connector(&b_cfg).unwrap();
+        assert!(!Arc::ptr_eq(&a.config().clone(), &b.config().clone()));
+        assert_eq!(a.config().alpn_protocols, vec![b"h2".to_vec()]);
+        assert_eq!(b.config().alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn insecure_and_verified_are_separate_cache_entries() {
+        let mut verified = TlsClientConfig::new("example.com");
+        verified.insecure = false;
+        let mut insecure = TlsClientConfig::new("example.com");
+        insecure.insecure = true;
+        let a = TlsTransport::create_client_connector(&verified).unwrap();
+        let b = TlsTransport::create_client_connector(&insecure).unwrap();
+        assert!(!Arc::ptr_eq(&a.config().clone(), &b.config().clone()));
     }
 }

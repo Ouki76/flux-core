@@ -12,6 +12,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 type HmacSha1 = hmac::Hmac<sha1::Sha1>;
 
 /// A stream wrapper that handles ShadowTLS v3 TLS record framing and HMAC verification.
+/// How many consecutive HMAC failures are tolerated before giving up.
+const MAX_SKIPPED_RECORDS: usize = 32;
+
 pub struct ShadowTlsStream<S> {
     inner: S,
     write_hmac: HmacSha1,
@@ -24,6 +27,8 @@ pub struct ShadowTlsStream<S> {
     hdr_buf: [u8; 9],
     hdr_pos: usize,
     payload_len: usize,
+    /// Consecutive records rejected by HMAC verification.
+    skipped_records: usize,
     payload_buf: Vec<u8>,
     payload_pos: usize,
 
@@ -51,6 +56,7 @@ impl<S> ShadowTlsStream<S> {
             hdr_buf: [0u8; 9],
             hdr_pos: 0,
             payload_len: 0,
+            skipped_records: 0,
             payload_buf: Vec::new(),
             payload_pos: 0,
             read_buf: Vec::new(),
@@ -82,6 +88,7 @@ impl<S> ShadowTlsStream<S> {
             hdr_buf: [0u8; 9],
             hdr_pos: 0,
             payload_len: 0,
+            skipped_records: 0,
             payload_buf: Vec::new(),
             payload_pos: 0,
             read_buf: first_payload,
@@ -108,6 +115,7 @@ impl<S> ShadowTlsStream<S> {
             hdr_buf: [0u8; 9],
             hdr_pos: 0,
             payload_len: 0,
+            skipped_records: 0,
             payload_buf: Vec::new(),
             payload_pos: 0,
             read_buf: Vec::new(),
@@ -262,15 +270,31 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowTlsStream<S> {
 
             let actual_tag = &this.hdr_buf[5..9];
             if actual_tag != expected_tag {
-                // Decoy application data frame from handshake relay, skip it
+                // A tag mismatch is expected only while the decoy handshake relay
+                // is still finishing. An unbounded number of them is either a
+                // broken peer or an attempt to keep this poll loop spinning, so
+                // cap consecutive skips and fail instead of silently consuming
+                // junk forever.
+                this.skipped_records += 1;
+                if this.skipped_records > MAX_SKIPPED_RECORDS {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "shadowtls: {MAX_SKIPPED_RECORDS} consecutive records failed                              HMAC verification; peer is not speaking ShadowTLS"
+                        ),
+                    )));
+                }
                 tracing::debug!(
-                    "shadowtls: tag mismatch, skipping record ({}B)",
-                    this.payload_len
+                    "shadowtls: tag mismatch, skipping record ({}B, {}/{} skipped)",
+                    this.payload_len,
+                    this.skipped_records,
+                    MAX_SKIPPED_RECORDS
                 );
                 this.payload_len = 0;
                 this.hdr_pos = 0;
                 continue;
             }
+            this.skipped_records = 0;
 
             this.read_hmac.update(&this.payload_buf);
             this.read_hmac.update(actual_tag);

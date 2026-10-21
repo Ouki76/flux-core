@@ -121,8 +121,31 @@ where
     let mut lines = header_str.lines();
     let first_line = lines.next().unwrap_or("");
     let mut parts = first_line.split_whitespace();
-    let _method = parts.next().unwrap_or("");
+    let method = parts.next().unwrap_or("");
     let path = parts.next().unwrap_or("/");
+    // HTTPUpgrade is a `GET` upgrade (its documentation claims header validation,
+    // but only the path was checked). Requiring the method and the `Upgrade:
+    // websocket` header keeps an ordinary request from being promoted to a tunnel.
+    if method != "GET" {
+        return Err(FluxError::Protocol {
+            protocol: "httpupgrade",
+            message: format!("expected GET for the upgrade request, got '{method}'"),
+        });
+    }
+    let mut has_upgrade_header = false;
+    for line in header_str.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("upgrade")
+        {
+            has_upgrade_header = v.trim().eq_ignore_ascii_case("websocket");
+        }
+    }
+    if !has_upgrade_header {
+        return Err(FluxError::Protocol {
+            protocol: "httpupgrade",
+            message: "missing 'Upgrade: websocket' header".into(),
+        });
+    }
 
     if let Some(exp) = expected_path {
         let actual_path = path.split('?').next().unwrap_or(path);

@@ -9,6 +9,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 pub const GRPC_HEADER_LEN: usize = 5;
 
+/// Maximum accepted length for a single length-prefixed gRPC message.
+///
+/// The length is four raw wire bytes, so a peer may legally claim up to
+/// `u32::MAX`; without a cap a single 5-byte header makes the proxy buffer
+/// 4 GiB before it can emit anything (unauthenticated remote memory DoS).
+/// 16 MiB is far above any legitimate proxy frame (the tunnel streams in
+/// `read_buf`-sized chunks) and keeps the worst case bounded.
+pub const MAX_GRPC_MESSAGE: usize = 16 * 1024 * 1024;
+
 /// gRPC stream wrapper applying RFC standard gRPC frame encapsulation:
 /// [Compressed-Flag (1 byte: 0x00) + Message-Length (4 bytes BE) + Message-Data]
 pub struct GrpcStream {
@@ -66,6 +75,15 @@ impl AsyncRead for GrpcStream {
                     this.read_buf[4],
                 ]) as usize;
 
+                if msg_len > MAX_GRPC_MESSAGE {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "gRPC message length {msg_len} exceeds the {MAX_GRPC_MESSAGE}-byte limit"
+                        ),
+                    )));
+                }
+
                 let total_frame_len = GRPC_HEADER_LEN + msg_len;
                 if this.read_buf.len() >= total_frame_len {
                     // Extract payload
@@ -100,11 +118,28 @@ impl AsyncRead for GrpcStream {
                             )));
                         }
                         let _varint = body.split_to(consumed);
-                        let data_len = (val as usize).min(body.len());
-                        body.split_to(data_len).freeze()
+                        if val as usize > body.len() {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "gRPC protobuf length {} exceeds message body {}",
+                                    val,
+                                    body.len()
+                                ),
+                            )));
+                        }
+                        body.split_to(val as usize).freeze()
                     } else {
                         body.freeze()
                     };
+
+                    if payload.is_empty() {
+                        // An empty gRPC message carries no tunnel bytes. Returning
+                        // `Ready(Ok(()))` with an empty `ReadBuf` would be read as
+                        // end-of-stream by every caller, tearing the tunnel down,
+                        // so keep consuming frames instead.
+                        continue;
+                    }
 
                     let to_copy = payload.len().min(buf.remaining());
                     buf.put_slice(&payload[..to_copy]);
@@ -192,14 +227,17 @@ impl AsyncWrite for GrpcStream {
         let varint_bytes = &varint[..vn];
 
         let proto_len = 1 + varint_bytes.len() + chunk_size;
-        let mut frame = Vec::with_capacity(GRPC_HEADER_LEN + proto_len);
-        frame.push(0x00); // Uncompressed
-        frame.extend_from_slice(&(proto_len as u32).to_be_bytes());
-        frame.push(0x0A); // Protobuf field 1 length-delimited
-        frame.extend_from_slice(varint_bytes);
-        frame.extend_from_slice(&buf[..chunk_size]);
-
-        this.write_buf = frame;
+        // Reuse the pre-reserved allocation instead of replacing it: assigning a
+        // fresh `Vec` threw away the 16 KiB capacity reserved at construction and
+        // reallocated on every write.
+        this.write_buf.clear();
+        this.write_buf.reserve(GRPC_HEADER_LEN + proto_len);
+        this.write_buf.push(0x00); // Uncompressed
+        this.write_buf
+            .extend_from_slice(&(proto_len as u32).to_be_bytes());
+        this.write_buf.push(0x0A); // Protobuf field 1 length-delimited
+        this.write_buf.extend_from_slice(varint_bytes);
+        this.write_buf.extend_from_slice(&buf[..chunk_size]);
         this.write_pos = 0;
         this.pending_chunk_len = chunk_size;
 

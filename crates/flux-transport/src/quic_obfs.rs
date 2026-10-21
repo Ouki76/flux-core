@@ -1,9 +1,12 @@
 //! Salamander obfuscation for QUIC transports (Hysteria 2 `obfs: salamander`).
 //!
-//! Wraps quinn's UDP socket at the runtime level: every outgoing datagram gets
-//! a random 16-byte salt prefix and XOR keystream (blake3 keyed by the
-//! password), every incoming datagram is deobfuscated before quinn sees it.
-//! Packets that fail deobfuscation are silently dropped.
+//! Wraps quinn's UDP socket at the runtime level: every outgoing datagram is
+//! salted and XOR-obfuscated by [`flux_common::Salamander`], every incoming
+//! datagram is deobfuscated before quinn sees it. Packets that fail
+//! deobfuscation are silently dropped.
+//!
+//! The cipher itself lives in `flux-common` so that the QUIC wrapper and the
+//! protocol codec can never drift apart.
 
 use std::fmt::Debug;
 use std::io::{self, IoSliceMut};
@@ -18,15 +21,32 @@ use quinn::{AsyncUdpSocket, Runtime, TokioRuntime, UdpPoller};
 /// QUIC runtime whose UDP sockets are wrapped with Salamander obfuscation.
 #[derive(Debug)]
 pub struct SalamanderRuntime {
-    key: [u8; 32],
+    obfs: flux_common::Salamander,
 }
 
 impl SalamanderRuntime {
     pub fn new(password: &str) -> Arc<Self> {
-        Arc::new(Self {
-            key: *blake3::hash(password.as_bytes()).as_bytes(),
-        })
+        // Fall back to a random PSK rather than silently disabling
+        // obfuscation: a too-short configured password is a configuration
+        // error, but producing clear-text QUIC would leak the protocol.
+        let obfs = flux_common::Salamander::new(password).unwrap_or_else(|e| {
+            tracing::error!("{e}; using a random Salamander PSK instead");
+            let mut pw = [0u8; 32];
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut pw);
+            flux_common::Salamander::new(&hex(&pw)).expect("32-byte hex password is long enough")
+        });
+        Arc::new(Self { obfs })
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 impl Runtime for SalamanderRuntime {
@@ -42,7 +62,7 @@ impl Runtime for SalamanderRuntime {
         let inner = TokioRuntime.wrap_udp_socket(t)?;
         Ok(Arc::new(ObfuscatedSocket {
             inner,
-            key: self.key,
+            obfs: self.obfs.clone(),
         }))
     }
 
@@ -55,43 +75,18 @@ impl Runtime for SalamanderRuntime {
 #[derive(Debug)]
 struct ObfuscatedSocket {
     inner: Arc<dyn AsyncUdpSocket>,
-    key: [u8; 32],
+    obfs: flux_common::Salamander,
 }
 
 impl ObfuscatedSocket {
     fn obfuscate(&self, plaintext: &[u8]) -> Vec<u8> {
-        use rand::RngCore;
-        let mut salt = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut salt);
-        let mut hasher = blake3::Hasher::new_keyed(&self.key);
-        hasher.update(&salt);
-        let mut xof = hasher.finalize_xof();
-
-        let mut out = Vec::with_capacity(16 + plaintext.len());
-        out.extend_from_slice(&salt);
-        let mut keystream = vec![0u8; plaintext.len()];
-        xof.fill(&mut keystream);
-        out.extend(plaintext.iter().zip(keystream.iter()).map(|(p, k)| p ^ k));
-        out
+        self.obfs.obfuscate(plaintext)
     }
 
     /// Deobfuscates `buf[..len]` in place, returning the plaintext length, or
-    /// `None` when the datagram is not Salamander-obfuscated.
+    /// `None` when the datagram is too short to be a Salamander packet.
     fn deobfuscate_in_place(&self, buf: &mut [u8], len: usize) -> Option<usize> {
-        if len < 16 {
-            return None;
-        }
-        let mut hasher = blake3::Hasher::new_keyed(&self.key);
-        hasher.update(&buf[..16]);
-        let mut xof = hasher.finalize_xof();
-
-        let plain_len = len - 16;
-        let mut keystream = vec![0u8; plain_len];
-        xof.fill(&mut keystream);
-        for i in 0..plain_len {
-            buf[i] = buf[16 + i] ^ keystream[i];
-        }
-        Some(plain_len)
+        self.obfs.deobfuscate_in_place(buf, len)
     }
 }
 
@@ -124,23 +119,33 @@ impl AsyncUdpSocket for ObfuscatedSocket {
         loop {
             match self.inner.poll_recv(cx, bufs, meta) {
                 Poll::Ready(Ok(count)) => {
-                    // max_receive_segments == 1: each datagram occupies its own
-                    // buffer starting at offset 0.
+                    // Each entry in `meta` describes one received datagram in the
+                    // matching `bufs` entry. Realistic segment handling only needs
+                    // to bound every slice: an oversized or coalesced buffer used
+                    // to be able to make the compaction copy panic.
                     let mut valid = 0;
                     for i in 0..count {
+                        if i >= bufs.len() || i >= meta.len() {
+                            break;
+                        }
                         let len = meta[i].len.min(bufs[i].len());
-                        if let Some(plain_len) = self.deobfuscate_in_place(&mut bufs[i][..], len) {
-                            // Compact valid datagrams to the front.
-                            if valid != i {
+                        let Some(plain_len) = self.deobfuscate_in_place(&mut bufs[i][..], len)
+                        else {
+                            continue; // undecodable: dropped silently
+                        };
+                        if valid != i {
+                            let dst_cap = bufs[valid].len();
+                            if dst_cap >= plain_len {
                                 let (head, tail) = bufs.split_at_mut(i);
                                 head[valid][..plain_len].copy_from_slice(&tail[0][..plain_len]);
                                 meta[valid] = meta[i];
+                            } else {
+                                continue;
                             }
-                            meta[valid].len = plain_len;
-                            meta[valid].stride = plain_len;
-                            valid += 1;
                         }
-                        // Undecodable datagrams are dropped silently.
+                        meta[valid].len = plain_len;
+                        meta[valid].stride = plain_len;
+                        valid += 1;
                     }
                     if valid > 0 {
                         return Poll::Ready(Ok(valid));
@@ -165,19 +170,24 @@ impl AsyncUdpSocket for ObfuscatedSocket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flux_common::SALAMANDER_SALT_LEN;
 
-    #[tokio::test]
-    async fn test_salamander_socket_roundtrip() {
-        let sock = ObfuscatedSocket {
+    fn mk(pw: &str) -> ObfuscatedSocket {
+        ObfuscatedSocket {
             inner: TokioRuntime
                 .wrap_udp_socket(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
                 .unwrap(),
-            key: *blake3::hash(b"secret").as_bytes(),
-        };
+            obfs: flux_common::Salamander::new(pw).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_salamander_socket_roundtrip() {
+        let sock = mk("salamander-secret");
         let plain = b"QUIC handshake bytes".as_slice();
         let obf = sock.obfuscate(plain);
-        assert_eq!(obf.len(), plain.len() + 16);
-        assert_ne!(&obf[..16], &obf[16..32.min(obf.len())]);
+        assert_eq!(obf.len(), plain.len() + SALAMANDER_SALT_LEN);
+        assert_ne!(&obf[SALAMANDER_SALT_LEN..], plain);
 
         let mut buf = obf.clone();
         let blen = buf.len();
@@ -185,19 +195,27 @@ mod tests {
         assert_eq!(&buf[..n], plain);
 
         // Wrong key: produces garbage, never panics.
-        let wrong = ObfuscatedSocket {
-            inner: TokioRuntime
-                .wrap_udp_socket(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
-                .unwrap(),
-            key: *blake3::hash(b"wrong").as_bytes(),
-        };
+        let wrong = mk("wrong-password");
         let mut buf2 = obf;
         let blen2 = buf2.len();
         let n2 = wrong.deobfuscate_in_place(&mut buf2, blen2).unwrap();
         assert_ne!(&buf2[..n2], plain);
 
         // Short packet is rejected.
-        let mut short = [0u8; 10];
-        assert!(sock.deobfuscate_in_place(&mut short, 10).is_none());
+        let mut short = [0u8; SALAMANDER_SALT_LEN - 1];
+        assert!(
+            sock.deobfuscate_in_place(&mut short, SALAMANDER_SALT_LEN - 1)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_salamander_runtime_tolerates_short_password() {
+        // A too-short PSK must not panic and must still obfuscate.
+        let rt = SalamanderRuntime::new("ab");
+        let socket = rt
+            .wrap_udp_socket(std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .unwrap();
+        assert!(socket.local_addr().is_ok());
     }
 }

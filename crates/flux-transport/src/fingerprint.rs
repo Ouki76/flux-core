@@ -4,7 +4,7 @@ use tokio_rustls::rustls::crypto::ring::cipher_suite::*;
 use tokio_rustls::rustls::crypto::ring::kx_group::*;
 use tokio_rustls::rustls::crypto::{CryptoProvider, SupportedKxGroup};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum TlsFingerprint {
     #[default]
     Chrome,

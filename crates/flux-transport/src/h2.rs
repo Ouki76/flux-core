@@ -76,6 +76,17 @@ impl AsyncRead for H2Stream {
             match &mut this.recv {
                 H2RecvState::Pending(fut) => match Pin::new(fut).poll(cx) {
                     Poll::Ready(Ok(response)) => {
+                        // A tunnel is only established on success: a 404,
+                        // captive-portal 200-less error page or 407 proxy
+                        // challenge would otherwise be spliced into the stream
+                        // body as if it were proxy data (silent corruption).
+                        let status = response.status();
+                        if !status.is_success() {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::ConnectionRefused,
+                                format!("H2 tunnel rejected by peer with HTTP status {status}"),
+                            )));
+                        }
                         let recv_stream = response.into_body();
                         this.recv = H2RecvState::Ready(recv_stream);
                         continue;
@@ -129,7 +140,17 @@ impl AsyncWrite for H2Stream {
         match this.send.poll_capacity(cx) {
             Poll::Ready(Some(Ok(capacity))) => {
                 if capacity == 0 {
-                    return Poll::Pending;
+                    // After `reserve_capacity`, `poll_capacity` returns `Pending`
+                    // until at least one byte of capacity is granted, so a
+                    // `Ready(0)` here means the peer will never accept more data
+                    // (stream closed/reset). Returning `Pending` lost the wake-up
+                    // and could stall the tunnel indefinitely; returning `Ok(0)`
+                    // would surface as a confusing `WriteZero`. Report the real
+                    // condition instead.
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "H2 stream can no longer accept data",
+                    )));
                 }
                 let to_write = buf.len().min(capacity);
                 let chunk = Bytes::copy_from_slice(&buf[..to_write]);

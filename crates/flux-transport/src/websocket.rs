@@ -9,6 +9,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 pub const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+/// Size of the staging buffer used to unmask client frames.
+const UNMASK_CHUNK: usize = 16 * 1024;
+
 /// Performs client-side RFC 6455 WebSocket handshake over an underlying stream.
 pub async fn client_handshake<S>(
     mut stream: S,
@@ -74,10 +77,36 @@ where
 
     let header_str = String::from_utf8_lossy(&resp_buf[..h_end]);
     let first_line = header_str.lines().next().unwrap_or("");
-    if !first_line.contains("101") {
+    // Parse the status code: `contains("101")` also matched reason phrases.
+    let status: Option<u16> = first_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok());
+    if status != Some(101) {
         return Err(FluxError::Protocol {
             protocol: "websocket",
             message: format!("server rejected websocket upgrade: {}", first_line),
+        });
+    }
+    // Verify the accept token so a captive portal or wrong endpoint cannot be
+    // mistaken for a tunnel.
+    let expected_accept = {
+        let mut hasher = Sha1::new();
+        hasher.update(key.as_bytes());
+        hasher.update(WS_GUID);
+        base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+    };
+    let got_accept = header_str.lines().find_map(|l| {
+        l.split_once(':').and_then(|(k, v)| {
+            k.trim()
+                .eq_ignore_ascii_case("sec-websocket-accept")
+                .then(|| v.trim().to_string())
+        })
+    });
+    if got_accept.as_deref() != Some(expected_accept.as_str()) {
+        return Err(FluxError::Protocol {
+            protocol: "websocket",
+            message: "websocket handshake returned a mismatched Sec-WebSocket-Accept".into(),
         });
     }
 
@@ -170,13 +199,38 @@ where
     }
 
     let mut client_key = None;
+    let mut has_upgrade = false;
+    let mut has_connection_upgrade = false;
+    let mut version_ok = false;
     for line in lines {
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("sec-websocket-key")
-        {
-            client_key = Some(v.trim().to_string());
-            break;
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let k = k.trim();
+        let v = v.trim();
+        if k.eq_ignore_ascii_case("sec-websocket-key") {
+            client_key = Some(v.to_string());
+        } else if k.eq_ignore_ascii_case("upgrade") {
+            has_upgrade = v.eq_ignore_ascii_case("websocket");
+        } else if k.eq_ignore_ascii_case("connection") {
+            has_connection_upgrade = v
+                .split(',')
+                .any(|t| t.trim().eq_ignore_ascii_case("upgrade"));
+        } else if k.eq_ignore_ascii_case("sec-websocket-version") {
+            // RFC 6455 §4.2.1: version 13 is the only one in use.
+            version_ok = v == "13";
         }
+    }
+
+    // A valid upgrade request must carry all four; otherwise this is an ordinary
+    // HTTP request that must not be upgraded (it would let any GET with a key
+    // through as a tunnel).
+    if !has_upgrade || !has_connection_upgrade || !version_ok {
+        return Err(FluxError::Protocol {
+            protocol: "websocket",
+            message: "invalid websocket upgrade request (missing Upgrade/Connection/Version)"
+                .into(),
+        });
     }
 
     let key = client_key.ok_or_else(|| FluxError::Protocol {
@@ -420,17 +474,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
 
                     let n_read = if this.buffered_pos < this.buffered_excess.len() {
                         let avail = this.buffered_excess.len() - this.buffered_pos;
-                        let n = avail.min(max_to_read);
+                        // The masked path unmasks through a fixed 16 KiB staging
+                        // buffer: `n` must be clamped to that size, otherwise the
+                        // surplus bytes are consumed (`buffered_pos`/`payload_rem`
+                        // advance by `n`) without ever being delivered — silent
+                        // data loss plus stream desynchronisation.
+                        let n = if this.mask_key.is_some() && !is_control {
+                            avail.min(max_to_read).min(UNMASK_CHUNK)
+                        } else {
+                            avail.min(max_to_read)
+                        };
                         let slice = &this.buffered_excess[this.buffered_pos..this.buffered_pos + n];
 
                         if !is_control {
                             if let Some(mask) = this.mask_key {
-                                let mut unmasked = [0u8; 16 * 1024];
-                                let to_unmask = n.min(unmasked.len());
-                                for (i, &b) in slice[..to_unmask].iter().enumerate() {
+                                let mut unmasked = [0u8; UNMASK_CHUNK];
+                                debug_assert!(n <= unmasked.len());
+                                for (i, &b) in slice.iter().enumerate() {
                                     unmasked[i] = b ^ mask[(this.mask_idx + i) % 4];
                                 }
-                                buf.put_slice(&unmasked[..to_unmask]);
+                                buf.put_slice(&unmasked[..n]);
                             } else {
                                 buf.put_slice(slice);
                             }
