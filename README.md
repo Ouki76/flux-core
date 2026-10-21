@@ -145,6 +145,19 @@ Single stream, 300 MB per round, median of 7:
 | **flux-core** | **4171 MB/s** | **0.51 s** | **8 MiB** |
 | sing-box | 4005 MB/s | 0.57 s | 28 MiB |
 
+Userspace datapaths (the two that run their own TCP/IP stack):
+
+| Path | Throughput | CPU per GB |
+|---|---|---|
+| **TUN** (smoltcp, default jumbo MTU 9000) | **745 MiB/s** | **3.40 s** |
+| TUN (same code, MTU 1500) | 324 MiB/s | 6.67 s |
+| **WireGuard** (Noise + smoltcp) | **93.6 MB/s** | **21.4 s** |
+| kernel loopback reference | 2.8 GiB/s | 0.31 s |
+
+A TUN device supports no read/write batching (verified with `readv`/`writev`
+probes: it returns exactly one packet per call), so these paths are syscall-bound
+and bytes-per-syscall is the only lever — which is why the default MTU is 9000.
+
 | Path | Throughput |
 |---|---|
 | Direct UDP echo (no proxy) | 167k datagrams/s |

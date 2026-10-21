@@ -4,6 +4,62 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.1] - 2026-10-22
+
+Continuous audit, cycle 1. Three workstreams (smux security, DNS security, both
+userspace datapaths) plus hardening found 22 defects; every fix is proved by a
+test that fails without it.
+
+### Fixed (security)
+
+- **smux: 8 defects**, including a writer that could hang forever (a `Notify`
+  future was dropped while returning `Pending`, deregistering the waiter), a
+  leaked stream slot per UDP association, one detached task per FIN frame under
+  backpressure, a silently dropped half-close FIN, and a buffering bound that
+  allowed 64x the configured budget.
+- **DNS: 6 defects**, including 83x reflection amplification (the relay ignored
+  the client's UDP payload size), SERVFAIL/REFUSED being cached as "does not
+  resolve" for up to an hour, a trailing-dot FQDN bypassing every split-DNS rule
+  (a DNS leak), and fake-IP allocations outside their own range.
+- **DNS hardening:** per-source-IP query rate limiting on the listener (a DNS port
+  is an amplification vector) and a hard budget of 64 upstream exchanges per
+  client query, so a CNAME chain cannot amplify with the number of servers.
+- **WireGuard:** an unbounded proxy→socket queue held ~500 MiB of resident memory
+  during a 512 MiB transfer (measured 1 byte of RSS per byte moved).
+
+### Fixed (throughput / memory)
+
+- **TUN `mtu` was a no-op** — it sized a buffer and was logged, but the device was
+  never programmed, so the kernel always segmented at 1500. Now applied via
+  `SIOCSIFMTU`, and the default is 9000 (jumbo): **324 → 745 MiB/s**, CPU
+  **6.7 → 3.4 s/GB**. Also: socket buffers scale with the MTU (jumbo previously
+  collapsed to 58 MiB/s because one segment filled the window), smoltcp's 10 ms
+  delayed ACK is disabled (holding an ACK holds the client's window shut), and the
+  egress path no longer drops a frame when the device momentarily refuses a write.
+- **WireGuard: 58 → 93.6 MB/s (+46 %), CPU 50.3 → 21.4 s/GB (−53 %), RSS on a
+  512 MiB transfer 503 → 27 MiB.** The datapath was syscall- and scheduling-bound,
+  not crypto-bound: ~4 syscalls per packet because every packet crossed three
+  tasks per direction. In-place AEAD (zero allocation), `recvmmsg`/`sendmmsg`
+  batching and merging the pump tasks cut syscalls per datagram 2.1 → 0.08 and
+  scheduler wakeups 1.03 → 0.27.
+
+### Added
+
+- `tests/test_malformed_input_resilience.rs`: every inbound survives garbage on its
+  socket and keeps serving real clients.
+- `tests/test_api_auth.rs`: the API's negative paths (no token, wrong token, wrong
+  scheme, cross-origin query token) and proof that a rejected request does not
+  execute its side effect.
+- `scripts/config_field_audit.py`: finds configuration fields that parse and are
+  then ignored (all 59 are consumed today).
+- `docs/audit-log.md`: the audit protocol, the baseline table and every cycle's
+  findings with the command that produced them.
+
+### Measured
+
+`scripts/soak.sh 240` — 3,349,277 requests, 0 errors, 26 GB proxied, RSS flat
+(12.5 → 12.6 MB), file descriptors and threads bounded.
+
 ## [1.3.0] - 2026-10-22
 
 Closes the four gaps that remained after the 1.2.1 review — a missing feature, an
