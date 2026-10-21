@@ -88,6 +88,17 @@ pub struct RuleSet {
     #[serde(skip)]
     #[doc(hidden)]
     pub file_loaded: bool,
+    /// Mutable parse statistics (interior mutability: remote rule sets are
+    /// refreshed through a shared `&RuleSet`).
+    #[serde(skip)]
+    pub stats: Arc<RuleSetStats>,
+}
+
+/// Line counters for a rule set, shared across refreshes.
+#[derive(Default, Debug)]
+pub struct RuleSetStats {
+    parsed: std::sync::atomic::AtomicUsize,
+    unparsed: std::sync::atomic::AtomicUsize,
 }
 
 impl RuleSet {
@@ -107,15 +118,36 @@ impl RuleSet {
             return;
         }
 
-        // Handle Clash comma format: "DOMAIN-SUFFIX,google.com" or "IP-CIDR,1.2.3.4/32"
-        if let Some((rule_type, val)) = trimmed.split_once(',') {
-            let val = val.trim().trim_matches('\'').trim_matches('"');
+        // Handle Clash comma format: "DOMAIN-SUFFIX,google.com[,no-resolve]".
+        //
+        // The value is the *second* field; trailing modifiers such as
+        // `no-resolve` must be dropped rather than folded into the value —
+        // `"1.2.3.4/32,no-resolve"` does not parse as a CIDR, so the rule was
+        // silently discarded and the rule set matched less than the user wrote
+        // (fail-open routing).
+        if let Some((rule_type, rest)) = trimmed.split_once(',') {
+            let mut fields = rest
+                .split(',')
+                .map(|f| f.trim().trim_matches('\'').trim_matches('"'));
+            let val = fields.next().unwrap_or_default();
+            if val.is_empty() {
+                self.stats
+                    .unparsed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             match rule_type.trim().to_ascii_uppercase().as_str() {
                 "DOMAIN-SUFFIX" => self.domain_suffix.push(val.to_string()),
                 "DOMAIN" | "DOMAIN-FULL" => self.domain.push(val.to_string()),
                 "DOMAIN-KEYWORD" => self.domain_keyword.push(val.to_string()),
                 "IP-CIDR" | "IP-CIDR6" | "CIDR" => self.ip_cidr.push(val.to_string()),
-                _ => {}
+                _ => {
+                    // Unsupported Clash rule type (GEOIP, PROCESS-NAME, …): count
+                    // it so the operator can see that the rule set is partial.
+                    self.stats
+                        .unparsed
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
             return;
         }
@@ -158,11 +190,47 @@ impl RuleSet {
     /// Atomically replaces the compiled contents with the given text (used by
     /// remote rule set fetches). Takes `&self` so it works through shared Arcs.
     pub fn apply_content(&self, content: &str) {
-        let mut tmp = RuleSet::default();
+        // Merge into the lists the configuration supplied alongside
+        // `type: remote` instead of replacing them: rebuilding from the fetched
+        // text alone silently dropped every inline `domain`/`ip_cidr` entry.
+        let mut merged = RuleSet {
+            ip_cidr: self.ip_cidr.clone(),
+            domain: self.domain.clone(),
+            domain_suffix: self.domain_suffix.clone(),
+            domain_keyword: self.domain_keyword.clone(),
+            ..RuleSet::default()
+        };
         for line in content.lines() {
-            tmp.parse_rule_line(line);
+            merged.parse_rule_line(line);
         }
-        *self.compiled.write() = CompiledRuleSet::build(&tmp);
+        self.stats.parsed.store(
+            merged.domain.len()
+                + merged.domain_suffix.len()
+                + merged.domain_keyword.len()
+                + merged.ip_cidr.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.stats.unparsed.store(
+            merged
+                .stats
+                .unparsed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        *self.compiled.write() = CompiledRuleSet::build(&merged);
+    }
+
+    /// Number of rule entries successfully parsed from the most recent load.
+    pub fn parsed_entry_count(&self) -> usize {
+        self.stats.parsed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of lines that could not be interpreted (unsupported rule type,
+    /// malformed value, …). Non-zero means the rule set is partial.
+    pub fn unparsed_entry_count(&self) -> usize {
+        self.stats
+            .unparsed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Rebuilds the compiled lookup structures from the raw lists and swaps them in.
@@ -371,5 +439,73 @@ mod tests {
             NetworkType::Tcp,
         );
         assert!(rs.matches(&meta4));
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    fn compiled_from(text: &str) -> RuleSet {
+        let mut rs = RuleSet::default();
+        for line in text.lines() {
+            rs.parse_rule_line(line);
+        }
+        rs.rebuild_compiled();
+        rs
+    }
+
+    /// Clash lines carry trailing modifiers such as `no-resolve`; the value is
+    /// field 1 and everything after it must be ignored. Folding the modifier
+    /// into the value made the CIDR unparseable and the rule silently vanished.
+    #[test]
+    fn clash_rule_with_no_resolve_is_parsed() {
+        let rs =
+            compiled_from("IP-CIDR,1.2.3.4/32,no-resolve\nDOMAIN-SUFFIX,example.com,no-resolve\n");
+        assert_eq!(rs.ip_cidr, vec!["1.2.3.4/32"]);
+        assert_eq!(rs.domain_suffix, vec!["example.com"]);
+        assert_eq!(
+            rs.parsed_entry_count(),
+            0,
+            "counters are set on apply_content"
+        );
+        // And the compiled matcher actually matches.
+        assert!(
+            rs.compiled
+                .read()
+                .ip_range_set
+                .contains(&"1.2.3.4".parse().unwrap())
+        );
+        assert!(rs.compiled.read().suffix_set.contains("example.com"));
+    }
+
+    #[test]
+    fn unsupported_rule_type_is_counted_not_silent() {
+        let rs = compiled_from("GEOIP,CN\nPROCESS-NAME,curl\nDOMAIN,ok.example\n");
+        assert_eq!(rs.domain, vec!["ok.example"]);
+        assert_eq!(rs.unparsed_entry_count(), 2);
+    }
+
+    /// A remote refresh must merge with the config's inline lists instead of
+    /// discarding them (they are part of the same rule set definition).
+    #[test]
+    fn apply_content_keeps_inline_lists() {
+        let rs = RuleSet {
+            domain: vec!["inline.example".into()],
+            ip_cidr: vec!["10.0.0.0/8".into()],
+            ..RuleSet::default()
+        };
+        rs.apply_content("DOMAIN-SUFFIX,fetched.example\n");
+        let compiled = rs.compiled.read();
+        assert!(
+            compiled.exact_set.contains("inline.example"),
+            "inline domain lost"
+        );
+        assert!(compiled.suffix_set.contains("fetched.example"));
+        assert!(
+            compiled.ip_range_set.contains(&"10.1.2.3".parse().unwrap()),
+            "inline CIDR lost"
+        );
+        assert_eq!(rs.parsed_entry_count(), 3);
     }
 }

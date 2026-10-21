@@ -13,6 +13,9 @@ const POSITIVE_CACHE_TTL: Duration = Duration::from_secs(10);
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 const MAX_CACHE_ENTRIES: usize = 4096;
 
+/// Maximum number of queued / `/proc` scans for unresolved source addresses.
+const MAX_PENDING_SCANS: usize = 256;
+
 /// Resolves the name of the process owning a local socket.
 ///
 /// Linux `/proc` scanning is performed on a dedicated background worker thread,
@@ -107,6 +110,14 @@ impl ProcessResolver {
         // Queue a background scan (deduplicated via `pending`).
         {
             let mut pending = self.inner.pending.lock();
+            // A connection flood would otherwise queue one /proc walk per new
+            // source port (each scan reads /proc/*/fd) and grow `pending` without
+            // bound. Past the cap, drop the request: the rule simply does not
+            // match for that connection, which is the same outcome as a failed
+            // scan.
+            if pending.len() >= MAX_PENDING_SCANS {
+                return None;
+            }
             if pending.insert(src) {
                 // If the channel is disconnected the worker is gone; just drop the request.
                 if self.inner.scan_tx.send(src).is_err() {
@@ -172,20 +183,30 @@ fn find_socket_inode(src: SocketAddr) -> Option<u64> {
         };
         let reader = std::io::BufReader::new(file);
         for line in reader.lines().skip(1).map_while(Result::ok) {
-            let mut parts = line.split_whitespace();
-            let _sl = parts.next();
-            if let Some(local_addr) = parts.next()
-                && let Some((ip_hex, p_hex)) = local_addr.split_once(':')
-                && p_hex.eq_ignore_ascii_case(&hex_port)
-            {
-                if !ip_hex.eq_ignore_ascii_case(&target_ip_hex) && ip_hex != wildcard {
-                    continue;
-                }
-                if let Some(inode_str) = parts.nth(7)
-                    && let Ok(inode) = inode_str.parse::<u64>()
-                {
-                    return Some(inode);
-                }
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // sl(0) local(1) remote(2) state(3) tx:rx(4) tr:tm(5) retrnsmt(6)
+            // uid(7) timeout(8) inode(9)
+            let Some(local_addr) = fields.get(1) else {
+                continue;
+            };
+            let Some((ip_hex, p_hex)) = local_addr.split_once(':') else {
+                continue;
+            };
+            if !p_hex.eq_ignore_ascii_case(&hex_port) {
+                continue;
+            }
+            if !ip_hex.eq_ignore_ascii_case(&target_ip_hex) && ip_hex != wildcard {
+                continue;
+            }
+            // Only an established connection can be the client's socket. Without
+            // this, a listening socket (or a TIME_WAIT leftover) that happens to
+            // own the same ephemeral port would be attributed to the wrong
+            // process. State is `01` (ESTABLISHED) for both TCP and UDP.
+            if fields.get(3).is_some_and(|st| *st != "01") {
+                continue;
+            }
+            if let Some(inode) = fields.get(9).and_then(|s| s.parse::<u64>().ok()) {
+                return Some(inode);
             }
         }
     }
