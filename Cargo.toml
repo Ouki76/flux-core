@@ -116,6 +116,7 @@ rand = { workspace = true }
 criterion = { workspace = true }
 rcgen = { workspace = true }
 futures-util = { workspace = true }
+socket2 = { workspace = true }
 
 [[bench]]
 name = "throughput"
