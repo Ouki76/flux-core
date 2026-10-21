@@ -10,13 +10,16 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
 use flux_protocol::wireguard::{
-    AwgConfig, WG_REJECT_AFTER_TIME_SECS, WireGuardHandshake, WireGuardPeerAuth, WireGuardSession,
+    AwgConfig, WG_AEAD_TAG_LEN, WG_DATA_HEADER_LEN, WG_REJECT_AFTER_TIME_SECS, WireGuardHandshake,
+    WireGuardPeerAuth, WireGuardSession,
 };
 use flux_types::{Dispatcher, FluxError, FluxResult, Inbound};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tracing::{debug, info, warn};
 use x25519_dalek::StaticSecret;
@@ -25,10 +28,6 @@ use x25519_dalek::StaticSecret;
 pub const WG_INBOUND_DEFAULT_MTU: usize = 1420;
 /// Channel capacity between the UDP receive loop and the smoltcp stack actor.
 const FRAME_CHANNEL_CAP: usize = 2048;
-
-/// Minimum on-wire length of a WireGuard transport (data) packet:
-/// `type(4) + receiver_index(4) + counter(8)` header plus a 16-byte AEAD tag.
-const WG_DATA_HEADER_LEN: usize = 16 + 16;
 
 /// Upper bound on concurrent sessions held by the inbound. Each authenticated
 /// handshake creates one; a misbehaving (but authorized) peer must not be able
@@ -121,6 +120,7 @@ impl Inbound for WireGuardInbound {
             ))
         })?;
         let socket = Arc::new(socket);
+        tune_socket_buffers(&socket);
         self.running.store(true, Ordering::SeqCst);
 
         info!(
@@ -167,7 +167,14 @@ impl Inbound for WireGuardInbound {
             });
         }
 
-        // 2. UDP receive loop: handshakes + data packets → stack.
+        // 2. Single tunnel pump: handshakes + decrypt → stack, and stack → encrypt
+        //    → socket, in one task.
+        //
+        //    These two directions used to be separate tasks that woke each other
+        //    (and the smoltcp actor) once per packet burst; a request/response
+        //    flow always has work in both directions, so one task handling both
+        //    halves the scheduler round trips per burst and lets a wakeup do
+        //    ingress *and* egress.
         {
             let socket = socket.clone();
             let sessions = sessions.clone();
@@ -176,6 +183,7 @@ impl Inbound for WireGuardInbound {
             let tag = tag.clone();
             let running = self.running.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let mut stack_out_rx = stack_out_rx;
             let local_static = StaticSecret::from(self.private_key);
             let peers_auth: Vec<WireGuardPeerAuth> = self
                 .peers
@@ -193,12 +201,90 @@ impl Inbound for WireGuardInbound {
             let awg = self.awg.clone();
 
             tokio::spawn(async move {
-                let mut buf = vec![0u8; 4096];
+                let fd = socket.as_raw_fd();
+                let mut rx = UdpBatch::new();
+                let mut tx = UdpBatch::new();
+                // Inner source IP → session index, cached so a steady flow does
+                // not take the route map's write lock once per packet.
+                let mut last_route: Option<(IpAddr, u32)> = None;
+                // Datagram buffers are recycled: after the first burst each
+                // encrypted packet is built in a buffer from this pool, so a
+                // steady flow allocates nothing on the send path.
+                let mut pool: Vec<Vec<u8>> = Vec::new();
+                let mut pending_out: Option<Vec<u8>> = None;
+
                 loop {
-                    let (n, peer_addr) = tokio::select! {
+                    // ---- A. Flush egress: everything the stack has produced,
+                    //         encrypted into one `sendmmsg` burst.
+                    let mut batch: Vec<Vec<u8>> = Vec::new();
+                    if let Some(p) = pending_out.take() {
+                        batch.push(p);
+                    }
+                    while batch.len() < UDP_BATCH {
+                        match stack_out_rx.try_recv() {
+                            Ok(p) => batch.push(p),
+                            Err(_) => break,
+                        }
+                    }
+                    if !batch.is_empty() {
+                        let mut sealed: Vec<Vec<u8>> = Vec::with_capacity(batch.len());
+                        let mut dsts: Vec<SocketAddr> = Vec::with_capacity(batch.len());
+                        for ip_pkt in batch.iter() {
+                            let Some((_, dst_ip)) = inner_addrs(ip_pkt) else {
+                                continue;
+                            };
+                            let Some(idx) = ip_to_index.get(&dst_ip).map(|v| *v) else {
+                                debug!(
+                                    "[{}] wireguard egress: no session for inner dst {}",
+                                    tag, dst_ip
+                                );
+                                continue; // no session owns this inner destination
+                            };
+                            let Some(state) = sessions.get(&idx).map(|v| v.value().clone()) else {
+                                continue;
+                            };
+                            let addr = *state.addr.lock();
+                            let mut out = pool.pop().unwrap_or_default();
+                            let ok = {
+                                let mut sess = state.session.lock().await;
+                                match sess.encrypt_data_packet_into(ip_pkt, &mut out) {
+                                    Ok(()) => true,
+                                    Err(e) => {
+                                        debug!("[{}] wireguard encrypt failed: {}", tag, e);
+                                        false
+                                    }
+                                }
+                            };
+                            if ok {
+                                sealed.push(out);
+                                dsts.push(addr);
+                            } else {
+                                pool.push(out);
+                            }
+                        }
+                        let mut off = 0;
+                        while off < sealed.len() {
+                            match socket
+                                .async_io(Interest::WRITABLE, || {
+                                    tx.send_each(fd, &sealed[off..], &dsts[off..])
+                                })
+                                .await
+                            {
+                                Ok(0) => break,
+                                Ok(n) => off += n,
+                                Err(_) => break,
+                            }
+                        }
+                        pool.append(&mut sealed);
+                    }
+
+                    // ---- B. Wait for the next burst of datagrams, or for the
+                    //         stack to produce output.
+                    rx.arm();
+                    let got = tokio::select! {
                         _ = shutdown_rx.recv() => break,
-                        res = socket.recv_from(&mut buf) => match res {
-                            Ok(v) => v,
+                        res = socket.async_io(Interest::READABLE, || rx.recv(fd, UDP_BATCH)) => match res {
+                            Ok(n) => n,
                             Err(e) => {
                                 if running.load(Ordering::Relaxed) {
                                     warn!("[{}] wireguard udp recv error: {}", tag, e);
@@ -206,242 +292,211 @@ impl Inbound for WireGuardInbound {
                                 break;
                             }
                         },
+                        p = stack_out_rx.recv() => match p {
+                            Some(p) => {
+                                pending_out = Some(p);
+                                continue;
+                            }
+                            None => break,
+                        },
                     };
                     if !running.load(Ordering::Relaxed) {
                         break;
                     }
-                    let pkt = &buf[..n];
+                    if got == 0 {
+                        continue;
+                    }
 
-                    let Some(msg_type) = pkt
-                        .get(0..4)
-                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    else {
-                        continue; // runt datagram: not a WireGuard message
-                    };
-
-                    if msg_type == awg.h4 {
-                        // ---- Data packet: [h4][receiver_index(4)][counter(8)][ciphertext]
-                        // A data packet is at least the 16-byte header plus a 16-byte
-                        // Poly1305 tag. Reject runts before indexing: an attacker could
-                        // otherwise send `h4` alone and panic this (the only) receive loop,
-                        // permanently taking the inbound down.
-                        let Some(idx_bytes) = pkt.get(4..8) else {
+                    for i in 0..got {
+                        let Some(peer_addr) = rx.peer(i) else {
                             continue;
                         };
-                        if pkt.len() < WG_DATA_HEADER_LEN {
-                            continue;
+                        let mut buf = rx.take(i);
+                        let n = buf.len();
+                        if n < 4 {
+                            continue; // runt datagram: not a WireGuard message
                         }
-                        let receiver_index = u32::from_le_bytes([
-                            idx_bytes[0],
-                            idx_bytes[1],
-                            idx_bytes[2],
-                            idx_bytes[3],
-                        ]);
-                        let Some(entry) = sessions.get(&receiver_index) else {
-                            debug!(
-                                "[{}] wireguard data for unknown session {}",
-                                tag, receiver_index
-                            );
-                            continue; // unknown/expired session: drop silently
-                        };
-                        let state = entry.value().clone();
-                        drop(entry);
+                        let msg_type = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
-                        let plain = {
-                            let mut sess = state.session.lock().await;
-                            match sess.decrypt_data_packet(pkt) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    debug!(
-                                        "[{}] wireguard data decrypt failed from {}: {}",
-                                        tag, peer_addr, e
-                                    );
-                                    continue;
-                                }
+                        if msg_type == awg.h4 {
+                            // ---- Data packet: [h4][receiver_index(4)][counter(8)][ciphertext]
+                            // A data packet is at least the 16-byte header plus a
+                            // 16-byte Poly1305 tag. Reject runts before indexing: an
+                            // attacker could otherwise send `h4` alone and panic this
+                            // (the only) receive loop, permanently taking the inbound down.
+                            if n < WG_DATA_HEADER_LEN + WG_AEAD_TAG_LEN {
+                                continue;
                             }
-                        };
+                            let receiver_index =
+                                u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                            let Some(entry) = sessions.get(&receiver_index) else {
+                                debug!(
+                                    "[{}] wireguard data for unknown session {}",
+                                    tag, receiver_index
+                                );
+                                continue; // unknown/expired session: drop silently
+                            };
+                            let state = entry.value().clone();
+                            drop(entry);
 
-                        // Authenticated packet: roaming support — track latest peer address.
-                        {
-                            let mut addr = state.addr.lock();
-                            if *addr != peer_addr {
-                                *addr = peer_addr;
-                            }
-                        }
-
-                        if plain.is_empty() {
-                            continue; // WireGuard keepalive
-                        }
-
-                        let Some(parsed) = crate::tun::parse_ip_packet(&plain) else {
-                            continue; // non TCP/UDP inner traffic: drop
-                        };
-
-                        // Enforce per-peer allowed source IPs when configured.
-                        if !state.allowed_ips.is_empty()
-                            && !state
-                                .allowed_ips
-                                .iter()
-                                .any(|net| net.contains(&parsed.src.ip()))
-                        {
-                            debug!(
-                                "[{}] wireguard peer {} sent inner packet from disallowed IP {}",
-                                tag, peer_addr, parsed.src
-                            );
-                            continue;
-                        }
-
-                        ip_to_index.insert(parsed.src.ip(), receiver_index);
-                        if frame_tx.try_send(plain).is_err() {
-                            debug!(
-                                "[{}] wireguard stack frame channel full; dropping packet",
-                                tag
-                            );
-                        }
-                    } else if pkt.len() >= awg.s1 as usize + 148
-                        && u32::from_le_bytes([
-                            pkt[awg.s1 as usize],
-                            pkt[awg.s1 as usize + 1],
-                            pkt[awg.s1 as usize + 2],
-                            pkt[awg.s1 as usize + 3],
-                        ]) == awg.h1
-                    {
-                        // ---- Handshake initiation (possibly with AWG s1 junk prefix)
-                        // Bind a session slot with a fresh receiver index. `rand::random`
-                        // could collide with a live session, which would silently hijack
-                        // (and later reap) another peer's tunnel, so retry a few times on
-                        // collision instead of trusting the RNG.
-                        let Some(receiver_index) = (0..8).find_map(|_| {
-                            let candidate = rand::random::<u32>();
-                            (!sessions.contains_key(&candidate)).then_some(candidate)
-                        }) else {
-                            warn!(
-                                "[{}] wireguard session table saturated; rejecting handshake from {}",
-                                tag, peer_addr
-                            );
-                            continue;
-                        };
-                        if sessions.len() >= MAX_SESSIONS {
-                            warn!(
-                                "[{}] wireguard session limit ({}) reached; rejecting handshake from {}",
-                                tag, MAX_SESSIONS, peer_addr
-                            );
-                            continue;
-                        }
-                        let result = WireGuardHandshake::respond_to_initiation_with_peers(
-                            &local_static,
-                            receiver_index,
-                            &awg,
-                            pkt,
-                            &peers_auth,
-                        );
-                        match result {
-                            Ok(hs) => {
-                                // Reject replayed initiations: the timestamp must be
-                                // strictly newer than the last accepted one per peer.
-                                {
-                                    let fresh = match peer_timestamps.get(&hs.peer_public_key) {
-                                        Some(last) => hs.peer_timestamp > *last,
-                                        None => true,
-                                    };
-                                    if !fresh {
+                            // Decrypt in place: the plaintext replaces the ciphertext
+                            // inside the receive buffer, so no copy or allocation.
+                            let range = {
+                                let mut sess = state.session.lock().await;
+                                match sess.open_data_packet_in_place(&mut buf) {
+                                    Ok(r) => r,
+                                    Err(e) => {
                                         debug!(
-                                            "[{}] wireguard initiation from {} replayed (stale TAI64N); dropped",
-                                            tag, peer_addr
+                                            "[{}] wireguard data decrypt failed from {}: {}",
+                                            tag, peer_addr, e
                                         );
                                         continue;
                                     }
-                                    peer_timestamps.insert(hs.peer_public_key, hs.peer_timestamp);
                                 }
-                                let allowed_ips = peers_allowed
-                                    .iter()
-                                    .find(|(pk, _)| *pk == hs.peer_public_key)
-                                    .map(|(_, ips)| ips.clone())
-                                    .unwrap_or_default();
-                                sessions.insert(
-                                    receiver_index,
-                                    Arc::new(PeerSessionState {
-                                        session: tokio::sync::Mutex::new(hs.session),
-                                        addr: parking_lot::Mutex::new(peer_addr),
-                                        created: Instant::now(),
-                                        allowed_ips,
-                                    }),
-                                );
-                                if let Err(e) = socket.send_to(&hs.response, peer_addr).await {
-                                    warn!(
-                                        "[{}] failed to send wireguard handshake response to {}: {}",
-                                        tag, peer_addr, e
-                                    );
-                                } else {
-                                    debug!(
-                                        "[{}] wireguard handshake completed with {} (peer {:02x?}…)",
-                                        tag,
-                                        peer_addr,
-                                        &hs.peer_public_key[..4]
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "[{}] wireguard initiation from {} rejected: {}",
-                                    tag, peer_addr, e
-                                );
-                            }
-                        }
-                    }
-                    // Unknown message types (incl. junk/cookie): drop silently.
-                }
-            });
-        }
+                            };
 
-        // 3. TX path: stack output → encrypt → send to the owning peer.
-        {
-            let socket = socket.clone();
-            let sessions = sessions.clone();
-            let ip_to_index = ip_to_index.clone();
-            let tag = tag.clone();
-            let mut shutdown_rx = self.shutdown_tx.subscribe();
-            let mut stack_out_rx = stack_out_rx;
-            tokio::spawn(async move {
-                loop {
-                    let ip_pkt = tokio::select! {
-                        _ = shutdown_rx.recv() => break,
-                        res = stack_out_rx.recv() => match res {
-                            Some(p) => p,
-                            None => break,
-                        },
-                    };
-                    let Some(parsed) = crate::tun::parse_ip_packet(&ip_pkt) else {
-                        continue;
-                    };
-                    let Some(idx) = ip_to_index.get(&parsed.dst.ip()).map(|v| *v) else {
-                        debug!(
-                            "[{}] wireguard egress: no session for inner dst {}",
-                            tag,
-                            parsed.dst.ip()
-                        );
-                        continue; // no session owns this inner destination
-                    };
-                    let Some(state) = sessions.get(&idx).map(|v| v.value().clone()) else {
-                        continue;
-                    };
-                    let encrypted = {
-                        let mut sess = state.session.lock().await;
-                        match sess.encrypt_data_packet(&ip_pkt) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                debug!("[{}] wireguard encrypt failed: {}", tag, e);
+                            // Authenticated packet: roaming support — track latest peer address.
+                            {
+                                let mut addr = state.addr.lock();
+                                if *addr != peer_addr {
+                                    *addr = peer_addr;
+                                }
+                            }
+
+                            if range.is_empty() {
+                                continue; // WireGuard keepalive
+                            }
+
+                            // The stack wants the IP packet at offset 0: one in-place
+                            // shift instead of a fresh allocation per packet.
+                            let plain_len = range.len();
+                            buf.copy_within(range, 0);
+                            buf.truncate(plain_len);
+
+                            let Some((src_ip, _)) = inner_addrs(&buf) else {
+                                continue; // non IP inner traffic: drop
+                            };
+
+                            // Enforce per-peer allowed source IPs when configured.
+                            if !state.allowed_ips.is_empty()
+                                && !state.allowed_ips.iter().any(|net| net.contains(&src_ip))
+                            {
+                                debug!(
+                                    "[{}] wireguard peer {} sent inner packet from disallowed IP {}",
+                                    tag, peer_addr, src_ip
+                                );
                                 continue;
                             }
+
+                            if last_route != Some((src_ip, receiver_index)) {
+                                ip_to_index.insert(src_ip, receiver_index);
+                                last_route = Some((src_ip, receiver_index));
+                            }
+                            if frame_tx.try_send(buf).is_err() {
+                                debug!(
+                                    "[{}] wireguard stack frame channel full; dropping packet",
+                                    tag
+                                );
+                            }
+                        } else if n >= awg.s1 as usize + 148
+                            && u32::from_le_bytes([
+                                buf[awg.s1 as usize],
+                                buf[awg.s1 as usize + 1],
+                                buf[awg.s1 as usize + 2],
+                                buf[awg.s1 as usize + 3],
+                            ]) == awg.h1
+                        {
+                            // ---- Handshake initiation (possibly with AWG s1 junk prefix)
+                            // Bind a session slot with a fresh receiver index. `rand::random`
+                            // could collide with a live session, which would silently hijack
+                            // (and later reap) another peer's tunnel, so retry a few times on
+                            // collision instead of trusting the RNG.
+                            let Some(receiver_index) = (0..8).find_map(|_| {
+                                let candidate = rand::random::<u32>();
+                                (!sessions.contains_key(&candidate)).then_some(candidate)
+                            }) else {
+                                warn!(
+                                    "[{}] wireguard session table saturated; rejecting handshake from {}",
+                                    tag, peer_addr
+                                );
+                                continue;
+                            };
+                            if sessions.len() >= MAX_SESSIONS {
+                                warn!(
+                                    "[{}] wireguard session limit ({}) reached; rejecting handshake from {}",
+                                    tag, MAX_SESSIONS, peer_addr
+                                );
+                                continue;
+                            }
+                            let result = WireGuardHandshake::respond_to_initiation_with_peers(
+                                &local_static,
+                                receiver_index,
+                                &awg,
+                                &buf,
+                                &peers_auth,
+                            );
+                            match result {
+                                Ok(hs) => {
+                                    // Reject replayed initiations: the timestamp must be
+                                    // strictly newer than the last accepted one per peer.
+                                    {
+                                        let fresh = match peer_timestamps.get(&hs.peer_public_key) {
+                                            Some(last) => hs.peer_timestamp > *last,
+                                            None => true,
+                                        };
+                                        if !fresh {
+                                            debug!(
+                                                "[{}] wireguard initiation from {} replayed (stale TAI64N); dropped",
+                                                tag, peer_addr
+                                            );
+                                            continue;
+                                        }
+                                        peer_timestamps
+                                            .insert(hs.peer_public_key, hs.peer_timestamp);
+                                    }
+                                    let allowed_ips = peers_allowed
+                                        .iter()
+                                        .find(|(pk, _)| *pk == hs.peer_public_key)
+                                        .map(|(_, ips)| ips.clone())
+                                        .unwrap_or_default();
+                                    sessions.insert(
+                                        receiver_index,
+                                        Arc::new(PeerSessionState {
+                                            session: tokio::sync::Mutex::new(hs.session),
+                                            addr: parking_lot::Mutex::new(peer_addr),
+                                            created: Instant::now(),
+                                            allowed_ips,
+                                        }),
+                                    );
+                                    if let Err(e) = socket.send_to(&hs.response, peer_addr).await {
+                                        warn!(
+                                            "[{}] failed to send wireguard handshake response to {}: {}",
+                                            tag, peer_addr, e
+                                        );
+                                    } else {
+                                        debug!(
+                                            "[{}] wireguard handshake completed with {} (peer {:02x?}…)",
+                                            tag,
+                                            peer_addr,
+                                            &hs.peer_public_key[..4]
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        "[{}] wireguard initiation from {} rejected: {}",
+                                        tag, peer_addr, e
+                                    );
+                                }
+                            }
                         }
-                    };
-                    let addr = *state.addr.lock();
-                    let _ = socket.send_to(&encrypted, addr).await;
+                        // Unknown message types (incl. junk/cookie): drop silently.
+                    }
                 }
             });
         }
 
-        // 4. Session reaper: expire sessions past REJECT_AFTER_TIME (peers must re-handshake).
+        // 3. Session reaper: expire sessions past REJECT_AFTER_TIME (peers must re-handshake).
         {
             let sessions = sessions.clone();
             let ip_to_index = ip_to_index.clone();
@@ -478,5 +533,254 @@ impl Inbound for WireGuardInbound {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batched datagram I/O
+//
+// One datagram per `recv_from`/`send_to` costs a syscall *and* a scheduler round
+// trip per inner packet, in each direction; measured on this path it was ~4
+// syscalls per packet per side (recvfrom, sendto, epoll_wait, futex) with most
+// process CPU inside the kernel. `recvmmsg`/`sendmmsg` move a whole burst per
+// syscall, and because both tunnel ends batch, the bursts reinforce each other.
+//
+// The outbound side of the tunnel (flux-outbound) carries a copy of this helper:
+// the two crates are deliberately independent, and this is datapath plumbing
+// rather than shared policy.
+// ---------------------------------------------------------------------------
+
+/// Datagrams moved by a single `recvmmsg`/`sendmmsg` call.
+const UDP_BATCH: usize = 32;
+/// Receive slot size: a 1420-byte inner packet plus WG header/tag plus any
+/// AmneziaWG junk prefix fits comfortably.
+const UDP_DGRAM_CAP: usize = 4096;
+
+/// Reusable scratch space for batched datagram syscalls.
+struct UdpBatch {
+    /// Receive slots. An armed slot has `len == UDP_DGRAM_CAP`; a slot handed to
+    /// the stack is left empty and re-allocated by [`Self::arm`].
+    slots: Vec<Vec<u8>>,
+    iov: Vec<libc::iovec>,
+    hdr: Vec<libc::mmsghdr>,
+    addr: Vec<libc::sockaddr_storage>,
+}
+
+// SAFETY: `UdpBatch` is scratch space used by exactly one task at a time. Its raw
+// pointers are rebuilt from its own heap allocations on every syscall attempt and
+// never outlive the struct, so moving it to another thread is sound.
+unsafe impl Send for UdpBatch {}
+
+impl UdpBatch {
+    fn new() -> Self {
+        Self {
+            slots: (0..UDP_BATCH).map(|_| vec![0u8; UDP_DGRAM_CAP]).collect(),
+            iov: (0..UDP_BATCH)
+                .map(|_| libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                })
+                .collect(),
+            hdr: (0..UDP_BATCH)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect(),
+            addr: (0..UDP_BATCH)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect(),
+        }
+    }
+
+    /// (Re)arms empty slots so the kernel may write into all of them.
+    fn arm(&mut self) {
+        for slot in &mut self.slots {
+            if slot.len() != UDP_DGRAM_CAP {
+                *slot = vec![0u8; UDP_DGRAM_CAP];
+            }
+        }
+    }
+
+    /// One `recvmmsg` attempt. Returns how many datagrams were read; slot `i`
+    /// then holds datagram `i` (its length in `slots[i].len()`).
+    fn recv(&mut self, fd: RawFd, max: usize) -> std::io::Result<usize> {
+        let max = max.min(UDP_BATCH);
+        for i in 0..max {
+            self.addr[i] = unsafe { std::mem::zeroed() };
+            self.iov[i] = libc::iovec {
+                iov_base: self.slots[i].as_mut_ptr() as *mut libc::c_void,
+                iov_len: UDP_DGRAM_CAP,
+            };
+            self.hdr[i] = unsafe { std::mem::zeroed() };
+            self.hdr[i].msg_hdr.msg_name = &mut self.addr[i] as *mut _ as *mut libc::c_void;
+            self.hdr[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            self.hdr[i].msg_hdr.msg_iov = &mut self.iov[i];
+            self.hdr[i].msg_hdr.msg_iovlen = 1;
+        }
+        let ret = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.hdr.as_mut_ptr(),
+                max as libc::c_uint,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ret = ret as usize;
+        for i in 0..ret {
+            self.slots[i].truncate(self.hdr[i].msg_len as usize);
+        }
+        Ok(ret)
+    }
+
+    /// Removes slot `i` (the caller owns the bytes from then on).
+    fn take(&mut self, i: usize) -> Vec<u8> {
+        std::mem::take(&mut self.slots[i])
+    }
+
+    /// Source address of the datagram in slot `i`.
+    fn peer(&self, i: usize) -> Option<SocketAddr> {
+        sockaddr_to_std(&self.addr[i])
+    }
+
+    /// One `sendmmsg` attempt, with a destination per datagram (an inbound can
+    /// serve several roaming peers at once).
+    fn send_each(
+        &mut self,
+        fd: RawFd,
+        datagrams: &[Vec<u8>],
+        dsts: &[SocketAddr],
+    ) -> std::io::Result<usize> {
+        let n = datagrams.len().min(dsts.len()).min(UDP_BATCH);
+        if n == 0 {
+            return Ok(0);
+        }
+        for i in 0..n {
+            let (storage, addr_len) = sockaddr_of(dsts[i]);
+            self.addr[i] = storage;
+            self.iov[i] = libc::iovec {
+                // The kernel only reads the payload; `as_ptr` keeps the borrow honest.
+                iov_base: datagrams[i].as_ptr() as *mut libc::c_void,
+                iov_len: datagrams[i].len(),
+            };
+            self.hdr[i] = unsafe { std::mem::zeroed() };
+            self.hdr[i].msg_hdr.msg_name = &mut self.addr[i] as *mut _ as *mut libc::c_void;
+            self.hdr[i].msg_hdr.msg_namelen = addr_len;
+            self.hdr[i].msg_hdr.msg_iov = &mut self.iov[i];
+            self.hdr[i].msg_hdr.msg_iovlen = 1;
+        }
+        let ret = unsafe { libc::sendmmsg(fd, self.hdr.as_mut_ptr(), n as libc::c_uint, 0) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ret as usize)
+    }
+}
+
+/// Request a deep kernel queue for the tunnel socket.
+///
+/// The tunnel is a bulk transport: with the default 208 KiB buffer the receiver
+/// drains (and wakes) almost as often as the sender sends, so a burst is only a
+/// couple of packets. A multi-megabyte queue decouples the two ends and lets one
+/// `recvmmsg` collect a genuinely full batch. The kernel caps the request at
+/// `net.core.{r,w}mem_max`, so this is a best-effort hint, not a guarantee.
+pub(crate) fn tune_socket_buffers(socket: &UdpSocket) {
+    const BYTES: libc::c_int = 4 * 1024 * 1024;
+    let fd = socket.as_raw_fd();
+    let arg = &BYTES as *const libc::c_int as *const libc::c_void;
+    let len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is a live UDP socket and the option buffer is a valid c_int.
+    unsafe {
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, arg, len);
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, arg, len);
+    }
+}
+
+fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe { std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in, sin) };
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe { std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in6, sin6) };
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
+
+fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            Some(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes()),
+                u16::from_be(sin.sin_port),
+            )))
+        }
+        libc::AF_INET6 => {
+            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(sin6.sin6_addr.s6_addr),
+                u16::from_be(sin6.sin6_port),
+                sin6.sin6_flowinfo,
+                sin6.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
+/// Inner IPv4/IPv6 source and destination address of a tunnel packet.
+///
+/// Header-only: the smoltcp stack parses the packet again anyway, so paying for
+/// a payload copy here (`tun::parse_ip_packet`) is pure overhead on this path.
+fn inner_addrs(pkt: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    match pkt.first()? >> 4 {
+        4 => {
+            if pkt.len() < 20 {
+                return None;
+            }
+            Some((
+                IpAddr::V4(Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15])),
+                IpAddr::V4(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19])),
+            ))
+        }
+        6 => {
+            if pkt.len() < 40 {
+                return None;
+            }
+            Some((
+                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[8..24]).ok()?)),
+                IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[24..40]).ok()?)),
+            ))
+        }
+        _ => None,
     }
 }

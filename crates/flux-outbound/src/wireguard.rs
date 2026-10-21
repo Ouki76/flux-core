@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use flux_protocol::wireguard::{
-    WG_DEFAULT_KEEPALIVE_SECS, WG_REKEY_AFTER_TIME_SECS, WireGuardConfig, WireGuardHandshake,
-    WireGuardSession,
+    WG_AEAD_TAG_LEN, WG_DATA_HEADER_LEN, WG_DEFAULT_KEEPALIVE_SECS, WG_REKEY_AFTER_TIME_SECS,
+    WireGuardConfig, WireGuardHandshake, WireGuardSession,
 };
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
@@ -10,9 +10,11 @@ use flux_types::{
 use futures_util::{Sink, Stream};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -22,6 +24,15 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const WG_MTU: usize = 1420;
 /// TCP connect timeout inside the tunnel.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Inner TCP buffer per direction. Raising it to 256 KiB was measured and made no
+/// difference (the single-flow limit is the per-packet pipeline, not the window),
+/// so the original size stays.
+const WG_TCP_BUF: usize = 64 * 1024;
+/// How much data one connection may queue between the proxy task and the inner
+/// socket. Beyond this the proxy is blocked instead of the queue growing.
+const MAX_PENDING_FROM_PROXY: usize = 256 * 1024;
+/// Command-channel depth per stack actor (payload chunks, not bytes).
+const CMD_CHANNEL_CAP: usize = 32;
 
 /// Shared mutable WireGuard tunnel state (socket + current session).
 #[derive(Default)]
@@ -40,10 +51,216 @@ struct ConnectRequest {
     respond: oneshot::Sender<FluxResult<WgTcpStream>>,
 }
 
-/// Lazily-started embedded userspace TCP/IP stack (smoltcp, client mode).
+/// Control channel for the embedded userspace TCP/IP stack (smoltcp, client
+/// mode) that runs inside [`WgTunnel::tunnel_pump`].
 struct StackState {
-    frame_tx: mpsc::Sender<Vec<u8>>,
     connect_tx: mpsc::Sender<ConnectRequest>,
+}
+
+// ---------------------------------------------------------------------------
+// Batched datagram I/O
+//
+// The tunnel carries one datagram per inner IP packet, so a per-datagram
+// `recv_from`/`send_to` costs one syscall *and* one scheduler round trip per
+// packet in each direction. Measured on this datapath that was ~4 syscalls
+// (recvfrom, sendto, epoll_wait, futex) per packet per hop, with the majority of
+// process CPU spent in the kernel. `recvmmsg`/`sendmmsg` move a whole burst per
+// syscall, and because both ends batch, the bursts reinforce each other.
+// ---------------------------------------------------------------------------
+
+/// Datagrams moved by a single `recvmmsg`/`sendmmsg` call.
+pub(crate) const UDP_BATCH: usize = 32;
+/// Receive slot size: a 1420-byte inner packet plus WG header/tag plus any
+/// AmneziaWG junk prefix fits comfortably.
+pub(crate) const UDP_DGRAM_CAP: usize = 4096;
+
+/// Reusable scratch space for batched datagram syscalls.
+pub(crate) struct UdpBatch {
+    /// Receive slots. An armed slot has `len == UDP_DGRAM_CAP`; a slot that was
+    /// handed to the stack is left empty and re-allocated by [`Self::arm`].
+    slots: Vec<Vec<u8>>,
+    iov: Vec<libc::iovec>,
+    hdr: Vec<libc::mmsghdr>,
+    addr: Vec<libc::sockaddr_storage>,
+}
+
+impl UdpBatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: (0..UDP_BATCH).map(|_| vec![0u8; UDP_DGRAM_CAP]).collect(),
+            iov: (0..UDP_BATCH)
+                .map(|_| libc::iovec {
+                    iov_base: std::ptr::null_mut(),
+                    iov_len: 0,
+                })
+                .collect(),
+            hdr: (0..UDP_BATCH)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect(),
+            addr: (0..UDP_BATCH)
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect(),
+        }
+    }
+
+    /// (Re)arms empty slots so the kernel may write into all of them.
+    pub(crate) fn arm(&mut self) {
+        for slot in &mut self.slots {
+            if slot.len() != UDP_DGRAM_CAP {
+                *slot = vec![0u8; UDP_DGRAM_CAP];
+            }
+        }
+    }
+
+    /// One `recvmmsg` attempt. Returns how many datagrams were read; slot `i`
+    /// then holds datagram `i` (its length in `slots[i].len()`).
+    pub(crate) fn recv(&mut self, fd: RawFd, max: usize) -> std::io::Result<usize> {
+        let max = max.min(UDP_BATCH);
+        for i in 0..max {
+            self.addr[i] = unsafe { std::mem::zeroed() };
+            self.iov[i] = libc::iovec {
+                iov_base: self.slots[i].as_mut_ptr() as *mut libc::c_void,
+                iov_len: UDP_DGRAM_CAP,
+            };
+            self.hdr[i] = unsafe { std::mem::zeroed() };
+            self.hdr[i].msg_hdr.msg_name = &mut self.addr[i] as *mut _ as *mut libc::c_void;
+            self.hdr[i].msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            self.hdr[i].msg_hdr.msg_iov = &mut self.iov[i];
+            self.hdr[i].msg_hdr.msg_iovlen = 1;
+        }
+        let ret = unsafe {
+            libc::recvmmsg(
+                fd,
+                self.hdr.as_mut_ptr(),
+                max as libc::c_uint,
+                0,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ret = ret as usize;
+        for i in 0..ret {
+            self.slots[i].truncate(self.hdr[i].msg_len as usize);
+        }
+        Ok(ret)
+    }
+
+    /// Removes slot `i` (the receiver owns the bytes from then on).
+    pub(crate) fn take(&mut self, i: usize) -> Vec<u8> {
+        std::mem::take(&mut self.slots[i])
+    }
+
+    /// One `sendmmsg` attempt for `datagrams`, all addressed to `dst`. Returns
+    /// how many were accepted by the socket.
+    pub(crate) fn send(
+        &mut self,
+        fd: RawFd,
+        datagrams: &[Vec<u8>],
+        dst: SocketAddr,
+    ) -> std::io::Result<usize> {
+        let n = datagrams.len().min(UDP_BATCH);
+        let (storage, addr_len) = sockaddr_of(dst);
+        self.addr[0] = storage;
+        for (i, datagram) in datagrams.iter().enumerate().take(n) {
+            self.iov[i] = libc::iovec {
+                // The kernel only reads the payload; `as_ptr` keeps the borrow honest.
+                iov_base: datagram.as_ptr() as *mut libc::c_void,
+                iov_len: datagram.len(),
+            };
+            self.hdr[i] = unsafe { std::mem::zeroed() };
+            self.hdr[i].msg_hdr.msg_name = &mut self.addr[0] as *mut _ as *mut libc::c_void;
+            self.hdr[i].msg_hdr.msg_namelen = addr_len;
+            self.hdr[i].msg_hdr.msg_iov = &mut self.iov[i];
+            self.hdr[i].msg_hdr.msg_iovlen = 1;
+        }
+        let ret = unsafe { libc::sendmmsg(fd, self.hdr.as_mut_ptr(), n as libc::c_uint, 0) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ret as usize)
+    }
+}
+
+// SAFETY: `UdpBatch` is scratch space used by exactly one task at a time. Its raw
+// pointers are rebuilt from its own heap allocations on every syscall attempt and
+// never outlive the struct, so moving it to another thread is sound.
+unsafe impl Send for UdpBatch {}
+
+/// Request a deep kernel queue for the tunnel socket.
+///
+/// The tunnel is a bulk transport: with the default 208 KiB buffer the receiver
+/// drains (and wakes) almost as often as the sender sends, so a burst is only a
+/// couple of packets. A multi-megabyte queue decouples the two ends and lets one
+/// `recvmmsg` collect a genuinely full batch. The kernel caps the request at
+/// `net.core.{r,w}mem_max`, so this is a best-effort hint, not a guarantee.
+pub(crate) fn tune_socket_buffers(socket: &UdpSocket) {
+    const BYTES: libc::c_int = 4 * 1024 * 1024;
+    let fd = socket.as_raw_fd();
+    let arg = &BYTES as *const libc::c_int as *const libc::c_void;
+    let len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `fd` is a live UDP socket and the option buffer is a valid c_int.
+    unsafe {
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, arg, len);
+        let _ = libc::setsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, arg, len);
+    }
+}
+
+pub(crate) fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+            };
+            unsafe { std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in, sin) };
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: v6.port().to_be(),
+                sin6_flowinfo: v6.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: v6.ip().octets(),
+                },
+                sin6_scope_id: v6.scope_id(),
+            };
+            unsafe { std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in6, sin6) };
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
+        }
+    }
+}
+
+/// One decrypted inner IP packet, still inside the receive buffer it was
+/// decrypted in (`buf[start..end]`), so no copy is needed to hand it on.
+pub(crate) struct InboundFrame {
+    buf: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl InboundFrame {
+    pub(crate) fn new(buf: Vec<u8>, start: usize, end: usize) -> Self {
+        Self { buf, start, end }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.buf[self.start..self.end]
+    }
 }
 
 /// Shared tunnel core used by both stream and packet dialing.
@@ -155,90 +372,23 @@ impl WgTunnel {
                     }
                     Err(e) => return Err(FluxError::Io(e)),
                 };
+                tune_socket_buffers(&s);
                 guard.socket = Some(Arc::new(s));
             }
             guard.peer = Some(peer);
         }
 
+        // The stack's control channel is created with the pump, not on the first
+        // `connect`: one task owns the UDP socket *and* the smoltcp interface, so
+        // a burst of datagrams is decrypted and polled in the same wakeup instead
+        // of being handed to a second task through a channel.
+        let (connect_tx, connect_rx) = mpsc::channel::<ConnectRequest>(64);
+        *self.stack.lock().await = Some(StackState { connect_tx });
+
         self.demux_started.store(true, AtomicOrdering::Relaxed);
         let tunnel = self.clone();
-        tokio::spawn(async move { tunnel.demux_loop().await });
+        tokio::spawn(async move { tunnel.tunnel_pump(connect_rx).await });
         Ok(())
-    }
-
-    /// Single reader task for the tunnel UDP socket.
-    async fn demux_loop(self: Arc<Self>) {
-        let socket = match self.state.lock().await.socket.clone() {
-            Some(s) => s,
-            None => return,
-        };
-        let awg_h2 = self.config.awg.clone().unwrap_or_default().h2;
-        let mut buf = vec![0u8; 4096];
-        loop {
-            let n = tokio::select! {
-                _ = self.cancel.cancelled() => break,
-                res = socket.recv_from(&mut buf) => match res {
-                    Ok((n, _)) => n,
-                    Err(_) => break,
-                },
-            };
-            let pkt = &buf[..n];
-            if pkt.len() < 4 {
-                continue;
-            }
-            let msg_type = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
-
-            if msg_type == awg_h2 {
-                // Handshake response: forward to the in-flight handshake, if any.
-                let waiter = self.handshake_waiter.lock().clone();
-                if let Some(tx) = waiter {
-                    let _ = tx.try_send(pkt.to_vec());
-                }
-                continue;
-            }
-
-            // Data packet: decrypt with the current session.
-            let session = match self.state.lock().await.session.clone() {
-                Some(s) => s,
-                None => continue,
-            };
-            let plain = {
-                let mut sess = session.lock().await;
-                match sess.decrypt_data_packet(pkt) {
-                    Ok(p) => p,
-                    Err(_) => continue, // corrupted / stale-session packet
-                }
-            };
-            if plain.is_empty() {
-                continue; // keepalive
-            }
-            let Some(parsed) = parse_ip_packet_meta(&plain) else {
-                continue;
-            };
-            match parsed.proto {
-                IpProto::Udp => {
-                    // Replies are addressed to the local tunnel address.
-                    if let Some(tx) = self.udp_routes.get(&parsed.dst) {
-                        let _ = tx.try_send(UdpPacket::new(
-                            parsed.payload,
-                            TargetAddress::Ip(parsed.src),
-                            TargetAddress::Ip(parsed.dst),
-                        ));
-                    }
-                }
-                IpProto::Tcp => {
-                    let stack = self.stack.lock().await;
-                    if let Some(st) = stack.as_ref() {
-                        // Dropping a frame here silently corrupts the inner TCP
-                        // stream — smoltcp never retransmits what it never saw.
-                        // Apply backpressure instead.
-                        if st.frame_tx.send(plain).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Ensures a fresh session exists, performing a handshake if needed.
@@ -411,33 +561,16 @@ impl WgTunnel {
         });
     }
 
-    /// Ensures the embedded smoltcp client stack actor is running.
-    async fn ensure_stack(self: &Arc<Self>) -> FluxResult<()> {
-        let mut guard = self.stack.lock().await;
-        if guard.is_some() {
-            return Ok(());
-        }
-        let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(2048);
-        let (connect_tx, connect_rx) = mpsc::channel::<ConnectRequest>(64);
-        *guard = Some(StackState {
-            frame_tx,
-            connect_tx,
-        });
-        let tunnel = self.clone();
-        tokio::spawn(async move { tunnel.stack_actor(frame_rx, connect_rx).await });
-        Ok(())
-    }
-
     /// Opens a TCP connection through the tunnel via the embedded stack.
     async fn connect_tcp(self: &Arc<Self>, dst: SocketAddr) -> FluxResult<WgTcpStream> {
-        self.ensure_stack().await?;
+        self.ensure_demux().await?;
         let (tx, rx) = oneshot::channel();
         let req = ConnectRequest { dst, respond: tx };
         let connect_tx = {
             let guard = self.stack.lock().await;
             guard
                 .as_ref()
-                .expect("stack just started")
+                .expect("demux installs the stack state")
                 .connect_tx
                 .clone()
         };
@@ -469,12 +602,15 @@ impl WgTunnel {
         }
     }
 
-    /// The embedded userspace TCP stack actor (smoltcp, client mode).
-    async fn stack_actor(
-        self: Arc<Self>,
-        mut frame_rx: mpsc::Receiver<Vec<u8>>,
-        mut connect_rx: mpsc::Receiver<ConnectRequest>,
-    ) {
+    /// The tunnel pump: UDP socket *and* embedded smoltcp stack in one task.
+    ///
+    /// Every inner packet used to cross two tasks per direction (a UDP reader
+    /// task handed decrypted frames to this stack actor through a channel, and a
+    /// second pass encrypted them back onto the socket). Each hop costs a
+    /// scheduler round trip, so on a request/response flow — which always has
+    /// work in both directions — the wakeups dominated the profile. Owning the
+    /// socket here means one wakeup does ingress, stack polling and egress.
+    async fn tunnel_pump(self: Arc<Self>, mut connect_rx: mpsc::Receiver<ConnectRequest>) {
         use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
         use smoltcp::socket::tcp;
         use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
@@ -504,6 +640,9 @@ impl WgTunnel {
             to_proxy: futures_channel::mpsc::Sender<bytes::Bytes>,
             pending_to_proxy: Option<bytes::Bytes>,
             pending_from_proxy: VecDeque<bytes::Bytes>,
+            /// Bytes held in `pending_from_proxy`; maintained incrementally so the
+            /// backpressure check below is O(1) per command.
+            queued_bytes: usize,
             /// Set when the proxy half-closed its write side. The socket must only
             /// send FIN *after* everything already queued has been transmitted.
             closing: bool,
@@ -511,30 +650,91 @@ impl WgTunnel {
             dst: SocketAddr,
         }
 
-        let (cmd_tx, mut cmd_rx) = futures_channel::mpsc::channel::<StackCmd>(4096);
+        // Small on purpose: each item carries up to 16 KiB of payload, so a deep
+        // channel would itself be a multi-megabyte buffer per connection. The real
+        // budget is MAX_PENDING_FROM_PROXY below.
+        let (cmd_tx, mut cmd_rx) = futures_channel::mpsc::channel::<StackCmd>(CMD_CHANNEL_CAP);
         let mut conns: HashMap<SocketHandle, Conn> = HashMap::new();
         let mut next_ephemeral_port: u16 = 49152;
 
         // Items captured by the idle select arms below; `select!` consumes them,
         // so they must be stashed and processed on the next iteration.
-        let mut pending_frame: Option<Vec<u8>> = None;
         let mut pending_connect: Option<ConnectRequest> = None;
         let mut pending_cmd: Option<StackCmd> = None;
 
+        let Some(socket) = self.state.lock().await.socket.clone() else {
+            return;
+        };
+        let fd = socket.as_raw_fd();
+        let awg_h2 = self.config.awg.clone().unwrap_or_default().h2;
+        // Batched datagram scratch, reused for the lifetime of the pump.
+        let mut udp_rx = UdpBatch::new();
+        let mut udp_tx = UdpBatch::new();
+        // Consecutive failed receives; a permanently broken socket must not spin.
+        let mut recv_failures = 0u32;
+
         loop {
-            // ---- 1. Inbound IP frames from the tunnel.
-            let mut drained = 0;
-            if let Some(f) = pending_frame.take() {
-                device.rxq.push_back(f);
-                drained += 1;
-            }
-            while drained < 512 {
-                match frame_rx.try_recv() {
-                    Ok(f) => {
-                        device.rxq.push_back(f);
-                        drained += 1;
+            // ---- 1. Ingress: one `recvmmsg` burst, decrypted in place, straight
+            //         into the device queue (no channel, no copy).
+            udp_rx.arm();
+            match socket.try_io(Interest::READABLE, || udp_rx.recv(fd, UDP_BATCH)) {
+                Ok(0) => {}
+                Ok(got) => {
+                    recv_failures = 0;
+                    let session = { self.state.lock().await.session.clone() };
+                    let mut sess = match &session {
+                        Some(s) => Some(s.lock().await),
+                        None => None,
+                    };
+                    for i in 0..got {
+                        let mut buf = udp_rx.take(i);
+                        if buf.len() < 4 {
+                            continue;
+                        }
+                        let msg_type = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        if msg_type == awg_h2 {
+                            // Handshake response: forward to the in-flight handshake.
+                            let waiter = self.handshake_waiter.lock().clone();
+                            if let Some(tx) = waiter {
+                                let _ = tx.try_send(buf);
+                            }
+                            continue;
+                        }
+                        let Some(sess) = sess.as_mut() else { continue };
+                        // Decrypt in place: the plaintext stays in this buffer.
+                        let range = match sess.open_data_packet_in_place(&mut buf) {
+                            Ok(r) => r,
+                            Err(_) => continue, // corrupted / stale-session packet
+                        };
+                        if range.is_empty() {
+                            continue; // keepalive
+                        }
+                        let frame = InboundFrame::new(buf, range.start, range.end);
+                        let Some(parsed) = parse_ip_packet_meta(frame.as_slice()) else {
+                            continue;
+                        };
+                        match parsed.proto {
+                            // TCP: hand the frame on without copying the payload.
+                            IpProto::Tcp => device.rxq.push_back(frame),
+                            IpProto::Udp => {
+                                // Replies are addressed to the local tunnel address.
+                                if let Some(tx) = self.udp_routes.get(&parsed.dst) {
+                                    let _ = tx.try_send(UdpPacket::new(
+                                        parsed.payload,
+                                        TargetAddress::Ip(parsed.src),
+                                        TargetAddress::Ip(parsed.dst),
+                                    ));
+                                }
+                            }
+                        }
                     }
-                    Err(_) => break,
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    recv_failures += 1;
+                    if recv_failures > 1000 {
+                        break;
+                    }
                 }
             }
 
@@ -548,8 +748,8 @@ impl WgTunnel {
                 cmd_tx: &futures_channel::mpsc::Sender<StackCmd>,
             ) {
                 let mut sock = tcp::Socket::new(
-                    tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
-                    tcp::SocketBuffer::new(vec![0u8; 64 * 1024]),
+                    tcp::SocketBuffer::new(vec![0u8; WG_TCP_BUF]),
+                    tcp::SocketBuffer::new(vec![0u8; WG_TCP_BUF]),
                 );
                 let local_port = *next_ephemeral_port;
                 *next_ephemeral_port = next_ephemeral_port.wrapping_add(1).max(49152);
@@ -573,6 +773,7 @@ impl WgTunnel {
                         to_proxy: to_proxy_tx,
                         pending_to_proxy: None,
                         pending_from_proxy: VecDeque::new(),
+                        queued_bytes: 0,
                         closing: false,
                         established_tx: Some(est_tx),
                         dst: req.dst,
@@ -624,6 +825,17 @@ impl WgTunnel {
                 match cmd {
                     StackCmd::TcpData { handle, data } => {
                         if let Some(c) = conns.get_mut(&handle) {
+                            // Backpressure: if accepting this chunk would push the
+                            // connection past its buffer budget, leave the command
+                            // (and everything behind it) in the bounded channel.
+                            // The proxy task then blocks in `send().await` instead
+                            // of this queue growing with the whole transfer — a
+                            // 512 MiB run used to leave ~500 MiB resident here.
+                            if c.queued_bytes + data.len() > MAX_PENDING_FROM_PROXY {
+                                pending_cmd = Some(StackCmd::TcpData { handle, data });
+                                break;
+                            }
+                            c.queued_bytes += data.len();
                             c.pending_from_proxy.push_back(data);
                         }
                     }
@@ -653,9 +865,11 @@ impl WgTunnel {
                     };
                     match sock.send_slice(chunk) {
                         Ok(n) if n == chunk.len() => {
+                            conn.queued_bytes -= n;
                             conn.pending_from_proxy.pop_front();
                         }
                         Ok(n) => {
+                            conn.queued_bytes -= n;
                             bytes::Buf::advance(chunk, n);
                             break;
                         }
@@ -672,27 +886,58 @@ impl WgTunnel {
             let now = SmolInstant::from_millis(start.elapsed().as_millis() as i64);
             iface.poll(now, &mut device, &mut sockets);
 
-            // ---- 6. Egress IP frames → encrypt → tunnel.
-            while let Some(frame) = device.txq.pop_front() {
-                let sess = match self.state.lock().await.session.clone() {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let encrypted = {
-                    let mut s = sess.lock().await;
-                    match s.encrypt_data_packet(&frame) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    }
-                };
-                let (sock, peer) = {
+            // ---- 6. Egress IP frames → encrypt in place → one batched send per burst.
+            //
+            // The session/socket/peer are resolved once per burst instead of
+            // three times per packet, and `seal_data_packet_in_place` finishes
+            // the datagram the device already laid out, so no frame is copied or
+            // allocated here.
+            if !device.txq.is_empty() {
+                let (session, sock, peer) = {
                     let g = self.state.lock().await;
-                    (g.socket.clone(), g.peer)
+                    (g.session.clone(), g.socket.clone(), g.peer)
                 };
-                if let (Some(sock), Some(peer)) = (sock, peer)
-                    && sock.send_to(&encrypted, peer).await.is_ok()
-                {
-                    self.state.lock().await.last_sent = Some(Instant::now());
+                match (session, sock, peer) {
+                    (Some(session), Some(sock), Some(peer)) => {
+                        let fd = sock.as_raw_fd();
+                        let mut sealed: Vec<Vec<u8>> = Vec::with_capacity(UDP_BATCH);
+                        {
+                            let mut s = session.lock().await;
+                            while sealed.len() < UDP_BATCH {
+                                let Some(mut frame) = device.txq.pop_front() else {
+                                    break;
+                                };
+                                let plaintext_len =
+                                    frame.len() - WG_DATA_HEADER_LEN - WG_AEAD_TAG_LEN;
+                                if s.seal_data_packet_in_place(&mut frame, plaintext_len)
+                                    .is_ok()
+                                {
+                                    sealed.push(frame);
+                                }
+                            }
+                        }
+                        if !sealed.is_empty() {
+                            let mut off = 0;
+                            while off < sealed.len() {
+                                match sock
+                                    .async_io(Interest::WRITABLE, || {
+                                        udp_tx.send(fd, &sealed[off..], peer)
+                                    })
+                                    .await
+                                {
+                                    Ok(0) => break,
+                                    Ok(n) => off += n,
+                                    Err(_) => break,
+                                }
+                            }
+                            if off > 0 {
+                                self.state.lock().await.last_sent = Some(Instant::now());
+                            }
+                        }
+                    }
+                    // No session yet: the frames cannot be encrypted, so drop
+                    // them exactly as before rather than letting txq grow.
+                    _ => device.txq.clear(),
                 }
             }
 
@@ -772,10 +1017,13 @@ impl WgTunnel {
 
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
+                // Readiness only: the burst is drained at the top of the loop.
+                _ = socket.readable() => {}
                 // select! consumes the item: stash it for the next iteration.
-                f = frame_rx.recv() => { pending_frame = f; }
                 c = connect_rx.recv() => { pending_connect = c; }
-                c = futures_util::StreamExt::next(&mut cmd_rx) => { pending_cmd = c; }
+                // Guarded: a stashed command must not be overwritten by the next
+                // channel item (that would silently drop a 16 KiB chunk).
+                c = futures_util::StreamExt::next(&mut cmd_rx), if pending_cmd.is_none() => { pending_cmd = c; }
                 _ = tokio::time::sleep(wait_std) => {}
             }
         }
@@ -805,26 +1053,31 @@ enum StackCmd {
 }
 
 /// Frame-queue device bridging smoltcp with the async tunnel tasks.
+///
+/// Egress buffers are allocated with room for the WireGuard header and AEAD tag
+/// in front of and behind the IP packet, so smoltcp writes the plaintext exactly
+/// where it has to be encrypted: the frame *becomes* the datagram, with no copy
+/// and no second allocation.
 #[derive(Default)]
 struct QueueDevice {
-    rxq: VecDeque<Vec<u8>>,
+    rxq: VecDeque<InboundFrame>,
     txq: VecDeque<Vec<u8>>,
     mtu: usize,
 }
 
-struct QueueRxToken(Vec<u8>);
+struct QueueRxToken(InboundFrame);
 struct QueueTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
 
 impl smoltcp::phy::RxToken for QueueRxToken {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-        f(&self.0)
+        f(self.0.as_slice())
     }
 }
 
 impl smoltcp::phy::TxToken for QueueTxToken<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut buf = vec![0u8; len];
-        let r = f(&mut buf);
+        let mut buf = vec![0u8; WG_DATA_HEADER_LEN + len + WG_AEAD_TAG_LEN];
+        let r = f(&mut buf[WG_DATA_HEADER_LEN..WG_DATA_HEADER_LEN + len]);
         self.0.push_back(buf);
         r
     }

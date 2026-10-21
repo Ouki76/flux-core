@@ -738,6 +738,7 @@ dependencies = [
  "flux-types",
  "futures-channel",
  "futures-util",
+ "libc",
  "parking_lot",
  "quinn",
  "rand 0.8.8",

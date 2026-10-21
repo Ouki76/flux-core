@@ -10,7 +10,7 @@ use blake2::digest::{Digest, Mac};
 use blake2::{Blake2s256, Blake2sMac};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce as ChaChaNonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, AeadInPlace, KeyInit},
 };
 use flux_types::{FluxError, FluxResult, TargetAddress};
 use rand::RngCore;
@@ -145,6 +145,10 @@ pub const WG_REKEY_AFTER_TIME_SECS: u64 = 120;
 pub const WG_REJECT_AFTER_TIME_SECS: u64 = 180;
 /// Default persistent keepalive interval.
 pub const WG_DEFAULT_KEEPALIVE_SECS: u64 = 25;
+/// On-wire WireGuard data-packet header: `type(4) + receiver_index(4) + counter(8)`.
+pub const WG_DATA_HEADER_LEN: usize = 16;
+/// Poly1305 authentication tag appended to every data packet.
+pub const WG_AEAD_TAG_LEN: usize = 16;
 
 #[derive(Clone, Debug, Default)]
 pub struct AntiReplayWindow {
@@ -236,28 +240,81 @@ impl WireGuardSession {
 
     /// Encapsulates plaintext IP packet into an authentic WireGuard / AmneziaWG data packet.
     pub fn encrypt_data_packet(&mut self, payload: &[u8]) -> FluxResult<Vec<u8>> {
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&self.send_counter.to_le_bytes());
-
-        let ciphertext = self
-            .send_cipher
-            .encrypt(ChaChaNonce::from_slice(&nonce_bytes), payload)
-            .map_err(|e| FluxError::Crypto(format!("wireguard encrypt data failed: {}", e)))?;
-
-        // [Message Type (4 bytes) + Receiver Index (4 bytes) + Counter (8 bytes) + Encrypted Payload]
-        let mut packet = Vec::with_capacity(16 + ciphertext.len());
-        packet.extend_from_slice(&self.awg.h4.to_le_bytes());
-        packet.extend_from_slice(&self.receiver_index.to_le_bytes());
-        packet.extend_from_slice(&self.send_counter.to_le_bytes());
-        packet.extend_from_slice(&ciphertext);
-
-        self.send_counter = self.send_counter.wrapping_add(1);
+        let mut packet = Vec::new();
+        self.encrypt_data_packet_into(payload, &mut packet)?;
         Ok(packet)
+    }
+
+    /// Same as [`Self::encrypt_data_packet`] but reuses `out`, which keeps the
+    /// datapath allocation-free after the first packet on a buffer pool.
+    pub fn encrypt_data_packet_into(
+        &mut self,
+        payload: &[u8],
+        out: &mut Vec<u8>,
+    ) -> FluxResult<()> {
+        out.clear();
+        out.reserve(WG_DATA_HEADER_LEN + payload.len() + WG_AEAD_TAG_LEN);
+        out.resize(WG_DATA_HEADER_LEN + payload.len() + WG_AEAD_TAG_LEN, 0);
+        out[WG_DATA_HEADER_LEN..WG_DATA_HEADER_LEN + payload.len()].copy_from_slice(payload);
+        self.seal_data_packet_in_place(out, payload.len())
+    }
+
+    /// Encrypts a data packet whose plaintext is already placed inside `packet`,
+    /// turning the buffer into a wire-ready datagram without any allocation or
+    /// copy.
+    ///
+    /// Layout contract (this is the only layout the datapath uses):
+    /// `[type 4][receiver 4][counter 8][plaintext @ 16 .. 16+plaintext_len][tag 16]`,
+    /// i.e. `packet.len() == 16 + plaintext_len + 16`, with the sender's plaintext
+    /// already written at offset 16.
+    pub fn seal_data_packet_in_place(
+        &mut self,
+        packet: &mut [u8],
+        plaintext_len: usize,
+    ) -> FluxResult<()> {
+        debug_assert_eq!(
+            packet.len(),
+            WG_DATA_HEADER_LEN + plaintext_len + WG_AEAD_TAG_LEN
+        );
+        let counter = self.send_counter;
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
+
+        packet[0..4].copy_from_slice(&self.awg.h4.to_le_bytes());
+        packet[4..8].copy_from_slice(&self.receiver_index.to_le_bytes());
+        packet[8..16].copy_from_slice(&counter.to_le_bytes());
+
+        let (body, tag_out) = packet[WG_DATA_HEADER_LEN..].split_at_mut(plaintext_len);
+        let tag = self
+            .send_cipher
+            .encrypt_in_place_detached(ChaChaNonce::from_slice(&nonce_bytes), b"", body)
+            .map_err(|e| FluxError::Crypto(format!("wireguard encrypt data failed: {}", e)))?;
+        tag_out.copy_from_slice(&tag);
+
+        self.send_counter = counter.wrapping_add(1);
+        Ok(())
     }
 
     /// Decapsulates and decrypts incoming WireGuard / AmneziaWG data packet.
     pub fn decrypt_data_packet(&mut self, packet: &[u8]) -> FluxResult<Vec<u8>> {
-        if packet.len() < 32 {
+        let mut owned = packet.to_vec();
+        let range = self.open_data_packet_in_place(&mut owned)?;
+        Ok(owned[range].to_vec())
+    }
+
+    /// Decapsulates and decrypts an incoming data packet **in place**: the
+    /// buffer `packet[..packet_len]` holds the datagram on entry and the
+    /// plaintext on success, at the returned range.
+    ///
+    /// This is the datapath variant: it costs one AEAD pass and no allocation,
+    /// where [`Self::decrypt_data_packet`] additionally copies the buffer in and
+    /// the plaintext out.
+    pub fn open_data_packet_in_place(
+        &mut self,
+        packet: &mut [u8],
+    ) -> FluxResult<std::ops::Range<usize>> {
+        let packet_len = packet.len();
+        if packet_len < WG_DATA_HEADER_LEN + WG_AEAD_TAG_LEN {
             return Err(FluxError::Protocol {
                 protocol: "wireguard",
                 message: "data packet too short".into(),
@@ -288,16 +345,23 @@ impl WireGuardSession {
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
 
-        let ciphertext = &packet[16..];
-        let plaintext = self
-            .recv_cipher
-            .decrypt(ChaChaNonce::from_slice(&nonce_bytes), ciphertext)
+        let body_len = packet_len - WG_DATA_HEADER_LEN - WG_AEAD_TAG_LEN;
+        let (body, tag) = packet[WG_DATA_HEADER_LEN..].split_at_mut(body_len);
+        let mut tag_arr = [0u8; WG_AEAD_TAG_LEN];
+        tag_arr.copy_from_slice(tag);
+        self.recv_cipher
+            .decrypt_in_place_detached(
+                ChaChaNonce::from_slice(&nonce_bytes),
+                b"",
+                body,
+                chacha20poly1305::Tag::from_slice(&tag_arr),
+            )
             .map_err(|e| FluxError::Crypto(format!("wireguard decrypt data failed: {}", e)))?;
 
         // Mutate replay window ONLY after decryption & auth verification succeeds!
         self.replay_window.update(counter);
         self.recv_counter = counter.wrapping_add(1);
-        Ok(plaintext)
+        Ok(WG_DATA_HEADER_LEN..WG_DATA_HEADER_LEN + body_len)
     }
 }
 

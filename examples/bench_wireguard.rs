@@ -312,7 +312,10 @@ fn spawn_proxy(bin: &Path, config: &str, label: &str) -> ProxyProc {
         "proxy binary not found: {} (build it first: cargo build --release -p flux-core)",
         bin.display()
     );
-    let cfg_path = std::env::temp_dir().join(format!("bench_wg_{label}.json"));
+    // Per-process config name: two benchmark runs (or the same one run twice by
+    // parallel CI jobs) must not overwrite each other's config file.
+    let cfg_path =
+        std::env::temp_dir().join(format!("bench_wg_{label}_{}.json", std::process::id()));
     std::fs::write(&cfg_path, config).unwrap();
     let child = Command::new(bin)
         .args(["run", "-c", cfg_path.to_str().unwrap(), "-f", "json"])
@@ -855,40 +858,52 @@ async fn main() -> anyhow::Result<()> {
     }
     println!("{}", "-".repeat(100));
 
-    let find = |name: &str| results.iter().find(|r| r.0 == name).unwrap();
+    // With `--paths` only a subset of the rows exists; every comparison below is
+    // therefore optional instead of assuming all three paths were measured.
+    let find = |name: &str| results.iter().find(|r| r.0 == name);
     let d = find("direct");
     let f = find("flux direct");
     let w = find("wireguard");
     println!("\ncomparison:");
-    println!(
-        "  kernel TCP relay (flux direct): {:.1} MB/s, {:.2} CPU s/GB, {:.0} µs RTT",
-        f.1,
-        f.4.unwrap_or(0.0),
-        f.6
-    );
-    println!(
-        "  WireGuard userspace tunnel:     {:.1} MB/s ({:+.1}% vs direct, {:+.1}% vs kernel relay)",
-        w.1,
-        (w.1 / d.1 - 1.0) * 100.0,
-        (w.1 / f.1 - 1.0) * 100.0
-    );
-    println!(
-        "  WireGuard cost:                 {:.2} CPU s/GB tunnel CPU (client+server), {:.1} MiB RSS combined",
-        w.4.unwrap_or(0.0),
-        w.5
-    );
-    println!(
-        "  WireGuard RTT:                  {:.0} µs p50 / {:.0} µs p99 vs {:.0}/{:.0} µs direct ({:+.0} µs p50)",
-        w.6,
-        w.7,
-        d.6,
-        d.7,
-        w.6 - d.6
-    );
-    println!(
-        "  WireGuard connect setup:        {:.2} ms p50 vs {:.2} ms direct (inner TCP handshake through smoltcp)",
-        w.8, d.8
-    );
+    if let Some(f) = f {
+        println!(
+            "  kernel TCP relay (flux direct): {:.1} MB/s, {:.2} CPU s/GB, {:.0} µs RTT",
+            f.1,
+            f.4.unwrap_or(0.0),
+            f.6
+        );
+    }
+    if let Some(w) = w {
+        let rel = |other: Option<&(_, f64, _, _, _, _, _, _, _, _, _)>| match other {
+            Some(o) if o.1 > 0.0 => format!(", {:+.1}% vs {}", (w.1 / o.1 - 1.0) * 100.0, o.0),
+            _ => String::new(),
+        };
+        println!(
+            "  WireGuard userspace tunnel:     {:.1} MB/s ({:+.1}% vs direct{})",
+            w.1,
+            d.map(|d| (w.1 / d.1 - 1.0) * 100.0).unwrap_or(0.0),
+            rel(f)
+        );
+        println!(
+            "  WireGuard cost:                 {:.2} CPU s/GB tunnel CPU (client+server), {:.1} MiB RSS combined",
+            w.4.unwrap_or(0.0),
+            w.5
+        );
+        if let Some(d) = d {
+            println!(
+                "  WireGuard RTT:                  {:.0} µs p50 / {:.0} µs p99 vs {:.0}/{:.0} µs direct ({:+.0} µs p50)",
+                w.6,
+                w.7,
+                d.6,
+                d.7,
+                w.6 - d.6
+            );
+            println!(
+                "  WireGuard connect setup:        {:.2} ms p50 vs {:.2} ms direct (inner TCP handshake through smoltcp)",
+                w.8, d.8
+            );
+        }
+    }
     println!("{}", "-".repeat(100));
 
     // Machine-readable lines for scripts/bench_all.sh.
