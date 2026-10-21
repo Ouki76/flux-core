@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use flux_protocol::http::HttpHandshake;
-use flux_protocol::socks5::{REP_SUCCESS, Socks5Command, Socks5Handshake};
+use flux_protocol::socks5::{
+    REP_COMMAND_NOT_SUPPORTED, REP_SUCCESS, Socks5Command, Socks5Handshake,
+};
 use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp_reply};
 use flux_types::{
     Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
@@ -366,7 +368,18 @@ impl Inbound for MixedInbound {
                                 send_task.abort();
                             }
                             Socks5Command::Bind => {
-                                warn!("[{}] BIND not supported in mixed mode", inbound_tag);
+                                // RFC 1928 §6: answer unsupported commands with
+                                // REP 0x07 instead of closing silently.
+                                warn!(
+                                    "[{}] BIND not supported in mixed mode; replying 0x07",
+                                    inbound_tag
+                                );
+                                let _ = Socks5Handshake::send_reply(
+                                    &mut socket,
+                                    REP_COMMAND_NOT_SUPPORTED,
+                                    None,
+                                )
+                                .await;
                             }
                         }
                     } else {
@@ -423,5 +436,109 @@ impl Inbound for MixedInbound {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_types::{BoxedStream, SessionMeta, UdpPacket};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    struct NullDispatcher;
+
+    #[async_trait::async_trait]
+    impl Dispatcher for NullDispatcher {
+        async fn dispatch_stream(&self, _meta: SessionMeta, _stream: BoxedStream) {}
+        async fn dial_outbound(&self, _meta: &SessionMeta) -> FluxResult<BoxedStream> {
+            Err(FluxError::Protocol {
+                protocol: "test",
+                message: "no outbound in this test".into(),
+            })
+        }
+        async fn bridge_streams(&self, _m: SessionMeta, _a: BoxedStream, _b: BoxedStream) {}
+        async fn dispatch_packet(
+            &self,
+            _meta: SessionMeta,
+            _rx: mpsc::Receiver<UdpPacket>,
+            _tx: mpsc::Sender<UdpPacket>,
+        ) {
+        }
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    async fn spawn() -> (Arc<MixedInbound>, SocketAddr) {
+        let port = free_port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let inbound = Arc::new(MixedInbound::new("mixed-test", addr));
+        let dispatcher: Arc<dyn Dispatcher> = Arc::new(NullDispatcher);
+        inbound.start(dispatcher).await.unwrap();
+        for _ in 0..100 {
+            if TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (inbound, addr)
+    }
+
+    /// The mixed listener must auto-detect SOCKS5 by the first byte and, for an
+    /// unsupported command, answer RFC 1928's REP 0x07 rather than closing.
+    #[tokio::test]
+    async fn socks5_bind_gets_command_not_supported() {
+        let (inbound, addr) = spawn().await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut sel = [0u8; 2];
+        s.read_exact(&mut sel).await.unwrap();
+        assert_eq!(sel, [0x05, 0x00]);
+
+        let mut req = vec![0x05, 0x02, 0x00, 0x01];
+        req.extend_from_slice(&[127, 0, 0, 1]);
+        req.extend_from_slice(&0u16.to_be_bytes());
+        s.write_all(&req).await.unwrap();
+
+        let mut reply = [0u8; 10];
+        tokio::time::timeout(std::time::Duration::from_secs(2), s.read_exact(&mut reply))
+            .await
+            .expect("mixed inbound must answer BIND instead of hanging up")
+            .expect("reply read");
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], REP_COMMAND_NOT_SUPPORTED);
+        inbound.stop().await.unwrap();
+    }
+
+    /// The same listener must recognise an HTTP request (first byte not 0x05) and
+    /// fail the handshake instead of treating it as SOCKS5.
+    #[tokio::test]
+    async fn http_request_is_not_parsed_as_socks5() {
+        let (inbound, addr) = spawn().await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        // Unparsable as HTTP (no CRLFCRLF) — the point is only that it is not
+        // misrouted into the SOCKS5 parser, which would read it as a greeting.
+        s.write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(2), s.read_exact(&mut buf)).await;
+        // Either EOF/timeout (connection dropped) — but never a SOCKS5 greeting
+        // reply (0x05 0x00) followed by data.
+        if let Ok(Ok(_)) = res {
+            assert_ne!(
+                &buf[..2],
+                &[0x05, 0x00],
+                "HTTP request was answered as SOCKS5"
+            );
+        }
+        inbound.stop().await.unwrap();
     }
 }

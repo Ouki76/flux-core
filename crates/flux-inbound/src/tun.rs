@@ -520,11 +520,19 @@ mod smol_stack {
 
     /// Per-connection state owned by the stack actor.
     struct TcpConn {
-        to_proxy: futures_channel::mpsc::Sender<Bytes>,
+        /// `None` once the proxy side has been told about EOF (peer FIN or
+        /// teardown); dropping the sender is what delivers EOF to the proxy.
+        to_proxy: Option<futures_channel::mpsc::Sender<Bytes>>,
         /// Chunk read from the socket that did not fit into the channel yet.
         pending_to_proxy: Option<Bytes>,
         /// Data received from the proxy but not yet accepted by the socket.
         pending_from_proxy: VecDeque<Bytes>,
+        /// The peer's FIN (or the socket otherwise stopped receiving) has
+        /// already been forwarded to the proxy as EOF.
+        read_eof: bool,
+        /// The proxy asked to close; the FIN is sent once everything the proxy
+        /// wrote has been handed to the socket.
+        closing: bool,
     }
 
     impl TcpConn {
@@ -852,9 +860,12 @@ mod smol_stack {
                     }
                     StackCmd::TcpClose { handle } => {
                         if let Some(conn) = tcp_conns.get_mut(&handle) {
-                            conn.pending_from_proxy.clear();
-                            let sock = sockets.get_mut::<tcp::Socket>(handle);
-                            sock.close();
+                            // Do not discard data that the proxy already wrote
+                            // but the socket has not accepted yet: close once
+                            // the queue has been flushed (see step 2b). Clearing
+                            // it here truncated the last up-to-256 KiB of a
+                            // proxied response on every graceful shutdown.
+                            conn.closing = true;
                         }
                     }
                     StackCmd::UdpSessionClose { key } => {
@@ -901,6 +912,12 @@ mod smol_stack {
                         _ => break,
                     }
                 }
+                // Deferred close: only send the FIN once every byte the proxy
+                // wrote has been accepted by the socket.
+                if conn.closing && conn.pending_from_proxy.is_empty() {
+                    conn.closing = false;
+                    sock.close();
+                }
             }
 
             // ---- 3. Poll the stack (ingress + egress + timers/retransmits).
@@ -908,9 +925,20 @@ mod smol_stack {
             iface.poll(now, &mut device, &mut sockets);
 
             // ---- 4. Emit frames to the transport writer.
+            //
+            // On a full channel the frame must be put back: `try_send` consumes
+            // it, so the previous `if ... .is_err() { break }` silently *dropped*
+            // the segment every time the writer task fell behind by
+            // `TUN_OUT_CAP` frames. Dropped data segments turn into retransmit
+            // timeouts (throughput collapse) and dropped pure ACKs/window
+            // updates can wedge the connection.
             while let Some(frame) = device.txq.pop_front() {
-                if stack_out_tx.try_send(frame).is_err() {
-                    break; // writer channel full; try again next iteration
+                match stack_out_tx.try_send(frame) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        device.txq.push_front(e.into_inner());
+                        break;
+                    }
                 }
             }
 
@@ -922,31 +950,45 @@ mod smol_stack {
             for (handle, conn) in tcp_conns.iter_mut() {
                 let sock = sockets.get_mut::<tcp::Socket>(*handle);
                 // Flush a chunk that previously didn't fit into the channel.
-                if let Some(chunk) = conn.pending_to_proxy.take() {
-                    match conn.to_proxy.try_send(chunk) {
-                        Ok(()) => {}
-                        Err(e) => {
-                            conn.pending_to_proxy = Some(e.into_inner());
+                if let Some(tx) = conn.to_proxy.as_mut() {
+                    if let Some(chunk) = conn.pending_to_proxy.take() {
+                        match tx.try_send(chunk) {
+                            Ok(()) => {}
+                            Err(e) => {
+                                conn.pending_to_proxy = Some(e.into_inner());
+                            }
                         }
                     }
-                }
-                if conn.pending_to_proxy.is_none() {
-                    let mut tmp = [0u8; 8192];
-                    while sock.can_recv() {
-                        match sock.recv_slice(&mut tmp) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                match conn.to_proxy.try_send(Bytes::copy_from_slice(&tmp[..n])) {
+                    if conn.pending_to_proxy.is_none() {
+                        let mut tmp = [0u8; 8192];
+                        while sock.can_recv() {
+                            match sock.recv_slice(&mut tmp) {
+                                Ok(0) => break,
+                                Ok(n) => match tx.try_send(Bytes::copy_from_slice(&tmp[..n])) {
                                     Ok(()) => {}
                                     Err(e) => {
                                         conn.pending_to_proxy = Some(e.into_inner());
                                         break;
                                     }
-                                }
+                                },
+                                Err(_) => break,
                             }
-                            Err(_) => break,
                         }
                     }
+                }
+
+                // The peer half-closed (FIN): hand EOF to the proxy so the
+                // outbound side is shut down. Without this the proxy kept
+                // waiting for data that can never arrive, the socket stayed in
+                // CloseWait forever (leaking 128 KiB of smoltcp buffers per
+                // connection) and clients that half-close — a very common
+                // pattern — hung instead of receiving the response tail.
+                if matches!(sock.state(), tcp::State::CloseWait | tcp::State::Closing)
+                    && conn.pending_to_proxy.is_none()
+                    && !conn.read_eof
+                {
+                    conn.read_eof = true;
+                    conn.to_proxy = None;
                 }
                 let nothing_queued =
                     conn.pending_to_proxy.is_none() && conn.pending_from_proxy.is_empty();
@@ -1010,9 +1052,11 @@ mod smol_stack {
                 tcp_conns.insert(
                     handle,
                     TcpConn {
-                        to_proxy: to_proxy_tx,
+                        to_proxy: Some(to_proxy_tx),
                         pending_to_proxy: None,
                         pending_from_proxy: VecDeque::new(),
+                        read_eof: false,
+                        closing: false,
                     },
                 );
 
@@ -1139,7 +1183,13 @@ mod smol_stack {
                     }
                     pending_frame = f;
                 }
-                c = cmd_rx.next(), if cmd_rx_open => { // keep the command for step 2
+                // Only take a new command when no command is already waiting:
+                // the backpressure branch in step 2 deliberately leaves the
+                // current command in `pending_cmd` for the next iteration, and
+                // overwriting it here silently discarded the payload (a 64 KiB
+                // chunk per occurrence -> truncated streams). It also avoids
+                // spinning on a full command channel while backpressured.
+                c = cmd_rx.next(), if cmd_rx_open && pending_cmd.is_none() => {
                     if c.is_none() {
                         cmd_rx_open = false;
                     }

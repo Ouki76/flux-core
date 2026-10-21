@@ -888,6 +888,9 @@ pub struct Tls13Stream<S> {
     /// Encrypted records awaiting write to the underlying stream.
     pending_write: Vec<u8>,
     pending_write_pos: usize,
+    /// Plaintext bytes whose record is buffered but not yet acknowledged to the
+    /// caller (the transport returned `Pending` while writing it).
+    pending_unacked: usize,
     closed: bool,
 }
 
@@ -1292,6 +1295,7 @@ impl Tls13Client {
             body_len: 0,
             pending_write: Vec::new(),
             pending_write_pos: 0,
+            pending_unacked: 0,
             closed: false,
         };
         if !verified {
@@ -1598,6 +1602,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
         self.pending_write.clear();
         self.pending_write_pos = 0;
 
+        // A record that was buffered because the transport returned `Pending` was
+        // never acknowledged to the caller: `write_all` will retry with the same
+        // buffer. Now that it is on the wire, acknowledge it and stop — falling
+        // through would encrypt the very same plaintext a second time, which is
+        // exactly the duplicate-data corruption that showed up as a position
+        // mismatch in sustained transfers.
+        if self.pending_unacked > 0 {
+            let acknowledged = self.pending_unacked.min(buf.len());
+            self.pending_unacked = 0;
+            return Poll::Ready(Ok(acknowledged));
+        }
+
         // 2. Encrypt and write one record worth of plaintext.
         let n = buf.len().min(MAX_TLS_RECORD);
         let rec = match self.write_state.encrypt_record(23, &buf[..n]) {
@@ -1611,13 +1627,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
         };
         match Pin::new(&mut self.inner).poll_write(cx, &rec) {
             Poll::Ready(Ok(written)) if written < rec.len() => {
+                // `written` bytes are on the wire and the plaintext they encode is
+                // acknowledged now; only the tail stays buffered.
                 self.pending_write.extend_from_slice(&rec[written..]);
+                self.pending_unacked = 0;
                 Poll::Ready(Ok(n))
             }
             Poll::Ready(Ok(_)) => Poll::Ready(Ok(n)),
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             Poll::Pending => {
+                // Nothing was written and nothing is acknowledged: buffer the whole
+                // record and remember that `n` plaintext bytes are still pending
+                // from the caller's point of view.
                 self.pending_write.extend_from_slice(&rec);
+                self.pending_unacked = n;
                 Poll::Pending
             }
         }
@@ -2097,6 +2120,7 @@ impl Tls13Server {
             body_len: 0,
             pending_write: Vec::new(),
             pending_write_pos: 0,
+            pending_unacked: 0,
             closed: false,
         })
     }
@@ -2392,7 +2416,7 @@ mod tests {
         );
     }
 
-    fn server_cfg(priv_key: [u8; 32]) -> RealityServerConfig {
+    pub(super) fn server_cfg(priv_key: [u8; 32]) -> RealityServerConfig {
         RealityServerConfig::new(
             vec!["www.microsoft.com".into()],
             priv_key,
@@ -2575,5 +2599,89 @@ mod cert_parse_tests {
         let mut full = OID.to_vec();
         full.extend_from_slice(&[0xABu8; 32]);
         assert_eq!(extract_ed25519_pubkey(&full), Some(&[0xABu8; 32]));
+    }
+}
+
+#[cfg(test)]
+mod bulk_integrity_tests {
+    use super::tests::server_cfg;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Every byte written must come back byte-for-byte, in order, across many
+    /// records. The single-message test above cannot catch record-boundary bugs.
+    #[tokio::test]
+    async fn bulk_upload_and_download_are_byte_exact() {
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = X25519PublicKey::from(&server_secret);
+        let scfg = server_cfg(server_secret.to_bytes());
+        let ccfg = RealityClientConfig {
+            server_name: "www.microsoft.com".into(),
+            public_key: server_public.to_bytes(),
+            short_id: vec![0x01, 0x02, 0x03, 0x04],
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server =
+            tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
+        let client =
+            tokio::spawn(async move { RealityHandshake::client_handshake(client_io, &ccfg).await });
+        let mut s = server.await.unwrap().unwrap();
+        let mut c = client.await.unwrap().unwrap();
+
+        // A position-dependent pattern exposes any shift or dropped run.
+        const TOTAL: usize = 512 * 1024;
+        let payload: Vec<u8> = (0..TOTAL)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 8)) as u8)
+            .collect();
+
+        // Server echoes whatever it reads, on a separate task.
+        let expect = payload.clone();
+        let echo = tokio::spawn(async move {
+            let mut got = Vec::with_capacity(TOTAL);
+            let mut buf = vec![0u8; 64 * 1024];
+            while got.len() < TOTAL {
+                let n = s.read(&mut buf).await.expect("server read");
+                if n == 0 {
+                    break;
+                }
+                s.write_all(&buf[..n]).await.expect("server write");
+                got.extend_from_slice(&buf[..n]);
+            }
+            let _ = s.flush().await;
+            got
+        });
+
+        let writer = {
+            let payload = payload.clone();
+            tokio::spawn(async move {
+                for chunk in payload.chunks(16 * 1024) {
+                    c.write_all(chunk).await.expect("client write");
+                }
+                c.flush().await.expect("client flush");
+                let mut back = vec![0u8; TOTAL];
+                let mut filled = 0;
+                while filled < TOTAL {
+                    let n = c.read(&mut back[filled..]).await.expect("client read");
+                    if n == 0 {
+                        break;
+                    }
+                    filled += n;
+                }
+                back.truncate(filled);
+                back
+            })
+        };
+
+        let received = writer.await.unwrap();
+        let got = echo.await.unwrap();
+        assert_eq!(got.len(), expect.len(), "server received a short stream");
+        assert_eq!(got, expect, "server received corrupted bytes");
+        assert_eq!(
+            received.len(),
+            expect.len(),
+            "client received a short stream"
+        );
+        assert_eq!(received, expect, "client received corrupted bytes");
     }
 }

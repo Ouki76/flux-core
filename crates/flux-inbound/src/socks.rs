@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use flux_protocol::socks5::{REP_SUCCESS, Socks5Command, Socks5Handshake};
+use flux_protocol::socks5::{
+    REP_COMMAND_NOT_SUPPORTED, REP_SUCCESS, Socks5Command, Socks5Handshake,
+};
 use flux_protocol::udp::{decode_socks5_udp, encode_socks5_udp_reply};
 use flux_types::{
     Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta, TargetAddress, UdpPacket,
@@ -358,7 +360,16 @@ impl Inbound for SocksInbound {
                             send_task.abort();
                         }
                         Socks5Command::Bind => {
-                            warn!("[{}] BIND not supported", inbound_tag);
+                            // RFC 1928 §6: unsupported commands must be answered
+                            // with REP 0x07. Closing silently left the client
+                            // waiting for a reply until its own timeout.
+                            warn!("[{}] BIND not supported; replying 0x07", inbound_tag);
+                            let _ = Socks5Handshake::send_reply(
+                                &mut stream,
+                                REP_COMMAND_NOT_SUPPORTED,
+                                None,
+                            )
+                            .await;
                         }
                     }
                 });
@@ -372,5 +383,133 @@ impl Inbound for SocksInbound {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flux_types::{BoxedStream, SessionMeta, UdpPacket};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    /// Minimal dispatcher: the SOCKS tests only exercise the handshake layer, so
+    /// nothing is ever dispatched.
+    struct NullDispatcher;
+
+    #[async_trait::async_trait]
+    impl Dispatcher for NullDispatcher {
+        async fn dispatch_stream(&self, _meta: SessionMeta, _stream: BoxedStream) {}
+        async fn dial_outbound(&self, _meta: &SessionMeta) -> FluxResult<BoxedStream> {
+            Err(FluxError::Protocol {
+                protocol: "test",
+                message: "no outbound in this test".into(),
+            })
+        }
+        async fn bridge_streams(&self, _meta: SessionMeta, _a: BoxedStream, _b: BoxedStream) {}
+        async fn dispatch_packet(
+            &self,
+            _meta: SessionMeta,
+            _rx: mpsc::Receiver<UdpPacket>,
+            _tx: mpsc::Sender<UdpPacket>,
+        ) {
+        }
+    }
+
+    /// Reserves a free loopback port, then releases it for the inbound to take.
+    /// `listen_addr()` reports the *configured* address, so port 0 would give the
+    /// tests nothing to connect to.
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    async fn spawn_inbound() -> (Arc<SocksInbound>, SocketAddr) {
+        let port = free_port();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let inbound = Arc::new(SocksInbound::new("socks-test", addr));
+        let dispatcher: Arc<dyn Dispatcher> = Arc::new(NullDispatcher);
+        inbound.start(dispatcher).await.unwrap();
+
+        // Wait for the listener to accept connections instead of sleeping blind.
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        (inbound, addr)
+    }
+
+    /// RFC 1928 §6: an unsupported command (BIND) must be answered with REP 0x07.
+    /// The server used to close silently, leaving the client to hang until its
+    /// own timeout.
+    #[tokio::test]
+    async fn bind_command_is_answered_with_command_not_supported() {
+        let (inbound, addr) = spawn_inbound().await;
+
+        let mut s = TcpStream::connect(addr)
+            .await
+            .expect("connect to socks inbound");
+        // Greeting: version 5, one method, "no authentication".
+        s.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut sel = [0u8; 2];
+        s.read_exact(&mut sel).await.unwrap();
+        assert_eq!(sel, [0x05, 0x00], "server must pick the no-auth method");
+
+        // BIND to 127.0.0.1:0
+        let mut req = vec![0x05, 0x02, 0x00, 0x01];
+        req.extend_from_slice(&[127, 0, 0, 1]);
+        req.extend_from_slice(&0u16.to_be_bytes());
+        s.write_all(&req).await.unwrap();
+
+        let mut reply = [0u8; 10];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), s.read_exact(&mut reply))
+            .await
+            .expect("server must reply to BIND instead of closing silently")
+            .expect("reply read");
+        assert_eq!(n, 10);
+        assert_eq!(reply[0], 0x05, "reply version");
+        assert_eq!(
+            reply[1], REP_COMMAND_NOT_SUPPORTED,
+            "unsupported command must be answered with REP 0x07, got 0x{:02x}",
+            reply[1]
+        );
+
+        inbound.stop().await.unwrap();
+    }
+
+    /// An unsupported auth method must be rejected with 0xFF and the connection
+    /// closed, not silently accepted.
+    #[tokio::test]
+    async fn unsupported_auth_method_is_rejected() {
+        let (inbound, addr) = spawn_inbound().await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        // Offering only GSSAPI (0x01), which this inbound does not implement.
+        s.write_all(&[0x05, 0x01, 0x01]).await.unwrap();
+        let mut resp = [0u8; 2];
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(2), s.read_exact(&mut resp)).await;
+        assert_eq!(
+            resp[1], 0xFF,
+            "server must answer 0xFF when no method is acceptable"
+        );
+        inbound.stop().await.unwrap();
+    }
+
+    /// A greeting with the wrong protocol version must not be accepted.
+    #[tokio::test]
+    async fn wrong_version_is_rejected() {
+        let (inbound, addr) = spawn_inbound().await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(&[0x04, 0x01, 0x00]).await.unwrap();
+        let mut buf = [0u8; 2];
+        let res =
+            tokio::time::timeout(std::time::Duration::from_secs(2), s.read_exact(&mut buf)).await;
+        // Either the connection is closed (EOF/err) or an explicit rejection.
+        if let Ok(Ok(_)) = res {
+            assert_eq!(buf[1], 0xFF, "SOCKS4 greeting must be rejected");
+        }
+        inbound.stop().await.unwrap();
     }
 }

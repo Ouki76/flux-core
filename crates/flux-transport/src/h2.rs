@@ -297,12 +297,33 @@ impl H2Transport {
 
         let recv_stream = request.into_body();
 
-        // Spawn server connection driver in background that keeps processing H2 connection frames
+        // Server connection driver: keeps the H2 connection's frames flowing for
+        // the lifetime of the tunnel stream.
+        //
+        // Only I/O-level failures are fatal. A stream-level or protocol-level
+        // error concerns the offending stream, not the connection: tearing the
+        // whole connection down there reset the underlying TCP socket, so a peer
+        // saw `ECONNRESET` instead of `RST_STREAM`/`GOAWAY` (h2spec 3.4/1, 5.1/9,
+        // 7/2). Extra streams are refused individually with REFUSED_STREAM —
+        // this endpoint carries exactly one tunnel stream.
         tokio::spawn(async move {
             let mut conn = server_conn;
+            // A non-IO error is per-stream, but a *persistent* one would spin this
+            // loop forever (accept() returning instantly with the same error), so
+            // give up after a short run of consecutive failures.
+            let mut consecutive_errors = 0u32;
             while let Some(res) = conn.accept().await {
-                if res.is_err() {
-                    break;
+                match res {
+                    Ok((_request, mut respond)) => {
+                        respond.send_reset(h2::Reason::REFUSED_STREAM);
+                    }
+                    Err(e) if e.is_io() => break,
+                    Err(_) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors > 8 {
+                            break;
+                        }
+                    }
                 }
             }
         });

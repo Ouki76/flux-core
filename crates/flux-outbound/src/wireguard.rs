@@ -229,7 +229,12 @@ impl WgTunnel {
                 IpProto::Tcp => {
                     let stack = self.stack.lock().await;
                     if let Some(st) = stack.as_ref() {
-                        let _ = st.frame_tx.try_send(plain);
+                        // Dropping a frame here silently corrupts the inner TCP
+                        // stream — smoltcp never retransmits what it never saw.
+                        // Apply backpressure instead.
+                        if st.frame_tx.send(plain).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
@@ -499,6 +504,9 @@ impl WgTunnel {
             to_proxy: futures_channel::mpsc::Sender<bytes::Bytes>,
             pending_to_proxy: Option<bytes::Bytes>,
             pending_from_proxy: VecDeque<bytes::Bytes>,
+            /// Set when the proxy half-closed its write side. The socket must only
+            /// send FIN *after* everything already queued has been transmitted.
+            closing: bool,
             established_tx: Option<oneshot::Sender<Result<(), String>>>,
             dst: SocketAddr,
         }
@@ -565,6 +573,7 @@ impl WgTunnel {
                         to_proxy: to_proxy_tx,
                         pending_to_proxy: None,
                         pending_from_proxy: VecDeque::new(),
+                        closing: false,
                         established_tx: Some(est_tx),
                         dst: req.dst,
                     },
@@ -620,9 +629,16 @@ impl WgTunnel {
                     }
                     StackCmd::TcpClose { handle } => {
                         if let Some(c) = conns.get_mut(&handle) {
-                            c.pending_from_proxy.clear();
-                            let sock = sockets.get_mut::<tcp::Socket>(handle);
-                            sock.close();
+                            // A graceful half-close (shutdown(SHUT_WR)) must not
+                            // throw away bytes the application already wrote: mark
+                            // the connection and let the drain loop below send FIN
+                            // once the queue is empty. Clearing the queue here
+                            // truncated the tail of every response that ended with
+                            // a half-close.
+                            c.closing = true;
+                            if c.pending_from_proxy.is_empty() {
+                                sockets.get_mut::<tcp::Socket>(handle).close();
+                            }
                         }
                     }
                 }
@@ -645,6 +661,10 @@ impl WgTunnel {
                         }
                         _ => break,
                     }
+                }
+                // Half-closed and fully drained: now it is safe to send FIN.
+                if conn.closing && conn.pending_from_proxy.is_empty() {
+                    sock.close();
                 }
             }
 
