@@ -11,6 +11,12 @@ use tokio::sync::Mutex;
 
 const DOH_POOL_SIZE: usize = 4;
 
+/// Hard cap on an HTTP response body, chunked or close-delimited.
+///
+/// A DNS message never needs more than 64 KiB, so a body larger than this is
+/// either broken or hostile; it must not be buffered.
+const MAX_DOH_BODY: usize = 65536;
+
 /// Deadline for each DoH network step (connect, request/response).
 ///
 /// Without it a black-holed or MITM-stalled upstream holds the pool slot's
@@ -18,15 +24,22 @@ const DOH_POOL_SIZE: usize = 4;
 /// which in turn starves `dial_outbound` and leaks connection tasks.
 const DOH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Decodes an HTTP/1.1 chunked body.
-fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
+/// Decodes as much of a chunked body as `input` holds.
+///
+/// `Ok(Some(body))` means the terminating zero-length chunk was reached and
+/// `body` is complete. `Ok(None)` means the buffer ends mid-chunk and the caller
+/// should read more — which is what makes this usable on a **keep-alive**
+/// connection, where waiting for EOF (or for a `Content-Length` that a chunked
+/// response does not have) would hang until the read deadline. `Err` is a
+/// framing error.
+fn decode_chunked_partial(input: &[u8]) -> Result<Option<Vec<u8>>, String> {
     let mut rest = input;
     let mut out = Vec::with_capacity(input.len());
     loop {
-        let line_end = rest
-            .windows(2)
-            .position(|w| w == b"\r\n")
-            .ok_or("truncated chunk size line")?;
+        let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
+            // No complete chunk-size line yet.
+            return Ok(None);
+        };
         let size_str = std::str::from_utf8(&rest[..line_end])
             .map_err(|_| "non-UTF-8 chunk size")?
             .split(';')
@@ -36,18 +49,20 @@ fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
             .to_string();
         let size = usize::from_str_radix(&size_str, 16)
             .map_err(|_| format!("invalid chunk size '{size_str}'"))?;
-        rest = &rest[line_end + 2..];
+        let after = &rest[line_end + 2..];
         if size == 0 {
-            return Ok(out);
+            return Ok(Some(out));
         }
-        if rest.len() < size {
-            return Err("chunk shorter than declared".into());
+        // The chunk must be followed by its CRLF before the next size line.
+        if after.len() < size + 2 {
+            return Ok(None);
         }
-        out.extend_from_slice(&rest[..size]);
-        rest = &rest[size..];
-        if rest.starts_with(b"\r\n") {
-            rest = &rest[2..];
+        out.extend_from_slice(&after[..size]);
+        let tail = &after[size..];
+        if !tail.starts_with(b"\r\n") {
+            return Err("chunk not terminated by CRLF".into());
         }
+        rest = &tail[2..];
     }
 }
 
@@ -248,7 +263,7 @@ impl DohClient {
                     }
                 }
 
-                if content_length.is_some_and(|l| l > 65536) {
+                if content_length.is_some_and(|l| l > MAX_DOH_BODY) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "response body too large",
@@ -256,48 +271,75 @@ impl DohClient {
                 }
 
                 let mut body = header_buf[h_end..].to_vec();
-                match content_length {
-                    Some(expected) if !chunked => {
-                        while body.len() < expected {
-                            let needed = expected - body.len();
-                            let to_read = needed.min(chunk.len());
-                            let n = s.read(&mut chunk[..to_read]).await?;
-                            if n == 0 {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::UnexpectedEof,
-                                    "EOF reading DoH body",
-                                ));
-                            }
-                            body.extend_from_slice(&chunk[..n]);
-                        }
-                        body.truncate(expected);
-                    }
-                    _ => {
-                        // No Content-Length (chunked or close-delimited): read to
-                        // EOF with a hard cap instead of assuming an empty body,
-                        // which made every such server fail.
-                        loop {
-                            if body.len() > 65536 {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    "response body too large",
-                                ));
-                            }
-                            let n = s.read(&mut chunk).await?;
-                            if n == 0 {
+                if chunked {
+                    // `Transfer-Encoding: chunked` is self-delimiting: decode as
+                    // the bytes arrive and stop at the terminating chunk. Reading
+                    // to EOF instead (as a close-delimited body does) can never
+                    // complete on the keep-alive connection this client asks for,
+                    // so every chunked DoH answer used to end in a read timeout.
+                    loop {
+                        match decode_chunked_partial(&body)
+                            .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?
+                        {
+                            Some(decoded) => {
+                                body = decoded;
                                 break;
                             }
-                            body.extend_from_slice(&chunk[..n]);
+                            None => {
+                                if body.len() > MAX_DOH_BODY {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "response body too large",
+                                    ));
+                                }
+                                let n = s.read(&mut chunk).await?;
+                                if n == 0 {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "EOF before the final chunk",
+                                    ));
+                                }
+                                body.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                    }
+                } else {
+                    match content_length {
+                        Some(expected) => {
+                            while body.len() < expected {
+                                let needed = expected - body.len();
+                                let to_read = needed.min(chunk.len());
+                                let n = s.read(&mut chunk[..to_read]).await?;
+                                if n == 0 {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "EOF reading DoH body",
+                                    ));
+                                }
+                                body.extend_from_slice(&chunk[..n]);
+                            }
+                            body.truncate(expected);
+                        }
+                        None => {
+                            // No Content-Length (close-delimited): read to EOF
+                            // with a hard cap instead of assuming an empty body,
+                            // which made every such server fail.
+                            loop {
+                                if body.len() > MAX_DOH_BODY {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        "response body too large",
+                                    ));
+                                }
+                                let n = s.read(&mut chunk).await?;
+                                if n == 0 {
+                                    break;
+                                }
+                                body.extend_from_slice(&chunk[..n]);
+                            }
                         }
                     }
                 }
-
-                let body = if chunked {
-                    decode_chunked(&body)
-                        .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?
-                } else {
-                    body
-                };
 
                 Ok(body)
             };
@@ -427,7 +469,13 @@ mod tests {
 
 #[cfg(test)]
 mod body_decoding_tests {
-    use super::decode_chunked;
+    use super::decode_chunked_partial;
+
+    /// Convenience for the tests: the complete body, or the reason it never
+    /// completes.
+    fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
+        decode_chunked_partial(input)?.ok_or_else(|| "truncated chunked body".to_string())
+    }
 
     #[test]
     fn decodes_chunked_bodies() {
@@ -446,5 +494,37 @@ mod body_decoding_tests {
         assert!(decode_chunked(b"5\r\nab").is_err());
         assert!(decode_chunked(b"zz\r\nx\r\n").is_err());
         assert!(decode_chunked(b"no-crlf").is_err());
+        // A chunk that is not followed by CRLF is framing corruption, not a
+        // "need more data" case: it must not be retried forever.
+        assert!(decode_chunked(b"3\r\nabcXX").is_err());
+    }
+
+    /// The incremental contract: a prefix reports `None` (more data needed)
+    /// instead of an error, and decoding the whole buffer reports the body. This
+    /// is what lets a keep-alive chunked response complete without EOF.
+    #[test]
+    fn incomplete_prefixes_ask_for_more_data() {
+        let full = b"5\r\nhello\r\n0\r\n\r\n";
+        // Everything before the terminating chunk-size line is incomplete. (The
+        // zero-length chunk line is enough to finish the body; any trailer after
+        // it belongs to the next message and is ignored.)
+        for cut in 0..13 {
+            assert_eq!(
+                decode_chunked_partial(&full[..cut]),
+                Ok(None),
+                "prefix of {cut} bytes must ask for more data"
+            );
+        }
+        assert_eq!(
+            decode_chunked_partial(full).unwrap(),
+            Some(b"hello".to_vec())
+        );
+        // Trailing bytes after the terminator are ignored (the body is complete).
+        let mut with_trailer = full.to_vec();
+        with_trailer.extend_from_slice(b"HTTP/1.1 200 OK\r\n\r\n");
+        assert_eq!(
+            decode_chunked_partial(&with_trailer).unwrap(),
+            Some(b"hello".to_vec())
+        );
     }
 }

@@ -82,9 +82,21 @@ impl Instance {
         {
             let pool = if let Some(fip) = &dns_cfg.fakeip {
                 if fip.enabled.unwrap_or(false) {
-                    let range = fip.inet4_range.as_deref().unwrap_or("198.18.0.0/15");
-                    let p = FakeIpPool::new(range, 10000).map_err(|e| {
-                        FluxError::Config(format!("invalid fake-ip range {}: {}", range, e))
+                    let v4 = fip
+                        .inet4_range
+                        .as_deref()
+                        .unwrap_or(flux_dns::fakeip::DEFAULT_INET4_RANGE);
+                    // The IPv6 pool is on by default so AAAA queries can be
+                    // answered; `off`/`none`/`disabled`/"" restores NODATA.
+                    let v6 = fip
+                        .inet6_range
+                        .as_deref()
+                        .unwrap_or(flux_dns::fakeip::DEFAULT_INET6_RANGE);
+                    let p = FakeIpPool::from_ranges(v4, Some(v6), 10000).map_err(|e| {
+                        FluxError::Config(format!(
+                            "invalid fake-ip range v4={} v6={}: {}",
+                            v4, v6, e
+                        ))
                     })?;
                     Some(Arc::new(p))
                 } else {

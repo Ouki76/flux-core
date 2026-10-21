@@ -29,6 +29,15 @@ const MIN_DNS_TTL_SECS: u32 = 10;
 const MAX_DNS_TTL_SECS: u32 = 86400;
 /// Negative-caching TTL used when the upstream sent no SOA record.
 const NEGATIVE_DNS_TTL_SECS: u32 = 10;
+
+/// Hard cap on upstream exchanges caused by one client query.
+///
+/// A CNAME chain forces a re-query per hop, for both A and AAAA, against every
+/// configured server that is raced. The chain depth is bounded, but the product
+/// (hops x families x servers) is not, so one small client datagram could
+/// otherwise amplify into dozens of upstream lookups. This bounds the total
+/// regardless of how many servers are configured.
+const MAX_UPSTREAM_EXCHANGES_PER_QUERY: usize = 64;
 /// Upper bound for a negative entry taken from SOA MINIMUM (RFC 2308 §5 allows
 /// a longer value, but a bogus SOA must not pin "does not resolve" for hours).
 const MAX_NEGATIVE_TTL_SECS: u32 = 3600;
@@ -217,16 +226,20 @@ impl DnsResolver {
         let domain_lower = domain.to_ascii_lowercase();
         let idx = self.cache_shard_index(&domain_lower);
         let mut cache = self.inner.cache_shards[idx].lock();
-        match cache.get(&domain_lower) {
-            // A negative entry means "this name does not resolve", which is not a
-            // cached resolution.
-            Some(entry) if entry.ip.is_some() && Instant::now() < entry.expires_at => true,
-            Some(_) => {
-                cache.pop(&domain_lower);
-                false
-            }
-            None => false,
+        let now = Instant::now();
+        // A negative entry means "this name does not resolve", which is not a
+        // cached resolution — but it is a *live* entry and looking at it must not
+        // destroy it (that would silently disable negative caching). Only expired
+        // entries are evicted here.
+        let (is_positive, expires_at) = match cache.get(&domain_lower) {
+            Some(entry) => (entry.ip.is_some(), entry.expires_at),
+            None => return false,
+        };
+        if now < expires_at {
+            return is_positive;
         }
+        cache.pop(&domain_lower);
+        false
     }
 
     pub fn with_servers(mut self, servers: Vec<String>) -> Self {
@@ -298,7 +311,16 @@ impl DnsResolver {
                 domain
             )));
         }
-        let domain_lower = domain.to_ascii_lowercase();
+        // `host.internal.corp.` and `host.internal.corp` are the same name
+        // (RFC 1035 §3.1: the root label is implicit), so the trailing dot is
+        // removed *before* rule matching, the cache key and the single-flight
+        // key are derived. Otherwise a client could append a dot to an internal
+        // name to miss the split-DNS rule and have it resolved by the public
+        // upstream (a DNS leak), and the same name would be cached twice.
+        let domain_lower = domain
+            .to_ascii_lowercase()
+            .trim_end_matches('.')
+            .to_string();
 
         // 1. Check sharded LRU DNS cache with TTL expiration
         let shard_idx = self.cache_shard_index(&domain_lower);
@@ -434,6 +456,7 @@ impl DnsResolver {
         if !target_servers.is_empty() {
             use futures_util::stream::{FuturesUnordered, StreamExt};
             let mut futures = FuturesUnordered::new();
+            let budget = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
             for server in target_servers {
                 let s = server.clone();
@@ -441,7 +464,8 @@ impl DnsResolver {
                 let ecs = target_ecs;
                 let this = self.clone();
 
-                futures.push(async move { this.query_server_dual(&s, &d, ecs).await });
+                let budget = budget.clone();
+                futures.push(async move { this.query_server_dual(&s, &d, ecs, &budget).await });
             }
 
             // Transport failures and clean negatives are kept apart: the former
@@ -502,10 +526,11 @@ impl DnsResolver {
         server: &str,
         domain: &str,
         ecs: Option<ipnet::IpNet>,
+        budget: &std::sync::atomic::AtomicUsize,
     ) -> Result<(IpAddr, u32), QueryError> {
         let (res_a, res_aaaa) = tokio::join!(
-            self.query_server(server, domain, ecs, QTYPE_A),
-            self.query_server(server, domain, ecs, QTYPE_AAAA)
+            self.query_server(server, domain, ecs, QTYPE_A, budget),
+            self.query_server(server, domain, ecs, QTYPE_AAAA, budget)
         );
         match (res_a, res_aaaa) {
             (Ok(v4), _) => Ok(v4),
@@ -536,6 +561,7 @@ impl DnsResolver {
         domain: &str,
         ecs: Option<ipnet::IpNet>,
         qtype: u16,
+        budget: &std::sync::atomic::AtomicUsize,
     ) -> Result<(IpAddr, u32), QueryError> {
         let mut name = Name::from_str(domain)
             .map_err(|e| QueryError::Malformed(format!("invalid DNS name '{domain}': {e}")))?;
@@ -543,6 +569,14 @@ impl DnsResolver {
         let mut chain_ttl: Option<u32> = None;
 
         loop {
+            // Global per-query budget: see MAX_UPSTREAM_EXCHANGES_PER_QUERY.
+            if budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                >= MAX_UPSTREAM_EXCHANGES_PER_QUERY
+            {
+                return Err(QueryError::Malformed(format!(
+                    "upstream exchange budget exhausted while resolving '{domain}'"
+                )));
+            }
             let answer = self.exchange(server, &name, ecs, qtype).await?;
             match answer {
                 Answer::Address { ip, ttl } => {

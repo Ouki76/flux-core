@@ -28,6 +28,15 @@ use tracing::{debug, info, warn};
 /// Maximum number of queries handled concurrently by one DNS inbound.
 const MAX_INFLIGHT_QUERIES: usize = 256;
 
+/// Per-source-IP query rate for the DNS listener.
+///
+/// A DNS listener is an amplification vector: a 40-byte spoofed query can produce
+/// a much larger answer. Without a per-source cap, anyone who can reach the port
+/// gets a free reflector, so the rate is bounded even for a loopback bind (where
+/// it costs nothing) rather than only for public ones.
+const DNS_QUERIES_PER_SEC_PER_IP: u32 = 200;
+const DNS_BURST_PER_IP: u32 = 400;
+
 pub struct DnsInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -143,7 +152,7 @@ async fn answer_forwarded(
     qtype: u16,
 ) -> Option<Vec<u8>> {
     match resolver.forward_query(query).await {
-        Ok(resp) => return Some(resp),
+        Ok(resp) => return clamp_to_client_udp_size(query, resp),
         Err(e) => {
             debug!("DNS passthrough unavailable for '{}': {}", qname, e);
         }
@@ -164,6 +173,32 @@ async fn answer_forwarded(
         },
         Err(_) => DnsMessage::build_response(query, None),
     }
+}
+
+/// Bounds a relayed answer to what the client said it can receive.
+///
+/// The relay path forwards the upstream's bytes verbatim, and an upstream (or a
+/// hostile one) may answer a ~30-byte query with several kilobytes. Sending that
+/// back unfiltered is wrong twice over:
+///
+/// * a client that sent no EDNS0 OPT record expects at most 512 bytes
+///   (RFC 1035 §4.2.1) and will drop or truncate anything larger, hiding a
+///   perfectly good answer;
+/// * with a spoofed source address the listener becomes an amplifier — a
+///   ~30-byte datagram in, a multi-kilobyte datagram at the victim out.
+///
+/// An answer that does not fit is replaced by the protocol-correct stand-in:
+/// the question echoed, no records, TC=1, so the client retries over a transport
+/// that can carry the full reply (RFC 2181 §9). The answer is relayed verbatim
+/// whenever it *does* fit, which is the normal case.
+fn clamp_to_client_udp_size(query: &[u8], resp: Vec<u8>) -> Option<Vec<u8>> {
+    if resp.len() <= DnsMessage::client_udp_payload_size(query) {
+        return Some(resp);
+    }
+    // Keep the upstream's status so the client sees the same verdict, just
+    // without the records it cannot receive.
+    let rcode = resp.get(3).map(|b| b & 0x000F).unwrap_or(0);
+    DnsMessage::build_truncated_response(query, rcode)
 }
 
 #[async_trait]
@@ -239,6 +274,17 @@ impl Inbound for DnsInbound {
         // a trivial memory/CPU exhaustion vector for a datagram listener.
         let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_QUERIES));
 
+        if !self.listen_addr.ip().is_loopback() {
+            warn!(
+                "[{}] DNS inbound is listening on a non-loopback address ({}). Anyone who can \
+                 reach it can use it as a resolver; queries are rate-limited per source IP \
+                 ({} qps, burst {}) but an ACL is still advisable.",
+                self.tag, self.listen_addr, DNS_QUERIES_PER_SEC_PER_IP, DNS_BURST_PER_IP
+            );
+        }
+        let limiter =
+            flux_common::RateLimiter::new(DNS_QUERIES_PER_SEC_PER_IP, DNS_BURST_PER_IP, 0);
+
         tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             loop {
@@ -259,6 +305,12 @@ impl Inbound for DnsInbound {
                 }
                 // Drop the query when the listener is saturated rather than
                 // queueing without bound; the client simply retries.
+                // Reflective amplification guard: drop queries above the per-IP
+                // rate instead of answering them.
+                let Some(rate_guard) = limiter.try_acquire(peer.ip()) else {
+                    debug!("[{}] dns query from {} rate-limited", tag, peer.ip());
+                    continue;
+                };
                 let Ok(permit) = inflight.clone().try_acquire_owned() else {
                     debug!("[{}] dns inbound saturated; dropping query", tag);
                     continue;
@@ -269,6 +321,7 @@ impl Inbound for DnsInbound {
                 let fake_ip = fake_ip.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let _rate_guard = rate_guard;
                     if let Some(resp) = answer_query(&query, &resolver, fake_ip.as_deref()).await {
                         let _ = sock.send_to(&resp, peer).await;
                     }

@@ -150,7 +150,16 @@ pub struct DnsRuleConfig {
 #[serde(deny_unknown_fields)]
 pub struct FakeIpConfig {
     pub enabled: Option<bool>,
+    /// IPv4 range handed out for fake addresses (default `198.18.0.0/15`).
+    #[serde(default)]
     pub inet4_range: Option<String>,
+    /// IPv6 range for fake `AAAA` answers (default `fc00::/18`).
+    ///
+    /// Set to `"off"`/`"none"`/`"disabled"`/`""` to answer `AAAA` with NODATA
+    /// instead. Without this field an `AAAA` query could never be served, which
+    /// made half of the fake-IP implementation unreachable from configuration.
+    #[serde(default)]
+    pub inet6_range: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

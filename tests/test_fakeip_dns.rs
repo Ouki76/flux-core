@@ -141,3 +141,96 @@ async fn dns_inbound_without_fakeip_does_not_allocate() {
 
     instance.stop().await.unwrap();
 }
+
+/// IPv6 fake-IP must be reachable from configuration: with `inet6_range` set, an
+/// AAAA query is answered with a fake address from that range instead of NODATA.
+/// Before the config field was wired, half of the fake-IP implementation was dead
+/// code that no configuration could reach.
+#[tokio::test]
+async fn aaaa_gets_a_fake_v6_address_when_inet6_range_is_configured() {
+    use tokio::net::UdpSocket;
+
+    let dns_port = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let cfg = flux_app::Config::from_json_str(&format!(
+        r#"{{
+            "dns": {{ "listen": "127.0.0.1:{dns_port}",
+                      "fakeip": {{ "enabled": true,
+                                   "inet4_range": "198.18.0.0/15",
+                                   "inet6_range": "fc00::/18" }} }},
+            "outbounds": [{{ "type": "direct", "tag": "direct" }}]
+        }}"#
+    ))
+    .expect("config with inet6_range must parse");
+
+    let instance = flux_app::Instance::new(cfg).expect("instance");
+    instance.start().await.expect("start");
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{dns_port}").parse().unwrap();
+
+    // AAAA query for example.com
+    let mut q = vec![0x22, 0x33, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    q.extend_from_slice(b"\x07example\x03com\x00");
+    q.extend_from_slice(&[0x00, 0x1c, 0x00, 0x01]);
+    sock.send_to(&q, addr).await.unwrap();
+
+    let mut buf = vec![0u8; 512];
+    let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("AAAA query must be answered")
+        .expect("recv");
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]);
+    assert_eq!(ancount, 1, "AAAA must carry one answer, got {ancount}");
+    // The rrdata of an AAAA record is the last 16 bytes.
+    assert!(n >= 16);
+    let v6 = &buf[n - 16..n];
+    assert_eq!(
+        v6[0], 0xfc,
+        "answer must come from the configured fc00::/18 pool, got {v6:02x?}"
+    );
+
+    let _ = instance.stop().await;
+}
+
+/// `inet6_range: "off"` must restore the previous NODATA behaviour.
+#[tokio::test]
+async fn aaaa_gets_nodata_when_inet6_range_is_off() {
+    use tokio::net::UdpSocket;
+
+    let dns_port = {
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let cfg = flux_app::Config::from_json_str(&format!(
+        r#"{{
+            "dns": {{ "listen": "127.0.0.1:{dns_port}",
+                      "fakeip": {{ "enabled": true, "inet6_range": "off" }} }},
+            "outbounds": [{{ "type": "direct", "tag": "direct" }}]
+        }}"#
+    ))
+    .expect("config");
+    let instance = flux_app::Instance::new(cfg).expect("instance");
+    instance.start().await.expect("start");
+
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{dns_port}").parse().unwrap();
+    let mut q = vec![0x22, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    q.extend_from_slice(b"\x07example\x03com\x00");
+    q.extend_from_slice(&[0x00, 0x1c, 0x00, 0x01]);
+    sock.send_to(&q, addr).await.unwrap();
+
+    let mut buf = vec![0u8; 512];
+    let (_, _) = tokio::time::timeout(std::time::Duration::from_secs(5), sock.recv_from(&mut buf))
+        .await
+        .expect("AAAA query must still be answered")
+        .expect("recv");
+    assert_eq!(
+        u16::from_be_bytes([buf[6], buf[7]]),
+        0,
+        "with inet6_range off, AAAA must be NODATA"
+    );
+    let _ = instance.stop().await;
+}

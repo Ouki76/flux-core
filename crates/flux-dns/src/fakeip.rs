@@ -39,6 +39,27 @@ const DEFAULT_CAPACITY: NonZeroUsize = match NonZeroUsize::new(DEFAULT_FAKEIP_CA
     None => unreachable!(),
 };
 
+/// The inclusive window of addresses a pool hands out inside `[network, broadcast]`.
+///
+/// The first and last address of a subnet are skipped where they exist (network
+/// and broadcast address, as the v4 default range does), and a range with no
+/// interior — `/31`, `/32` v4, `/127`, `/128` v6 — falls back to the whole range.
+///
+/// The result is **always** inside `[network, broadcast]`: that is what makes
+/// `contains_ip` agree with `allocate`, and `contains_ip` is what decides whether
+/// a destination is treated as a fake-IP (and therefore re-mapped to its domain
+/// and routed by name). An address outside the range would be dialled as a
+/// literal IP and silently bypass the domain rules.
+fn usable_window(network: u128, broadcast: u128) -> (u128, u128) {
+    let first = network.saturating_add(1);
+    let last = broadcast.saturating_sub(1);
+    if first > last || first > broadcast {
+        (network, broadcast.max(network))
+    } else {
+        (first, last)
+    }
+}
+
 #[derive(Debug)]
 struct FakeIpCache {
     domain_to_ip: LruCache<String, Ipv4Addr>,
@@ -68,10 +89,15 @@ impl V6Pool {
         let network: Ipv6Net = cidr.parse()?;
         let cap = NonZeroUsize::new(capacity).unwrap_or(DEFAULT_CAPACITY);
 
-        // Saturating arithmetic keeps degenerate prefixes (/127, /128) from
-        // underflowing; the range then collapses to a single address.
-        let start = u128::from(network.network()).saturating_add(1);
-        let end = u128::from(network.broadcast()).saturating_sub(1).max(start);
+        // Same rule as the v4 pool: the allocatable window is the range minus
+        // its network and broadcast addresses, and it always stays *inside* the
+        // configured range. A degenerate prefix (/128, /127) has no such
+        // interior, so it falls back to the range itself instead of walking out
+        // of it.
+        let (start, end) = usable_window(
+            u128::from(network.network()),
+            u128::from(network.broadcast()),
+        );
 
         Ok(Self {
             network,
@@ -154,12 +180,13 @@ impl FakeIpPool {
         let network: Ipv4Net = cidr.parse()?;
         let cap = NonZeroUsize::new(capacity).unwrap_or(DEFAULT_CAPACITY);
 
-        // saturating ops guard against degenerate prefixes (/31, /32, 0.0.0.0/32)
-        // where broadcast() - 1 or network() + 1 would otherwise underflow/overflow.
-        let start_ip = u32::from(network.network()).saturating_add(1);
-        let end_ip = u32::from(network.broadcast())
-            .saturating_sub(1)
-            .max(start_ip);
+        // The allocatable window always stays inside the configured range; see
+        // `usable_window` for why that invariant matters.
+        let (start_ip, end_ip) = usable_window(
+            u128::from(u32::from(network.network())),
+            u128::from(u32::from(network.broadcast())),
+        );
+        let (start_ip, end_ip) = (start_ip as u32, end_ip as u32);
 
         Ok(Self {
             network,
@@ -234,8 +261,11 @@ impl FakeIpPool {
             Ok(p) => p,
             Err(_) => {
                 let net = Ipv4Net::new(Ipv4Addr::new(198, 18, 0, 0), 15).unwrap_or_default();
-                let start = u32::from(net.network()).saturating_add(1);
-                let end = u32::from(net.broadcast()).saturating_sub(1).max(start);
+                let (start, end) = usable_window(
+                    u128::from(u32::from(net.network())),
+                    u128::from(u32::from(net.broadcast())),
+                );
+                let (start, end) = (start as u32, end as u32);
                 Self {
                     network: net,
                     start_ip: start,

@@ -62,6 +62,13 @@ pub const MAX_CNAME_CHAIN: usize = 16;
 /// Maximum number of elements (TXT strings, SVCB params) kept per record.
 const MAX_RDATA_ITEMS: usize = 64;
 
+/// Classic UDP DNS payload limit (RFC 1035 §4.2.1): what a sender that did not
+/// send an EDNS0 OPT record is assumed to be able to receive.
+pub const DEFAULT_UDP_PAYLOAD: usize = 512;
+/// Largest UDP DNS response this crate will emit or accept from an upstream,
+/// whatever an EDNS0 OPT record advertises.
+pub const MAX_UDP_RESPONSE: usize = 4096;
+
 /// A DNS name, kept as its raw labels so it re-encodes losslessly.
 ///
 /// Labels are byte strings, not `String`, because DNS labels are arbitrary
@@ -794,6 +801,23 @@ impl Message {
             })
     }
 
+    /// The UDP payload size the sender advertised in its EDNS0 OPT record
+    /// (RFC 6891 §6.2.3), in the range this crate is willing to emit.
+    ///
+    /// A sender with no OPT record (or one advertising less than the classic
+    /// 512-byte limit) is treated as a 512-byte receiver, which is what
+    /// RFC 1035 §4.2.1 requires. The upper bound is [`MAX_UDP_RESPONSE`]: it is
+    /// the largest datagram this resolver ever emits, so a hostile client cannot
+    /// talk an upstream into a larger amplification factor than that.
+    pub fn udp_payload_size(&self) -> usize {
+        self.additional
+            .iter()
+            .find(|r| r.rtype == QTYPE_OPT)
+            .map(|r| usize::from(r.rclass))
+            .unwrap_or(DEFAULT_UDP_PAYLOAD)
+            .clamp(DEFAULT_UDP_PAYLOAD, MAX_UDP_RESPONSE)
+    }
+
     /// First address record of any family, ignoring owner names. Used by the
     /// legacy single-record helpers (and by the fuzz target).
     pub fn first_address(&self) -> Option<(IpAddr, u32)> {
@@ -1126,6 +1150,28 @@ impl DnsMessage {
         Some(out)
     }
 
+    /// Builds the reply to send when the real answer does not fit in the
+    /// client's UDP buffer: the question is echoed, no records are carried and
+    /// TC is set so the client retries over a transport that can carry it
+    /// (RFC 1035 §4.2.1, RFC 2181 §9).
+    pub fn build_truncated_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
+        let mut out = Self::build_response_records(query, rcode, &[])?;
+        let flags = u16::from_be_bytes([out[2], out[3]]) | 0x0200; // TC
+        out[2..4].copy_from_slice(&flags.to_be_bytes());
+        Some(out)
+    }
+
+    /// The UDP payload size the client that sent `query` can receive
+    /// (RFC 1035 §4.2.1 / RFC 6891 §6.2.3) — see [`Message::udp_payload_size`].
+    ///
+    /// Falls back to [`DEFAULT_UDP_PAYLOAD`] when the query does not parse, which
+    /// is the safe direction: an unparseable query never earns a large answer.
+    pub fn client_udp_payload_size(query: &[u8]) -> usize {
+        Message::parse(query)
+            .map(|m| m.udp_payload_size())
+            .unwrap_or(DEFAULT_UDP_PAYLOAD)
+    }
+
     /// Validates a DNS response header:
     /// - length >= 12
     /// - matching transaction ID
@@ -1177,6 +1223,19 @@ impl DnsMessage {
         let msg = Message::parse(data)
             .map_err(|e| QueryError::Malformed(format!("unparseable DNS response: {e}")))?;
         let answer = msg.answer(qname, qtype);
+        // RFC 2308 §7: only NXDOMAIN (and NOERROR/NODATA) say anything about the
+        // *name*. SERVFAIL, REFUSED, NOTIMP and the rest are transient server
+        // failures and "MUST NOT" be cached as negative answers — otherwise one
+        // bad or hostile reply (with an SOA attached to give it a long TTL) pins
+        // the name as unresolvable for the whole negative TTL.
+        if let Answer::Negative { rcode, .. } = &answer
+            && *rcode != RCODE_NOERROR
+            && *rcode != RCODE_NXDOMAIN
+        {
+            return Err(QueryError::malformed(format!(
+                "upstream returned rcode {rcode} for '{qname}': a server failure, not a negative answer"
+            )));
+        }
         // A truncated answer is incomplete, not a negative: retrying over TCP (or
         // against another server) is the right response, and it must not be
         // remembered as "this name does not resolve".
@@ -2028,6 +2087,68 @@ mod tests {
         assert!(query.windows(2).any(|w| w == [0x00, 0x08]));
         let msg = Message::parse(&query).unwrap();
         assert_eq!(msg.additional.len(), 1);
+    }
+
+    // -- EDNS0 buffer size ------------------------------------------------
+
+    #[test]
+    fn client_udp_payload_size_defaults_to_512_and_follows_edns0() {
+        // No OPT record: the RFC 1035 default applies, never "unlimited".
+        let plain = DnsMessage::build_query("example.com", QTYPE_A);
+        assert_eq!(DnsMessage::client_udp_payload_size(&plain), 512);
+
+        // The ECS builder advertises 4096.
+        let edns = DnsMessage::build_query_with_ecs(
+            "example.com",
+            QTYPE_A,
+            Some("192.0.2.0/24".parse().unwrap()),
+        );
+        assert_eq!(DnsMessage::client_udp_payload_size(&edns), 4096);
+
+        // A client asking for less than 512 gets 512 (it may not shrink the
+        // classic limit), and one asking for 64 KiB is capped at what this
+        // resolver can actually emit.
+        let opt = edns
+            .windows(3)
+            .position(|w| w == [0x00, 0x00, 0x29])
+            .expect("OPT record");
+        for (advertised, expected) in [(100u16, 512usize), (1232, 1232), (u16::MAX, MAX_UDP_RESPONSE)]
+        {
+            let mut q = edns.clone();
+            q[opt + 3..opt + 5].copy_from_slice(&advertised.to_be_bytes());
+            assert_eq!(
+                DnsMessage::client_udp_payload_size(&q),
+                expected,
+                "advertised {advertised}"
+            );
+        }
+
+        // Garbage is not an invitation to send a big datagram.
+        assert_eq!(DnsMessage::client_udp_payload_size(&[]), 512);
+        assert_eq!(DnsMessage::client_udp_payload_size(b"not a dns query"), 512);
+    }
+
+    #[test]
+    fn truncated_response_echoes_the_question_and_sets_tc() {
+        let q = DnsMessage::build_query_with_ecs(
+            "big.example.com",
+            QTYPE_TXT,
+            Some("192.0.2.0/24".parse().unwrap()),
+        );
+        let (_id, _flags, qname, qtype, _end) = DnsMessage::parse_question(&q).unwrap();
+        let t = DnsMessage::build_truncated_response(&q, RCODE_NOERROR).expect("truncated reply");
+        let msg = Message::parse(&t).unwrap();
+        assert!(msg.is_truncated(), "TC must be set");
+        assert_eq!(msg.rcode(), RCODE_NOERROR);
+        assert!(msg.answers.is_empty(), "a TC reply carries no records");
+        assert_eq!(msg.id, u16::from_be_bytes([q[0], q[1]]));
+        assert_eq!(msg.questions.len(), 1);
+        assert_eq!(msg.questions[0].name.to_string(), qname);
+        assert_eq!(msg.questions[0].qtype, qtype);
+        assert!(
+            t.len() <= DEFAULT_UDP_PAYLOAD,
+            "the placeholder reply itself must fit in 512 bytes"
+        );
     }
 
     #[test]
