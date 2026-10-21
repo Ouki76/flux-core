@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use flux_protocol::mux::{MuxClient, MuxConfig, mux_destination};
 use flux_protocol::vmess::{
     VMESS_SECURITY_AES_128_GCM, VMESS_SECURITY_CHACHA20_POLY1305, VmessProtocol, VmessStream,
 };
@@ -16,6 +17,8 @@ pub struct VmessOutbound {
     uuid: Uuid,
     security: u8,
     dialer: Arc<dyn StreamDialer>,
+    /// Stream multiplexer, when `multiplex.enabled` is set on the node.
+    mux: Option<Arc<MuxClient>>,
 }
 
 impl VmessOutbound {
@@ -39,7 +42,51 @@ impl VmessOutbound {
             uuid,
             security,
             dialer,
+            mux: None,
         }
+    }
+
+    /// Enables multiplexing over a shared smux session.
+    pub fn with_mux(mut self, config: MuxConfig) -> Self {
+        let mux_dialer = Arc::new(VmessMuxDialer {
+            inner: self.dialer.clone(),
+            uuid: self.uuid,
+            security: self.security,
+        });
+        self.mux = Some(MuxClient::new(mux_dialer, config));
+        self
+    }
+}
+
+/// Opens the physical carrier for a multiplexed session: a VMess request to the
+/// reserved mux destination, wrapped in the VMess AEAD stream.
+struct VmessMuxDialer {
+    inner: Arc<dyn StreamDialer>,
+    uuid: Uuid,
+    security: u8,
+}
+
+#[async_trait]
+impl StreamDialer for VmessMuxDialer {
+    async fn dial(&self) -> FluxResult<BoxedStream> {
+        let mut stream = self.inner.dial().await?;
+        let (key, iv, resp_header) = VmessProtocol::write_request_header(
+            &mut stream,
+            &self.uuid,
+            NetworkType::Tcp,
+            &mux_destination(),
+            self.security,
+        )
+        .await?;
+        let vmess_stream: BoxedStream = Box::new(VmessStream::new_client(
+            stream,
+            key,
+            iv,
+            self.security,
+            resp_header,
+            0x05,
+        ));
+        Ok(vmess_stream)
     }
 }
 
@@ -54,6 +101,9 @@ impl Outbound for VmessOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
+        if let Some(mux) = &self.mux {
+            return mux.dial_stream(&meta.destination).await;
+        }
         let mut stream = self.dialer.dial().await?;
 
         let (key, iv, resp_header) = VmessProtocol::write_request_header(
@@ -77,6 +127,9 @@ impl Outbound for VmessOutbound {
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+        if let Some(mux) = &self.mux {
+            return mux.dial_packet(&meta.destination).await;
+        }
         let mut stream = self.dialer.dial().await?;
 
         let (key, iv, resp_header) = VmessProtocol::write_request_header(

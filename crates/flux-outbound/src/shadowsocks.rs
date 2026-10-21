@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use flux_dns::DnsResolver;
+use flux_protocol::mux::{MuxClient, MuxConfig, mux_destination};
 use flux_protocol::shadowsocks::{
     CipherKind, ShadowsocksCipher, ShadowsocksStream, TAG_LEN, derive_master_key_for_kind,
     derive_subkey, encode_ss_address,
@@ -22,6 +23,8 @@ pub struct ShadowsocksOutbound {
     dialer: Option<Arc<dyn StreamDialer>>,
     server_address: TargetAddress,
     resolver: Arc<DnsResolver>,
+    /// Stream multiplexer, when `multiplex.enabled` is set on the node.
+    mux: Option<Arc<MuxClient>>,
 }
 
 impl ShadowsocksOutbound {
@@ -42,6 +45,7 @@ impl ShadowsocksOutbound {
             dialer: Some(dialer),
             server_address,
             resolver,
+            mux: None,
         }
     }
 
@@ -61,6 +65,7 @@ impl ShadowsocksOutbound {
             dialer: None,
             server_address,
             resolver,
+            mux: None,
         }
     }
 
@@ -68,6 +73,93 @@ impl ShadowsocksOutbound {
         self.cipher_kind = kind;
         self.master_key = derive_master_key_for_kind(&self.password, kind);
         self
+    }
+
+    /// Enables multiplexing over a shared smux session.
+    ///
+    /// Requires a stream dialer (a datagram-only outbound cannot carry a muxed
+    /// TCP session).
+    pub fn with_mux(mut self, config: MuxConfig) -> FluxResult<Self> {
+        let Some(dialer) = self.dialer.clone() else {
+            return Err(FluxError::Config(
+                "multiplex requires a tcp carrier (datagram-only shadowsocks outbound)".into(),
+            ));
+        };
+        let mux_dialer = Arc::new(ShadowsocksMuxDialer {
+            outbound: ShadowsocksCarrier {
+                master_key: self.master_key.clone(),
+                cipher_kind: self.cipher_kind,
+                dialer,
+            },
+        });
+        self.mux = Some(MuxClient::new(mux_dialer, config));
+        Ok(self)
+    }
+}
+
+/// The carrier part of a shadowsocks outbound, shared by the normal dial path
+/// and the multiplex session path.
+struct ShadowsocksCarrier {
+    master_key: Vec<u8>,
+    cipher_kind: CipherKind,
+    dialer: Arc<dyn StreamDialer>,
+}
+
+impl ShadowsocksCarrier {
+    async fn open(&self, destination: &TargetAddress) -> FluxResult<BoxedStream> {
+        let mut stream = self.dialer.dial().await?;
+
+        if let CipherKind::Ss2022(method) = self.cipher_kind {
+            let key_bytes = &self.master_key[..method.key_len()];
+            let ss_stream = flux_protocol::shadowsocks2022::Ss2022Protocol::client_handshake(
+                stream,
+                method,
+                key_bytes,
+                destination,
+            )
+            .await?;
+            return Ok(Box::new(ss_stream));
+        }
+
+        // 1. Generate client salt
+        let salt_len = self.cipher_kind.salt_len();
+        let mut salt = vec![0u8; salt_len];
+        rand::rngs::OsRng.fill_bytes(&mut salt);
+        stream.write_all(&salt).await.map_err(FluxError::Io)?;
+
+        // 2. Derive subkey and cipher
+        let subkey = derive_subkey(&self.master_key, &salt);
+        let mut enc = ShadowsocksCipher::with_kind(self.cipher_kind, &subkey);
+
+        // 3. Encrypt target address as the first payload
+        let addr_bytes = encode_ss_address(destination);
+        let len_buf = (addr_bytes.len() as u16).to_be_bytes();
+
+        let enc_len = enc.encrypt(&len_buf)?;
+        let enc_addr = enc.encrypt(&addr_bytes)?;
+
+        stream.write_all(&enc_len).await.map_err(FluxError::Io)?;
+        stream.write_all(&enc_addr).await.map_err(FluxError::Io)?;
+        stream.flush().await.map_err(FluxError::Io)?;
+
+        Ok(Box::new(ShadowsocksStream::new(
+            stream,
+            enc,
+            None,
+            &self.master_key,
+        )))
+    }
+}
+
+/// Opens the physical carrier for a multiplexed session.
+struct ShadowsocksMuxDialer {
+    outbound: ShadowsocksCarrier,
+}
+
+#[async_trait]
+impl StreamDialer for ShadowsocksMuxDialer {
+    async fn dial(&self) -> FluxResult<BoxedStream> {
+        self.outbound.open(&mux_destination()).await
     }
 }
 
@@ -82,6 +174,9 @@ impl Outbound for ShadowsocksOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
+        if let Some(mux) = &self.mux {
+            return mux.dial_stream(&meta.destination).await;
+        }
         let dialer = self.dialer.as_ref().ok_or_else(|| FluxError::Protocol {
             protocol: "shadowsocks",
             message: "datagram-only outbound does not support stream dialing".into(),
@@ -125,7 +220,10 @@ impl Outbound for ShadowsocksOutbound {
         Ok(Box::new(ss_stream))
     }
 
-    async fn dial_packet(&self, _meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+    async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+        if let Some(mux) = &self.mux {
+            return mux.dial_packet(&meta.destination).await;
+        }
         let server_addr = self.resolver.resolve(&self.server_address).await?;
         let is_v6 = server_addr.is_ipv6();
         let udp_socket = if is_v6 {

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use flux_protocol::mux::{MuxConfig, is_mux_destination};
 use flux_protocol::vless::{VLESS_CMD_TCP, VlessProtocol};
 use flux_types::{
     BoxedStream, Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta,
@@ -15,6 +16,8 @@ pub struct VlessInbound {
     uuids: Vec<Uuid>,
     pipeline: flux_transport::pipeline::ServerTransportPipeline,
     rate_limiter: Option<Arc<flux_common::RateLimiter>>,
+    /// Accept multiplexed (smux) sessions when set.
+    mux: Option<MuxConfig>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -33,6 +36,7 @@ impl VlessInbound {
             uuids,
             pipeline,
             rate_limiter: None,
+            mux: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -40,6 +44,12 @@ impl VlessInbound {
 
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
+        self
+    }
+
+    /// Accept multiplexed (smux) sessions on this inbound.
+    pub fn with_mux(mut self, config: MuxConfig) -> Self {
+        self.mux = Some(config);
         self
     }
 }
@@ -67,6 +77,7 @@ impl Inbound for VlessInbound {
         let uuids = self.uuids.clone();
         let pipeline = self.pipeline.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let mux = self.mux.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] VLESS inbound listening on {}", tag, self.listen_addr);
@@ -110,6 +121,7 @@ impl Inbound for VlessInbound {
                 let inbound_tag = tag.clone();
                 let uuids = uuids.clone();
                 let pipe = pipeline.clone();
+                let mux = mux.clone();
 
                 tokio::spawn(async move {
                     let _conn_guard = conn_guard;
@@ -143,6 +155,33 @@ impl Inbound for VlessInbound {
                         }
                     };
 
+                    // A mux session is a normal VLESS connection whose target is
+                    // the reserved mux destination (sing-box convention).
+                    if let Some(mux_config) = &mux
+                        && !req.is_vision
+                        && is_mux_destination(&req.address)
+                    {
+                        let mux_config = mux_config.clone();
+                        let disp = disp.clone();
+                        let session_tag = inbound_tag.clone();
+                        let accept = move |accepted| {
+                            flux_protocol::mux::spawn_mux_dispatcher(
+                                disp.clone(),
+                                session_tag.clone(),
+                                client_addr,
+                                accepted,
+                            )
+                        };
+                        if let Err(e) = flux_protocol::mux::serve(stream, &mux_config, accept).await
+                        {
+                            debug!(
+                                "[{}] mux session from {} ended: {}",
+                                inbound_tag, client_addr, e
+                            );
+                        }
+                        return;
+                    }
+
                     if req.command == VLESS_CMD_TCP {
                         let meta = SessionMeta::new(
                             client_addr,
@@ -163,6 +202,65 @@ impl Inbound for VlessInbound {
                         };
 
                         disp.dispatch_stream(meta, final_stream).await;
+                    } else if req.command == flux_protocol::vless::VLESS_CMD_PACKETADDR {
+                        // sing-box (and Xray's packetaddr mode) send UDP this way:
+                        // every datagram carries its own destination. The request
+                        // header's address is a placeholder, so replies must echo
+                        // the responder address per datagram.
+                        let (pkt_tx, pkt_rx) =
+                            tokio::sync::mpsc::channel::<flux_types::UdpPacket>(128);
+                        let (out_tx, mut out_rx) =
+                            tokio::sync::mpsc::channel::<flux_types::UdpPacket>(128);
+
+                        let meta = SessionMeta::new(
+                            client_addr,
+                            req.address.clone(),
+                            inbound_tag.clone(),
+                            NetworkType::Udp,
+                        );
+
+                        let disp_clone = disp.clone();
+                        tokio::spawn(async move {
+                            disp_clone.dispatch_packet(meta, pkt_rx, out_tx).await;
+                        });
+
+                        let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+                        let read_fut = async move {
+                            while let Ok(packet) =
+                                flux_protocol::udp::decode_vless_packetaddr(&mut read_half).await
+                            {
+                                if pkt_tx.send(packet).await.is_err() {
+                                    break;
+                                }
+                            }
+                        };
+
+                        let write_fut = async move {
+                            while let Some(packet) = out_rx.recv().await {
+                                let encoded = flux_protocol::udp::encode_vless_packetaddr(
+                                    &packet,
+                                    &packet.source,
+                                );
+                                if tokio::io::AsyncWriteExt::write_all(&mut write_half, &encoded)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if tokio::io::AsyncWriteExt::flush(&mut write_half)
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        };
+
+                        tokio::select! {
+                            _ = read_fut => {},
+                            _ = write_fut => {},
+                        }
                     } else if req.command == flux_protocol::vless::VLESS_CMD_UDP {
                         let (pkt_tx, pkt_rx) =
                             tokio::sync::mpsc::channel::<flux_types::UdpPacket>(128);

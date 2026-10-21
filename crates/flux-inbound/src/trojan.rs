@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use flux_protocol::mux::{MuxConfig, is_mux_destination};
 use flux_protocol::trojan::{TROJAN_CMD_CONNECT, TrojanProtocol, hash_trojan_password};
 use flux_types::{Dispatcher, FluxError, FluxResult, Inbound, NetworkType, SessionMeta};
 use std::net::SocketAddr;
@@ -12,6 +13,8 @@ pub struct TrojanInbound {
     password_hashes: Vec<String>,
     pipeline: flux_transport::pipeline::ServerTransportPipeline,
     rate_limiter: Option<Arc<flux_common::RateLimiter>>,
+    /// Accept multiplexed (smux) sessions when set.
+    mux: Option<MuxConfig>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -34,6 +37,7 @@ impl TrojanInbound {
             password_hashes,
             pipeline,
             rate_limiter: None,
+            mux: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -41,6 +45,12 @@ impl TrojanInbound {
 
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
+        self
+    }
+
+    /// Accept multiplexed (smux) sessions on this inbound.
+    pub fn with_mux(mut self, config: MuxConfig) -> Self {
+        self.mux = Some(config);
         self
     }
 }
@@ -68,6 +78,7 @@ impl Inbound for TrojanInbound {
         let hashes = self.password_hashes.clone();
         let pipeline = self.pipeline.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let mux = self.mux.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] Trojan inbound listening on {}", tag, self.listen_addr);
@@ -111,6 +122,7 @@ impl Inbound for TrojanInbound {
                 let inbound_tag = tag.clone();
                 let valid_hashes = hashes.clone();
                 let pipe = pipeline.clone();
+                let mux = mux.clone();
 
                 tokio::spawn(async move {
                     let _conn_guard = conn_guard;
@@ -143,6 +155,32 @@ impl Inbound for TrojanInbound {
                             return;
                         }
                     };
+
+                    if let Some(mux_config) = &mux
+                        && cmd == TROJAN_CMD_CONNECT
+                        && is_mux_destination(&target)
+                    {
+                        let mux_config = mux_config.clone();
+                        let disp = disp.clone();
+                        let session_tag = inbound_tag.clone();
+                        let accept = move |accepted| {
+                            flux_protocol::mux::spawn_mux_dispatcher(
+                                disp.clone(),
+                                session_tag.clone(),
+                                client_addr,
+                                accepted,
+                            )
+                        };
+                        if let Err(e) =
+                            flux_protocol::mux::serve(tls_stream, &mux_config, accept).await
+                        {
+                            debug!(
+                                "[{}] mux session from {} ended: {}",
+                                inbound_tag, client_addr, e
+                            );
+                        }
+                        return;
+                    }
 
                     if cmd == TROJAN_CMD_CONNECT {
                         let meta =

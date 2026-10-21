@@ -1079,11 +1079,36 @@ fn build_layered_outbound(
             framings,
         ));
 
+    // Multiplexing is opt-in per node and only exists for the stream protocols.
+    let mux = node
+        .multiplex
+        .as_ref()
+        .map(|config| config.build())
+        .transpose()?
+        .flatten();
+    if mux.is_some()
+        && !matches!(
+            node.protocol,
+            ProtocolConfig::Vless { .. }
+                | ProtocolConfig::Vmess { .. }
+                | ProtocolConfig::Trojan { .. }
+                | ProtocolConfig::Shadowsocks { .. }
+        )
+    {
+        return Err(FluxError::Config(format!(
+            "outbound '{}': multiplex is only supported for vless, vmess, trojan and shadowsocks",
+            tag
+        )));
+    }
+
     match node.protocol {
         ProtocolConfig::Vless { uuid, flow } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid vless uuid {}: {}", uuid, e)))?;
-            let out = VlessOutbound::new(tag.clone(), parsed_uuid, flow, dialer);
+            let mut out = VlessOutbound::new(tag.clone(), parsed_uuid, flow, dialer);
+            if let Some(mux) = mux.clone() {
+                out = out.with_mux(mux)?;
+            }
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Shadowsocks { password, method } => {
@@ -1091,7 +1116,7 @@ fn build_layered_outbound(
                 .as_deref()
                 .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
                 .unwrap_or_default();
-            let out = flux_outbound::ShadowsocksOutbound::new(
+            let mut out = flux_outbound::ShadowsocksOutbound::new(
                 tag.clone(),
                 target,
                 &password,
@@ -1099,21 +1124,30 @@ fn build_layered_outbound(
                 dialer,
             )
             .with_cipher_kind(cipher_kind);
+            if let Some(mux) = mux.clone() {
+                out = out.with_mux(mux)?;
+            }
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Trojan { password } => {
-            let out = flux_outbound::TrojanOutbound::new(tag.clone(), password, dialer);
+            let mut out = flux_outbound::TrojanOutbound::new(tag.clone(), password, dialer);
+            if let Some(mux) = mux.clone() {
+                out = out.with_mux(mux);
+            }
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Vmess { uuid, security } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid vmess uuid {}: {}", uuid, e)))?;
-            let out = flux_outbound::VmessOutbound::new(
+            let mut out = flux_outbound::VmessOutbound::new(
                 tag.clone(),
                 parsed_uuid,
                 security.as_deref(),
                 dialer,
             );
+            if let Some(mux) = mux.clone() {
+                out = out.with_mux(mux);
+            }
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Socks { username, password } => {
@@ -1382,6 +1416,34 @@ fn build_layered_inbound(
     let tag = node.tag;
     let (addr, is_udp) = parse_inbound_carrier(&node.carrier)?;
     let rate_limiter = node.rate_limit.as_ref().map(|c| c.build());
+    // Multiplexing needs a stream carrier and a stream protocol.
+    let mux = node
+        .multiplex
+        .as_ref()
+        .map(|config| config.build())
+        .transpose()?
+        .flatten();
+    if mux.is_some() && is_udp {
+        return Err(FluxError::Config(format!(
+            "inbound '{}': multiplex requires a tcp carrier",
+            tag
+        )));
+    }
+    if mux.is_some()
+        && !matches!(
+            node.protocol,
+            ProtocolConfig::Vless { .. }
+                | ProtocolConfig::Vmess { .. }
+                | ProtocolConfig::Trojan { .. }
+                | ProtocolConfig::Shadowsocks { .. }
+        )
+    {
+        return Err(FluxError::Config(format!(
+            "inbound '{}': multiplex is only supported for vless, vmess, trojan and shadowsocks",
+            tag
+        )));
+    }
+    let mux = mux.filter(|_| !is_udp);
 
     if is_udp {
         match node.protocol {
@@ -1456,6 +1518,9 @@ fn build_layered_inbound(
             if let Some(rl) = rate_limiter.clone() {
                 ib = ib.with_rate_limiter(rl);
             }
+            if let Some(mux) = mux.clone() {
+                ib = ib.with_mux(mux);
+            }
             inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::Shadowsocks { password, method } => {
@@ -1469,12 +1534,18 @@ fn build_layered_inbound(
             if let Some(rl) = rate_limiter.clone() {
                 ib = ib.with_rate_limiter(rl);
             }
+            if let Some(mux) = mux.clone() {
+                ib = ib.with_mux(mux);
+            }
             inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::Trojan { password } => {
             let mut ib = flux_inbound::TrojanInbound::new(tag, addr, vec![password], pipeline);
             if let Some(rl) = rate_limiter.clone() {
                 ib = ib.with_rate_limiter(rl);
+            }
+            if let Some(mux) = mux.clone() {
+                ib = ib.with_mux(mux);
             }
             inbounds.push(Arc::new(ib));
         }
@@ -1484,6 +1555,9 @@ fn build_layered_inbound(
             let mut ib = flux_inbound::VmessInbound::new(tag, addr, vec![parsed_uuid], pipeline);
             if let Some(rl) = rate_limiter.clone() {
                 ib = ib.with_rate_limiter(rl);
+            }
+            if let Some(mux) = mux.clone() {
+                ib = ib.with_mux(mux);
             }
             inbounds.push(Arc::new(ib));
         }

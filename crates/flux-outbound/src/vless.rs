@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use flux_protocol::mux::{MuxClient, MuxConfig, mux_destination};
 use flux_protocol::udp::{decode_vless_udp_packet, encode_vless_udp_packet};
 use flux_protocol::vless::{VLESS_VERSION, VlessProtocol};
 use flux_types::{
@@ -15,6 +16,8 @@ pub struct VlessOutbound {
     uuid: Uuid,
     flow: Option<String>,
     dialer: Arc<dyn StreamDialer>,
+    /// Stream multiplexer, when `multiplex.enabled` is set on the node.
+    mux: Option<Arc<MuxClient>>,
 }
 
 impl VlessOutbound {
@@ -29,7 +32,51 @@ impl VlessOutbound {
             uuid,
             flow,
             dialer,
+            mux: None,
         }
+    }
+
+    /// Enables multiplexing: every dialled stream is tunnelled over a shared
+    /// smux session instead of its own connection.
+    pub fn with_mux(mut self, config: MuxConfig) -> FluxResult<Self> {
+        if self.flow.as_deref() == Some(flux_protocol::vision::VISION_FLOW) {
+            return Err(FluxError::Config(
+                "multiplex is incompatible with the vless flow 'xtls-rprx-vision'".into(),
+            ));
+        }
+        let mux_dialer = Arc::new(VlessMuxDialer {
+            inner: self.dialer.clone(),
+            uuid: self.uuid,
+        });
+        self.mux = Some(MuxClient::new(mux_dialer, config));
+        Ok(self)
+    }
+}
+
+/// Opens the physical carrier for a multiplexed session: a VLESS request to the
+/// reserved mux destination (exactly what sing-box sends).
+struct VlessMuxDialer {
+    inner: Arc<dyn StreamDialer>,
+    uuid: Uuid,
+}
+
+#[async_trait]
+impl StreamDialer for VlessMuxDialer {
+    async fn dial(&self) -> FluxResult<BoxedStream> {
+        let mut stream = self.inner.dial().await?;
+        VlessProtocol::write_request_header(
+            &mut stream,
+            &self.uuid,
+            NetworkType::Tcp,
+            &mux_destination(),
+            None,
+        )
+        .await?;
+        // The VLESS server answers with its own header before any payload; the
+        // mux session must only ever see the tunnel bytes.
+        Ok(Box::new(flux_protocol::vless::VlessClientStream::new(
+            stream,
+        )))
     }
 }
 
@@ -44,6 +91,9 @@ impl Outbound for VlessOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
+        if let Some(mux) = &self.mux {
+            return mux.dial_stream(&meta.destination).await;
+        }
         let mut stream = self.dialer.dial().await?;
 
         VlessProtocol::write_request_header(
@@ -70,6 +120,9 @@ impl Outbound for VlessOutbound {
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+        if let Some(mux) = &self.mux {
+            return mux.dial_packet(&meta.destination).await;
+        }
         let mut stream = self.dialer.dial().await?;
 
         VlessProtocol::write_request_header(

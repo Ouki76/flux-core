@@ -9,7 +9,13 @@ use uuid::Uuid;
 pub const VLESS_VERSION: u8 = 0x00;
 
 pub const VLESS_CMD_TCP: u8 = 0x01;
+/// Classic UDP: the destination comes from the request header and each datagram
+/// is a bare `[len u16 BE][payload]`.
 pub const VLESS_CMD_UDP: u8 = 0x02;
+/// "Packet address" mode: every datagram carries its own destination, as
+/// `[addr][len u16 BE][payload]`. This is what sing-box emits for UDP traffic, so
+/// an inbound that only understands [`VLESS_CMD_UDP`] cannot serve it.
+pub const VLESS_CMD_PACKETADDR: u8 = 0x03;
 
 pub const VLESS_ATYP_IPV4: u8 = 0x01;
 pub const VLESS_ATYP_DOMAIN: u8 = 0x02;
@@ -279,17 +285,39 @@ impl VlessProtocol {
             }
         }
 
-        let mut cmd_and_port = [0u8; 3];
+        // The command comes first. In packet-address mode (command 3) the header
+        // carries *no* port and *no* address: every datagram supplies its own
+        // destination, so reading a placeholder address here would desynchronise
+        // the stream (this is what sing-box sends for UDP).
+        let mut command_buf = [0u8; 1];
         stream
-            .read_exact(&mut cmd_and_port)
+            .read_exact(&mut command_buf)
             .await
             .map_err(|e| FluxError::Protocol {
                 protocol: "vless",
-                message: format!("failed to read vless command and port: {}", e),
+                message: format!("failed to read vless command: {}", e),
             })?;
+        let command = command_buf[0];
 
-        let command = cmd_and_port[0];
-        let port = u16::from_be_bytes([cmd_and_port[1], cmd_and_port[2]]);
+        if command == VLESS_CMD_PACKETADDR {
+            return Ok(VlessRequest {
+                uuid: client_uuid,
+                command,
+                // Filled in from each datagram by the caller.
+                address: TargetAddress::Ip(std::net::SocketAddr::from(([0, 0, 0, 0], 0))),
+                is_vision: false,
+            });
+        }
+
+        let mut port_buf = [0u8; 2];
+        stream
+            .read_exact(&mut port_buf)
+            .await
+            .map_err(|e| FluxError::Protocol {
+                protocol: "vless",
+                message: format!("failed to read vless port: {}", e),
+            })?;
+        let port = u16::from_be_bytes(port_buf);
 
         let mut atyp_buf = [0u8; 1];
         stream

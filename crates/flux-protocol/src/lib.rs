@@ -1,5 +1,6 @@
 pub mod http;
 pub mod hysteria2;
+pub mod mux;
 pub mod shadowsocks;
 pub mod shadowsocks2022;
 pub mod socks5;
@@ -13,6 +14,7 @@ pub mod wireguard;
 
 pub use http::*;
 pub use hysteria2::*;
+pub use mux::*;
 pub use shadowsocks::*;
 pub use shadowsocks2022::*;
 pub use socks5::*;

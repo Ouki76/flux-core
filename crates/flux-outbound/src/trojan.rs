@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use flux_protocol::mux::{MuxClient, MuxConfig, mux_destination};
 use flux_protocol::socks5::Socks5Handshake;
 use flux_protocol::trojan::TrojanProtocol;
 use flux_protocol::udp::encode_trojan_udp;
@@ -14,6 +15,8 @@ pub struct TrojanOutbound {
     tag: String,
     password_hash: String,
     dialer: Arc<dyn StreamDialer>,
+    /// Stream multiplexer, when `multiplex.enabled` is set on the node.
+    mux: Option<Arc<MuxClient>>,
 }
 
 impl TrojanOutbound {
@@ -28,7 +31,39 @@ impl TrojanOutbound {
             tag: tag.into(),
             password_hash,
             dialer,
+            mux: None,
         }
+    }
+
+    /// Enables multiplexing over a shared smux session.
+    pub fn with_mux(mut self, config: MuxConfig) -> Self {
+        let mux_dialer = Arc::new(TrojanMuxDialer {
+            inner: self.dialer.clone(),
+            password_hash: self.password_hash.clone(),
+        });
+        self.mux = Some(MuxClient::new(mux_dialer, config));
+        self
+    }
+}
+
+/// Opens the physical carrier for a multiplexed session.
+struct TrojanMuxDialer {
+    inner: Arc<dyn StreamDialer>,
+    password_hash: String,
+}
+
+#[async_trait]
+impl StreamDialer for TrojanMuxDialer {
+    async fn dial(&self) -> FluxResult<BoxedStream> {
+        let mut stream = self.inner.dial().await?;
+        TrojanProtocol::write_request_header_with_hash(
+            &mut stream,
+            &self.password_hash,
+            NetworkType::Tcp,
+            &mux_destination(),
+        )
+        .await?;
+        Ok(stream)
     }
 }
 
@@ -43,6 +78,9 @@ impl Outbound for TrojanOutbound {
     }
 
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
+        if let Some(mux) = &self.mux {
+            return mux.dial_stream(&meta.destination).await;
+        }
         let mut stream = self.dialer.dial().await?;
 
         TrojanProtocol::write_request_header_with_hash(
@@ -57,6 +95,9 @@ impl Outbound for TrojanOutbound {
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+        if let Some(mux) = &self.mux {
+            return mux.dial_packet(&meta.destination).await;
+        }
         let mut stream = self.dialer.dial().await?;
 
         TrojanProtocol::write_request_header_with_hash(

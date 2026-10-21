@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use dashmap::DashMap;
+use flux_protocol::mux::{MuxConfig, is_mux_destination};
 use flux_protocol::shadowsocks::{
     CipherKind, ShadowsocksCipher, ShadowsocksStream, TAG_LEN, derive_master_key_for_kind,
     derive_subkey, encode_ss_address,
@@ -24,6 +25,8 @@ pub struct ShadowsocksInbound {
     replay_filter: Arc<flux_protocol::shadowsocks2022::ReplayFilter>,
     pipeline: flux_transport::pipeline::ServerTransportPipeline,
     rate_limiter: Option<Arc<flux_common::RateLimiter>>,
+    /// Accept multiplexed (smux) sessions when set.
+    mux: Option<MuxConfig>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
 }
@@ -42,6 +45,7 @@ impl ShadowsocksInbound {
             replay_filter: Arc::new(flux_protocol::shadowsocks2022::ReplayFilter::new(10000)),
             pipeline: flux_transport::pipeline::ServerTransportPipeline::raw(),
             rate_limiter: None,
+            mux: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
         }
@@ -63,6 +67,12 @@ impl ShadowsocksInbound {
         pipeline: flux_transport::pipeline::ServerTransportPipeline,
     ) -> Self {
         self.pipeline = pipeline;
+        self
+    }
+
+    /// Accept multiplexed (smux) sessions on this inbound.
+    pub fn with_mux(mut self, config: MuxConfig) -> Self {
+        self.mux = Some(config);
         self
     }
 }
@@ -90,6 +100,7 @@ impl Inbound for ShadowsocksInbound {
         let master_key = self.master_key.clone();
         let cipher_kind = self.cipher_kind;
         let replay_filter = self.replay_filter.clone();
+        let mux = self.mux.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!(
@@ -144,6 +155,7 @@ impl Inbound for ShadowsocksInbound {
                 let replay = replay_tcp.clone();
                 let pipe = pipeline_tcp.clone();
                 let master_key = master_key.clone();
+                let mux = mux.clone();
 
                 tokio::spawn(async move {
                     let _conn_guard = conn_guard;
@@ -187,15 +199,22 @@ impl Inbound for ShadowsocksInbound {
                             }
                         };
 
-                        let meta =
-                            SessionMeta::new(client_addr, target, inbound_tag, NetworkType::Tcp);
-
                         let stream: flux_types::BoxedStream = if !extra.is_empty() {
                             Box::new(flux_common::copy::PrefixedStream::new(ss_stream, extra))
                         } else {
                             Box::new(ss_stream)
                         };
 
+                        if let Some(mux_config) = &mux
+                            && is_mux_destination(&target)
+                        {
+                            serve_mux_session(stream, mux_config, &disp, &inbound_tag, client_addr)
+                                .await;
+                            return;
+                        }
+
+                        let meta =
+                            SessionMeta::new(client_addr, target, inbound_tag, NetworkType::Tcp);
                         disp.dispatch_stream(meta, stream).await;
                         return;
                     }
@@ -277,8 +296,6 @@ impl Inbound for ShadowsocksInbound {
                         }
                     };
 
-                    let meta = SessionMeta::new(client_addr, target, inbound_tag, NetworkType::Tcp);
-
                     // Generate server salt and prepare server encoder
                     let salt_len = cipher_kind.salt_len();
                     let mut server_salt = vec![0u8; salt_len];
@@ -297,6 +314,21 @@ impl Inbound for ShadowsocksInbound {
                         pipelined_data,
                     );
 
+                    if let Some(mux_config) = &mux
+                        && is_mux_destination(&target)
+                    {
+                        serve_mux_session(
+                            Box::new(ss_stream),
+                            mux_config,
+                            &disp,
+                            &inbound_tag,
+                            client_addr,
+                        )
+                        .await;
+                        return;
+                    }
+
+                    let meta = SessionMeta::new(client_addr, target, inbound_tag, NetworkType::Tcp);
                     disp.dispatch_stream(meta, Box::new(ss_stream)).await;
                 });
             }
@@ -446,5 +478,24 @@ impl Inbound for ShadowsocksInbound {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
         Ok(())
+    }
+}
+
+/// Runs a multiplexed (smux) session on an authenticated Shadowsocks stream.
+async fn serve_mux_session(
+    stream: flux_types::BoxedStream,
+    config: &MuxConfig,
+    dispatcher: &Arc<dyn Dispatcher>,
+    inbound_tag: &Arc<str>,
+    source: SocketAddr,
+) {
+    let config = config.clone();
+    let disp = dispatcher.clone();
+    let tag = inbound_tag.clone();
+    let accept = move |accepted| {
+        flux_protocol::mux::spawn_mux_dispatcher(disp.clone(), tag.clone(), source, accepted);
+    };
+    if let Err(e) = flux_protocol::mux::serve(stream, &config, accept).await {
+        debug!("[{}] mux session from {} ended: {}", inbound_tag, source, e);
     }
 }

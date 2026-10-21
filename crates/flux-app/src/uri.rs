@@ -475,6 +475,7 @@ impl ProxySpec {
             protocol,
             security,
             framing,
+            multiplex: None,
         })))
     }
 }

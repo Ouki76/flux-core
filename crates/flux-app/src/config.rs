@@ -540,6 +540,97 @@ impl<T> FlexibleList<T> {
     }
 }
 
+/// Stream multiplexing for a node (sing-box compatible smux).
+///
+/// Off by default: enabling it changes the wire format, so both peers must
+/// agree on it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultiplexConfig {
+    /// Enable multiplexing for this node.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Multiplex protocol. Only "smux" is implemented.
+    #[serde(default = "default_mux_protocol")]
+    pub protocol: String,
+    /// Streams carried by one physical connection (0 = unlimited).
+    ///
+    /// Outbound: pooling target - another session is opened when one is full.
+    /// Inbound: hard cap per session, excess streams are refused.
+    #[serde(default = "default_mux_max_streams")]
+    pub max_streams: u32,
+    /// Client: pad the session preface and the first writes.
+    /// Inbound: require the client to pad.
+    #[serde(default)]
+    pub padding: bool,
+    /// Client: maximum number of physical sessions kept open (default 4).
+    #[serde(default)]
+    pub max_connections: Option<u32>,
+    /// NOP keepalive interval in seconds (default 30, 0 disables).
+    #[serde(default)]
+    pub keepalive_secs: Option<u64>,
+    /// Close a session that has had no streams for this many seconds
+    /// (default 300, 0 disables).
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+}
+
+fn default_mux_protocol() -> String {
+    "smux".into()
+}
+
+fn default_mux_max_streams() -> u32 {
+    128
+}
+
+impl Default for MultiplexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            protocol: default_mux_protocol(),
+            max_streams: default_mux_max_streams(),
+            padding: false,
+            max_connections: None,
+            keepalive_secs: None,
+            idle_timeout_secs: None,
+        }
+    }
+}
+
+impl MultiplexConfig {
+    /// Builds the runtime settings, or `None` when multiplexing is disabled.
+    pub fn build(&self) -> FluxResult<Option<flux_protocol::mux::MuxConfig>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let protocol = flux_protocol::mux::MuxProtocol::parse(&self.protocol).ok_or_else(|| {
+            FluxError::Config(format!(
+                "multiplex: unsupported protocol '{}' (only 'smux' is implemented)",
+                self.protocol
+            ))
+        })?;
+        let defaults = flux_protocol::mux::MuxConfig::default();
+        let config = flux_protocol::mux::MuxConfig {
+            protocol,
+            max_streams: self.max_streams,
+            max_connections: self.max_connections.unwrap_or(defaults.max_connections),
+            padding: self.padding,
+            keepalive: match self.keepalive_secs {
+                Some(0) => None,
+                Some(secs) => Some(std::time::Duration::from_secs(secs)),
+                None => defaults.keepalive,
+            },
+            idle_timeout: match self.idle_timeout_secs {
+                Some(0) => None,
+                Some(secs) => Some(std::time::Duration::from_secs(secs)),
+                None => defaults.idle_timeout,
+            },
+            ..defaults
+        };
+        config.validate()?;
+        Ok(Some(config))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayeredOutboundNode {
     pub tag: String,
@@ -549,6 +640,9 @@ pub struct LayeredOutboundNode {
     pub security: Option<FlexibleList<SecurityConfig>>,
     #[serde(default)]
     pub framing: Option<FlexibleList<FramingConfig>>,
+    /// Optional stream multiplexing (off by default).
+    #[serde(default)]
+    pub multiplex: Option<MultiplexConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -563,6 +657,9 @@ pub struct LayeredInboundNode {
     /// Optional connection rate limiting (DoS hardening for public listeners).
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
+    /// Optional stream multiplexing (off by default).
+    #[serde(default)]
+    pub multiplex: Option<MultiplexConfig>,
 }
 
 /// Per-inbound connection rate limiting: per-IP token bucket + global cap.
@@ -692,7 +789,8 @@ pub struct RuleSetConfig {
     pub update_interval: Option<String>,
     /// Optional disk cache file for remote rule sets: the last successfully
     /// fetched content is applied instantly at startup, before any network
-    /// fetch completes. Default: $XDG_CACHE_HOME/flux-core/rulesets/<tag>-<urlhash>.txt
+    /// fetch completes. Default:
+    /// `$XDG_CACHE_HOME/flux-core/rulesets/<tag>-<urlhash>.txt`
     #[serde(default)]
     pub cache_path: Option<String>,
     #[serde(default)]
@@ -1688,6 +1786,66 @@ mod tests {
         assert_eq!(cfg.inbounds.len(), 1);
         assert_eq!(cfg.outbounds.len(), 2);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_multiplex_block_parses_and_builds() {
+        // YAML surface, exactly as documented for users.
+        let yaml = r#"
+inbounds:
+  - tag: vless-in
+    carrier: { type: tcp, listen: 127.0.0.1, listen_port: 8443 }
+    protocol: { type: vless, uuid: "a1b2c3d4-e5f6-7890-1234-56789abcdef0" }
+    multiplex: { enabled: true, protocol: smux, max_streams: 32, padding: true }
+outbounds:
+  - tag: node
+    carrier: { type: tcp, address: 127.0.0.1:443 }
+    protocol: { type: vless, uuid: "a1b2c3d4-e5f6-7890-1234-56789abcdef0" }
+    multiplex: { enabled: true }
+"#;
+        let cfg = Config::from_yaml_str(yaml).expect("yaml config parses");
+        assert!(cfg.validate().is_ok());
+
+        let InboundConfig::Node(node) = &cfg.inbounds[0] else {
+            panic!("expected a layered inbound");
+        };
+        let inbound_mux = node
+            .multiplex
+            .as_ref()
+            .expect("inbound multiplex block")
+            .build()
+            .expect("build")
+            .expect("enabled");
+        assert_eq!(inbound_mux.protocol.as_str(), "smux");
+        assert_eq!(inbound_mux.max_streams, 32);
+        assert!(inbound_mux.padding);
+
+        let OutboundConfig::Node(node) = &cfg.outbounds[0] else {
+            panic!("expected a layered outbound");
+        };
+        let outbound_mux = node
+            .multiplex
+            .as_ref()
+            .expect("outbound multiplex block")
+            .build()
+            .expect("build")
+            .expect("enabled");
+        // Defaults: 128 streams per session, no padding, keepalive on.
+        assert_eq!(outbound_mux.max_streams, 128);
+        assert!(!outbound_mux.padding);
+        assert!(outbound_mux.keepalive.is_some());
+
+        // Multiplexing is off unless explicitly enabled.
+        let disabled = MultiplexConfig::default();
+        assert!(disabled.build().expect("build").is_none());
+
+        // Only smux exists; anything else is a config error.
+        let unsupported = MultiplexConfig {
+            enabled: true,
+            protocol: "yamux".into(),
+            ..Default::default()
+        };
+        assert!(unsupported.build().is_err());
     }
 
     #[test]
