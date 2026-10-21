@@ -302,3 +302,191 @@ impl ServerTransportPipeline {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The pipeline is where every security and framing layer is composed; a bug
+    /// here means the wrong protocol goes on the wire. Each test stands up a real
+    /// server listener, dials it through the client pipeline and asserts a
+    /// byte-exact round trip in both directions.
+    async fn serve_one(server: ServerTransportPipeline) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((socket, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut stream) = server.unwrap(socket).await else {
+                return;
+            };
+            let mut buf = vec![0u8; 9];
+            if stream.read_exact(&mut buf).await.is_err() {
+                return;
+            }
+            assert_eq!(&buf, b"from-cli!");
+            let _ = stream.write_all(b"from-srv!").await;
+            let _ = stream.flush().await;
+            // Give the peer time to read before dropping the stream: dropping an
+            // H2/gRPC response immediately can race the RST_STREAM against the
+            // data, which is a test artefact rather than a tunnel bug.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+        addr
+    }
+
+    async fn round_trip(client: LayeredTransportPipeline) {
+        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(10), client.dial())
+            .await
+            .expect("client handshake must not hang")
+            .expect("client handshake");
+        stream.write_all(b"from-cli!").await.unwrap();
+        stream.flush().await.unwrap();
+        let mut buf = vec![0u8; 9];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_exact(&mut buf),
+        )
+        .await
+        .expect("server must answer")
+        .expect("read");
+        assert_eq!(&buf, b"from-srv!");
+    }
+
+    fn client(addr: std::net::SocketAddr) -> LayeredTransportPipeline {
+        LayeredTransportPipeline::new(TargetAddress::domain("example.com", 443), addr)
+    }
+
+    #[tokio::test]
+    async fn raw_to_raw_round_trips() {
+        let addr = serve_one(ServerTransportPipeline::raw()).await;
+        round_trip(client(addr)).await;
+    }
+
+    #[tokio::test]
+    async fn websocket_round_trips() {
+        let addr = serve_one(ServerTransportPipeline::new(
+            vec![ServerSecurityLayer::None],
+            vec![ServerFramingLayer::WebSocket {
+                path: Some("/tunnel".into()),
+            }],
+        ))
+        .await;
+        let c = client(addr).with_framing(FramingLayer::WebSocket {
+            path: "/tunnel".into(),
+            headers: HashMap::new(),
+        });
+        round_trip(c).await;
+    }
+
+    #[tokio::test]
+    async fn httpupgrade_round_trips() {
+        let addr = serve_one(ServerTransportPipeline::new(
+            vec![ServerSecurityLayer::None],
+            vec![ServerFramingLayer::HttpUpgrade {
+                path: Some("/up".into()),
+            }],
+        ))
+        .await;
+        let c = client(addr).with_framing(FramingLayer::HttpUpgrade {
+            path: "/up".into(),
+            headers: HashMap::new(),
+        });
+        round_trip(c).await;
+    }
+
+    #[tokio::test]
+    async fn http2_round_trips() {
+        let addr = serve_one(ServerTransportPipeline::new(
+            vec![ServerSecurityLayer::None],
+            vec![ServerFramingLayer::Http2],
+        ))
+        .await;
+        let c = client(addr).with_framing(FramingLayer::Http2 {
+            path: "/".into(),
+            headers: HashMap::new(),
+        });
+        round_trip(c).await;
+    }
+
+    #[tokio::test]
+    async fn grpc_round_trips() {
+        let addr = serve_one(ServerTransportPipeline::new(
+            vec![ServerSecurityLayer::None],
+            vec![ServerFramingLayer::Grpc],
+        ))
+        .await;
+        let c = client(addr).with_framing(FramingLayer::Grpc {
+            service_name: "Tun".into(),
+            headers: HashMap::new(),
+        });
+        round_trip(c).await;
+    }
+
+    /// Two layers compose: fragmentation *under* WebSocket framing. The fragment
+    /// layer must not corrupt the framing it wraps.
+    #[tokio::test]
+    async fn fragment_under_websocket_composes() {
+        let addr = serve_one(ServerTransportPipeline::new(
+            vec![ServerSecurityLayer::None],
+            vec![ServerFramingLayer::WebSocket {
+                path: Some("/x".into()),
+            }],
+        ))
+        .await;
+        let c = client(addr)
+            .with_security(SecurityLayer::Fragment(
+                crate::fragment::FragmentationConfig {
+                    enabled: true,
+                    length_min: 2,
+                    length_max: 4,
+                    interval_ms: 1,
+                },
+            ))
+            .with_framing(FramingLayer::WebSocket {
+                path: "/x".into(),
+                headers: HashMap::new(),
+            });
+        round_trip(c).await;
+    }
+
+    /// A path mismatch must be rejected, not silently accepted on the wrong path.
+    #[tokio::test]
+    async fn websocket_path_mismatch_is_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            ServerTransportPipeline::new(
+                vec![ServerSecurityLayer::None],
+                vec![ServerFramingLayer::WebSocket {
+                    path: Some("/expected".into()),
+                }],
+            )
+            .unwrap(socket)
+            .await
+            .map(|_| ())
+        });
+
+        let c = client(addr).with_framing(FramingLayer::WebSocket {
+            path: "/wrong".into(),
+            headers: HashMap::new(),
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), c.dial()).await;
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(10), server_task)
+            .await
+            .expect("server must not hang")
+            .expect("join");
+        assert!(res.is_err(), "a path mismatch must be rejected");
+    }
+
+    #[tokio::test]
+    async fn server_address_survives_construction() {
+        let p = client("127.0.0.1:443".parse().unwrap());
+        assert_eq!(p.server_address().host(), "example.com");
+        assert_eq!(p.server_address().port(), 443);
+    }
+}

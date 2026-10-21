@@ -252,6 +252,7 @@ impl Outbound for ShadowsocksOutbound {
             udp_socket: Arc::new(udp_socket),
             server_addr,
             inner,
+            salt_cipher: parking_lot::Mutex::new(None),
         }))
     }
 }
@@ -268,6 +269,8 @@ pub struct ShadowsocksPacketEndpoint {
     udp_socket: Arc<UdpSocket>,
     server_addr: SocketAddr,
     inner: ShadowsocksPacketEndpointInner,
+    /// One-entry cache of the receive cipher for the peer's current salt.
+    salt_cipher: parking_lot::Mutex<Option<(Vec<u8>, ShadowsocksCipher)>>,
 }
 
 #[async_trait]
@@ -287,16 +290,18 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
                 let subkey = derive_subkey(master_key, &salt);
                 let mut cipher = ShadowsocksCipher::with_kind(*cipher_kind, &subkey);
 
+                // Build `salt || addr || payload` in one buffer and seal the
+                // address+payload region in place: the previous shape allocated a
+                // plaintext Vec, a ciphertext Vec and then copied both, i.e. three
+                // allocations and two copies per datagram.
                 let addr_bytes = encode_ss_address(&packet.destination);
-                let mut plain = Vec::with_capacity(addr_bytes.len() + packet.payload.len());
-                plain.extend_from_slice(&addr_bytes);
-                plain.extend_from_slice(&packet.payload);
-
-                let ciphertext = cipher.encrypt(&plain)?;
-
-                let mut out = Vec::with_capacity(salt_len + ciphertext.len());
+                let mut out = Vec::with_capacity(
+                    salt_len + addr_bytes.len() + packet.payload.len() + TAG_LEN,
+                );
                 out.extend_from_slice(&salt);
-                out.extend_from_slice(&ciphertext);
+                out.extend_from_slice(&addr_bytes);
+                out.extend_from_slice(&packet.payload);
+                cipher.encrypt_tail(&mut out, salt_len)?;
                 out
             }
         };
@@ -364,10 +369,20 @@ impl ShadowsocksPacketEndpoint {
                 }
 
                 let salt = &guard[..salt_len];
-                let subkey = derive_subkey(master_key, salt);
-                let mut cipher = ShadowsocksCipher::with_kind(*cipher_kind, &subkey);
-
-                let plain = cipher.decrypt(&guard[salt_len..len])?;
+                // Peers reuse one salt for a session, so cache the derived cipher:
+                // HKDF-SHA1 plus the AES key schedule otherwise run per datagram.
+                // The guard is scoped so it is released before the `await` below —
+                // a `parking_lot` guard held across an await is not `Send`.
+                let plain = {
+                    let mut cache = self.salt_cipher.lock();
+                    if cache.as_ref().map(|(s, _)| s.as_slice()) != Some(salt) {
+                        let subkey = derive_subkey(master_key, salt);
+                        let cipher = ShadowsocksCipher::with_kind(*cipher_kind, &subkey);
+                        *cache = Some((salt.to_vec(), cipher));
+                    }
+                    let cipher = &mut cache.as_mut().expect("just populated").1;
+                    cipher.decrypt(&guard[salt_len..len])?
+                };
                 if plain.is_empty() {
                     return Err(FluxError::Protocol {
                         protocol: "shadowsocks-udp",
