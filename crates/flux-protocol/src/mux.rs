@@ -2730,7 +2730,7 @@ mod tests {
         }
     }
 
-// =======================================================================
+    // =======================================================================
     // Hardening tests for the untrusted-input paths (security audit)
     // =======================================================================
 
@@ -2743,7 +2743,12 @@ mod tests {
         async fn dial_outbound(&self, _meta: &SessionMeta) -> FluxResult<BoxedStream> {
             Err(smux_err("unused"))
         }
-        async fn bridge_streams(&self, _meta: SessionMeta, _stream: BoxedStream, _out: BoxedStream) {
+        async fn bridge_streams(
+            &self,
+            _meta: SessionMeta,
+            _stream: BoxedStream,
+            _out: BoxedStream,
+        ) {
         }
         async fn dispatch_packet(
             &self,
@@ -2797,10 +2802,7 @@ mod tests {
     ) -> (Arc<MuxSession>, mpsc::Receiver<PendingAccept>) {
         let mut server_side = server_side;
         let mut preface = [0u8; 2];
-        server_side
-            .read_exact(&mut preface)
-            .await
-            .expect("preface");
+        server_side.read_exact(&mut preface).await.expect("preface");
         assert_eq!(preface, [PREFACE_VERSION_0, PREFACE_PROTOCOL_SMUX]);
         let (accepts_tx, accepts_rx) = mpsc::channel::<PendingAccept>(8);
         let session = MuxSession::start(
@@ -3144,10 +3146,8 @@ mod tests {
         let (session, mut accepts_rx) = manual_server_session(server_raw, &config).await;
 
         // A stream and its request, both within the configured frame size.
-        let request = encode_stream_request(
-            &TargetAddress::domain("slow.example", 80),
-            NetworkType::Tcp,
-        );
+        let request =
+            encode_stream_request(&TargetAddress::domain("slow.example", 80), NetworkType::Tcp);
         peer.write_all(&FrameHeader::new(CMD_SYN, 3, 0).encode())
             .await
             .expect("syn");
@@ -3262,7 +3262,11 @@ mod tests {
                 let cmd = (xorshift(&mut rng) % 6) as u8;
                 let stream_id = (xorshift(&mut rng) % 12) as u32;
                 let length = (xorshift(&mut rng) % 128) as u16;
-                let version = if xorshift(&mut rng).is_multiple_of(8) { 2 } else { 1 };
+                let version = if xorshift(&mut rng).is_multiple_of(8) {
+                    2
+                } else {
+                    1
+                };
                 bytes.extend_from_slice(
                     &FrameHeader {
                         version,
@@ -3305,7 +3309,9 @@ mod tests {
             for task in tasks {
                 match tokio::time::timeout(Duration::from_secs(1), task).await {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => assert!(!e.is_panic(), "round {round}: session task panicked: {e}"),
+                    Ok(Err(e)) => {
+                        assert!(!e.is_panic(), "round {round}: session task panicked: {e}")
+                    }
                     Err(_) => panic!("round {round}: session task did not stop"),
                 }
             }

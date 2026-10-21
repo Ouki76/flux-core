@@ -25,9 +25,7 @@ use flux_app::{Config, Instance};
 use flux_dns::doh::DohClient;
 use flux_dns::fakeip::FakeIpPool;
 use flux_dns::resolver::{DnsResolver, DnsRule};
-use flux_dns::wire::{
-    DnsMessage, MAX_SECTION_RECORDS, Message, Name, QTYPE_A, QTYPE_TXT,
-};
+use flux_dns::wire::{DnsMessage, MAX_SECTION_RECORDS, Message, Name, QTYPE_A, QTYPE_TXT};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::str::FromStr;
@@ -189,11 +187,8 @@ async fn forwarded_response_is_capped_to_the_client_udp_size() {
 
     let resp = udp_roundtrip(&cx, &q).await.expect("listener must answer");
     let flags = u16::from_be_bytes([resp[2], resp[3]]);
+    // The reply must be a well-formed message at all, never a chopped one.
     let _ = Message::parse(&resp).expect("the capped response must still be a valid DNS message");
-    let _ = {
-        // The reply must be a well-formed message at all, never a chopped one.
-        let _ = flags;
-    };
     assert!(
         resp.len() <= 512,
         "a UDP reply to a non-EDNS client must fit in 512 bytes, got {} bytes",
@@ -242,8 +237,8 @@ async fn forwarded_response_follows_the_edns0_payload_size() {
 /// Boots a `DnsInbound` (through the real config) whose only upstream is a fake
 /// server that answers every query with a `payload`-byte TXT record.
 async fn fake_hostile_upstream(payload: usize) -> (String, Instance) {
-    let upstream = FakeDns::start(move |name, qtype| Some(respond_large_txt(name, qtype, payload)))
-        .await;
+    let upstream =
+        FakeDns::start(move |name, qtype| Some(respond_large_txt(name, qtype, payload))).await;
 
     let port = portpicker().await;
     let cfg = Config::from_json_str(&format!(
@@ -283,7 +278,8 @@ async fn trailing_dot_does_not_bypass_split_dns_rules() {
     let internal =
         FakeDns::start(|name, qtype| Some(respond_ip(name, qtype, 0, Some([10, 1, 2, 3])))).await;
     let public =
-        FakeDns::start(|name, qtype| Some(respond_ip(name, qtype, 0, Some([203, 0, 113, 5])))).await;
+        FakeDns::start(|name, qtype| Some(respond_ip(name, qtype, 0, Some([203, 0, 113, 5]))))
+            .await;
 
     let resolver = DnsResolver::new(None)
         .with_servers(vec![public.server_string()])
@@ -476,13 +472,10 @@ async fn doh_completes_a_chunked_response_on_a_keepalive_connection() {
 
     let client = DohClient::new(&format!("http://{addr}/dns-query"));
     let name = Name::from_str("example.com").unwrap();
-    let answer = tokio::time::timeout(
-        Duration::from_secs(6),
-        client.query_doh(&name, QTYPE_A),
-    )
-    .await
-    .expect("a chunked DoH answer must not wait for EOF")
-    .expect("chunked DoH answer must be accepted");
+    let answer = tokio::time::timeout(Duration::from_secs(6), client.query_doh(&name, QTYPE_A))
+        .await
+        .expect("a chunked DoH answer must not wait for EOF")
+        .expect("chunked DoH answer must be accepted");
     assert_eq!(
         answer,
         flux_dns::wire::Answer::Address {
@@ -492,13 +485,10 @@ async fn doh_completes_a_chunked_response_on_a_keepalive_connection() {
     );
 
     // The connection must be reused for a second query (keep-alive).
-    let again = tokio::time::timeout(
-        Duration::from_secs(6),
-        client.query_doh(&name, QTYPE_A),
-    )
-    .await
-    .expect("second chunked query must not wait for EOF")
-    .expect("second chunked query must succeed");
+    let again = tokio::time::timeout(Duration::from_secs(6), client.query_doh(&name, QTYPE_A))
+        .await
+        .expect("second chunked query must not wait for EOF")
+        .expect("second chunked query must succeed");
     assert_eq!(again, answer);
 }
 
@@ -516,12 +506,9 @@ fn parser_output_is_bounded() {
     buf.extend_from_slice(&0u16.to_be_bytes());
     // No records follow: the parse must fail (or return few records), never
     // allocate thousands of empty ones.
-    match Message::parse(&buf) {
-        Ok(m) => {
-            assert!(m.questions.len() <= MAX_SECTION_RECORDS);
-            assert!(m.answers.len() <= MAX_SECTION_RECORDS);
-        }
-        Err(_) => {}
+    if let Ok(m) = Message::parse(&buf) {
+        assert!(m.questions.len() <= MAX_SECTION_RECORDS);
+        assert!(m.answers.len() <= MAX_SECTION_RECORDS);
     }
     let _ = HashMap::<String, u16>::new();
 }
@@ -594,7 +581,9 @@ async fn server_failures_are_not_cached_as_negative_answers() {
         .await
         .expect_err("SERVFAIL must not resolve");
     assert!(
-        resolver.cached_ttl_remaining("flaky.example.test").is_none(),
+        resolver
+            .cached_ttl_remaining("flaky.example.test")
+            .is_none(),
         "a server failure must not be remembered as 'does not resolve'"
     );
 
@@ -649,8 +638,11 @@ async fn dns_listener_rate_limits_a_flooding_source() {
     let mut buf = vec![0u8; 512];
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(std::time::Duration::from_millis(100), sock.recv_from(&mut buf))
-            .await
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sock.recv_from(&mut buf),
+        )
+        .await
         {
             Ok(Ok(_)) => answered += 1,
             _ => break,

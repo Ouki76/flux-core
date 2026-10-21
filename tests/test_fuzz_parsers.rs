@@ -414,10 +414,7 @@ fn dns_seed_packets() -> Vec<Vec<u8>> {
         "www.example.com",
         QTYPE_A,
         0x8180,
-        &[
-            (QTYPE_A, 300, vec![192, 0, 2, 1]),
-            (QTYPE_AAAA, 60, aaaa),
-        ],
+        &[(QTYPE_A, 300, vec![192, 0, 2, 1]), (QTYPE_AAAA, 60, aaaa)],
     ));
 
     // In-packet CNAME chain (two hops, then the address).
@@ -475,7 +472,12 @@ fn dns_seed_packets() -> Vec<Vec<u8>> {
     // Truncated-by-design response (TC set) and a compressed owner that points
     // back into the header.
     seeds.push(response("tc.example.com", QTYPE_A, 0x8380, &[]));
-    let mut bad_ptr = response("ptr.example.com", QTYPE_A, 0x8180, &[(QTYPE_A, 30, vec![1, 2, 3, 4])]);
+    let mut bad_ptr = response(
+        "ptr.example.com",
+        QTYPE_A,
+        0x8180,
+        &[(QTYPE_A, 30, vec![1, 2, 3, 4])],
+    );
     let n = bad_ptr.len();
     bad_ptr[n - 12] = 0xC0;
     bad_ptr[n - 11] = 0x02; // pointer to offset 2 (inside the header)
@@ -487,9 +489,7 @@ fn dns_seed_packets() -> Vec<Vec<u8>> {
 /// Every parser reachable from the wire, run on one input. Returns the answer
 /// classification so the caller can assert the chain stayed bounded.
 fn dns_exercise_all_parsers(input: &[u8]) -> Option<flux_dns::wire::Answer> {
-    use flux_dns::wire::{
-        DnsMessage, MAX_NAME_LEN, Message, Name, QTYPE_A, QTYPE_AAAA, QTYPE_TXT,
-    };
+    use flux_dns::wire::{DnsMessage, MAX_NAME_LEN, Message, Name, QTYPE_A, QTYPE_AAAA, QTYPE_TXT};
 
     // Header-only / question paths (these are what the inbound listener hits).
     let _ = DnsMessage::validate_response(input, 0x1234);
@@ -508,8 +508,7 @@ fn dns_exercise_all_parsers(input: &[u8]) -> Option<flux_dns::wire::Answer> {
 
     // Response builders: they must reject junk instead of indexing into it.
     let _ = DnsMessage::build_response(input, Some(std::net::Ipv4Addr::new(198, 18, 0, 1)));
-    let _ =
-        DnsMessage::build_response_ip(input, Some("fc00::1".parse().unwrap()));
+    let _ = DnsMessage::build_response_ip(input, Some("fc00::1".parse().unwrap()));
     let _ = DnsMessage::build_response_ptr(input, &Name::root());
     let _ = DnsMessage::build_response_records(
         input,
@@ -639,7 +638,7 @@ fn fuzz_dns_message_parser_is_bounded() {
 /// name that cannot be encoded.
 #[test]
 fn fuzz_dns_names_and_ptr_helpers() {
-    use flux_dns::wire::{Name, ip_to_ptr_name, ptr_name_to_ip, MAX_NAME_LEN};
+    use flux_dns::wire::{MAX_NAME_LEN, Name, ip_to_ptr_name, ptr_name_to_ip};
     use std::str::FromStr;
 
     let mut rng = Rng(0xfeed_face_dead_0d06);
@@ -663,7 +662,11 @@ fn fuzz_dns_names_and_ptr_helpers() {
         // Hard-coded pathological names.
         let _ = Name::from_str(&"a".repeat(len));
         let _ = Name::from_str(&vec!["a".repeat(63); (len % 6) + 1].join("."));
-        let _ = Name::from_str(&format!("{}..{}", "b".repeat(len % 40), "c".repeat(len % 70)));
+        let _ = Name::from_str(&format!(
+            "{}..{}",
+            "b".repeat(len % 40),
+            "c".repeat(len % 70)
+        ));
     }
 
     // Every address must survive the PTR round-trip; no address may produce a

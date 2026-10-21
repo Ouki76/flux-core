@@ -2112,8 +2112,11 @@ mod tests {
             .windows(3)
             .position(|w| w == [0x00, 0x00, 0x29])
             .expect("OPT record");
-        for (advertised, expected) in [(100u16, 512usize), (1232, 1232), (u16::MAX, MAX_UDP_RESPONSE)]
-        {
+        for (advertised, expected) in [
+            (100u16, 512usize),
+            (1232, 1232),
+            (u16::MAX, MAX_UDP_RESPONSE),
+        ] {
             let mut q = edns.clone();
             q[opt + 3..opt + 5].copy_from_slice(&advertised.to_be_bytes());
             assert_eq!(

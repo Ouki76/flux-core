@@ -79,7 +79,10 @@ async fn wrong_token_is_rejected() {
         "GET /api/v1/status HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer wrong-token\r\nConnection: close\r\n\r\n",
     )
     .await;
-    assert!(status.contains("401"), "wrong token must be 401, got: {status}");
+    assert!(
+        status.contains("401"),
+        "wrong token must be 401, got: {status}"
+    );
     let _ = instance.stop().await;
 }
 
@@ -151,7 +154,10 @@ async fn correct_token_is_accepted() {
         ),
     )
     .await;
-    assert!(status.contains("200"), "correct token must be 200, got: {status}");
+    assert!(
+        status.contains("200"),
+        "correct token must be 200, got: {status}"
+    );
     assert!(
         body.contains("flux-core"),
         "status body must describe the engine, got: {body}"
@@ -190,7 +196,10 @@ async fn rejected_request_does_not_execute_its_side_effect() {
         "PUT /api/v1/outbounds/sel/select HTTP/1.1\r\nHost: localhost\r\nContent-Length: 21\r\nConnection: close\r\n\r\n{\"outbound\":\"blocked\"}",
     )
     .await;
-    assert!(status.contains("401"), "unauthenticated PUT must be 401, got: {status}");
+    assert!(
+        status.contains("401"),
+        "unauthenticated PUT must be 401, got: {status}"
+    );
 
     // The selection must be unchanged.
     let sel = instance.registry.get_outbound("sel").expect("selector");

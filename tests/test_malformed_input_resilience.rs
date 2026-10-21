@@ -144,8 +144,14 @@ async fn garbage_on_stream_inbounds_does_not_break_the_proxy() {
     exists_after_garbage(trojan_port, 0x4567_89ab).await;
 
     // Each listener must still do its job, not merely accept a socket.
-    assert!(socks5_is_alive(socks_port).await, "socks wedged after garbage");
-    assert!(socks5_is_alive(mixed_port).await, "mixed wedged after garbage");
+    assert!(
+        socks5_is_alive(socks_port).await,
+        "socks wedged after garbage"
+    );
+    assert!(
+        socks5_is_alive(mixed_port).await,
+        "mixed wedged after garbage"
+    );
     assert!(
         vless_alive(vless_port, "aa11bb22-cc33-dd44-ee55-ff6677889900").await,
         "vless wedged after garbage"
@@ -226,7 +232,10 @@ async fn garbage_datagrams_do_not_break_the_dns_listener() {
         .await
         .expect("DNS listener stopped answering after garbage")
         .expect("recv");
-    assert!(n >= 12 && buf[0] == 0x12 && buf[1] == 0x34, "unexpected DNS reply");
+    assert!(
+        n >= 12 && buf[0] == 0x12 && buf[1] == 0x34,
+        "unexpected DNS reply"
+    );
 
     let _ = instance.stop().await;
 }
