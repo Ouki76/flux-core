@@ -57,6 +57,10 @@ struct Args {
     /// TUN device MTU. A TUN carries exactly one IP packet per read()/write(),
     /// so this sets how many bytes each syscall can move.
     mtu: usize,
+    /// Skip the kernel-loopback comparison rounds. Iterating on a datapath
+    /// change wants the TUN rounds and their CPU split only; the baseline costs
+    /// wall time and adds unrelated syscall noise to the same process.
+    baseline: bool,
 }
 
 impl Args {
@@ -66,6 +70,7 @@ impl Args {
             bytes_per_round: 256 * 1024 * 1024,
             chunk: 64 * 1024,
             mtu: 1500,
+            baseline: true,
         };
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
@@ -84,10 +89,12 @@ impl Args {
                 args.mtu = (v as usize).clamp(576, 65535);
             } else if let Some(v) = take("--chunk") {
                 args.chunk = (v as usize).clamp(1024, 1024 * 1024);
+            } else if a == "--no-baseline" {
+                args.baseline = false;
             } else if a == "--help" || a == "-h" {
                 println!(
                     "usage: bench_tun [--rounds N] [--bytes BYTES_PER_ROUND] [--chunk BYTES] \
-                     [--mtu BYTES]"
+                     [--mtu BYTES] [--no-baseline]"
                 );
                 std::process::exit(0);
             }
@@ -449,11 +456,15 @@ async fn run(args: Args) {
     // --- warm-up (page faults, ARP, TCP slow start) -------------------------
     let warm = std::cmp::min(args.bytes_per_round, 16 * 1024 * 1024);
     measure_once(client_src, tun_dst, warm, args.chunk).await;
-    measure_once(client_src, kernel_dst, warm, args.chunk).await;
+    if args.baseline {
+        measure_once(client_src, kernel_dst, warm, args.chunk).await;
+    }
 
     // --- TUN rounds ---------------------------------------------------------
     let mut tun_rounds = Vec::new();
     let mut tun_cpu = Vec::new();
+    let mut tun_user = Vec::new();
+    let mut tun_sys = Vec::new();
     for i in 0..args.rounds {
         let (u0, s0) = proc_cpu_split();
         let t0 = Instant::now();
@@ -465,6 +476,8 @@ async fn run(args: Args) {
         let gb = args.bytes_per_round as f64 / 1e9;
         tun_rounds.push(mib_s);
         tun_cpu.push(cpu / gb);
+        tun_user.push(cpu_user / gb);
+        tun_sys.push(cpu_sys / gb);
         println!(
             "  tun    round {}/{}: {:8.2} s  {:9.1} MiB/s  {:.2} CPU s/GB \
              (user {:.2}, sys {:.2})",
@@ -481,24 +494,26 @@ async fn run(args: Args) {
     // --- kernel loopback baseline ------------------------------------------
     let mut base_rounds = Vec::new();
     let mut base_cpu = Vec::new();
-    for i in 0..args.rounds {
-        let cpu0 = proc_cpu_seconds();
-        let t0 = Instant::now();
-        measure_once(client_src, kernel_dst, args.bytes_per_round, args.chunk).await;
-        let elapsed = t0.elapsed();
-        let cpu = proc_cpu_seconds() - cpu0;
-        let mib_s = args.bytes_per_round as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
-        let gb = args.bytes_per_round as f64 / 1e9;
-        base_rounds.push(mib_s);
-        base_cpu.push(cpu / gb);
-        println!(
-            "  kernel round {}/{}: {:8.2} s  {:9.1} MiB/s  {:.2} CPU s/GB",
-            i + 1,
-            args.rounds,
-            elapsed.as_secs_f64(),
-            mib_s,
-            cpu / gb
-        );
+    if args.baseline {
+        for i in 0..args.rounds {
+            let cpu0 = proc_cpu_seconds();
+            let t0 = Instant::now();
+            measure_once(client_src, kernel_dst, args.bytes_per_round, args.chunk).await;
+            let elapsed = t0.elapsed();
+            let cpu = proc_cpu_seconds() - cpu0;
+            let mib_s = args.bytes_per_round as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+            let gb = args.bytes_per_round as f64 / 1e9;
+            base_rounds.push(mib_s);
+            base_cpu.push(cpu / gb);
+            println!(
+                "  kernel round {}/{}: {:8.2} s  {:9.1} MiB/s  {:.2} CPU s/GB",
+                i + 1,
+                args.rounds,
+                elapsed.as_secs_f64(),
+                mib_s,
+                cpu / gb
+            );
+        }
     }
 
     let tun = Report {
@@ -507,29 +522,41 @@ async fn run(args: Args) {
         cpu_s_per_gb: median(tun_cpu),
         rounds: sorted(tun_rounds),
     };
-    let base = Report {
-        label: "kernel loopback (baseline)",
-        mib_s: median(base_rounds.clone()),
-        cpu_s_per_gb: median(base_cpu),
-        rounds: sorted(base_rounds),
-    };
 
     println!("\n=== results (median of {}) ===", args.rounds);
     tun.print();
-    base.print();
-    let throughput_ratio = base.mib_s / tun.mib_s;
-    let cpu_ratio = tun.cpu_s_per_gb / base.cpu_s_per_gb.max(f64::MIN_POSITIVE);
     println!(
-        "TUN overhead vs kernel baseline: {:.1}% of the kernel loopback throughput \
-         ({:.2}x slower), {:.2}x the CPU per byte",
-        tun.mib_s / base.mib_s * 100.0,
-        throughput_ratio,
-        cpu_ratio
+        "  cpu split: user {:.2} s/GB, sys {:.2} s/GB",
+        median(tun_user),
+        median(tun_sys)
     );
+    if args.baseline {
+        let base = Report {
+            label: "kernel loopback (baseline)",
+            mib_s: median(base_rounds.clone()),
+            cpu_s_per_gb: median(base_cpu),
+            rounds: sorted(base_rounds),
+        };
+        base.print();
+        let throughput_ratio = base.mib_s / tun.mib_s;
+        let cpu_ratio = tun.cpu_s_per_gb / base.cpu_s_per_gb.max(f64::MIN_POSITIVE);
+        println!(
+            "TUN overhead vs kernel baseline: {:.1}% of the kernel loopback throughput \
+             ({:.2}x slower), {:.2}x the CPU per byte",
+            tun.mib_s / base.mib_s * 100.0,
+            throughput_ratio,
+            cpu_ratio
+        );
+    }
     println!(
         "served by echo server: {} MiB",
         echo.served.load(Ordering::Relaxed) / (1024 * 1024)
     );
+    // Device-level counters. A datapath change that makes the userspace pump
+    // keep up but lets the kernel-side TUN queue overflow would look like a
+    // throughput *win* in `MiB/s` while actually dropping segments (and paying
+    // for it in retransmissions), so the drops/errors are part of the result.
+    println!("{}", tun_link_counters(TUN));
     if std::env::var_os("FLUX_BENCH_THREADS").is_some() {
         println!("per-thread CPU (ticks of 10 ms):");
         for (ticks, comm) in thread_cpu() {
@@ -546,4 +573,38 @@ fn sorted(v: Vec<f64>) -> Vec<f64> {
     let mut v = v;
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     v
+}
+
+/// `RX`/`TX` bytes, packets, errors and drops of the TUN device.
+///
+/// Parsed out of `ip -s link show` rather than `/sys/class/net/...`: sysfs is
+/// not per network namespace, so inside the throwaway namespace it would read
+/// the host device (or nothing), while `ip` asks netlink.
+fn tun_link_counters(dev: &str) -> String {
+    let Ok(out) = sh(&format!("ip -s link show {dev}")) else {
+        return "device counters: unavailable".to_string();
+    };
+    // "RX:  bytes packets errors dropped missed mcast" followed by the numbers
+    // on the next line; same for TX.
+    let mut lines = out.lines().map(str::trim);
+    let mut grabbed = Vec::new();
+    while let Some(line) = lines.next() {
+        if line.starts_with("RX:") || line.starts_with("TX:") {
+            let dir = if line.starts_with("RX:") { "rx" } else { "tx" };
+            if let Some(nums) = lines.next() {
+                let n: Vec<&str> = nums.split_whitespace().collect();
+                if n.len() >= 4 {
+                    grabbed.push(format!(
+                        "{dir} {:>10} B {:>8} pkt {:>4} err {:>4} drop",
+                        n[0], n[1], n[2], n[3]
+                    ));
+                }
+            }
+        }
+    }
+    if grabbed.is_empty() {
+        "device counters: unparsed".to_string()
+    } else {
+        format!("device counters: {}", grabbed.join("  |  "))
+    }
 }

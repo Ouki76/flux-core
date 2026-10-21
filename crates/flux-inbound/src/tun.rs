@@ -23,21 +23,59 @@ pub struct ParsedPacket {
     pub tcp_flags: u8,
 }
 
+/// Everything [`parse_ip_packet`] extracts, *except* the payload: the payload
+/// stays where it is and is described by `payload` as a byte range.
+///
+/// The datapath only ever needs to classify an inbound frame (is it the SYN
+/// that opens a new port? which UDP port?) before handing the frame to the
+/// stack, and the stack parses the frame again itself. Building a
+/// [`ParsedPacket`] for that would allocate and copy the whole payload once per
+/// inbound packet — at MTU 1500 that is one `malloc` + ~1.4 KiB `memcpy` for
+/// every 1448 bytes carried.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PacketHeader {
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+    pub network: NetworkType,
+    pub tcp_seq: u32,
+    pub tcp_ack: u32,
+    pub tcp_flags: u8,
+    /// Byte range of the L4 payload within the packet that was peeked at.
+    pub payload: std::ops::Range<usize>,
+}
+
 /// Parses raw IP packets (IPv4 and IPv6) into structured session and payload metadata.
 pub fn parse_ip_packet(packet: &[u8]) -> Option<ParsedPacket> {
+    let header = peek_ip_packet(packet)?;
+    Some(ParsedPacket {
+        src: header.src,
+        dst: header.dst,
+        network: header.network,
+        payload: Bytes::copy_from_slice(&packet[header.payload]),
+        tcp_seq: header.tcp_seq,
+        tcp_ack: header.tcp_ack,
+        tcp_flags: header.tcp_flags,
+    })
+}
+
+/// Header-only variant of [`parse_ip_packet`]: no allocation, no payload copy.
+///
+/// Validates exactly the same fields as [`parse_ip_packet`] (they share this
+/// implementation), so a frame accepted here is accepted there too.
+pub fn peek_ip_packet(packet: &[u8]) -> Option<PacketHeader> {
     if packet.is_empty() {
         return None;
     }
 
     let version = packet[0] >> 4;
     match version {
-        4 => parse_ipv4_packet(packet),
-        6 => parse_ipv6_packet(packet),
+        4 => peek_ipv4_packet(packet),
+        6 => peek_ipv6_packet(packet),
         _ => None,
     }
 }
 
-fn parse_ipv4_packet(packet: &[u8]) -> Option<ParsedPacket> {
+fn peek_ipv4_packet(packet: &[u8]) -> Option<PacketHeader> {
     if packet.len() < 20 {
         return None;
     }
@@ -70,15 +108,14 @@ fn parse_ipv4_packet(packet: &[u8]) -> Option<ParsedPacket> {
                 return None;
             }
 
-            let payload = Bytes::copy_from_slice(&packet[ihl + 8..ihl + udp_len]);
-            Some(ParsedPacket {
+            Some(PacketHeader {
                 src: SocketAddr::new(IpAddr::V4(src_ip), src_port),
                 dst: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
                 network: NetworkType::Udp,
-                payload,
                 tcp_seq: 0,
                 tcp_ack: 0,
                 tcp_flags: 0,
+                payload: ihl + 8..ihl + udp_len,
             })
         }
         6 => {
@@ -107,22 +144,21 @@ fn parse_ipv4_packet(packet: &[u8]) -> Option<ParsedPacket> {
                 return None;
             }
 
-            let payload = Bytes::copy_from_slice(&packet[ihl + data_offset..actual_len]);
-            Some(ParsedPacket {
+            Some(PacketHeader {
                 src: SocketAddr::new(IpAddr::V4(src_ip), src_port),
                 dst: SocketAddr::new(IpAddr::V4(dst_ip), dst_port),
                 network: NetworkType::Tcp,
-                payload,
                 tcp_seq: seq,
                 tcp_ack: ack,
                 tcp_flags: flags,
+                payload: ihl + data_offset..actual_len,
             })
         }
         _ => None,
     }
 }
 
-fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
+fn peek_ipv6_packet(packet: &[u8]) -> Option<PacketHeader> {
     if packet.len() < 40 {
         return None;
     }
@@ -180,15 +216,14 @@ fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
                 return None;
             }
 
-            let payload = Bytes::copy_from_slice(&packet[offset + 8..offset + udp_len]);
-            Some(ParsedPacket {
+            Some(PacketHeader {
                 src: SocketAddr::new(IpAddr::V6(src_ip), src_port),
                 dst: SocketAddr::new(IpAddr::V6(dst_ip), dst_port),
                 network: NetworkType::Udp,
-                payload,
                 tcp_seq: 0,
                 tcp_ack: 0,
                 tcp_flags: 0,
+                payload: offset + 8..offset + udp_len,
             })
         }
         6 => {
@@ -217,15 +252,14 @@ fn parse_ipv6_packet(packet: &[u8]) -> Option<ParsedPacket> {
                 return None;
             }
 
-            let payload = Bytes::copy_from_slice(&packet[offset + data_offset..actual_len]);
-            Some(ParsedPacket {
+            Some(PacketHeader {
                 src: SocketAddr::new(IpAddr::V6(src_ip), src_port),
                 dst: SocketAddr::new(IpAddr::V6(dst_ip), dst_port),
                 network: NetworkType::Tcp,
-                payload,
                 tcp_seq: seq,
                 tcp_ack: ack,
                 tcp_flags: flags,
+                payload: offset + data_offset..actual_len,
             })
         }
         _ => None,
@@ -333,7 +367,7 @@ fn set_interface_mtu(name: &str, mtu: usize) -> std::io::Result<()> {
 // Portable smoltcp userspace stack: the channel-driven core (`run_stack_channels`)
 // works on every platform; only the TUN fd pump (`run_stack`) is Unix-gated.
 mod smol_stack {
-    use super::{TCP_SYN, parse_ip_packet};
+    use super::{TCP_SYN, peek_ip_packet};
     use bytes::Bytes;
     use flux_types::{BoxedStream, Dispatcher, NetworkType, SessionMeta, TargetAddress, UdpPacket};
     use futures_util::{Sink, SinkExt, Stream, StreamExt};
@@ -351,22 +385,46 @@ mod smol_stack {
     use std::time::{Duration, Instant};
     use tracing::{debug, info};
 
-    const TCP_SOCKET_BUF_MIN: usize = 64 * 1024;
+    /// Per-connection smoltcp buffer floor, per direction.
+    ///
+    /// A smoltcp socket buffer *is* the advertised TCP window, and on this
+    /// datapath the window — not the CPU — was the binding constraint up to
+    /// about 256 KiB. Measured with `examples/bench_tun.rs` (256 MiB payload
+    /// per round, pooled median over >= 20 rounds, one binary with only this
+    /// constant varied):
+    ///
+    /// ```text
+    /// window     MTU 1500      MTU 9000
+    ///  64 KiB    376 MiB/s     831 MiB/s
+    /// 128 KiB    424 MiB/s    1112 MiB/s
+    /// 256 KiB    459 MiB/s    1196 MiB/s
+    /// 384 KiB    473 MiB/s    1194 MiB/s
+    /// 512 KiB    511 MiB/s     918 MiB/s  (bimodal: rounds split between
+    ///                          ~1450 and ~650 MiB/s)
+    /// ```
+    ///
+    /// The knee at MTU 1500 is the bandwidth-delay product of the userspace
+    /// pipeline (~0.5 ms round trip for a 256 KiB window); below it the
+    /// connection is stop-and-wait, not CPU-bound.
+    ///
+    /// 256 KiB sits in the knee of both curves for 4x the memory of the old
+    /// 64 KiB floor (512 KiB instead of 128 KiB per connection, counting both
+    /// directions). 512 KiB buys another ~11 % at MTU 1500 but doubles that
+    /// memory and destabilises the jumbo path, so it is not the default.
+    const TCP_SOCKET_BUF_MIN: usize = 256 * 1024;
     /// Upper bound on a per-connection smoltcp buffer (2 MiB per connection
     /// counting both directions).
     const TCP_SOCKET_BUF_MAX: usize = 1024 * 1024;
 
     /// Per-connection smoltcp buffer size for a given interface MTU.
     ///
-    /// A smoltcp socket buffer *is* the advertised TCP window, and the window
-    /// has to cover several segments or the connection degenerates into one
-    /// segment per round trip. With a 1500-byte MTU the classic 64 KiB already
-    /// spans 45 segments, so it is kept (per-connection memory stays small).
-    /// With jumbo segments a single 64 KiB buffer holds *one* segment: measured
-    /// at MTU 65535 that stalled this benchmark at 58 MiB/s with the stack
-    /// actor idle 3.4 s out of 3.5 s. Scaling to 4x the MTU restores
-    /// pipelining, and window scaling (smoltcp derives the shift from the
-    /// receive capacity) keeps the advertised window honest above 64 KiB.
+    /// The `mtu * 4` term keeps a window that spans several *jumbo* segments:
+    /// at MTU 65535 a single 64 KiB buffer holds one segment, which measured
+    /// 58 MiB/s with the stack actor idle 3.4 s out of 3.5 s. The floor is what
+    /// covers the bandwidth-delay product of the userspace pipeline at small
+    /// MTUs (see [`TCP_SOCKET_BUF_MIN`]). Window scaling (smoltcp derives the
+    /// shift from the receive capacity) keeps the advertised window honest
+    /// above 64 KiB.
     fn tcp_buffer_size(mtu: usize) -> usize {
         mtu.saturating_mul(4)
             .clamp(TCP_SOCKET_BUF_MIN, TCP_SOCKET_BUF_MAX)
@@ -433,14 +491,29 @@ mod smol_stack {
         pub rxq: VecDeque<Vec<u8>>,
         pub txq: VecDeque<Vec<u8>>,
         pub mtu: usize,
+        /// Buffers whose frame the stack already consumed, kept for reuse by the
+        /// reader. Without this every inbound frame costs one allocation plus a
+        /// full-buffer memset on the actor's critical path.
+        pub rx_pool: Vec<Vec<u8>>,
     }
 
-    pub struct TunRxToken(Vec<u8>);
+    /// Recycled buffers kept for reuse; bounded so a burst cannot pin memory.
+    const RX_POOL_MAX: usize = 64;
+
+    pub struct TunRxToken<'a> {
+        buf: Vec<u8>,
+        pool: &'a mut Vec<Vec<u8>>,
+    }
+
     pub struct TunTxToken<'a>(&'a mut VecDeque<Vec<u8>>);
 
-    impl RxToken for TunRxToken {
-        fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
-            f(&self.0)
+    impl RxToken for TunRxToken<'_> {
+        fn consume<R, F: FnOnce(&[u8]) -> R>(mut self, f: F) -> R {
+            let r = f(&self.buf);
+            if self.pool.len() < RX_POOL_MAX {
+                self.pool.push(std::mem::take(&mut self.buf));
+            }
+            r
         }
     }
 
@@ -454,13 +527,13 @@ mod smol_stack {
     }
 
     impl Device for TunDevice {
-        type RxToken<'a> = TunRxToken;
+        type RxToken<'a> = TunRxToken<'a>;
         type TxToken<'a> = TunTxToken<'a>;
 
         fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-            self.rxq
-                .pop_front()
-                .map(|frame| (TunRxToken(frame), TunTxToken(&mut self.txq)))
+            let frame = self.rxq.pop_front()?;
+            let pool = &mut self.rx_pool;
+            Some((TunRxToken { buf: frame, pool }, TunTxToken(&mut self.txq)))
         }
 
         fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
@@ -679,8 +752,180 @@ mod smol_stack {
         addr.into()
     }
 
+    /// Where the stack actor gets its inbound frames from.
+    ///
+    /// The TUN datapath reads the device itself (see [`FdFrames`]); the
+    /// WireGuard inbound still feeds decrypted frames through a channel. Both
+    /// share the whole actor loop, so the classification, command handling,
+    /// backpressure and half-close state machine has exactly one implementation.
+    enum FrameSource {
+        Channel(tokio::sync::mpsc::Receiver<Vec<u8>>),
+        #[cfg(unix)]
+        Fd(FdFrames),
+    }
+
+    impl FrameSource {
+        /// Next frame that is available *right now*, without waiting.
+        fn try_next(&mut self, pool: &mut Vec<Vec<u8>>) -> Option<Vec<u8>> {
+            match self {
+                FrameSource::Channel(rx) => rx.try_recv().ok(),
+                #[cfg(unix)]
+                FrameSource::Fd(fd) => fd.try_read(pool),
+            }
+        }
+
+        /// Waits for the next frame. `None` means no frame can ever arrive
+        /// again (the carrier is gone).
+        async fn next(&mut self, pool: &mut Vec<Vec<u8>>) -> Option<Vec<u8>> {
+            match self {
+                FrameSource::Channel(rx) => rx.recv().await,
+                #[cfg(unix)]
+                FrameSource::Fd(fd) => fd.read(pool).await,
+            }
+        }
+    }
+
+    /// Inbound TUN frames read directly by the stack actor.
+    ///
+    /// This used to be a separate task that read the device and forwarded each
+    /// frame over a `tokio::sync::mpsc` channel. That cost, per inbound packet,
+    /// one allocation + copy (`buf[..n].to_vec()`), one channel send, one
+    /// receiver wakeup and one context switch between two tasks — for a packet
+    /// the actor was going to touch immediately anyway.
+    ///
+    /// Measured on `bench_tun`, at the old 64 KiB socket buffer the merge was a
+    /// wash: the connection was window-limited, so the hop was never on the
+    /// critical path. With the buffer floor at 256 KiB it is worth **+19.5 %**
+    /// at MTU 1500 (376 -> 449 MiB/s) and −6 % at MTU 9000, where the
+    /// per-frame kernel copy into a fresh buffer costs more than the hop saves;
+    /// the receive pool below is what turns that −6 % into +1 %.
+    ///
+    /// Edge-triggered readiness (mio registers `EPOLLET`) is handled the
+    /// canonical way: every read loop runs until the kernel reports
+    /// `EAGAIN`, and only that `EAGAIN` clears the cached readiness flag, so a
+    /// later arrival always produces a fresh edge. A readiness guard that is
+    /// dropped without a read does not clear anything, which is why the
+    /// non-blocking path uses `try_io` (which does not touch the flag when it
+    /// has no readiness to spend).
+    #[cfg(unix)]
+    struct FdFrames {
+        afd: Arc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
+        /// Read buffer size: one IP packet plus slack for a larger-than-MTU
+        /// frame (the kernel never hands out more than the device MTU).
+        cap: usize,
+    }
+
+    #[cfg(unix)]
+    impl FdFrames {
+        fn new(afd: Arc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>, mtu: usize) -> Self {
+            Self { afd, cap: mtu + 64 }
+        }
+
+        /// One non-blocking `read()` of the device, if it is ready.
+        fn try_read(&mut self, pool: &mut Vec<Vec<u8>>) -> Option<Vec<u8>> {
+            use std::os::fd::AsRawFd;
+            let cap = self.cap;
+            let mut buf = recycle(pool, cap);
+            // `AsyncFd::try_io` returns `WouldBlock` *without* spending the
+            // cached readiness when the device is not ready, so this neither
+            // blocks nor loses an edge.
+            let r = self.afd.try_io(tokio::io::Interest::READABLE, |inner| {
+                read_frame(inner.as_raw_fd(), &mut buf, cap)
+            });
+            match r {
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some(buf)
+                }
+                _ => {
+                    if pool.len() < RX_POOL_MAX {
+                        pool.push(buf);
+                    }
+                    None
+                }
+            }
+        }
+
+        /// Waits for the device to become readable and returns one frame.
+        async fn read(&mut self, pool: &mut Vec<Vec<u8>>) -> Option<Vec<u8>> {
+            use std::os::fd::AsRawFd;
+            loop {
+                let mut guard = match self.afd.readable().await {
+                    Ok(g) => g,
+                    Err(_) => return None,
+                };
+                let cap = self.cap;
+                let mut buf = recycle(pool, cap);
+                match guard.try_io(|inner| read_frame(inner.as_raw_fd(), &mut buf, cap)) {
+                    Ok(Ok(n)) => {
+                        buf.truncate(n);
+                        return Some(buf);
+                    }
+                    // Interrupted: retry the same read.
+                    Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        if pool.len() < RX_POOL_MAX {
+                            pool.push(buf);
+                        }
+                        continue;
+                    }
+                    // Real device error: no frame can ever arrive again.
+                    Ok(Err(_)) => return None,
+                    // Not readable after all (`try_io` spent the readiness):
+                    // wait for the next edge instead of spinning.
+                    Err(_) => {
+                        if pool.len() < RX_POOL_MAX {
+                            pool.push(buf);
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A writable `cap`-byte frame buffer, reusing a recycled one when possible.
+    ///
+    /// This is what keeps the per-frame allocation and the full-buffer memset
+    /// off the actor's critical path: at MTU 9000 that is 9 KiB of
+    /// allocation+zeroing per frame, measured at +7.4 % throughput
+    /// (1247 -> 1339 MiB/s) on the jumbo path.
+    #[cfg(unix)]
+    fn recycle(pool: &mut Vec<Vec<u8>>, cap: usize) -> Vec<u8> {
+        match pool.pop() {
+            Some(mut buf) if buf.capacity() >= cap => {
+                // Restore the length a read needs. Only the bytes the kernel did
+                // not write last time are re-zeroed, so this is usually the
+                // 64-byte slack and not a whole frame.
+                if buf.len() != cap {
+                    buf.resize(cap, 0);
+                }
+                buf
+            }
+            _ => vec![0u8; cap],
+        }
+    }
+
+    /// Reads one IP packet into `frame` (which must be `cap` bytes long).
+    #[cfg(unix)]
+    fn read_frame(fd: std::os::fd::RawFd, frame: &mut [u8], cap: usize) -> std::io::Result<usize> {
+        let n = unsafe { libc::read(fd, frame.as_mut_ptr() as *mut libc::c_void, cap) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let n = n as usize;
+        if n == 0 {
+            // A TUN never reports EOF; treat it as "no frame" so the caller
+            // keeps polling instead of tearing the stack down.
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
+        Ok(n)
+    }
+
     /// Runs the smoltcp stack actor over the TUN file descriptor.
-    /// Spawns fd reader/writer pump tasks and delegates to the channel-driven core.
+    ///
+    /// The actor reads the device itself; only the egress writer is a separate
+    /// task (it has to be able to wait for writability without stalling the
+    /// stack).
     #[cfg(unix)]
     pub(super) async fn run_stack(
         afd: Arc<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>,
@@ -690,48 +935,7 @@ mod smol_stack {
         running: Arc<AtomicBool>,
         shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUN_OUT_CAP);
         let (tun_out_tx, tun_out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(TUN_OUT_CAP);
-
-        // TUN reader task → frames into the actor.
-        {
-            let afd = afd.clone();
-            let running = running.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; mtu + 64];
-                while running.load(Ordering::Relaxed) {
-                    let mut guard = match afd.readable().await {
-                        Ok(g) => g,
-                        Err(_) => break,
-                    };
-                    let n = match guard.try_io(|inner| {
-                        use std::os::fd::AsRawFd;
-                        let res = unsafe {
-                            libc::read(
-                                inner.as_raw_fd(),
-                                buf.as_mut_ptr() as *mut libc::c_void,
-                                buf.len(),
-                            )
-                        };
-                        if res < 0 {
-                            Err(std::io::Error::last_os_error())
-                        } else {
-                            Ok(res as usize)
-                        }
-                    }) {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(_)) => continue,
-                        Err(_) => continue, // WouldBlock: spurious readiness
-                    };
-                    if n == 0 || frame_tx.send(buf[..n].to_vec()).await.is_err() {
-                        if n == 0 {
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            });
-        }
 
         // Actor → TUN writer task.
         {
@@ -789,20 +993,49 @@ mod smol_stack {
             });
         }
 
-        run_stack_channels(mtu, tag, dispatcher, shutdown_rx, frame_rx, tun_out_tx).await;
+        run_stack_core(
+            mtu,
+            tag,
+            dispatcher,
+            shutdown_rx,
+            FrameSource::Fd(FdFrames::new(afd, mtu)),
+            tun_out_tx,
+        )
+        .await;
     }
 
-    /// Channel-driven smoltcp stack actor core. Owns the Interface and SocketSet;
-    /// all socket manipulation happens on this single task (no locking required).
-    ///
-    /// Transport-agnostic: consumed both by the TUN inbound (via fd pump tasks) and
-    /// by the WireGuard inbound (via encrypted tunnel packets).
+    /// Channel-fed smoltcp stack actor core, for transports that decrypt or
+    /// otherwise produce frames in another task (the WireGuard inbound).
     pub(crate) async fn run_stack_channels(
         mtu: usize,
         tag: Arc<str>,
         dispatcher: Arc<dyn Dispatcher>,
+        shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        frame_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        stack_out_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ) {
+        run_stack_core(
+            mtu,
+            tag,
+            dispatcher,
+            shutdown_rx,
+            FrameSource::Channel(frame_rx),
+            stack_out_tx,
+        )
+        .await;
+    }
+
+    /// Smoltcp stack actor core. Owns the Interface and SocketSet;
+    /// all socket manipulation happens on this single task (no locking required).
+    ///
+    /// Transport-agnostic over [`FrameSource`]: the TUN datapath hands the
+    /// device fd over, the WireGuard inbound a channel of decrypted packets.
+    async fn run_stack_core(
+        mtu: usize,
+        tag: Arc<str>,
+        dispatcher: Arc<dyn Dispatcher>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
-        mut frame_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        mut frame_src: FrameSource,
         stack_out_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     ) {
         let start = Instant::now();
@@ -810,6 +1043,7 @@ mod smol_stack {
             rxq: VecDeque::with_capacity(64),
             txq: VecDeque::with_capacity(64),
             mtu,
+            rx_pool: Vec::new(),
         };
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, SmolInstant::ZERO);
@@ -867,74 +1101,71 @@ mod smol_stack {
         // poll; selecting on it unconditionally would spin the CPU at 100%.
         let mut cmd_rx_open = true;
 
+        // Pre-creates the listening socket a new flow needs before the frame is
+        // handed to smoltcp. Header-only: the stack parses the packet again
+        // itself, so a full `parse_ip_packet` here (payload allocation + copy
+        // per inbound packet) was pure overhead on the hot path.
+        fn precreate_listener(
+            frame: &[u8],
+            tcp_buf: usize,
+            sockets: &mut SocketSet<'static>,
+            tcp_listeners: &mut HashMap<u16, SocketHandle>,
+            udp_listeners: &mut HashMap<u16, (SocketHandle, Instant)>,
+        ) {
+            let Some(hdr) = peek_ip_packet(frame) else {
+                return;
+            };
+            match hdr.network {
+                NetworkType::Tcp
+                    if hdr.tcp_flags & TCP_SYN != 0
+                        && hdr.tcp_flags & 0x10 == 0 // pure SYN, no ACK
+                        && !tcp_listeners.contains_key(&hdr.dst.port()) =>
+                {
+                    let mut sock = new_tcp_socket(tcp_buf);
+                    if sock.listen(hdr.dst.port()).is_ok() {
+                        let h = sockets.add(sock);
+                        tcp_listeners.insert(hdr.dst.port(), h);
+                    }
+                }
+                NetworkType::Udp if !udp_listeners.contains_key(&hdr.dst.port()) => {
+                    reap_idle_udp_listeners(udp_listeners, sockets, now_instant());
+                    if let Some(sock) = new_udp_socket(hdr.dst.port()) {
+                        let h = sockets.add(sock);
+                        udp_listeners.insert(hdr.dst.port(), (h, Instant::now()));
+                    }
+                }
+                _ => {}
+            }
+        }
+
         loop {
             // ---- 1. Feed pending inbound frames into the device queue, pre-creating
             //         listener sockets for new flows.
             let mut drained = 0;
             if let Some(frame) = pending_frame.take() {
                 drained += 1;
-                if let Some(parsed) = parse_ip_packet(&frame) {
-                    match parsed.network {
-                        NetworkType::Tcp
-                            if parsed.tcp_flags & TCP_SYN != 0
-                                && parsed.tcp_flags & 0x10 == 0 // pure SYN, no ACK
-                                && !tcp_listeners.contains_key(&parsed.dst.port()) =>
-                        {
-                            let mut sock = new_tcp_socket(tcp_buf);
-                            if sock.listen(parsed.dst.port()).is_ok() {
-                                let h = sockets.add(sock);
-                                tcp_listeners.insert(parsed.dst.port(), h);
-                            }
-                        }
-                        NetworkType::Udp if !udp_listeners.contains_key(&parsed.dst.port()) => {
-                            reap_idle_udp_listeners(
-                                &mut udp_listeners,
-                                &mut sockets,
-                                now_instant(),
-                            );
-                            if let Some(sock) = new_udp_socket(parsed.dst.port()) {
-                                let h = sockets.add(sock);
-                                udp_listeners.insert(parsed.dst.port(), (h, Instant::now()));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                precreate_listener(
+                    &frame,
+                    tcp_buf,
+                    &mut sockets,
+                    &mut tcp_listeners,
+                    &mut udp_listeners,
+                );
                 device.rxq.push_back(frame);
             }
             while drained < 512 {
-                let frame = match frame_rx.try_recv() {
-                    Ok(f) => f,
-                    Err(_) => break,
+                let frame = match frame_src.try_next(&mut device.rx_pool) {
+                    Some(f) => f,
+                    None => break,
                 };
                 drained += 1;
-                if let Some(parsed) = parse_ip_packet(&frame) {
-                    match parsed.network {
-                        NetworkType::Tcp
-                            if parsed.tcp_flags & TCP_SYN != 0
-                                && parsed.tcp_flags & 0x10 == 0 // pure SYN, no ACK
-                                && !tcp_listeners.contains_key(&parsed.dst.port()) =>
-                        {
-                            let mut sock = new_tcp_socket(tcp_buf);
-                            if sock.listen(parsed.dst.port()).is_ok() {
-                                let h = sockets.add(sock);
-                                tcp_listeners.insert(parsed.dst.port(), h);
-                            }
-                        }
-                        NetworkType::Udp if !udp_listeners.contains_key(&parsed.dst.port()) => {
-                            reap_idle_udp_listeners(
-                                &mut udp_listeners,
-                                &mut sockets,
-                                now_instant(),
-                            );
-                            if let Some(sock) = new_udp_socket(parsed.dst.port()) {
-                                let h = sockets.add(sock);
-                                udp_listeners.insert(parsed.dst.port(), (h, Instant::now()));
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+                precreate_listener(
+                    &frame,
+                    tcp_buf,
+                    &mut sockets,
+                    &mut tcp_listeners,
+                    &mut udp_listeners,
+                );
                 device.rxq.push_back(frame);
             }
 
@@ -1321,9 +1552,9 @@ mod smol_stack {
                 // immediately rather than sleeping until unrelated input.
                 _ = std::future::ready(()), if egress_pending => {}
                 // Capture the frame so it is processed next iteration instead of dropped.
-                f = frame_rx.recv() => {
+                f = frame_src.next(&mut device.rx_pool) => {
                     if f.is_none() {
-                        // The carrier reader is gone: no packet can ever enter
+                        // The carrier is gone: no packet can ever enter
                         // the stack again, so the actor has nothing left to do.
                         break;
                     }
@@ -1429,6 +1660,7 @@ mod smol_stack_tests {
             rxq: Default::default(),
             txq: Default::default(),
             mtu: 1500,
+            rx_pool: Default::default(),
         }
     }
 
