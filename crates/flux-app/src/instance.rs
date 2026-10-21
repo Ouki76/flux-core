@@ -881,7 +881,6 @@ fn compile_client_securities(
                     flux_transport::shadowtls::ShadowTlsClientConfig {
                         server_name: sni,
                         password,
-                        insecure: false,
                     },
                 ));
             }

@@ -425,7 +425,10 @@ const TLS_CLIENT_HELLO: u8 = 0x01;
 pub struct ShadowTlsClientConfig {
     pub server_name: String,
     pub password: String,
-    pub insecure: bool,
+    // NOTE: there is deliberately no `insecure` flag. ShadowTLS v3 aborts the
+    // handshake right after ServerHello and never validates the decoy's
+    // certificate: it is camouflage, not a trust channel. Confidentiality and
+    // authentication come from the inner protocol (Shadowsocks/Trojan/VLESS).
 }
 
 #[derive(Clone, Debug)]
