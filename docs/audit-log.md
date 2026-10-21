@@ -125,3 +125,112 @@ port explicitly instead of timing out.
    (measured ceiling: MTU 1500 is already at 85–95 % of its syscall floor).
 4. The suite should surface a busy port as such instead of a start timeout.
 
+
+---
+
+## Cycle 2 — 2026-10-22
+
+### Baseline
+
+Same commands as cycle 1: fmt, clippy `-D warnings`, `cargo test --workspace`
+(516 tests), `cargo audit`, `cargo deny check`, `cargo doc -D warnings` — all
+green at `de7f75d`.
+
+### Coverage — measured for the first time
+
+Earlier cycles could not measure coverage (no rustup, no `llvm-tools`). An
+isolated toolchain was installed into `~/.local/rustup` **without touching the
+system toolchain**, and coverage was collected with `-C instrument-coverage`:
+
+```
+cargo test --workspace --lib --tests          # with RUSTFLAGS=-C instrument-coverage
+llvm-profdata merge -sparse cov-prof/*.profdata
+llvm-cov report --instr-profile=... <test binaries> --ignore-filename-regex='(/rustc/|\.cargo/|/registry/|tests/|examples/)'
+```
+
+Result: **53.25 % of lines, 55.20 % of regions, 55.40 % of functions** across the
+library crates (30,329 regions, 13,588 hit).
+
+Caveat recorded honestly: the number under-reports generic code that is only
+instantiated inside test binaries (e.g. `fragment.rs` reports 0 % although it has
+5 passing tests), so it is used as a *relative* signal, not an absolute score.
+
+Worst files by percentage, with the number of tests that actually exist:
+
+| File | Coverage | Tests |
+|---|---|---|
+| `flux-transport/src/pipeline.rs` | ~0 % | **0** → fixed this cycle |
+| `flux-transport/src/fingerprint.rs` | 26 % | 2 |
+| `flux-transport/src/httpupgrade.rs` | 32 % | 2 |
+| `flux-app/src/ruleset_fetch.rs` | 45 % | – |
+| `flux-transport/src/websocket.rs` | 46 % | 2 |
+| `flux-transport/src/reality.rs` | 50 % | 10 |
+
+### Fixed this cycle
+
+**The dominant finding: one root cause behind three separate "slow" numbers.**
+The `aes-gcm` crate drives AES one block at a time and never pipelines AES-NI.
+Microbenchmarked on 16 KiB records (enc+dec pair): `aes-gcm` 1.75 GB/s vs `ring`
+11.07 GB/s for the identical in-place call. Three protocols and one transport were
+paying it.
+
+| Path | Before | After | CPU s/GB |
+|---|---|---|---|
+| Shadowsocks-2022 (blake3-aes-128-gcm) | 805 MB/s | **3792 MB/s** | 1.23 → 0.27 |
+| Shadowsocks-AEAD (aes-256-gcm) | 748 MB/s | **3323 MB/s** | 1.33 → 0.30 |
+| VMess (aes-128-gcm) | 767 MB/s | **3676 MB/s** | 1.23 → 0.27 |
+| VLESS + REALITY | 375 MB/s | **729 MB/s** | 4.78 → 2.14 |
+| TUN, MTU 1500 | 349 MiB/s | **466 MiB/s** | 6.6 → 6.1 |
+| TUN, jumbo 9000 | 767 MiB/s | **1268 MiB/s** | 3.3 → 2.4 |
+
+REALITY is now faster than the rustls TLS path in the same harness (654 MB/s) and
+at parity with unencrypted VLESS (673 MB/s). Wire compatibility is proved by the
+41 sing-box interop tests and 4 Xray tests, not by inspection.
+
+Two secondary findings worth recording:
+
+- **TUN was window-limited, not syscall-limited.** A socket buffer *is* the
+  advertised window and must cover the bandwidth-delay product, not a segment
+  count; the old 64 KiB floor throttled the flow. Raising it to 256 KiB unlocked
+  the other fixes (the pump merge was worth +19.5 % only once the window stopped
+  being the bottleneck). Cost: 4× per-connection memory, documented in the
+  CHANGELOG with the constant to revert.
+- **A hypothesis that measured wrong and was reverted**: coalescing the record
+  read syscalls in REALITY (2.10 → 0.58 syscalls/record) made the transport 5 %
+  *slower* because the window straddles records and forces compaction memmoves.
+  Reverted rather than kept as a plausible-looking change.
+
+- **`pipeline.rs` had no tests at all** (304 lines, the composition point for every
+  security and framing layer). Added 9: a real listener plus the client pipeline,
+  then a byte-exact round trip through raw, WebSocket, HTTPUpgrade, HTTP/2 and gRPC
+  framing, two layers composed (fragmentation under WebSocket), a path mismatch
+  being rejected, and the accessor contract.
+
+### Test-suite reliability (recurring)
+
+The suite failed twice this session with `AddrInUse` in the mux interop tests.
+Root cause found: **benchmark runs orphan their spawned `flux-core` children**
+when the harness is killed by `timeout`, and those children hold ports in the test
+range. Not a product bug, but it wasted two full runs — cycle 3 should make the
+port allocator resilient to a foreign listener rather than relying on manual
+cleanup.
+
+Final state after cleanup: **525 tests, 0 failed** (was 516; +9 pipeline tests),
+fmt/clippy/audit/deny/doc all green.
+
+### Open: a rare mux teardown race
+
+One full-suite run failed with, in `test_mux_vless_flux_to_singbox`:
+
+```
+read echo: InvalidData: "mux stream closed before the server status byte"
+```
+
+Reproduction attempts: **30 clean runs** (20 isolated, 10 with eight CPU-saturating
+background loops and 8 test threads each) — not reproducible. The message is
+raised when the client's handshake is still waiting for the server's status byte
+and the underlying session reports EOF (`mux.rs:1209`/`:1217`), i.e. a teardown
+race between the peer closing the session and the reply arriving, not a data
+corruption. Cycle 3 should either reproduce it deterministically (e.g. by closing
+the session from the server at a chosen point) or add the session's event state to
+the error so the next occurrence is diagnosable.

@@ -4,6 +4,53 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.2] - 2026-10-22
+
+Audit cycle 2. Coverage was measured for the first time (53 % of lines), then
+four workstreams attacked the weakest measured numbers. The dominant finding was
+that three separate slownesses had the *same* root cause: the `aes-gcm` crate
+drives AES one block at a time and never pipelines AES-NI.
+
+### Performance
+
+- **Shadowsocks-2022, Shadowsocks-AEAD and VMess: 4.5–4.6× faster.**
+  `aes-gcm` 0.10 manages 1.75 GB/s where `ring`'s fused AES-GCM reaches
+  11.07 GB/s for the identical in-place call. On the protocol loopback:
+  SS-2022 805 → 3792 MB/s, SS-AEAD 748 → 3323 MB/s, VMess 767 → 3676 MB/s, with
+  CPU per GB falling from ~1.3 to ~0.27. ChaCha20-Poly1305 was switched too
+  (ring is 1.9× faster). Key schedules are now built once per session, the stream
+  paths seal in place inside the output buffer, and byte-for-byte compatibility is
+  proved by 41 sing-box interop tests.
+- **REALITY: 375 → 729 MB/s, 4.78 → 2.14 CPU s/GB.** Same root cause. REALITY is
+  now *faster* than the rustls TLS path (654 MB/s) and at parity with unencrypted
+  VLESS. Per-record allocations were removed too, but measured as neutral — the
+  AEAD backend was the whole win.
+- **TUN: +33 % at MTU 1500 (349 → 466 MiB/s) and +65 % at jumbo (767 → 1268).**
+  The flow was *window*-limited, not syscall-limited: a socket buffer is the
+  advertised window and must cover the bandwidth-delay product, not a segment
+  count. The floor went from 64 KiB to 256 KiB, which costs 4× per-connection
+  memory (128 → 512 KiB) — revert by changing `TCP_SOCKET_BUF_MIN`. Also: an
+  inbound frame is now header-peeked instead of fully copied, the pump task is
+  merged into the stack actor, and receive buffers are pooled.
+- SS-AEAD UDP no longer derives a subkey and builds a cipher per datagram: the
+  receive cipher is cached per peer salt and the send path seals in place instead
+  of allocating three buffers.
+
+### Added
+
+- **Coverage measurement**: an isolated toolchain in `~/.local/rustup` (the system
+  toolchain is untouched) with `-C instrument-coverage`, recorded in
+  `docs/audit-log.md`. Baseline: 53.25 % of lines.
+- **`pipeline.rs` had no tests at all** (304 lines, the composition point for every
+  security and framing layer). Nine now cover a real listener round trip through
+  raw, WebSocket, HTTPUpgrade, HTTP/2 and gRPC framing, two composed layers, and
+  path-mismatch rejection.
+
+### Notes
+
+- `chacha20poly1305` is no longer a `flux-transport` dependency (ring replaced it).
+- Benchmark numbers in `README.md` were stale by one cycle; refreshed.
+
 ## [1.3.1] - 2026-10-22
 
 Continuous audit, cycle 1. Three workstreams (smux security, DNS security, both

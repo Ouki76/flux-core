@@ -149,14 +149,19 @@ Userspace datapaths (the two that run their own TCP/IP stack):
 
 | Path | Throughput | CPU per GB |
 |---|---|---|
-| **TUN** (smoltcp, default jumbo MTU 9000) | **745 MiB/s** | **3.40 s** |
-| TUN (same code, MTU 1500) | 324 MiB/s | 6.67 s |
+| **TUN** (smoltcp, default jumbo MTU 9000) | **1259 MiB/s** | **2.49 s** |
+| TUN (same code, MTU 1500) | 464 MiB/s | 6.10 s |
 | **WireGuard** (Noise + smoltcp) | **93.6 MB/s** | **21.4 s** |
 | kernel loopback reference | 2.8 GiB/s | 0.31 s |
 
 A TUN device supports no read/write batching (verified with `readv`/`writev`
 probes: it returns exactly one packet per call), so these paths are syscall-bound
 and bytes-per-syscall is the only lever — which is why the default MTU is 9000.
+The other half of the TUN win was the TCP window: a socket buffer *is* the
+advertised window and must cover the bandwidth-delay product, not a segment count.
+Raising the floor from 64 KiB to 256 KiB cost 4x per-connection memory
+(128 → 512 KiB) and bought +33 % at MTU 1500 and +65 % at jumbo; lower
+`TCP_SOCKET_BUF_MIN` in `crates/flux-inbound/src/tun.rs` to trade it back.
 
 | Path | Throughput |
 |---|---|
