@@ -2,6 +2,13 @@ use crate::wire::DnsMessage;
 use flux_types::{FluxError, FluxResult};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Deadline for a complete DoQ query (connect + stream + exchange).
+///
+/// The connection mutex is held across the exchange, so an unresponsive peer
+/// would otherwise block every later lookup to this server forever.
+const DOQ_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct DoqClient {
@@ -119,6 +126,26 @@ impl DoqClient {
             })?
         };
 
+        tokio::time::timeout(
+            DOQ_IO_TIMEOUT,
+            self.query_doq_inner(connect_addr, domain, ecs, qtype),
+        )
+        .await
+        .map_err(|_| {
+            FluxError::Timeout(format!(
+                "DoQ query to {} timed out after {:?}",
+                self.server_host, DOQ_IO_TIMEOUT
+            ))
+        })?
+    }
+
+    async fn query_doq_inner(
+        &self,
+        connect_addr: SocketAddr,
+        domain: &str,
+        ecs: Option<ipnet::IpNet>,
+        qtype: u16,
+    ) -> FluxResult<(IpAddr, u32)> {
         let connection = self.get_connection(connect_addr).await?;
         let (mut send_stream, mut recv_stream) = match connection.open_bi().await {
             Ok(streams) => streams,

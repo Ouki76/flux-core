@@ -8,6 +8,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+/// Deadline for each DoT network step (connect, write, read).
+const DOT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone)]
 pub struct DotClient {
     pub server_host: String,
@@ -83,11 +86,22 @@ impl DotClient {
 
         for attempt in 0..2 {
             if guard.is_none() {
-                match self.connect_stream().await {
-                    Ok(s) => *guard = Some(s),
-                    Err(e) => {
+                // Bound connect/query: a stalled upstream must never hold this
+                // connection (and its mutex) indefinitely.
+                match tokio::time::timeout(DOT_IO_TIMEOUT, self.connect_stream()).await {
+                    Ok(Ok(s)) => *guard = Some(s),
+                    Ok(Err(e)) => {
                         if attempt == 1 {
                             return Err(e);
+                        }
+                        continue;
+                    }
+                    Err(_) => {
+                        if attempt == 1 {
+                            return Err(FluxError::Timeout(format!(
+                                "DoT connect to {} timed out",
+                                self.server_host
+                            )));
                         }
                         continue;
                     }
@@ -97,19 +111,26 @@ impl DotClient {
             let Some(s) = guard.as_mut() else {
                 continue;
             };
-            let write_res = async {
+            let write_res = match tokio::time::timeout(DOT_IO_TIMEOUT, async {
                 s.write_all(&len_bytes).await?;
                 s.write_all(&query).await?;
                 s.flush().await
-            }
-            .await;
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "DoT write timed out",
+                )),
+            };
 
             if write_res.is_err() {
                 *guard = None;
                 continue;
             }
 
-            let read_res = async {
+            let read_fut = async {
                 let mut resp_len_buf = [0u8; 2];
                 s.read_exact(&mut resp_len_buf).await?;
                 let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
@@ -122,8 +143,15 @@ impl DotClient {
                 let mut resp_buf = vec![0u8; resp_len];
                 s.read_exact(&mut resp_buf).await?;
                 Ok(resp_buf)
-            }
-            .await;
+            };
+
+            let read_res = match tokio::time::timeout(DOT_IO_TIMEOUT, read_fut).await {
+                Ok(r) => r,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "DoT read timed out",
+                )),
+            };
 
             match read_res {
                 Ok(resp_buf) => {

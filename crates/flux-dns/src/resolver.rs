@@ -26,12 +26,72 @@ const SHARD_DNS_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(1024) {
 const DEFAULT_DNS_TTL: Duration = Duration::from_secs(300);
 const MIN_DNS_TTL_SECS: u32 = 10;
 const MAX_DNS_TTL_SECS: u32 = 86400;
+/// How long a failed lookup (NXDOMAIN / no records) is remembered.
+const NEGATIVE_DNS_TTL: Duration = Duration::from_secs(10);
 const UDP_POOL_SIZE: usize = 16;
+
+// Thread-local scratch buffer for DNS responses (4 KiB is the classic EDNS size).
+//
+// The buffer is taken for the duration of a query and put back on drop, so a
+// cache miss costs no allocation. (Holding a `RefCell` borrow across an `await`
+// would make the future non-`Send`, hence the take/return guard.)
+thread_local! {
+    static DNS_BUF: std::cell::RefCell<Option<Vec<u8>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Owns the scratch buffer for one query and returns it to the pool on drop.
+///
+/// The buffer is never absent, so `deref_mut` cannot hand out an empty slice that
+/// a caller would then index into.
+struct DnsBuf(Vec<u8>);
+
+impl DnsBuf {
+    fn take() -> Self {
+        let reused = DNS_BUF.with(|b| b.borrow_mut().take());
+        let mut buf = reused.unwrap_or_else(|| vec![0u8; 4096]);
+        if buf.len() != 4096 {
+            buf.resize(4096, 0);
+        }
+        Self(buf)
+    }
+}
+
+impl std::ops::Deref for DnsBuf {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DnsBuf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for DnsBuf {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.0);
+        DNS_BUF.with(|b| *b.borrow_mut() = Some(buf));
+    }
+}
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Hard ceiling for one full `resolve_domain` call, covering every upstream
+/// attempt and retry.
+///
+/// Individual transports are deadline-bounded, but a single lookup can try
+/// several servers (and A+AAAA) in sequence. Connection setup awaits this
+/// call, so without an overall ceiling a pathological upstream set can stall
+/// `dial_outbound` for a very long time and pile up connection tasks.
+const DNS_RESOLVE_DEADLINE: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Debug)]
 struct CachedDnsEntry {
-    ip: IpAddr,
+    /// `None` = negative entry: the name failed to resolve. Clients retrying a
+    /// dead name would otherwise hit the upstream on every attempt.
+    ip: Option<IpAddr>,
     expires_at: Instant,
 }
 
@@ -150,7 +210,9 @@ impl DnsResolver {
         let idx = self.cache_shard_index(&domain_lower);
         let mut cache = self.inner.cache_shards[idx].lock();
         match cache.get(&domain_lower) {
-            Some(entry) if Instant::now() < entry.expires_at => true,
+            // A negative entry means "this name does not resolve", which is not a
+            // cached resolution.
+            Some(entry) if entry.ip.is_some() && Instant::now() < entry.expires_at => true,
             Some(_) => {
                 cache.pop(&domain_lower);
                 false
@@ -199,6 +261,15 @@ impl DnsResolver {
     }
 
     pub async fn resolve_domain(&self, domain: &str, port: u16) -> FluxResult<SocketAddr> {
+        // Reject invalid names up front: the wire encoder cannot represent them,
+        // and silently compiling a *different* name would resolve (and cache) the
+        // wrong host.
+        if !crate::wire::DnsMessage::is_valid_domain(domain) {
+            return Err(FluxError::Dns(format!(
+                "invalid DNS name '{}' (empty label, label > 63 bytes, or name > 255 bytes)",
+                domain
+            )));
+        }
         let domain_lower = domain.to_ascii_lowercase();
 
         // 1. Check sharded LRU DNS cache with TTL expiration
@@ -207,7 +278,18 @@ impl DnsResolver {
             let mut cache = self.inner.cache_shards[shard_idx].lock();
             if let Some(entry) = cache.get(&domain_lower) {
                 if Instant::now() < entry.expires_at {
-                    return Ok(SocketAddr::new(entry.ip, port));
+                    return match entry.ip {
+                        Some(ip) => Ok(SocketAddr::new(ip, port)),
+                        None => Err(FluxError::Dns(format!(
+                            "negative DNS cache: '{}' does not resolve (retry after {}s)",
+                            domain_lower,
+                            entry
+                                .expires_at
+                                .saturating_duration_since(Instant::now())
+                                .as_secs()
+                                .max(1)
+                        ))),
+                    };
                 }
                 cache.pop(&domain_lower);
             }
@@ -238,22 +320,48 @@ impl DnsResolver {
             }
         };
 
-        let result = shared.await;
+        let result = match tokio::time::timeout(DNS_RESOLVE_DEADLINE, shared).await {
+            Ok(r) => r,
+            Err(_) => {
+                self.inner.inflight.remove(&domain_lower);
+                return Err(FluxError::Timeout(format!(
+                    "DNS resolution of '{}' exceeded {:?}",
+                    domain, DNS_RESOLVE_DEADLINE
+                )));
+            }
+        };
         // Drop the inflight entry so future lookups start a fresh upstream query
         // (the cache below absorbs the thundering herd after success).
         self.inner.inflight.remove(&domain_lower);
 
-        let (ip, ttl) = result.map_err(|arc_err| match Arc::try_unwrap(arc_err) {
+        let (ip, ttl) = match result.map_err(|arc_err| match Arc::try_unwrap(arc_err) {
             Ok(e) => e,
             Err(arc) => FluxError::Dns(arc.to_string()),
-        })?;
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                // Cache "this name does not resolve" briefly, but never cache
+                // transport failures (timeouts, I/O): those are transient and the
+                // next attempt may well succeed.
+                if matches!(e, FluxError::Dns(_)) {
+                    self.inner.cache_shards[shard_idx].lock().put(
+                        domain_lower,
+                        CachedDnsEntry {
+                            ip: None,
+                            expires_at: Instant::now() + NEGATIVE_DNS_TTL,
+                        },
+                    );
+                }
+                return Err(e);
+            }
+        };
 
         let cache_ttl =
             Duration::from_secs(u64::from(ttl.clamp(MIN_DNS_TTL_SECS, MAX_DNS_TTL_SECS)));
         self.inner.cache_shards[shard_idx].lock().put(
             domain_lower,
             CachedDnsEntry {
-                ip,
+                ip: Some(ip),
                 expires_at: Instant::now() + cache_ttl,
             },
         );
@@ -294,15 +402,47 @@ impl DnsResolver {
                 futures.push(async move { this.query_server_dual(&s, &d, ecs).await });
             }
 
+            // Remember a transport-level failure separately: those are transient
+            // and must not be cached as "this name does not exist".
+            let mut transport_err: Option<FluxError> = None;
+            let mut last_err: Option<FluxError> = None;
+
             while let Some(res) = futures.next().await {
-                if let Ok(v) = res {
-                    return Ok(v);
+                match res {
+                    Ok(v) => return Ok(v),
+                    Err(e) => {
+                        if matches!(
+                            e,
+                            FluxError::Timeout(_) | FluxError::Io(_) | FluxError::Network(_)
+                        ) && transport_err.is_none()
+                        {
+                            transport_err = Some(match &e {
+                                FluxError::Timeout(m) => FluxError::Timeout(m.clone()),
+                                FluxError::Io(err) => {
+                                    FluxError::Io(std::io::Error::new(err.kind(), err.to_string()))
+                                }
+                                FluxError::Network(m) => FluxError::Network(m.clone()),
+                                other => FluxError::Dns(other.to_string()),
+                            });
+                        }
+                        last_err = Some(e);
+                    }
                 }
             }
 
+            // Surface the transport failure when there was one: `resolve_domain`
+            // only caches `FluxError::Dns` as a negative answer, so collapsing a
+            // timeout into `Dns` would pin "does not resolve" for the whole
+            // negative TTL against its own contract.
+            if let Some(e) = transport_err {
+                return Err(e);
+            }
             return Err(FluxError::Dns(format!(
-                "all configured upstream DNS servers failed to resolve '{}' (prevented DNS leak to system resolver)",
-                domain_lower
+                "all configured upstream DNS servers failed to resolve '{}': {} (prevented DNS leak to system resolver)",
+                domain_lower,
+                last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no upstream responded".into())
             )));
         }
 
@@ -452,7 +592,10 @@ impl DnsResolver {
             .map_err(FluxError::Io)?;
 
         let deadline = Instant::now() + DNS_QUERY_TIMEOUT;
-        let mut buf = vec![0u8; 4096];
+        // Reused query buffer: this path runs for every cache miss (and twice for
+        // a dual-stack lookup), so a fresh 4 KiB allocation per query is pure
+        // churn.
+        let mut buf = DnsBuf::take();
 
         loop {
             let time_left = deadline.saturating_duration_since(Instant::now());

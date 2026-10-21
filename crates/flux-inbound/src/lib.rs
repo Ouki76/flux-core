@@ -1,3 +1,4 @@
+pub mod dns;
 pub mod http;
 pub mod hysteria2;
 pub mod mixed;
@@ -12,6 +13,7 @@ pub mod vless;
 pub mod vmess;
 pub mod wireguard;
 
+pub use dns::*;
 pub use http::*;
 pub use hysteria2::*;
 pub use mixed::*;

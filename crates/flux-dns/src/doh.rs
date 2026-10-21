@@ -10,6 +10,46 @@ use tokio::sync::Mutex;
 
 const DOH_POOL_SIZE: usize = 4;
 
+/// Deadline for each DoH network step (connect, request/response).
+///
+/// Without it a black-holed or MITM-stalled upstream holds the pool slot's
+/// mutex forever, and every later lookup to that server queues behind it —
+/// which in turn starves `dial_outbound` and leaks connection tasks.
+const DOH_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Decodes an HTTP/1.1 chunked body.
+fn decode_chunked(input: &[u8]) -> Result<Vec<u8>, String> {
+    let mut rest = input;
+    let mut out = Vec::with_capacity(input.len());
+    loop {
+        let line_end = rest
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("truncated chunk size line")?;
+        let size_str = std::str::from_utf8(&rest[..line_end])
+            .map_err(|_| "non-UTF-8 chunk size")?
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let size = usize::from_str_radix(&size_str, 16)
+            .map_err(|_| format!("invalid chunk size '{size_str}'"))?;
+        rest = &rest[line_end + 2..];
+        if size == 0 {
+            return Ok(out);
+        }
+        if rest.len() < size {
+            return Err("chunk shorter than declared".into());
+        }
+        out.extend_from_slice(&rest[..size]);
+        rest = &rest[size..];
+        if rest.starts_with(b"\r\n") {
+            rest = &rest[2..];
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct DohClient {
     pub server_ip: String,
@@ -112,22 +152,33 @@ impl DohClient {
 
         for attempt in 0..2 {
             if guard.is_none() {
-                match self.connect_stream().await {
-                    Ok(s) => *guard = Some(s),
-                    Err(e) => {
+                // A stalled/hostile upstream must not hold this pool slot (and
+                // its mutex) forever: every network step is deadline-bounded.
+                let connect = tokio::time::timeout(DOH_IO_TIMEOUT, self.connect_stream()).await;
+                match connect {
+                    Err(_) => {
+                        if attempt == 1 {
+                            return Err(FluxError::Timeout(format!(
+                                "DoH connect to {} timed out",
+                                self.server_ip
+                            )));
+                        }
+                        continue;
+                    }
+                    Ok(Err(e)) => {
                         if attempt == 1 {
                             return Err(e);
                         }
                         continue;
                     }
+                    Ok(Ok(s)) => *guard = Some(s),
                 }
             }
-
             let Some(s) = guard.as_mut() else {
                 continue;
             };
 
-            let query_res = async {
+            let query_fut = async {
                 s.write_all(req.as_bytes()).await?;
                 s.write_all(&query_wire).await?;
                 s.flush().await?;
@@ -157,16 +208,43 @@ impl DohClient {
                 })?;
                 let header_str = String::from_utf8_lossy(&header_buf[..h_end]);
 
-                let mut content_length = 0usize;
-                for line in header_str.lines() {
-                    if let Some((k, v)) = line.split_once(':')
-                        && k.trim().eq_ignore_ascii_case("content-length")
-                    {
-                        content_length = v.trim().parse().unwrap_or(0);
+                // Status line: a captive portal or an error page returns 200-less
+                // bodies that must not be parsed as DNS.
+                let status: u16 = header_str
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "malformed DoH status line",
+                        )
+                    })?;
+                if status != 200 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("DoH server returned HTTP {status}"),
+                    ));
+                }
+
+                let mut content_length: Option<usize> = None;
+                let mut chunked = false;
+                for line in header_str.lines().skip(1) {
+                    if let Some((k, v)) = line.split_once(':') {
+                        let k = k.trim();
+                        let v = v.trim();
+                        if k.eq_ignore_ascii_case("content-length") {
+                            content_length = v.parse().ok();
+                        } else if k.eq_ignore_ascii_case("transfer-encoding")
+                            && v.to_ascii_lowercase().contains("chunked")
+                        {
+                            chunked = true;
+                        }
                     }
                 }
 
-                if content_length > 65536 {
+                if content_length.is_some_and(|l| l > 65536) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "response body too large",
@@ -174,22 +252,59 @@ impl DohClient {
                 }
 
                 let mut body = header_buf[h_end..].to_vec();
-                while body.len() < content_length {
-                    let needed = content_length - body.len();
-                    let to_read = needed.min(chunk.len());
-                    let n = s.read(&mut chunk[..to_read]).await?;
-                    if n == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "EOF reading DoH body",
-                        ));
+                match content_length {
+                    Some(expected) if !chunked => {
+                        while body.len() < expected {
+                            let needed = expected - body.len();
+                            let to_read = needed.min(chunk.len());
+                            let n = s.read(&mut chunk[..to_read]).await?;
+                            if n == 0 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "EOF reading DoH body",
+                                ));
+                            }
+                            body.extend_from_slice(&chunk[..n]);
+                        }
+                        body.truncate(expected);
                     }
-                    body.extend_from_slice(&chunk[..n]);
+                    _ => {
+                        // No Content-Length (chunked or close-delimited): read to
+                        // EOF with a hard cap instead of assuming an empty body,
+                        // which made every such server fail.
+                        loop {
+                            if body.len() > 65536 {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "response body too large",
+                                ));
+                            }
+                            let n = s.read(&mut chunk).await?;
+                            if n == 0 {
+                                break;
+                            }
+                            body.extend_from_slice(&chunk[..n]);
+                        }
+                    }
                 }
 
+                let body = if chunked {
+                    decode_chunked(&body)
+                        .map_err(|m| std::io::Error::new(std::io::ErrorKind::InvalidData, m))?
+                } else {
+                    body
+                };
+
                 Ok(body)
-            }
-            .await;
+            };
+
+            let query_res = match tokio::time::timeout(DOH_IO_TIMEOUT, query_fut).await {
+                Ok(r) => r,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "DoH query timed out",
+                )),
+            };
 
             match query_res {
                 Ok(body) => {
@@ -285,5 +400,29 @@ mod tests {
         assert_eq!(ip2, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
 
         assert!(doh.counter.load(Ordering::Relaxed) >= 2);
+    }
+}
+
+#[cfg(test)]
+mod body_decoding_tests {
+    use super::decode_chunked;
+
+    #[test]
+    fn decodes_chunked_bodies() {
+        let body = b"4\r\ntest\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked(body).unwrap(), b"test");
+    }
+
+    #[test]
+    fn decodes_multiple_chunks_with_extensions() {
+        let body = b"3;x=y\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+        assert_eq!(decode_chunked(body).unwrap(), b"abcde");
+    }
+
+    #[test]
+    fn rejects_truncated_and_malformed() {
+        assert!(decode_chunked(b"5\r\nab").is_err());
+        assert!(decode_chunked(b"zz\r\nx\r\n").is_err());
+        assert!(decode_chunked(b"no-crlf").is_err());
     }
 }
