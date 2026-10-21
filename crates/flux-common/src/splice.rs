@@ -160,6 +160,9 @@ async fn splice_direction(
                     };
                     if res < 0 {
                         let err = io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EINTR) {
+                            continue; // interrupted by a signal: retry
+                        }
                         if err.kind() == io::ErrorKind::WouldBlock
                             || err.raw_os_error() == Some(libc::ENOSPC)
                         {
@@ -208,6 +211,9 @@ async fn splice_direction(
                         };
                         if res < 0 {
                             let err = io::Error::last_os_error();
+                            if err.raw_os_error() == Some(libc::EINTR) {
+                                continue; // interrupted by a signal: retry
+                            }
                             if err.kind() == io::ErrorKind::WouldBlock
                                 || err.raw_os_error() == Some(libc::ENOSPC)
                             {

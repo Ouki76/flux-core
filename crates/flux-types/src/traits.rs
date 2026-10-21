@@ -83,6 +83,19 @@ pub trait Outbound: Send + Sync {
         vec![]
     }
 
+    /// Whether a single UDP endpoint may carry traffic for **multiple**
+    /// destinations.
+    ///
+    /// Most outbounds encode the destination inside every datagram (direct,
+    /// Shadowsocks, SOCKS5 UDP, Trojan, VLESS), so one endpoint is enough and the
+    /// dispatcher caches it per outbound tag. Protocols that establish a
+    /// per-destination association — VMess, whose UDP framing is a bare
+    /// length-prefixed stream — must return `true`, otherwise the first
+    /// destination's association silently serves every later destination.
+    fn udp_endpoint_per_destination(&self) -> bool {
+        false
+    }
+
     /// Graceful shutdown hook for background tasks (e.g. probing loops).
     fn stop(&self) {}
 }
