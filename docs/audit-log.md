@@ -128,6 +128,94 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 7 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 762 tests, audit, deny, doc — green at `7e7d326`.
+
+### The Hysteria 2 stall: diagnosed, not fixed
+
+The open item from cycle 6 is now attributed with a decisive experiment rather than
+a guess. Phase timings on loopback:
+
+| phase | time |
+|---|---|
+| server start | 1.6 ms |
+| QUIC connect | 3.2 ms |
+| `send_request` | 52 µs |
+| **`recv_response`** | **5.15 s** |
+| echo round trip | 1.1 ms |
+| second dial (reused connection) | 0.57 ms |
+
+A **raw quinn client** driving the *same* server completes the whole round trip in
+**1.17 ms** (`h3_lite::latency_tests::raw_quinn_round_trip_is_fast`). So our h3
+server is not the problem at all: the ~5.5 s lives in the `h3` crate's client path
+that we use for authentication — the driver task stays alive and polling (verified),
+the QPACK field section carries no dynamic-table dependency (verified), and quinn
+delivers the bytes promptly.
+
+Recorded rather than rushed: the fix is to replace or wrap that client driver, which
+is a structural change worth its own cycle. `tests/test_hy2_latency.rs` keeps the
+phase breakdown and asserts a bound *below* the observed stall, so a further
+regression is caught while the known one is documented instead of hidden.
+
+### instance.rs — 4 lifecycle defects (7 tests, 0 → 7)
+
+1702 lines with no unit tests, owning start/stop and the state every listener
+depends on:
+
+- **A half-started instance leaked its listeners**: `start()` bound inbounds in a
+  loop and returned on the first failure, leaving earlier ones bound and accepting
+  (quietly, because every listener sets SO_REUSEPORT).
+- **A failed reload candidate kept stealing traffic**: the SIGHUP path starts the
+  candidate before stopping the old instance, so a candidate failing after binding
+  the live port kept accepting half the connections for the "old" config. This is
+  the worst of the four — a reload failure silently split traffic between two
+  configurations.
+- **`start()` twice bound everything twice**: SO_REUSEPORT made the second bind
+  succeed, spawning a second accept loop per inbound.
+- **A restart silently stopped refreshing remote rule sets**: `fetch_cancel` was a
+  one-shot token cancelled by `stop()` and reused by `start()`, so after any
+  restart the fetch loops exited on their first poll.
+
+All four are proved by reverting the fix. The tests use `yield_now()` plus a
+deadline rather than sleeps, and assert task hygiene with the runtime's own alive
+task count.
+
+### gRPC — 13 defect groups (4 → 57 tests)
+
+The worst: **trailers were never read**. A response carrying `grpc-status: 7`
+(aborted) or `13` (internal error) arrived as a clean end of stream, so a failed or
+truncated tunnel looked successful to the caller. Also: the compression flag was
+never read (a compressed message parsed as plaintext); an under-declared inner
+length silently dropped bytes; a payload without the `0x0A` tag was delivered raw
+(two encodings for one message, inner check bypassable); the client never checked
+the response content type, so a `text/html` captive portal was spliceable; the
+server accepted **any** HTTP/2 request as a tunnel; the server answered with
+`application/octet-stream`; a config service name was interpolated into `:path`
+unvalidated; `poll_shutdown` sent trailers without draining a half-written frame;
+and a framing error did not poison the reader.
+
+`GrpcStream` now owns its own h2 streams because `H2Stream` discards response
+headers and never polls trailers — `grpc-status` was unreachable from above it.
+`h2.rs` is untouched; the cost is ~130 duplicated lines of handshake/flow control,
+recorded as the next refactor.
+
+### Routed for the next cycle
+
+- `Inbound::stop()` is fire-and-forget: `Instance::stop()` returns before the
+  listener FD closes, so a caller that binds immediately can still see
+  `EADDRINUSE`. Needs the accept-loop `JoinHandle` awaited in `stop()` — a
+  cross-crate trait change.
+- `TrafficMeter::new()` spawns a 1 s sampler inside `Instance::new` that `stop()`
+  cannot stop (it exits only when the instance drops), so a stopped-but-alive
+  instance always holds one task.
+- `ApiServer::start()` deliberately binds without SO_REUSEPORT, so zero-downtime
+  reload is impossible for the API port; `main.rs` special-cases only tun/wireguard.
+
+---
+
 ## Cycle 6 — 2026-10-22
 
 ### Baseline
