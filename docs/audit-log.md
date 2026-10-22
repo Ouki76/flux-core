@@ -128,6 +128,69 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 3 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 525 tests, audit, deny, doc — green at `a45d9f5`.
+
+### The weakest measured dimension: WireGuard — now 3.5x its starting point
+
+| | cycle 0 | cycle 1 | cycle 3 |
+|---|---|---|---|
+| throughput | 58 MB/s | 93.6 MB/s | **205.6 MB/s** |
+| CPU per GB | 50.3 s | 21.4 s | **9.34 s** |
+
+What did it, in the order it was found:
+
+1. **ring's ChaCha20-Poly1305** instead of the RustCrypto crate (the same 1.9x
+   backend gap that cycle 2 found for AES-GCM in three other protocols), with the
+   key schedule expanded once per session rather than per packet.
+2. **UDP GSO (`UDP_SEGMENT`)**: equal-sized datagrams sharing a destination become
+   one super-packet, so N datagrams cost one syscall, one route lookup and one skb.
+   Measured per datagram: plain `sendto` 5.0 CPU s/GB, `sendmmsg` 4.2,
+   `sendmsg`+`UDP_SEGMENT` **0.8**. Sender-side only, so a stock WireGuard peer
+   sees ordinary datagrams — verified against the real interop peer.
+3. Graceful degradation: the first rejected control message disables GSO
+   permanently and falls back to `sendmmsg`; `WG_NO_GSO_RX`/`TX` force it off.
+
+Verified independently: 205.6 MB/s over 5x48 MiB (min 202.9, max 211.5 — no
+bimodality), CPU 9.34 s/GB, RSS 25 MiB, byte-for-byte integrity, half-close still
+correct.
+
+The TCP-window hypothesis (from the TUN finding) was **tested and rejected here**:
+`WG_TCP_BUF` stayed at 64 KiB because widening it did not pay on this path. Worth
+recording, because it was the prior I gave the agent and it was wrong.
+
+### Fixed: the mux teardown race (closed, not deferred)
+
+The one-off `mux stream closed before the server status byte` was investigated by
+exhaustion of the teardown paths and turned out to be a **legitimate** session
+teardown, not a premature close. The actual defect was the diagnostic: six
+distinct events shared one byte-identical message, one of them described falsely,
+and it was `InvalidData` rather than `UnexpectedEof`. Reading those paths also
+found a real hang (`open_stream` racing `close()`), now fixed. Five deterministic
+reproductions fail on the old code (27 passed / 5 failed) and pass on the new
+(32 / 0). See `docs/mux-teardown-race.md`.
+
+### Fixed: test-suite port collisions — including one I caused myself
+
+Two `AddrInUse` failures traced to the port allocator probing with `bind()` while
+every flux listener holds ports with `SO_REUSEPORT`, so a leftover listener was
+invisible to the probe. The probe now also *connects*: a free port refuses.
+
+The honest part: the first version of that fix put a test in `tests/common/mod.rs`
+that **wrote to the shared port counter**, and because that module is compiled into
+every integration binary, the test ran concurrently with real tests and handed out
+duplicate ports — the exact failure it was meant to prevent. It now tests the pure
+`port_is_free` helper and never touches the counter.
+
+### State
+
+**552 tests, 0 failed** (was 525). fmt/clippy/audit/deny/doc green.
+
+---
+
 ## Cycle 2 — 2026-10-22
 
 ### Baseline
