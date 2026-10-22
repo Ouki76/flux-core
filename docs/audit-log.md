@@ -128,6 +128,83 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 10 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 835 tests, audit, deny, doc — green at `7057588`.
+
+### Router — 7 defects, five of them routing traffic to the wrong outbound
+
+A wrong routing decision is a privacy leak in one direction (traffic meant to be
+tunnelled goes direct) and a breakage in the other, so the matcher was attacked
+adversarially rather than read.
+
+| Defect | Direction |
+|---|---|
+| A trailing root dot (`example.com.`) never matched — the rule was dropped | **under-match → leak to `final`** |
+| The index canonicalised a pattern but the matcher compared it raw, so a mixed-case pattern matched the apex but not subdomains | under-match → leak |
+| `*.example.com` was accepted by the parser and dead in the matcher (no host contains `*`), so wildcard lists matched nothing | under-match → leak |
+| A v4-mapped IPv6 address missed every v4 rule | under-match → leak |
+| `Router::default()` returned an empty tag | wrong routing |
+| An **empty keyword matched every domain** (`contains("")` is always true), so one truncated feed line routed all traffic to that rule's outbound — and since it counted as parsed it also defeated the cycle-4 refresh guard and replaced a working list | over-match |
+| A malformed CIDR counted as parsed, then vanished at compile, so a rule set reported itself complete while matching less | silent under-match |
+
+The domain matcher is now one allocation-free, label-bounded, case-insensitive
+implementation shared by rules, rule sets and the router index, with a 6000-case
+differential test against a linear scan.
+
+### Buffer pool — the previous tenant's bytes were handed to the next caller
+
+`acquire()` returned a recycled buffer at full length with the previous connection's
+bytes still in it (`len` was normalised *up*, never to zero). No in-tree consumer
+read them — each does `read`/`recv_from` and slices `..n` — so there was no live
+leak, but the invariant was a doc comment, an old test pinned the dangerous
+behaviour as intended, and the changelog advertised it as a 48 % win.
+
+**Decision: the release scrubs.** It costs ~471 ns per 64 KiB (~6 % of one core on
+the UDP receive path at the README's packet rate) and reverses a measured decision,
+which is the trade I want for a disclosure primitive in shared-crate API. The
+sized-release API (`release_used(buf, len)`, ~10 ns) is the recorded optimisation —
+it needs every caller to report truthfully, so it is an API discipline decision, not
+a drop-in. README and CHANGELOG now describe what the code does.
+
+Six more defects in the same crate: `max_capacity` ignored below 16 (a pool of 4
+could hold 16 buffers); the rate limiter's overflow sweep **cleared the whole map**,
+resetting every client's bucket including the attacker's — a per-IP limit that could
+be switched off on demand (now three-tier, state-ordered eviction that never
+clears); a flat sweep horizon reclaimed nothing; a zero-size pool handed out empty
+buffers so every read returned EOF; an unbounded `buffer_size` OOM-aborted on first
+acquire; and a pool could pin an inflated allocation.
+
+### gRPC capacity — one defect, and the real shape of the gap
+
+`poll_send_some` called `poll_capacity` unconditionally, which reports *newly*
+granted capacity and stays `Pending` otherwise — so every 16 KiB message waited for
+the next WINDOW_UPDATE, a scheduler round trip per message. Using the capacity
+`SendStream::capacity()` already holds took one-way gRPC from 279 to 336-510 MB/s.
+
+The benchmark gained a one-way mode, because the echo shape couples the directions
+and that coupling turned out to dominate:
+
+| layer | one-way | full-duplex |
+|---|---|---|
+| raw | 3651 | 2179 |
+| ws | 963 | 527 |
+| h2 | 702 | 133 |
+| grpc | 336 | 109 |
+
+Full-duplex HTTP/2 and gRPC run at ~6 % of raw. It is not per-message framing (a
+4–64 KiB sweep is non-monotonic; 256 KiB is worse) and not a missing driver task
+(both spawn one), so the next cycle needs a profiler-level look at the h2 layer in
+bidirectional mode rather than more guessing.
+
+### State
+
+**893 tests, 0 failed** (was 835).
+
+---
+
 ## Cycle 9 — 2026-10-22
 
 ### Baseline
