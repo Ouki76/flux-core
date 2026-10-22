@@ -226,10 +226,9 @@ mod tests {
         }
 
         fn u8(&mut self) -> Result<u8, String> {
-            let v = *self
-                .buf
-                .get(self.pos)
-                .ok_or_else(|| format!("truncated: u8 at offset {} of {}", self.pos, self.buf.len()))?;
+            let v = *self.buf.get(self.pos).ok_or_else(|| {
+                format!("truncated: u8 at offset {} of {}", self.pos, self.buf.len())
+            })?;
             self.pos += 1;
             Ok(v)
         }
@@ -344,7 +343,9 @@ mod tests {
         let suite_len_at = c.pos();
         let suite_len = c.u16()? as usize;
         if suite_len == 0 || !suite_len.is_multiple_of(2) {
-            return Err(format!("cipher-suite list length {suite_len} is not an even, non-zero u16"));
+            return Err(format!(
+                "cipher-suite list length {suite_len} is not an even, non-zero u16"
+            ));
         }
         let suite_raw = c.take(suite_len)?;
         let cipher_suites: Vec<u16> = suite_raw
@@ -474,13 +475,21 @@ mod tests {
                 .iter()
                 .filter(|cs| cs.tls13().is_some())
                 .collect();
-            assert_eq!(tls13.len(), 3, "{name}: must offer exactly the three TLS 1.3 suites");
+            assert_eq!(
+                tls13.len(),
+                3,
+                "{name}: must offer exactly the three TLS 1.3 suites"
+            );
             assert!(
-                provider.cipher_suites[..3].iter().all(|cs| cs.tls13().is_some()),
+                provider.cipher_suites[..3]
+                    .iter()
+                    .all(|cs| cs.tls13().is_some()),
                 "{name}: the three TLS 1.3 suites must come first"
             );
             assert!(
-                provider.cipher_suites[3..].iter().all(|cs| cs.tls13().is_none()),
+                provider.cipher_suites[3..]
+                    .iter()
+                    .all(|cs| cs.tls13().is_none()),
                 "{name}: no TLS 1.3 suite may appear after a TLS 1.2 suite"
             );
             for required in [0x1301u16, 0x1302, 0x1303] {
@@ -493,7 +502,11 @@ mod tests {
             // Duplicated suites make a ClientHello malformed-looking and are
             // trivially detectable.
             let unique: HashSet<u16> = suites.iter().copied().collect();
-            assert_eq!(unique.len(), suites.len(), "{name}: duplicate cipher suite in the table");
+            assert_eq!(
+                unique.len(),
+                suites.len(),
+                "{name}: duplicate cipher suite in the table"
+            );
 
             // Key-exchange groups: X25519 first, then the NIST curves.
             assert_eq!(
@@ -547,8 +560,17 @@ mod tests {
         // Near misses must NOT silently resolve to a profile: a typo in a
         // config would otherwise negotiate a fingerprint the user did not ask for.
         for bad in [
-            "", " ", "chromeos", "chrome120", "chrome 120", "ff", "safari_ios_17", "randomize",
-            "unknown", "chrom", "firefoxes",
+            "",
+            " ",
+            "chromeos",
+            "chrome120",
+            "chrome 120",
+            "ff",
+            "safari_ios_17",
+            "randomize",
+            "unknown",
+            "chrom",
+            "firefoxes",
         ] {
             assert_eq!(TlsFingerprint::parse_str(bad), None, "must reject {bad:?}");
         }
@@ -583,20 +605,37 @@ mod tests {
             let hello = parse_client_hello(&bytes)
                 .unwrap_or_else(|e| panic!("{name}: emitted ClientHello is malformed: {e}"));
 
-            assert_eq!(hello.record_version, RECORD_VERSION, "{name}: record-layer version");
-            assert_eq!(hello.legacy_version, LEGACY_VERSION, "{name}: legacy_version");
-            assert_eq!(hello.compression, vec![0u8], "{name}: null compression only");
+            assert_eq!(
+                hello.record_version, RECORD_VERSION,
+                "{name}: record-layer version"
+            );
+            assert_eq!(
+                hello.legacy_version, LEGACY_VERSION,
+                "{name}: legacy_version"
+            );
+            assert_eq!(
+                hello.compression,
+                vec![0u8],
+                "{name}: null compression only"
+            );
 
             // A zero-length session id is a JA3 field and marks the client as
             // non-browser; rustls sends a 32-byte one for middlebox compat.
-            assert_eq!(hello.session_id.len(), 32, "{name}: legacy_session_id length");
+            assert_eq!(
+                hello.session_id.len(),
+                32,
+                "{name}: legacy_session_id length"
+            );
 
             // The provider table must reach the wire verbatim (plus the SCSV
             // rustls appends when TLS 1.2 is enabled). Any silent drop or
             // reordering inside rustls would break the claimed profile.
             let mut want = suite_ids(&provider);
             want.push(SCSV);
-            assert_eq!(hello.cipher_suites, want, "{name}: cipher suites on the wire");
+            assert_eq!(
+                hello.cipher_suites, want,
+                "{name}: cipher suites on the wire"
+            );
 
             // Extension set: complete, duplicate-free, and exactly what we expect.
             let types = hello.ext_types();
@@ -634,32 +673,50 @@ mod tests {
             );
 
             assert_eq!(
-                hello.ext(EXT_SUPPORTED_VERSIONS).expect("supported_versions"),
+                hello
+                    .ext(EXT_SUPPORTED_VERSIONS)
+                    .expect("supported_versions"),
                 &[0x04, 0x03, 0x04, 0x03, 0x03],
                 "{name}: must offer TLS 1.3 then TLS 1.2"
             );
 
             let groups = hello.ext(EXT_SUPPORTED_GROUPS).expect("supported_groups");
-            assert_eq!(u16::from_be_bytes([groups[0], groups[1]]) as usize, groups.len() - 2);
+            assert_eq!(
+                u16::from_be_bytes([groups[0], groups[1]]) as usize,
+                groups.len() - 2
+            );
             let groups: Vec<u16> = groups[2..]
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|p| u16::from_be_bytes([p[0], p[1]]))
                 .collect();
-            assert_eq!(groups, group_ids(&provider), "{name}: supported_groups order");
+            assert_eq!(
+                groups,
+                group_ids(&provider),
+                "{name}: supported_groups order"
+            );
 
             // key_share must offer the first supported group only (what browsers do).
             let ks = hello.ext(EXT_KEY_SHARE).expect("key_share");
             let ks_len = u16::from_be_bytes([ks[0], ks[1]]) as usize;
             assert_eq!(ks_len, ks.len() - 2, "{name}: key_share list length");
             let group = u16::from_be_bytes([ks[2], ks[3]]);
-            assert_eq!(group, groups[0], "{name}: key_share must match the first group");
-            assert_eq!(u16::from_be_bytes([ks[4], ks[5]]) as usize, 32, "{name}: X25519 share");
+            assert_eq!(
+                group, groups[0],
+                "{name}: key_share must match the first group"
+            );
+            assert_eq!(
+                u16::from_be_bytes([ks[4], ks[5]]) as usize,
+                32,
+                "{name}: X25519 share"
+            );
 
             // Signature algorithms: even count, no duplicates, and the two
             // schemes a real cert chain needs.
-            let sig = hello.ext(EXT_SIGNATURE_ALGORITHMS).expect("signature_algorithms");
+            let sig = hello
+                .ext(EXT_SIGNATURE_ALGORITHMS)
+                .expect("signature_algorithms");
             let sig_len = u16::from_be_bytes([sig[0], sig[1]]) as usize;
             assert_eq!(sig_len, sig.len() - 2, "{name}: sig-alg list length");
             assert_eq!(sig_len % 2, 0, "{name}: sig-alg list must be even");
@@ -676,10 +733,16 @@ mod tests {
                 "{name}: duplicate signature algorithm"
             );
             for required in [0x0403u16, 0x0804] {
-                assert!(sigs.contains(&required), "{name}: missing sig alg {required:#06x}");
+                assert!(
+                    sigs.contains(&required),
+                    "{name}: missing sig alg {required:#06x}"
+                );
             }
 
-            assert_eq!(hello.ext(EXT_PSK_KEY_EXCHANGE_MODES), Some(&[0x01u8, 0x01][..]));
+            assert_eq!(
+                hello.ext(EXT_PSK_KEY_EXCHANGE_MODES),
+                Some(&[0x01u8, 0x01][..])
+            );
             assert_eq!(hello.ext(EXT_EC_POINT_FORMATS), Some(&[0x01u8, 0x00][..]));
             assert_eq!(hello.ext(EXT_SESSION_TICKET), Some(&[][..]));
             assert!(hello.ext(EXT_EXTENDED_MASTER_SECRET).is_some());
@@ -687,7 +750,10 @@ mod tests {
             // Nothing but an optional middlebox-compat CCS may follow the
             // ClientHello in the first flight.
             for (ty, _ver) in &hello.trailing_records {
-                assert_eq!(*ty, REC_CCS, "{name}: unexpected record after the ClientHello");
+                assert_eq!(
+                    *ty, REC_CCS,
+                    "{name}: unexpected record after the ClientHello"
+                );
             }
         }
     }
@@ -705,7 +771,8 @@ mod tests {
             let mut ext_orders = HashSet::new();
 
             for i in 0..ITERATIONS {
-                let bytes = client_hello_bytes(provider.clone(), &[b"h2", b"http/1.1"], "example.org");
+                let bytes =
+                    client_hello_bytes(provider.clone(), &[b"h2", b"http/1.1"], "example.org");
                 let hello = parse_client_hello(&bytes).unwrap_or_else(|e| {
                     panic!("{name}: iteration {i} produced a malformed ClientHello: {e}")
                 });
@@ -716,24 +783,42 @@ mod tests {
                     assert_ne!(prev, &hello.random, "{name}: repeated client_random at {i}");
                 }
                 if let Some(prev) = &last_sid {
-                    assert_ne!(prev, &hello.session_id, "{name}: repeated session_id at {i}");
+                    assert_ne!(
+                        prev, &hello.session_id,
+                        "{name}: repeated session_id at {i}"
+                    );
                 }
                 last_random = Some(hello.random.clone());
                 last_sid = Some(hello.session_id.clone());
 
-                assert!(seen.insert(bytes), "{name}: two ClientHellos were byte-identical");
+                assert!(
+                    seen.insert(bytes),
+                    "{name}: two ClientHellos were byte-identical"
+                );
 
                 // The parts the profile controls must stay put across generations.
                 suite_lists.insert(hello.cipher_suites.clone());
                 ext_orders.insert(hello.ext_types());
 
-                assert_eq!(hello.extensions.len(), EMITTED_EXTS.len(), "{name}: ext count");
+                assert_eq!(
+                    hello.extensions.len(),
+                    EMITTED_EXTS.len(),
+                    "{name}: ext count"
+                );
                 // Structural validity is re-checked by the parser on every run.
                 assert_eq!(hello.marks.record_len, 3);
             }
 
-            assert_eq!(suite_lists.len(), 1, "{name}: the cipher list must not be randomised");
-            assert_eq!(seen.len(), ITERATIONS, "{name}: duplicates in {ITERATIONS} generations");
+            assert_eq!(
+                suite_lists.len(),
+                1,
+                "{name}: the cipher list must not be randomised"
+            );
+            assert_eq!(
+                seen.len(),
+                ITERATIONS,
+                "{name}: duplicates in {ITERATIONS} generations"
+            );
             // rustls randomises the order of order-insensitive extensions on
             // purpose; if that ever stops, the emitted order is fixed by rustls
             // and must be reviewed against the profile it claims to mimic.
@@ -792,7 +877,11 @@ mod tests {
 
         // Record length must equal handshake length.
         for delta in [-1i32, 1] {
-            let bad = patch_u16(&base, m.record_len, (read_u16(&base, m.record_len) as i32 + delta) as u16);
+            let bad = patch_u16(
+                &base,
+                m.record_len,
+                (read_u16(&base, m.record_len) as i32 + delta) as u16,
+            );
             assert!(
                 parse_client_hello(&bad).is_err(),
                 "record length {delta:+} was accepted"
@@ -801,7 +890,11 @@ mod tests {
 
         // Handshake body length must match the declared one.
         for delta in [-1i32, 1] {
-            let bad = patch_u24(&base, m.handshake_len, (read_u24(&base, m.handshake_len) as i32 + delta) as usize);
+            let bad = patch_u24(
+                &base,
+                m.handshake_len,
+                (read_u24(&base, m.handshake_len) as i32 + delta) as usize,
+            );
             assert!(
                 parse_client_hello(&bad).is_err(),
                 "handshake length {delta:+} was accepted"
@@ -829,9 +922,17 @@ mod tests {
         }
 
         // The final extension's own length field: inflating it always overruns
-        // the block, shrinking it always leaves the block short.
+        // the block, shrinking it always leaves the block short. rustls shuffles
+        // extension order per connection and emits some extensions (e.g.
+        // `session_ticket`) with an empty body, so when a zero-length extension
+        // lands last there is no smaller value to test — skip that half rather
+        // than compare 0 with 0.
         let last_len = read_u16(&base, m.last_ext_len);
-        for bad_len in [last_len + 4, last_len.saturating_sub(1)] {
+        let mut bad_lengths = vec![last_len + 4];
+        if last_len > 0 {
+            bad_lengths.push(last_len - 1);
+        }
+        for bad_len in bad_lengths {
             let bad = patch_u16(&base, m.last_ext_len, bad_len);
             assert!(
                 parse_client_hello(&bad).is_err(),
@@ -850,8 +951,16 @@ mod tests {
         let copy: Vec<u8> = dup[first_start..first_start + first_total].to_vec();
         dup.splice(block_end..block_end, copy);
         dup = patch_u16(&dup, m.ext_block_len, ext_len + first_total as u16);
-        dup = patch_u24(&dup, m.handshake_len, read_u24(&base, m.handshake_len) + first_total);
-        dup = patch_u16(&dup, m.record_len, read_u16(&base, m.record_len) + first_total as u16);
+        dup = patch_u24(
+            &dup,
+            m.handshake_len,
+            read_u24(&base, m.handshake_len) + first_total,
+        );
+        dup = patch_u16(
+            &dup,
+            m.record_len,
+            read_u16(&base, m.record_len) + first_total as u16,
+        );
         let err = parse_client_hello(&dup).expect_err("a duplicated extension must be rejected");
         assert!(err.contains("duplicate"), "unexpected error: {err}");
     }
@@ -903,7 +1012,10 @@ mod tests {
 
             let cli = tokio::spawn(async move {
                 let name = ServerName::try_from("localhost").unwrap();
-                let mut tls = connector.connect(name, client_io).await.expect("client handshake");
+                let mut tls = connector
+                    .connect(name, client_io)
+                    .await
+                    .expect("client handshake");
                 {
                     let (_, conn) = tls.get_ref();
                     assert_eq!(
@@ -931,8 +1043,10 @@ mod tests {
                 assert_eq!(&buf, b"pong");
             });
 
-            srv.await.unwrap_or_else(|e| panic!("{name}: server task failed: {e}"));
-            cli.await.unwrap_or_else(|e| panic!("{name}: client task failed: {e}"));
+            srv.await
+                .unwrap_or_else(|e| panic!("{name}: server task failed: {e}"));
+            cli.await
+                .unwrap_or_else(|e| panic!("{name}: client task failed: {e}"));
         }
     }
 

@@ -2965,7 +2965,11 @@ mod client_hello_shape_tests {
             hello.len() - 5
         );
         let hs_len = u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) as usize;
-        assert_eq!(record_len, 4 + hs_len, "record and handshake lengths disagree");
+        assert_eq!(
+            record_len,
+            4 + hs_len,
+            "record and handshake lengths disagree"
+        );
         let body = &hello[9..9 + hs_len];
         let sid_len = body[34] as usize;
         let mut i = 35 + sid_len;
@@ -3027,7 +3031,11 @@ mod client_hello_shape_tests {
         sorted.sort_unstable();
         let before = sorted.len();
         sorted.dedup();
-        assert_eq!(before, sorted.len(), "duplicate extension in ClientHello: {exts:?}");
+        assert_eq!(
+            before,
+            sorted.len(),
+            "duplicate extension in ClientHello: {exts:?}"
+        );
         let _ = alpn_pos;
 
         for required in [0x0000u16, 0x002b, 0x000a, 0x0033, 0x000d, 0x0010] {

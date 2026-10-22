@@ -317,7 +317,10 @@ mod tests {
     fn assert_protocol_error_matching<T>(result: FluxResult<T>, what: &str, expect: Option<&str>) {
         match result {
             Err(FluxError::Protocol { protocol, message }) => {
-                assert_eq!(protocol, "httpupgrade", "{what}: wrong protocol tag: {message}");
+                assert_eq!(
+                    protocol, "httpupgrade",
+                    "{what}: wrong protocol tag: {message}"
+                );
                 assert!(!message.is_empty(), "{what}: empty diagnostic");
                 if let Some(expect) = expect {
                     assert!(
@@ -539,7 +542,11 @@ mod tests {
              Upgrade: websocket\r\n\r\n",
             "the upgrade request must be byte-exact"
         );
-        assert_eq!(request.matches("Host:").count(), 1, "exactly one Host header");
+        assert_eq!(
+            request.matches("Host:").count(),
+            1,
+            "exactly one Host header"
+        );
         assert!(
             !request.replace("\r\n", "").contains('\n'),
             "a bare LF in a request is a fingerprint"
@@ -571,21 +578,39 @@ mod tests {
             .unwrap();
         let written = srv.await.unwrap();
         let request = String::from_utf8(written).unwrap();
-        assert_eq!(request.matches("Host:").count(), 1, "Host must not be duplicated");
+        assert_eq!(
+            request.matches("Host:").count(),
+            1,
+            "Host must not be duplicated"
+        );
         assert_eq!(
             request.matches("Connection:").count(),
             1,
             "Connection must not be duplicated"
         );
-        assert_eq!(request.matches("Upgrade:").count(), 1, "Upgrade must not be duplicated");
-        assert!(request.contains("Host: example.org\r\n"), "the argument wins over the header");
-        assert!(request.contains("Upgrade: spdy\r\n"), "an explicit upgrade token is honoured");
+        assert_eq!(
+            request.matches("Upgrade:").count(),
+            1,
+            "Upgrade must not be duplicated"
+        );
+        assert!(
+            request.contains("Host: example.org\r\n"),
+            "the argument wins over the header"
+        );
+        assert!(
+            request.contains("Upgrade: spdy\r\n"),
+            "an explicit upgrade token is honoured"
+        );
         assert!(request.contains("X-Trace: 1\r\n"));
 
         // An empty path must still produce an origin-form request target.
         let (res, written) = client_handshake_probe("", &HashMap::new()).await;
         res.unwrap();
-        assert!(String::from_utf8(written).unwrap().starts_with("GET / HTTP/1.1\r\n"));
+        assert!(
+            String::from_utf8(written)
+                .unwrap()
+                .starts_with("GET / HTTP/1.1\r\n")
+        );
     }
 
     /// Like `client_against`, but with control over path and headers.
@@ -664,28 +689,74 @@ mod tests {
             "control byte",
         )
         .await;
-        assert_rejected_before_writing("example.org", "/tunnel", {
-            let mut h = HashMap::new();
-            h.insert("X-Bad\r\nX-Injected: yes".to_string(), "v".to_string());
-            h
-        }, "CRLF in header name", "control byte")
+        assert_rejected_before_writing(
+            "example.org",
+            "/tunnel",
+            {
+                let mut h = HashMap::new();
+                h.insert("X-Bad\r\nX-Injected: yes".to_string(), "v".to_string());
+                h
+            },
+            "CRLF in header name",
+            "control byte",
+        )
         .await;
-        assert_rejected_before_writing("example.org", "/tunnel", {
-            let mut h = HashMap::new();
-            h.insert("X-Bad".to_string(), "v\r\nX-Injected: yes".to_string());
-            h
-        }, "CRLF in header value", "control byte")
+        assert_rejected_before_writing(
+            "example.org",
+            "/tunnel",
+            {
+                let mut h = HashMap::new();
+                h.insert("X-Bad".to_string(), "v\r\nX-Injected: yes".to_string());
+                h
+            },
+            "CRLF in header value",
+            "control byte",
+        )
         .await;
         // A request target cannot contain a space, and must be origin-form.
-        assert_rejected_before_writing("example.org", "/a b", HashMap::new(), "space in path", "invalid request path").await;
-        assert_rejected_before_writing("example.org", "tunnel", HashMap::new(), "relative path", "invalid request path").await;
-        assert_rejected_before_writing("", "/tunnel", HashMap::new(), "empty host", "invalid Host value").await;
-        assert_rejected_before_writing("exa mple.org", "/tunnel", HashMap::new(), "space in host", "invalid Host value").await;
-        assert_rejected_before_writing("example.org", "/tunnel", {
-            let mut h = HashMap::new();
-            h.insert("Bad:Name".to_string(), "v".to_string());
-            h
-        }, "colon in header name", "invalid header name")
+        assert_rejected_before_writing(
+            "example.org",
+            "/a b",
+            HashMap::new(),
+            "space in path",
+            "invalid request path",
+        )
+        .await;
+        assert_rejected_before_writing(
+            "example.org",
+            "tunnel",
+            HashMap::new(),
+            "relative path",
+            "invalid request path",
+        )
+        .await;
+        assert_rejected_before_writing(
+            "",
+            "/tunnel",
+            HashMap::new(),
+            "empty host",
+            "invalid Host value",
+        )
+        .await;
+        assert_rejected_before_writing(
+            "exa mple.org",
+            "/tunnel",
+            HashMap::new(),
+            "space in host",
+            "invalid Host value",
+        )
+        .await;
+        assert_rejected_before_writing(
+            "example.org",
+            "/tunnel",
+            {
+                let mut h = HashMap::new();
+                h.insert("Bad:Name".to_string(), "v".to_string());
+                h
+            },
+            "colon in header name",
+            "invalid header name",
+        )
         .await;
     }
 
@@ -697,19 +768,31 @@ mod tests {
         // error page or a websocket endpoint answering 200 is not our tunnel.
         let rejected: &[(&str, &[u8])] = &[
             ("200 OK", b"HTTP/1.1 200 OK\r\n\r\n"),
-            ("200 with body", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi"),
+            (
+                "200 with body",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
+            ),
             ("1010", b"HTTP/1.1 1010 Not A Status\r\n\r\n"),
-            ("500 mentioning 101", b"HTTP/1.1 500 Internal Server Error: 101\r\n\r\n"),
+            (
+                "500 mentioning 101",
+                b"HTTP/1.1 500 Internal Server Error: 101\r\n\r\n",
+            ),
             ("404", b"HTTP/1.1 404 Not Found\r\n\r\n"),
             ("301", b"HTTP/1.1 301 Moved Permanently\r\n\r\n"),
             ("204", b"HTTP/1.1 204 No Content\r\n\r\n"),
-            ("101 as a reason phrase", b"HTTP/1.1 400 101 Switching Protocols\r\n\r\n"),
+            (
+                "101 as a reason phrase",
+                b"HTTP/1.1 400 101 Switching Protocols\r\n\r\n",
+            ),
             ("HTTP/1.0 101", b"HTTP/1.0 101 Switching Protocols\r\n\r\n"),
             ("HTTP/2 101", b"HTTP/2 101 Switching Protocols\r\n\r\n"),
             ("ICY 101", b"ICY 101 Switching Protocols\r\n\r\n"),
             ("empty status line", b"\r\n\r\n"),
             ("garbage", b"SMTP ready\r\n\r\n"),
-            ("header without colon", b"HTTP/1.1 101 Switching Protocols\r\nBadHeaderLine\r\n\r\n"),
+            (
+                "header without colon",
+                b"HTTP/1.1 101 Switching Protocols\r\nBadHeaderLine\r\n\r\n",
+            ),
         ];
         for (what, response) in rejected {
             let (res, _) = client_against(&[response]).await;
@@ -727,9 +810,12 @@ mod tests {
             ("canonical", GOOD_RESPONSE),
             ("bare 101", &b"HTTP/1.1 101 Switching Protocols\r\n\r\n"[..]),
             ("status only", &b"HTTP/1.1 101\r\n\r\n"[..]),
-            ("extra headers", &b"HTTP/1.1 101 Switching Protocols\r\nServer: nginx\r\n\
+            (
+                "extra headers",
+                &b"HTTP/1.1 101 Switching Protocols\r\nServer: nginx\r\n\
                 Date: Thu, 01 Jan 1970 00:00:00 GMT\r\nConnection: Upgrade\r\n\
-                Upgrade: websocket\r\nX-Extra: 1\r\n\r\n"[..]),
+                Upgrade: websocket\r\nX-Extra: 1\r\n\r\n"[..],
+            ),
         ] {
             let (res, _) = client_against(&[response]).await;
             assert!(res.is_ok(), "{what}: a valid 101 must be accepted");
@@ -764,7 +850,11 @@ mod tests {
         drop(srv.await.unwrap()); // close the server side so the read can finish
         let mut buf = [0u8; 32];
         let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"early-bytes", "bytes after the 101 must be preserved");
+        assert_eq!(
+            &buf[..n],
+            b"early-bytes",
+            "bytes after the 101 must be preserved"
+        );
     }
 
     #[tokio::test]
@@ -780,7 +870,11 @@ mod tests {
         let mut stream = server_handshake(server_io, Some("/tunnel")).await.unwrap();
         let mut buf = [0u8; 32];
         let n = stream.read(&mut buf).await.unwrap();
-        assert_eq!(&buf[..n], b"pipelined", "bytes after the request must be preserved");
+        assert_eq!(
+            &buf[..n],
+            b"pipelined",
+            "bytes after the request must be preserved"
+        );
     }
 
     // ---- server-side request validation ------------------------------------
@@ -812,8 +906,7 @@ mod tests {
         let mut huge = b"GET /tunnel HTTP/1.1\r\nX-Pad: ".to_vec();
         huge.extend(std::iter::repeat_n(b'a', 16 * 1024));
         huge.extend_from_slice(b"\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n");
-        assert_server_rejects(&huge, None, "16 KiB header line", "missing terminal CRLF")
-            .await;
+        assert_server_rejects(&huge, None, "16 KiB header line", "missing terminal CRLF").await;
     }
 
     #[tokio::test]
@@ -855,7 +948,10 @@ mod tests {
         ];
         for (what, request, expected) in cases {
             let (res, response) = server_against(request, *expected).await;
-            assert!(res.is_ok(), "{what}: a valid upgrade request must be accepted");
+            assert!(
+                res.is_ok(),
+                "{what}: a valid upgrade request must be accepted"
+            );
             assert_eq!(
                 response, GOOD_RESPONSE,
                 "{what}: the server response must be the canonical 101"
@@ -927,7 +1023,9 @@ mod tests {
 
         let reads = Arc::new(AtomicUsize::new(0));
         let res = client_handshake(
-            EndlessReader { reads: reads.clone() },
+            EndlessReader {
+                reads: reads.clone(),
+            },
             "example.org",
             "/tunnel",
             &HashMap::new(),
@@ -941,7 +1039,13 @@ mod tests {
         );
 
         let reads = Arc::new(AtomicUsize::new(0));
-        let res = server_handshake(EndlessReader { reads: reads.clone() }, None).await;
+        let res = server_handshake(
+            EndlessReader {
+                reads: reads.clone(),
+            },
+            None,
+        )
+        .await;
         assert_protocol_error(res, "endless request headers");
         assert!(
             reads.load(Ordering::SeqCst) <= MAX_READS,

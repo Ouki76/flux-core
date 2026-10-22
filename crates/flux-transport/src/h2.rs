@@ -466,10 +466,7 @@ mod hardening_tests {
             )
             .await
             .expect("handshake must not hang on garbage input");
-            assert!(
-                res.is_err(),
-                "server accepted a garbage preface: {label:?}"
-            );
+            assert!(res.is_err(), "server accepted a garbage preface: {label:?}");
         }
     }
 
@@ -479,9 +476,7 @@ mod hardening_tests {
     async fn a_peer_that_vanishes_after_the_preface_fails_cleanly() {
         let (client_io, mut peer) = tokio::io::duplex(4096);
         tokio::spawn(async move {
-            let _ = peer
-                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-                .await;
+            let _ = peer.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await;
             let _ = peer.shutdown().await;
         });
         let res = tokio::time::timeout(
@@ -490,6 +485,9 @@ mod hardening_tests {
         )
         .await
         .expect("handshake must not hang");
-        assert!(res.is_err(), "server accepted a stream from a vanished peer");
+        assert!(
+            res.is_err(),
+            "server accepted a stream from a vanished peer"
+        );
     }
 }
