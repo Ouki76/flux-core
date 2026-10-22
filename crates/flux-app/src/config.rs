@@ -1434,7 +1434,111 @@ impl Config {
     /// - Verifies that every outbound referenced in routing rules, groups, and selectors exists.
     /// - Validates UUIDs, Reality public keys, CIDRs.
     /// - Detects cycles in outbound groups (Selector, Fallback, LoadBalance).
+    /// Rejects configuration that parses but would not be honoured.
+    ///
+    /// A field that is accepted and ignored is worse than an unknown one: the
+    /// user believes a feature is configured, nothing errors, and the behaviour
+    /// they asked for silently does not happen. Every check below names the field
+    /// and says what the code does instead.
+    fn reject_unhonoured_options(&self) -> FluxResult<()> {
+        // A format marker with no meaning was accepted and merged but never read.
+        if let Some(flux) = &self.flux {
+            // The field is a format/version marker (a native config writes
+            // `"flux": "1.0"`). It is not otherwise used, so validate its shape
+            // rather than accept any string: a typo here would otherwise pass.
+            let looks_like_version = flux
+                .trim_start_matches(['v', 'V'])
+                .split('.')
+                .all(|part| part.chars().all(|c| c.is_ascii_digit()) && !part.is_empty());
+            if !looks_like_version && flux != "flux" && flux != "flux-core" {
+                return Err(FluxError::Config(format!(
+                    "config field 'flux' is a version marker such as \"1.0\", not {flux:?}"
+                )));
+            }
+        }
+
+        let mut check_protocol = |tag: &str, proto: &ProtocolConfig| -> FluxResult<()> {
+            match proto {
+                ProtocolConfig::Hysteria2 {
+                    h3,
+                    down_mbps,
+                    hop_interval_secs,
+                    ..
+                } => {
+                    if *h3 {
+                        return Err(FluxError::Config(format!(
+                            "outbound '{tag}': 'h3' is not configurable — Hysteria 2 always \
+                             authenticates over HTTP/3; remove the field"
+                        )));
+                    }
+                    let _ = down_mbps;
+                    if hop_interval_secs.is_some() {
+                        return Err(FluxError::Config(format!(
+                            "outbound '{tag}': 'hop_interval_secs' has no effect — a Hysteria 2 \
+                             node carries a single port here, so there is nothing to hop between"
+                        )));
+                    }
+                }
+                ProtocolConfig::Tuic {
+                    congestion_control,
+                    zero_rtt,
+                    ..
+                } => {
+                    if let Some(cc) = congestion_control {
+                        return Err(FluxError::Config(format!(
+                            "outbound '{tag}': 'congestion_control' is not implemented (QUIC \
+                             congestion control is fixed); remove the field instead of \
+                             believing it is set to {cc:?}"
+                        )));
+                    }
+                    if zero_rtt.is_some() {
+                        return Err(FluxError::Config(format!(
+                            "outbound '{tag}': 'zero_rtt' is not implemented; remove the field"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+
+        for out in &self.outbounds {
+            if let OutboundConfig::Node(node) = out {
+                check_protocol(&node.tag, &node.protocol)?;
+            }
+        }
+        for inb in &self.inbounds {
+            match inb {
+                InboundConfig::Node(node) => check_protocol(&node.tag, &node.protocol)?,
+                _ => {}
+            }
+        }
+
+        // An inbound TLS 'server_name' was destructured away: the acceptor never
+        // advertises an SNI list, so a config asking for one is misleading.
+        for inb in &self.inbounds {
+            if let InboundConfig::Node(node) = inb
+                && let Some(secs) = &node.security
+            {
+                for sec in secs.as_slice() {
+                    if let InboundSecurityConfig::Tls { server_name, .. } = sec
+                        && server_name.is_some()
+                    {
+                        return Err(FluxError::Config(format!(
+                            "inbound '{}': TLS 'server_name' is not supported — the acceptor \
+                             serves one certificate and does not filter by SNI; remove the field \
+                             (use ShadowTLS or REALITY 'server_names' if you need an SNI list)",
+                            node.tag
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> FluxResult<()> {
+        self.reject_unhonoured_options()?;
         let mut known_outbounds = HashSet::new();
         known_outbounds.insert("direct".to_string());
         known_outbounds.insert("block".to_string());

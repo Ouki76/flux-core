@@ -264,3 +264,106 @@ async fn a_supported_shadowsocks_method_is_accepted() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// A field that is accepted but not honoured is a lie: it must be refused
+// ---------------------------------------------------------------------------
+
+async fn build(json: &str) -> Result<(), String> {
+    let cfg = flux_app::Config::from_json_str(json).map_err(|e| format!("{e}"))?;
+    flux_app::Instance::new(cfg)
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+}
+
+const VLESS_PROTO: &str =
+    r#""protocol": { "type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }"#;
+
+/// `flux` is a version marker; a typo in it used to be accepted silently.
+#[tokio::test]
+async fn a_malformed_version_marker_is_refused() {
+    let err = build(r#"{"flux": "surely-not-a-version", "outbounds": []}"#)
+        .await
+        .expect_err("a malformed marker must be refused");
+    assert!(err.contains("version marker"), "got: {err}");
+
+    // The shapes a native config actually uses are accepted.
+    for marker in ["1.0", "1", "v2", "flux", "flux-core"] {
+        let json =
+            format!(r#"{{"flux": "{marker}", "outbounds": [{{"type": "direct", "tag": "d"}}]}}"#);
+        assert!(
+            build(&json).await.is_ok(),
+            "marker {marker:?} must be accepted"
+        );
+    }
+}
+
+/// TUIC congestion control and 0-RTT are not implemented; setting them used to be
+/// silently ignored, so the user believed a QUIC behaviour was configured.
+#[tokio::test]
+async fn unimplemented_tuic_options_are_refused() {
+    for field in [r#""congestion_control": "bbr""#, r#""zero_rtt": true"#] {
+        let json = format!(
+            r#"{{
+                "outbounds": [{{
+                    "tag": "t",
+                    "carrier": {{ "type": "udp", "address": "127.0.0.1:8443" }},
+                    "protocol": {{ "type": "tuic", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "pw", {field} }}
+                }}]
+            }}"#
+        );
+        let err = build(&json)
+            .await
+            .expect_err("an unimplemented TUIC option must be refused");
+        assert!(
+            err.contains("not implemented") || err.contains("no effect"),
+            "the error must say it is unimplemented, got: {err}"
+        );
+    }
+}
+
+/// Hysteria 2 always authenticates over HTTP/3, so `h3: true` (the serde default
+/// when present) claimed a choice that does not exist, and port hopping has
+/// nothing to hop between.
+#[tokio::test]
+async fn unimplemented_hysteria2_options_are_refused() {
+    for field in [r#""h3": true"#, r#""hop_interval_secs": 30"#] {
+        let json = format!(
+            r#"{{
+                "outbounds": [{{
+                    "tag": "h2",
+                    "carrier": {{ "type": "udp", "address": "127.0.0.1:8443" }},
+                    "protocol": {{ "type": "hysteria2", "password": "pw", {field} }}
+                }}]
+            }}"#
+        );
+        let err = build(&json)
+            .await
+            .expect_err("an unimplemented Hysteria 2 option must be refused");
+        assert!(
+            err.contains("h3") || err.contains("hop_interval_secs") || err.contains("hop"),
+            "the error must name the field, got: {err}"
+        );
+    }
+}
+
+/// An inbound TLS `server_name` was destructured away — the acceptor never
+/// filtered by SNI, so a config asking for it was misleading.
+#[tokio::test]
+async fn an_inbound_tls_server_name_is_refused() {
+    let json = format!(
+        r#"{{
+            "inbounds": [{{
+                "tag": "in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": 25811 }},
+                "security": {{ "type": "tls", "server_name": "example.com" }},
+                {VLESS_PROTO}
+            }}],
+            "outbounds": [{{ "type": "direct", "tag": "d" }}]
+        }}"#
+    );
+    let err = build(&json)
+        .await
+        .expect_err("an ignored server_name must be refused");
+    assert!(err.contains("server_name"), "got: {err}");
+}
