@@ -4,6 +4,56 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.3] - 2026-10-22
+
+Audit cycle 3. The weakest measured path was WireGuard; it is now at 143 MB/s and
+the remaining ceiling is documented rather than guessed at.
+
+### Performance
+
+- **WireGuard: 93.6 → 143 MB/s (+53 %), CPU 21.4 → 13.5 s/GB (−37 %).**
+  `ring`'s ChaCha20-Poly1305 replaces the RustCrypto crate for data packets (the
+  profile pointed at Poly1305 *per-message key setup*, not bulk throughput; a
+  null-cipher build isolated AEAD at 5.9 → 2.2 s/GB), and UDP GSO
+  (`UDP_SEGMENT`) coalesces equal-sized datagrams on the outbound egress so N
+  datagrams cost one syscall, one route lookup and one skb — the kernel floor per
+  datagram drops from 5.0 CPU s/GB (`sendto`) to 0.80. GSO is sender-side only, so
+  a stock WireGuard peer sees ordinary datagrams; the first rejected control
+  message disables it permanently and falls back to `sendmmsg`, and
+  `WG_NO_GSO_TX=1` forces it off.
+- The TUN "window" finding does **not** transfer: a measured sweep of
+  `WG_TCP_BUF` (64 KiB → 512 KiB) is worth +4 % with CPU per byte rising, because
+  this pump already keeps a burst in flight. Documented with the table; the stale
+  comment claiming "no effect" was replaced by the measurement.
+
+### Fixed
+
+- **smux:** the message a stream reports when it dies during the handshake was
+  identical for six distinct events, one of them described falsely, and was typed
+  `InvalidData` instead of `UnexpectedEof`. It now names the handshake stage,
+  response bytes received, FIN-vs-dead-channel and the session's teardown reason.
+  Reading those paths also found a real hang — `open_stream` racing `close()` left
+  its only sender in a map nobody drains, so the first read waited forever.
+- **Test infrastructure:** the port allocator probed with `bind()` only, which
+  cannot see a listener held with `SO_REUSEPORT` (every flux listener sets it), so
+  a leftover process was handed out twice and produced `AddrInUse`. The probe now
+  also connects: a free port refuses, an occupied one accepts.
+
+### Corrected
+
+A figure published in an earlier revision of `docs/audit-log.md` (205.6 MB/s,
+9.34 s/GB) was **withdrawn**: it came from a configuration with GSO on the inbound
+egress, which is bimodal (12/12 runs at 205–215 MB/s without it, 12/12 at
+9.8–25.6 MB/s with it). The shipped code reverts that path and measures 143 MB/s.
+The mistake and its lesson are recorded in the log.
+
+### Known limits
+
+At MTU 1420 the kernel charges ~4.25 CPU s/GB per direction for one datagram per
+packet, so ~190 MB/s is the ceiling for a per-datagram design even with batching;
+the same code at inner MTU 8192 reaches 231 MB/s, which is why a configurable inner
+MTU is the next lever (default stays 1420, the interop value).
+
 ## [1.3.2] - 2026-10-22
 
 Audit cycle 2. Coverage was measured for the first time (53 % of lines), then

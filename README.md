@@ -151,7 +151,7 @@ Userspace datapaths (the two that run their own TCP/IP stack):
 |---|---|---|
 | **TUN** (smoltcp, default jumbo MTU 9000) | **1259 MiB/s** | **2.49 s** |
 | TUN (same code, MTU 1500) | 464 MiB/s | 6.10 s |
-| **WireGuard** (Noise + smoltcp) | **93.6 MB/s** | **21.4 s** |
+| **WireGuard** (Noise + smoltcp) | **143 MB/s** | **13.5 s** |
 | kernel loopback reference | 2.8 GiB/s | 0.31 s |
 
 A TUN device supports no read/write batching (verified with `readv`/`writev`
