@@ -522,8 +522,11 @@ pub enum ProtocolConfig {
         down_mbps: u64,
         #[serde(default)]
         hop_interval_secs: Option<u64>,
+        /// Optional: authentication is always HTTP/3, so `true` is accepted (it
+        /// states what the code does) and `false` is refused (it asks for
+        /// something the implementation cannot do). Omitting it is fine.
         #[serde(default)]
-        h3: bool,
+        h3: Option<bool>,
         /// Salamander obfuscation mode ("salamander"); requires obfs_password.
         #[serde(default)]
         obfs: Option<String>,
@@ -1429,17 +1432,12 @@ impl Config {
         }
     }
 
-    /// Validates the full configuration graph:
-    /// - Checks for duplicate outbound and inbound tags.
-    /// - Verifies that every outbound referenced in routing rules, groups, and selectors exists.
-    /// - Validates UUIDs, Reality public keys, CIDRs.
-    /// - Detects cycles in outbound groups (Selector, Fallback, LoadBalance).
     /// Rejects configuration that parses but would not be honoured.
     ///
-    /// A field that is accepted and ignored is worse than an unknown one: the
-    /// user believes a feature is configured, nothing errors, and the behaviour
-    /// they asked for silently does not happen. Every check below names the field
-    /// and says what the code does instead.
+    /// A field that is accepted and ignored is worse than an unknown one: the user
+    /// believes a feature is configured, nothing errors, and the behaviour they
+    /// asked for silently does not happen. Every check below names the field and
+    /// says what the code does instead.
     fn reject_unhonoured_options(&self) -> FluxResult<()> {
         // A format marker with no meaning was accepted and merged but never read.
         if let Some(flux) = &self.flux {
@@ -1457,7 +1455,7 @@ impl Config {
             }
         }
 
-        let mut check_protocol = |tag: &str, proto: &ProtocolConfig| -> FluxResult<()> {
+        let check_protocol = |tag: &str, proto: &ProtocolConfig| -> FluxResult<()> {
             match proto {
                 ProtocolConfig::Hysteria2 {
                     h3,
@@ -1465,10 +1463,13 @@ impl Config {
                     hop_interval_secs,
                     ..
                 } => {
-                    if *h3 {
+                    // `h3: true` states what the code does (authentication is always
+                    // HTTP/3), so it is accepted; `h3: false` asks for something the
+                    // implementation cannot do, so it is refused rather than ignored.
+                    if *h3 == Some(false) {
                         return Err(FluxError::Config(format!(
-                            "outbound '{tag}': 'h3' is not configurable — Hysteria 2 always \
-                             authenticates over HTTP/3; remove the field"
+                            "outbound '{tag}': 'h3: false' is not supported — Hysteria 2 \
+                             authentication is always HTTP/3"
                         )));
                     }
                     let _ = down_mbps;
@@ -1508,9 +1509,8 @@ impl Config {
             }
         }
         for inb in &self.inbounds {
-            match inb {
-                InboundConfig::Node(node) => check_protocol(&node.tag, &node.protocol)?,
-                _ => {}
+            if let InboundConfig::Node(node) = inb {
+                check_protocol(&node.tag, &node.protocol)?;
             }
         }
 
@@ -1537,6 +1537,11 @@ impl Config {
         Ok(())
     }
 
+    /// Validates the full configuration graph:
+    /// - Checks for duplicate outbound and inbound tags.
+    /// - Verifies that every outbound referenced in routing rules, groups, and selectors exists.
+    /// - Validates UUIDs, Reality public keys, CIDRs.
+    /// - Detects cycles in outbound groups (Selector, Fallback, LoadBalance).
     pub fn validate(&self) -> FluxResult<()> {
         self.reject_unhonoured_options()?;
         let mut known_outbounds = HashSet::new();

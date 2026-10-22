@@ -398,7 +398,7 @@ impl ProxySpec {
                     up_mbps: self.up_mbps.unwrap_or(100),
                     down_mbps: self.down_mbps.unwrap_or(100),
                     hop_interval_secs: self.hop_interval_secs,
-                    h3: false,
+                    h3: Some(false),
                     obfs: self.obfs.clone(),
                     obfs_password: self.obfs_password.clone(),
                 }

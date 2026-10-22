@@ -322,12 +322,25 @@ async fn unimplemented_tuic_options_are_refused() {
     }
 }
 
-/// Hysteria 2 always authenticates over HTTP/3, so `h3: true` (the serde default
-/// when present) claimed a choice that does not exist, and port hopping has
-/// nothing to hop between.
+/// `h3: true` states what the code does (Hysteria 2 authenticates over HTTP/3), so it
+/// is accepted; `h3: false` asks for something the implementation cannot do, and
+/// port hopping has nothing to hop between because a node carries one port.
 #[tokio::test]
 async fn unimplemented_hysteria2_options_are_refused() {
-    for field in [r#""h3": true"#, r#""hop_interval_secs": 30"#] {
+    // Accepted: it describes reality.
+    let ok = r#"{
+        "outbounds": [{
+            "tag": "h2",
+            "carrier": { "type": "udp", "address": "127.0.0.1:8443" },
+            "protocol": { "type": "hysteria2", "password": "pw", "h3": true }
+        }]
+    }"#;
+    assert!(
+        build(ok).await.is_ok(),
+        "h3: true states what the code does and must be accepted"
+    );
+
+    for field in [r#""h3": false"#, r#""hop_interval_secs": 30"#] {
         let json = format!(
             r#"{{
                 "outbounds": [{{

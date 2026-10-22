@@ -1170,7 +1170,7 @@ fn build_layered_outbound(
                     server_name: q_sni,
                     obfs: resolve_hy2_obfs(obfs.as_deref(), obfs_password)?,
                     alpn: q_alpn,
-                    h3,
+                    h3: h3.unwrap_or(true),
                 };
                 let out =
                     flux_outbound::Hysteria2Outbound::new(tag.clone(), hy2_cfg, resolver.clone());
@@ -1376,7 +1376,7 @@ fn build_layered_outbound(
                 server_name: q_sni,
                 obfs: resolve_hy2_obfs(obfs.as_deref(), obfs_password)?,
                 alpn: q_alpn,
-                h3,
+                h3: h3.unwrap_or(true),
             };
             let out = if let CarrierConfig::Udp { .. } = node.carrier {
                 flux_outbound::Hysteria2Outbound::new(tag.clone(), hy2_cfg, resolver.clone())

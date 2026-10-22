@@ -895,8 +895,7 @@ async fn test_15_hysteria2_outbound_init() {
                 "type": "hysteria2",
                 "password": "secret_hy2_password",
                 "up_mbps": 50,
-                "down_mbps": 100,
-                "hop_interval_secs": 15
+                "down_mbps": 100
             }
         }]
     }"#;
@@ -918,9 +917,7 @@ async fn test_16_tuic_v5_outbound_init() {
                 "protocol": {{
                     "type": "tuic",
                     "uuid": "{}",
-                    "password": "tuic_secret_pw",
-                    "congestion_control": "bbr",
-                    "zero_rtt": true
+                    "password": "tuic_secret_pw"
                 }}
             }}]
         }}"#,
