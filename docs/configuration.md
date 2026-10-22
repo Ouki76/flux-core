@@ -153,8 +153,20 @@ traffic would fall through to `final`) and when lines are skipped.
 Rule-set lines may be Clash style (`IP-CIDR,1.2.3.4/32,no-resolve`,
 `DOMAIN-SUFFIX,example.com`) or V2Ray/sing-box style (`suffix:example.com`,
 `domain:…`, `keyword:…`, `ip-cidr:…`). Trailing Clash modifiers such as
-`no-resolve` are accepted and ignored. Unsupported Clash types (`GEOIP`,
-`PROCESS-NAME`, …) are counted and reported, never applied silently.
+`no-resolve` are accepted; unsupported Clash types (`GEOIP`, `PROCESS-NAME`, …) are
+counted and reported, never applied silently.
+
+> **`IP-CIDR` and `no-resolve` — read this before relying on an IP rule.**
+> Routing here is decided **without resolving the destination**: the router sees
+> `Domain("example.com")` and only a rule on the *name* can match it. An
+> `IP-CIDR` rule applies only when the client sent an address literal (a SOCKS5 or
+> VLESS request for `1.2.3.4:443`, or a TUN packet, which is always an IP).
+> `no-resolve` is therefore trivially honoured, and a rule that *depends* on
+> resolution — "block any connection whose IP is in 10.0.0.0/8" applied to a domain
+> — silently does not fire. That is a deliberate trade (no DNS lookup per
+> connection, no resolver in the matching path), not an oversight; if you need
+> IP-based decisions, give the rule a domain counterpart or use a TUN inbound,
+> where every destination is already an address.
 
 ## API
 
