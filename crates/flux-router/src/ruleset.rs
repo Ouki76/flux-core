@@ -172,11 +172,46 @@ impl RuleSet {
             self.ip_cidr.push(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("+.") {
             self.domain_suffix.push(rest.trim().to_string());
-        } else if trimmed.contains('/') || trimmed.parse::<std::net::IpAddr>().is_ok() {
+        } else if trimmed.parse::<std::net::IpAddr>().is_ok() {
             self.ip_cidr.push(trimmed.to_string());
-        } else {
+        } else if let Some((addr, prefix)) = trimmed.split_once('/')
+            && addr.parse::<std::net::IpAddr>().is_ok()
+            && prefix.parse::<u8>().is_ok()
+        {
+            // A CIDR must actually be `address/prefix`: checking only for a slash
+            // made `</html>` from an error page look like an IP rule, so a broken
+            // feed produced a "non-empty" rule set that matched nothing.
+            self.ip_cidr.push(trimmed.to_string());
+        } else if Self::looks_like_domain(trimmed) {
             self.domain_suffix.push(trimmed.to_string());
+        } else {
+            // A bare word that cannot be a domain — in practice an HTML error
+            // page, a captive-portal paragraph, or a JSON blob from a feed that
+            // broke. Treating it as a domain suffix produced a rule set that
+            // matched nothing meaningful and looked non-empty, which both hid the
+            // failure and passed it to the "did this refresh yield anything?"
+            // guard.
+            self.stats
+                .unparsed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// True when `s` can plausibly be a hostname: dot-separated labels of letters,
+    /// digits, `-`, `_` and `*` (wildcard feeds exist), each label 1..=63 bytes,
+    /// total ≤253. Rejects whitespace, angle brackets, quotes, control characters
+    /// and anything else that cannot appear in a domain.
+    fn looks_like_domain(s: &str) -> bool {
+        if s.is_empty() || s.len() > 253 {
+            return false;
+        }
+        s.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'*')
+        })
     }
 
     pub fn load_from_file(&mut self, path: &str) -> std::io::Result<()> {
@@ -185,6 +220,38 @@ impl RuleSet {
             self.parse_rule_line(line);
         }
         Ok(())
+    }
+
+    /// Applies fetched content **only if it yields at least one rule**, keeping
+    /// the previous contents otherwise.
+    ///
+    /// This is what a *refresh* must use. A remote feed that starts returning an
+    /// error page, a captive-portal response or an empty file used to replace a
+    /// working rule set with nothing, so every `rule_set` rule stopped matching
+    /// and traffic silently fell through to the final outbound — which, for a
+    /// proxy, can redirect traffic that was meant to be tunnelled straight onto
+    /// the local network. An empty result is never better than what we have.
+    ///
+    /// Returns `true` when the new content was applied.
+    pub fn try_apply_content(&self, content: &str) -> bool {
+        // Parse with the same parser `apply_content` uses, so "usable" means
+        // exactly what it will mean after the swap.
+        let mut fetched = RuleSet::default();
+        for line in content.lines() {
+            fetched.parse_rule_line(line);
+        }
+        // `parse_rule_line` only bumps the *unparsed* counter; usable entries are
+        // the parsed lists themselves (this is the same sum `apply_content` stores).
+        let fetched_entries = fetched.domain.len()
+            + fetched.domain_suffix.len()
+            + fetched.domain_keyword.len()
+            + fetched.ip_cidr.len();
+        // Nothing usable in the new content and we already have something: keep it.
+        if fetched_entries == 0 && self.parsed_entry_count() > 0 {
+            return false;
+        }
+        self.apply_content(content);
+        true
     }
 
     /// Atomically replaces the compiled contents with the given text (used by
@@ -507,5 +574,137 @@ mod parse_tests {
             "inline CIDR lost"
         );
         assert_eq!(rs.parsed_entry_count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod refresh_guard_tests {
+    use super::*;
+
+    fn remote_only() -> RuleSet {
+        RuleSet::default()
+    }
+
+    /// True when `domain` matches through the compiled sets (the same data the
+    /// router queries).
+    fn matches_domain(rs: &RuleSet, domain: &str) -> bool {
+        let compiled = rs.compiled.read();
+        compiled.exact_set.contains(domain) || compiled.suffix_set.contains(domain)
+    }
+
+    /// A refresh that parses to zero rules must not wipe a working rule set: that
+    /// would make every `rule_set` rule stop matching and silently send traffic to
+    /// the final outbound.
+    #[test]
+    fn an_empty_refresh_keeps_the_previous_rules() {
+        let rs = remote_only();
+        assert!(rs.try_apply_content("DOMAIN-SUFFIX,good.example\n"));
+        assert_eq!(rs.parsed_entry_count(), 1);
+
+        // A captive portal / error page / empty file.
+        assert!(!rs.try_apply_content("<html><body>Login required</body></html>\n"));
+        assert_eq!(
+            rs.parsed_entry_count(),
+            1,
+            "the working rule set was replaced by an empty one"
+        );
+        assert!(
+            matches_domain(&rs, "good.example"),
+            "the old rule no longer matches after a failed refresh"
+        );
+    }
+
+    /// The first successful load legitimately establishes the contents, and an
+    /// empty first load is allowed (it only warns).
+    #[test]
+    fn the_first_load_may_be_empty() {
+        let rs = remote_only();
+        assert!(rs.try_apply_content(""));
+        assert_eq!(rs.parsed_entry_count(), 0);
+
+        assert!(rs.try_apply_content("DOMAIN,late.example\n"));
+        assert!(matches_domain(&rs, "late.example"));
+    }
+
+    /// Partial-but-usable content is still applied: refusing it would keep stale
+    /// rules forever when a feed drops an unsupported line.
+    #[test]
+    fn partial_content_is_applied() {
+        let rs = remote_only();
+        assert!(rs.try_apply_content("DOMAIN,first.example\n"));
+        assert!(rs.try_apply_content("UNSUPPORTED-TYPE,whatever\nDOMAIN,second.example\n"));
+        assert!(matches_domain(&rs, "second.example"));
+    }
+}
+
+#[cfg(test)]
+mod garbage_line_tests {
+    use super::*;
+
+    /// An HTML error page, a captive-portal paragraph or a JSON blob must not
+    /// become rule entries. It used to: `</html>` contains a slash so it parsed as
+    /// an IP-CIDR, and any bare word parsed as a domain suffix — producing a rule
+    /// set that looked non-empty, matched nothing, and hid the failure.
+    #[test]
+    fn a_body_of_garbage_yields_no_rules() {
+        for garbage in [
+            "<html><body>Login required</body></html>",
+            "<!DOCTYPE html><html><head><title>502</title></head></html>",
+            "{\"error\":\"not found\"}",
+            "Please sign in to continue",
+            "\u{0}\u{1}binary junk",
+        ] {
+            let mut rs = RuleSet::default();
+            rs.parse_rule_line(garbage);
+            let total = rs.domain.len()
+                + rs.domain_suffix.len()
+                + rs.domain_keyword.len()
+                + rs.ip_cidr.len();
+            assert_eq!(total, 0, "garbage line {garbage:?} became a rule");
+            assert!(
+                rs.stats.unparsed.load(std::sync::atomic::Ordering::Relaxed) > 0,
+                "garbage line {garbage:?} was not counted as unparsed"
+            );
+        }
+    }
+
+    /// The legitimate shapes must keep parsing exactly as before.
+    #[test]
+    fn legitimate_lines_still_parse() {
+        let mut rs = RuleSet::default();
+        for line in [
+            "DOMAIN-SUFFIX,google.com",
+            "DOMAIN,exact.example.org",
+            "DOMAIN-KEYWORD,telemetry",
+            "IP-CIDR,10.0.0.0/8",
+            "IP-CIDR6,2001:db8::/32",
+            "10.1.2.3/32",
+            "192.168.1.1",
+            "example.com",
+            "full:www.example.net",
+            "suffix:cdn.example.net",
+            "keyword:ads",
+            "ip-cidr:172.16.0.0/12",
+            "+.wild.example",
+            "*.wildcard.example",
+            "xn--80ak6aa92e.com",
+            "localhost",
+        ] {
+            rs.parse_rule_line(line);
+        }
+        assert_eq!(
+            rs.domain_suffix.len(),
+            7,
+            "suffix entries: {:?}",
+            rs.domain_suffix
+        );
+        assert_eq!(rs.domain.len(), 2);
+        assert_eq!(rs.domain_keyword.len(), 2);
+        assert_eq!(rs.ip_cidr.len(), 5);
+        assert_eq!(
+            rs.stats.unparsed.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a legitimate line was rejected"
+        );
     }
 }
