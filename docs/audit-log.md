@@ -199,6 +199,35 @@ emitted set is 11 extensions against ~15 + 2×GREASE for Chrome, and ALPS,
 are absent. JA3/JA4 equivalence needs a uTLS-style encoder — a design change, not a
 test fix. Documented so it is a known limit rather than an assumption of stealth.
 
+### Measurement trap worth recording
+
+After reverting the unfinished GSO work, the benchmark reported **5–7 MB/s** for a
+tree that had just measured 143 MB/s three times. The cause was not a regression:
+`bench_wireguard` spawns `target/release/flux-core`, and that binary had been built
+from the reverted-in-source but still-on-disk edited state. `git checkout` restores
+sources; it does not rebuild. Rebuilding restored 138.7 MB/s (min 136.9, max 141.5).
+
+This is the same class of error as the withdrawn 205.6 MB/s figure: the measurement
+harness spawns the binary, so *the binary is part of the experiment*. Every cycle
+from here on rebuilds `--release` after any revert, and the audit protocol now says
+so explicitly.
+
+### Open: the inbound-GSO stall (investigated, not solved)
+
+Enabling GSO on the *inbound* egress reaches 205–215 MB/s but is bimodal: 12/12
+runs at 9.8–25.6 MB/s with it, 12/12 at 139–146 without. Nothing is lost (kernel
+drop counters 0, zero AEAD rejections, peer datagram count matches), and the peer's
+RTT stays ~100 µs through a collapse, so it is a stall bounded by a 1 s TCP RTO, not
+loss. The shipped configuration keeps per-datagram `sendmmsg` on the inbound and
+records the evidence at the call site.
+
+A second attempt at this ran for over two hours, produced ~760 lines of diagnostic
+instrumentation and no verified mechanism, and was **stopped and reverted**: the
+tree is back to the committed, verified state rather than carrying unreviewed
+probes. The honest status is "reproducible, mechanism unknown" — worth +40 % on this
+path when someone finds it, and the deterministic repro (`WG_NO_GSO_TX=1` against a
+run where the inbound also coalesces) is documented.
+
 ---
 
 ## Cycle 3 — 2026-10-22
