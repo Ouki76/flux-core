@@ -128,6 +128,91 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 12 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 878 tests, audit, deny, doc — green at `df3b73a`.
+
+### Coverage: re-measured, and it barely moved — which is the finding
+
+Re-ran the instrumented build after ten cycles of tests. Line coverage is **52.77 %**
+against 53.25 % in cycle 2, despite the suite doubling. The denominator also fell by
+a third, so runs are not comparable and the aggregate is near useless as a trend.
+
+What *is* useful is the per-file list, and it named the real gap: `dot.rs` (DNS over
+TLS, 180 lines) at **0 %** and `doq.rs` (DNS over QUIC, 248) at 10 %. Both are
+selectable from `dns.servers`, so 428 lines of networked protocol code had never
+been executed by any test.
+
+Recording the aggregate honestly: low coverage here mostly measures generic code
+that llvm-cov attributes to test binaries (fragment.rs reports 0 % with five passing
+tests), so it is a pointer to untested files, not a score.
+
+### The encrypted DNS transports had never been run — 11 defects
+
+Each now has a real local server (rcgen + rustls for DoT, quinn for DoQ, plain TCP
+HTTP for DoH) and end-to-end tests. Coverage: dot **0.0 → 90.2 %**, doq 10.2 →
+79.5 %, doh 50.4 → 83.5 %. Tests in the crate: 50 → 95.
+
+The defects a user would have hit: **DoQ never validated the response id** (any id
+was accepted as the answer); DoQ kept a stalled connection cached after a timeout
+and did not retry a stream-level failure; **DoT and DoQ capped responses at 4096
+bytes** — the UDP payload size applied to a stream; DoT left a desynchronised stream
+pooled and lost the query; DoH never checked the response `Content-Type`, sent a
+random non-zero id where RFC 8484 says zero, hung on an unparseable `Content-Length`
+and retried fatal HTTP errors; and **all three split IPv6 literals inside the
+address** (`tls://[2606:4700:4700::1111]` parsed as host `[2606:4700:4700:`),
+reachable straight from configuration.
+
+### The process layer — 18 defects between `main()` and the library
+
+Nothing there had a test. The worst: **SIGTERM was unhandled** (exit 143, no
+graceful stop, accept loops never joined); **signal handlers were installed only
+after the config load**, so a SIGHUP during startup — default action: terminate —
+killed a starting proxy; and **an empty config file was accepted as valid**
+(`check` said "Configuration is valid!" while `run` served nothing). Also: a bare
+invocation exited 0 (a supervisor with a broken `ExecStart` saw a healthy unit with
+no listener), `-w 0` panicked inside tokio, a port conflict did not name the inbound,
+and a rejected reload leaked the probes and sampler the candidate had spawned.
+
+Exit-code contract, now asserted by 19 black-box tests over the real binary
+(16 fail on the old one): 2 = bad invocation, 1 = invalid/unstartable config,
+0 = success including a graceful SIGTERM.
+
+### The relay copy serialised both directions — +13.5 % throughput
+
+Found because cycle 11's withdrawn benchmark taught me what `tokio::io::split`
+costs: it is a mutex around the whole stream taken on every poll, and
+**`copy_bidirectional_pooled` — the hot path of every proxied connection — used it
+twice**. A/B on the relay benchmark, same binary, one line changed:
+
+| copier | throughput | CPU |
+|---|---|---|
+| pooled split | 2171 MB/s | 0.42 s/GB |
+| `copy_bidirectional` | **2465 MB/s** | **0.38 s/GB** |
+
++13.5 % throughput, −9.5 % CPU, identical RSS (23.8 MB under 100 connections). The
+pooled variant is deleted rather than left dead.
+
+### Docs: rewritten against the code
+
+Eleven cycles of changes had left the documentation wrong in ways that cause silent
+breakage: it claimed an unset `${VAR}` expands to an empty string (it is a load
+error), that fake-IP answers `AAAA` with NODATA (the v6 pool is on by default), that
+the API refuses only some public binds, and a 1.85 MSRV that is actually 1.91.
+Thirty claims corrected, seven confirmed, and every performance number that could
+not be traced to a measurement from this session **removed rather than restated**.
+`docs/configuration.md` is now a complete reference — all 60 fields, every default
+traced to its implementation — and all six YAML examples pass `flux-core check`,
+which none of them did before.
+
+### State
+
+**952 tests, 0 failed** (was 878).
+
+---
+
 ## Cycle 11 — 2026-10-22
 
 ### Baseline
