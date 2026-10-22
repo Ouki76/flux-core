@@ -128,6 +128,73 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 13 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 952 tests, audit, deny, doc — green at `4c005aa`.
+
+### Dispatcher — two defects, one of them attacker-controlled resource growth
+
+The single funnel between inbounds and outbounds had one test for 602 lines.
+
+- **The UDP endpoint cap bounded the map, not the resources behind it.** Each cached
+  endpoint spawns a detached reply pump holding its own socket, and the cache stored
+  only the `Arc`, so evicting an entry stopped nothing. One association walking N
+  destinations through a per-destination outbound kept **N sockets and N tasks**
+  alive — descriptor growth a single client could drive, invisible until `EMFILE`.
+  Measured before the fix: **306 live endpoints for 306 destinations while the cache
+  claimed to cap at 256**. The cache now stores the endpoint with a cancellation
+  token, so eviction, replacement, send failure and teardown all release through one
+  mechanism.
+- **One failed send evicted every destination's association** for that outbound — a
+  single broken destination tore down up to 255 healthy VMess associations, each
+  costing a fresh handshake on its next packet. Only the failing entry is removed
+  now, found by pointer identity so the hot path stays allocation-free.
+- Plus: a pump stopped by eviction reported its key as dead, so a stale report could
+  evict a live replacement under the same key; and an eviction log claimed "oldest"
+  for an arbitrary hash-map entry.
+
+Verdicts on the rest of the file, each pinned by a test: connections are registered
+once and released on every exit path including the Linux splice early return;
+half-close propagates both ways over real sockets; byte counters survive an error;
+an unknown outbound tag and a `block` outbound fail cleanly on both networks; a
+Fake-IP destination is remapped before routing *and* dialling; adversarial
+`SessionMeta` values never panic.
+
+Recorded gap: **UDP associations are invisible to the connection table**, so the
+API cannot close them and their traffic is not attributable to a connection. That
+needs `api.rs`/inbound wiring, not a dispatcher change.
+
+### Configuration: refuse what would be ignored — and only that
+
+Five fields parsed, merged and were never read. Each is now decided individually
+instead of blanket-rejected:
+
+| field | decision |
+|---|---|
+| `flux` (format marker) | validated as a version marker (`"1.0"`, `"v2"`, `"flux"`) |
+| TUIC `congestion_control`, `zero_rtt` | refused — not implemented, and a value here is a claim we cannot honour |
+| Hysteria 2 `h3` | tri-state: `true` states what the code does and is accepted, `false` is refused, omitted is fine |
+| Hysteria 2 `hop_interval_secs` | refused — a node carries one port, so there is nothing to hop between |
+| inbound TLS `server_name` | refused — the acceptor serves one certificate and never filtered by SNI |
+
+My first version refused `h3: true` as well and broke a legitimate sing-box interop
+config; the test caught it, and the distinction (a true statement vs an unfulfillable
+one) is now the rule. Two existing tests asserted that inert fields *parse*; they no
+longer set them.
+
+Documented limit: `deny_unknown_fields` cannot be applied to serde's
+internally-tagged enums, so a typo **inside** a nested block is still accepted.
+Catching that needs a raw-key comparison against a schema — its own piece of work,
+not a one-line change.
+
+### State
+
+**972 tests, 0 failed** (was 952).
+
+---
+
 ## Cycle 12 — 2026-10-22
 
 ### Baseline
