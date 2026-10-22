@@ -70,7 +70,18 @@ pub struct Instance {
     /// Remote rule sets to fetch in the background.
     remote_rulesets: Vec<RemoteRuleSetSpec>,
     /// Cancel handle for background fetch loops (SIGHUP reload / shutdown safe).
-    fetch_cancel: tokio_util::sync::CancellationToken,
+    ///
+    /// Mutable behind a lock because a [`tokio_util::sync::CancellationToken`]
+    /// is one-shot: `stop()` cancels it, so `start()` hands out a *fresh* token.
+    /// Reusing the cancelled one left the fetch loops of a restarted instance
+    /// exiting on their first poll, silently losing the refresh.
+    fetch_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+    /// Serializes `start`/`stop` and remembers whether the instance is up.
+    ///
+    /// `start()` is idempotent (a second call would otherwise bind every port a
+    /// second time — SO_REUSEPORT makes that succeed instead of failing — and
+    /// spawn a second accept loop per inbound); `stop()` may be called twice.
+    started: tokio::sync::Mutex<bool>,
 }
 
 impl Instance {
@@ -558,7 +569,8 @@ impl Instance {
             api_server,
             resolver,
             remote_rulesets,
-            fetch_cancel: tokio_util::sync::CancellationToken::new(),
+            fetch_cancel: std::sync::Mutex::new(tokio_util::sync::CancellationToken::new()),
+            started: tokio::sync::Mutex::new(false),
         })
     }
 
@@ -592,27 +604,82 @@ impl Instance {
     }
 
     pub async fn start(&self) -> FluxResult<()> {
-        if let Some(api) = &self.api_server {
-            api.start().await?;
+        let mut started = self.started.lock().await;
+        if *started {
+            // Idempotent: bind-once / serve-once. See the field docs.
+            tracing::debug!("instance is already started; ignoring repeated start()");
+            return Ok(());
         }
-        for inbound in &self.inbounds {
-            inbound.start(self.dispatcher.clone()).await?;
+        self.reset_fetch_cancel();
+
+        if let Some(api) = &self.api_server
+            && let Err(e) = api.start().await
+        {
+            // The API is the first thing we bind, so nothing is left behind.
+            return Err(e);
+        }
+
+        for (idx, inbound) in self.inbounds.iter().enumerate() {
+            if let Err(e) = inbound.start(self.dispatcher.clone()).await {
+                // A start that fails half-way is worse than one that fails
+                // cleanly: the listeners opened by the inbounds before this one
+                // would stay bound (and accepting, under SO_REUSEPORT) for the
+                // lifetime of the process, which is exactly the half-applied
+                // state a SIGHUP reload must never produce. Release them, in
+                // reverse order, before reporting the error.
+                for already in self.inbounds[..=idx].iter().rev() {
+                    if let Err(stop_err) = already.stop().await {
+                        tracing::warn!(
+                            inbound = already.tag(),
+                            error = %stop_err,
+                            "failed to release inbound after a failed start"
+                        );
+                    }
+                }
+                if let Some(api) = &self.api_server
+                    && let Err(stop_err) = api.stop().await
+                {
+                    tracing::warn!(
+                        error = %stop_err,
+                        "failed to release API server after a failed start"
+                    );
+                }
+                return Err(e);
+            }
         }
         self.spawn_remote_ruleset_fetchers();
+        *started = true;
         Ok(())
+    }
+
+    /// Replaces the fetch cancellation token with a fresh, uncancelled one.
+    fn reset_fetch_cancel(&self) {
+        *self
+            .fetch_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            tokio_util::sync::CancellationToken::new();
+    }
+
+    fn fetch_cancel_token(&self) -> tokio_util::sync::CancellationToken {
+        self.fetch_cancel
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Spawns background fetch loops for remote (URL-based) rule sets.
     /// A fetch failure is logged and retried on the next interval (or once,
     /// when no `update_interval` is configured); it never breaks routing.
     fn spawn_remote_ruleset_fetchers(&self) {
+        let cancel = self.fetch_cancel_token();
         for spec in &self.remote_rulesets {
             let rs = spec.ruleset.clone();
             let url = spec.url.clone();
             let interval = spec.interval;
             let cache_path = spec.cache_path.clone();
             let resolver = self.resolver.clone();
-            let cancel = self.fetch_cancel.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 loop {
                     let fetch = crate::ruleset_fetch::fetch_remote_ruleset(&url, &resolver);
@@ -698,17 +765,39 @@ impl Instance {
     }
 
     pub async fn stop(&self) -> FluxResult<()> {
-        if let Some(api) = &self.api_server {
-            api.stop().await?;
+        let mut started = self.started.lock().await;
+        let mut first_error = None;
+
+        if *started {
+            *started = false;
+            if let Some(api) = &self.api_server
+                && let Err(e) = api.stop().await
+            {
+                first_error = Some(e);
+            }
+            // Keep going even if one inbound fails to stop: skipping the rest
+            // would leak their listeners and tasks.
+            for inbound in &self.inbounds {
+                if let Err(e) = inbound.stop().await
+                    && first_error.is_none()
+                {
+                    first_error = Some(e);
+                }
+            }
+            self.fetch_cancel_token().cancel();
         }
-        for inbound in &self.inbounds {
-            inbound.stop().await?;
-        }
+
+        // Outbound groups (urltest/fallback) spawn their probing loop in
+        // `new()`, i.e. *before* `start()`, so they are quiesced even when the
+        // instance never ran. Every group `stop()` is an idempotent cancel.
         for entry in self.registry.map.iter() {
             entry.value().stop();
         }
-        self.fetch_cancel.cancel();
-        Ok(())
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 }
 
@@ -1699,4 +1788,482 @@ fn build_layered_inbound(
         }
     }
     Ok(())
+}
+
+/// Lifecycle tests: they own the properties that only show up across a
+/// start/stop boundary (leaked listeners, half-started instances, leaked
+/// background tasks) rather than the behaviour of any single protocol.
+///
+/// No `sleep` is used for synchronisation: everything the tests wait for is
+/// caused by another task on the same runtime (a listener dropping its socket, a
+/// fetch loop running), so the tests yield to the scheduler and only use a
+/// deadline to bound the *failure*.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, TcpListener, UdpSocket};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::task::yield_now;
+
+    /// Upper bound for every "wait until the OS/task catches up" loop. Generous
+    /// enough for a loaded CI box, tight enough that a leaked listener fails the
+    /// test instead of hanging the suite.
+    const DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Hands out ports no other test in this process has received. The probe
+    /// socket is closed immediately, so two tests running in parallel could
+    /// otherwise be handed the same port by `bind(:0)`.
+    fn unique_port(bind: impl Fn() -> u16) -> u16 {
+        static HANDED_OUT: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+        let mut handed_out = HANDED_OUT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            let port = bind();
+            if !handed_out.contains(&port) {
+                handed_out.push(port);
+                return port;
+            }
+        }
+    }
+
+    fn free_port() -> u16 {
+        unique_port(|| {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("bind ephemeral port")
+                .local_addr()
+                .expect("local_addr")
+                .port()
+        })
+    }
+
+    fn free_udp_port() -> u16 {
+        unique_port(|| {
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .expect("bind ephemeral udp port")
+                .local_addr()
+                .expect("local_addr")
+                .port()
+        })
+    }
+
+    fn local(port: u16) -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    }
+
+    /// Holds a TCP port with a *plain* socket (no `SO_REUSEPORT`). Every proxy
+    /// listener sets `SO_REUSEPORT`, and Linux refuses to add a non-REUSEPORT
+    /// socket to a port that already has one — so this both simulates "the port
+    /// is taken" for a start, and proves a proxy listener really went away.
+    fn occupying_listener() -> (TcpListener, u16) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("occupy a port");
+        let port = listener.local_addr().expect("local_addr").port();
+        (listener, port)
+    }
+
+    fn tcp_port_is_free(port: u16) -> bool {
+        TcpListener::bind(local(port)).is_ok()
+    }
+
+    fn udp_port_is_free(port: u16) -> bool {
+        UdpSocket::bind(local(port)).is_ok()
+    }
+
+    /// Runs the scheduler until `cond` holds. Yielding — not sleeping — is the
+    /// synchronisation, because the state we wait for can only change when
+    /// another task on this runtime gets to run.
+    async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !cond() {
+            assert!(start.elapsed() < DEADLINE, "timed out waiting for {what}");
+            yield_now().await;
+        }
+    }
+
+    /// Number of live tasks on this test's runtime. A leaked accept loop or
+    /// fetch loop shows up here as a count that never returns to the baseline.
+    fn alive_tasks() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    fn tcp_inbound(tag: &str, port: u16, protocol: &str) -> String {
+        format!(
+            r#"{{"tag":"{tag}","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{port}}},"protocol":{{"type":"{protocol}"}}}}"#
+        )
+    }
+
+    /// Builds a config with the given inbounds plus an optional API / DNS
+    /// listener. Every listener is on loopback, so the tests need no privileges.
+    fn config(inbounds: &[String], api_port: Option<u16>, dns_port: Option<u16>) -> Config {
+        let mut sections: Vec<String> = Vec::new();
+        if let Some(p) = api_port {
+            sections.push(format!(
+                r#""api": {{"listen":"127.0.0.1:{p}","secret":"lifecycle-test-token"}}"#
+            ));
+        }
+        if let Some(p) = dns_port {
+            sections.push(format!(r#""dns": {{"listen":"127.0.0.1:{p}"}}"#));
+        }
+        sections.push(format!(r#""inbounds": [{}]"#, inbounds.join(",")));
+        sections.push(r#""outbounds": [{"type":"direct","tag":"direct"}]"#.to_string());
+        Config::from_json_str(&format!("{{{}}}", sections.join(","))).expect("config must parse")
+    }
+
+    /// SOCKS5 greeting. Any answer proves a live accept loop serving the old
+    /// protocol, not merely a socket that is still bound.
+    async fn socks_greeting(port: u16) -> Option<u8> {
+        let mut stream = TcpStream::connect(local(port)).await.ok()?;
+        stream.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+        let mut reply = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut reply))
+            .await
+            .ok()?
+            .ok()?;
+        (reply[0] == 0x05).then_some(reply[1])
+    }
+
+    /// Property: `start()` then `stop()` frees every port the instance listened
+    /// on, and the same instance can run a second cycle. A listener leaked by
+    /// the first cycle is invisible everywhere except in the second `start()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_stop_releases_every_listener_and_cycles() {
+        let socks_port = free_port();
+        let http_port = free_port();
+        let api_port = free_port();
+        let instance = Instance::new(config(
+            &[
+                tcp_inbound("in-socks", socks_port, "socks"),
+                tcp_inbound("in-http", http_port, "http"),
+            ],
+            Some(api_port),
+            None,
+        ))
+        .expect("instance");
+
+        for cycle in 0..2 {
+            instance.start().await.expect("start");
+
+            // `start()` returning Ok is not the assertion: the sockets must
+            // actually be bound now.
+            for port in [socks_port, http_port, api_port] {
+                assert!(
+                    !tcp_port_is_free(port),
+                    "cycle {cycle}: start() returned Ok but nothing is bound on {port}"
+                );
+            }
+            assert_eq!(
+                socks_greeting(socks_port).await,
+                Some(0x00),
+                "cycle {cycle}: the socks listener must serve, not just be bound"
+            );
+
+            instance.stop().await.expect("stop");
+
+            for port in [socks_port, http_port, api_port] {
+                wait_until(
+                    &format!("port {port} to be released after stop (cycle {cycle})"),
+                    || tcp_port_is_free(port),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Property: the DNS listener (UDP) is covered by the same guarantee; a
+    /// leaked datagram socket would otherwise keep answering on a port the new
+    /// instance also bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dns_listen_port_is_released_on_stop() {
+        let dns_port = free_udp_port();
+        let instance = Instance::new(config(&[], None, Some(dns_port))).expect("instance");
+
+        instance.start().await.expect("start");
+        assert!(
+            !udp_port_is_free(dns_port),
+            "the DNS inbound did not bind {dns_port}"
+        );
+
+        instance.stop().await.expect("stop");
+        wait_until("the DNS socket to be released", || {
+            udp_port_is_free(dns_port)
+        })
+        .await;
+    }
+
+    /// Property: `stop()` is idempotent and safe on a never-started instance;
+    /// `start()` is idempotent, so a repeated call does not bind a second time
+    /// (SO_REUSEPORT would happily allow that, and two accept loops would then
+    /// race for the same connections).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_start_and_stop_are_idempotent() {
+        let port = free_port();
+        let instance = Instance::new(config(
+            &[tcp_inbound("in-socks", port, "socks")],
+            None,
+            None,
+        ))
+        .expect("instance");
+        let baseline = alive_tasks();
+
+        // stop() before start(): no panic, no hang, and nothing invented.
+        tokio::time::timeout(Duration::from_secs(10), instance.stop())
+            .await
+            .expect("stop() must not hang when the instance never started")
+            .expect("stop() before start() must succeed");
+        assert!(tcp_port_is_free(port));
+
+        instance.start().await.expect("first start");
+        let after_start = alive_tasks();
+        assert_eq!(
+            after_start,
+            baseline + 1,
+            "one inbound must spawn exactly one accept loop"
+        );
+
+        instance
+            .start()
+            .await
+            .expect("a repeated start must be a no-op, not an error");
+        assert_eq!(
+            alive_tasks(),
+            after_start,
+            "a repeated start must not spawn a second accept loop"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), instance.stop())
+            .await
+            .expect("first stop must not hang")
+            .expect("first stop must succeed");
+        tokio::time::timeout(Duration::from_secs(10), instance.stop())
+            .await
+            .expect("second stop must not hang")
+            .expect("second stop must succeed");
+
+        wait_until("every task to exit", || alive_tasks() == baseline).await;
+        assert!(
+            tcp_port_is_free(port),
+            "the listener must stay released after repeated stop() calls"
+        );
+    }
+
+    /// Property: a start that fails half-way returns an error *and* releases the
+    /// inbound it already bound. This is the state that leaks a listener nobody
+    /// will ever stop — the port stays taken for the life of the process.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_start_releases_the_inbound_it_already_bound() {
+        let first_port = free_port();
+        let (blocker, blocked_port) = occupying_listener();
+        let instance = Instance::new(config(
+            &[
+                tcp_inbound("in-first", first_port, "socks"),
+                tcp_inbound("in-blocked", blocked_port, "http"),
+            ],
+            None,
+            None,
+        ))
+        .expect("instance");
+        let baseline = alive_tasks();
+
+        instance
+            .start()
+            .await
+            .expect_err("the second inbound cannot bind its port");
+
+        wait_until("the already-bound inbound to be released", || {
+            tcp_port_is_free(first_port)
+        })
+        .await;
+        wait_until("every task of the failed start to exit", || {
+            alive_tasks() == baseline
+        })
+        .await;
+
+        // A failed start must leave the instance usable, not wedged.
+        assert!(
+            instance.start().await.is_err(),
+            "the port is still taken; the retry must fail the same way"
+        );
+        wait_until("the retry to release the first listener too", || {
+            tcp_port_is_free(first_port)
+        })
+        .await;
+
+        // Once the obstacle is gone the very same instance must start.
+        drop(blocker);
+        instance
+            .start()
+            .await
+            .expect("with the port free the same instance must start");
+        assert_eq!(socks_greeting(first_port).await, Some(0x00));
+        instance.stop().await.expect("stop");
+        wait_until("the listener to be released", || {
+            tcp_port_is_free(first_port)
+        })
+        .await;
+    }
+
+    /// Property: the API listener binds first, so when it cannot, no inbound may
+    /// be left bound behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_api_bind_starts_no_inbound() {
+        let (blocker, api_port) = occupying_listener();
+        let inbound_port = free_port();
+        let instance = Instance::new(config(
+            &[tcp_inbound("in-socks", inbound_port, "socks")],
+            Some(api_port),
+            None,
+        ))
+        .expect("instance");
+
+        instance.start().await.expect_err("the API port is taken");
+        assert!(
+            tcp_port_is_free(inbound_port),
+            "no inbound may stay bound when the API bind fails"
+        );
+
+        drop(blocker);
+        instance.start().await.expect("start once the port is free");
+        instance.stop().await.expect("stop");
+    }
+
+    /// Property: a candidate config that fails to start must not disturb the
+    /// running instance — the reload path builds a new instance, starts it and
+    /// only then stops the old one, so a failing candidate must release what it
+    /// bound and leave the old listener serving its own configuration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_replacement_start_does_not_disturb_the_running_instance() {
+        let live_port = free_port();
+        let live = Instance::new(config(
+            &[tcp_inbound("old-socks", live_port, "socks")],
+            None,
+            None,
+        ))
+        .expect("instance");
+        live.start().await.expect("start");
+
+        // The candidate reuses the live port (SO_REUSEPORT lets it bind, which is
+        // the whole point of a zero-downtime reload) and adds an inbound on an
+        // occupied port: it fails *after* it already bound something.
+        let (blocker, blocked_port) = occupying_listener();
+        let candidate = Instance::new(config(
+            &[
+                tcp_inbound("new-socks", live_port, "socks"),
+                tcp_inbound("new-blocked", blocked_port, "http"),
+            ],
+            None,
+            None,
+        ))
+        .expect("instance");
+        // `Instance::new` already owns one task of its own (`TrafficMeter`'s
+        // sampler, in api.rs), so "no leftovers" is measured against the
+        // candidate's own construction baseline, not against the old instance.
+        let tasks_with_candidate = alive_tasks();
+
+        candidate
+            .start()
+            .await
+            .expect_err("the candidate cannot bind its second inbound");
+
+        wait_until("the failed candidate to release its accept loop", || {
+            alive_tasks() == tasks_with_candidate
+        })
+        .await;
+
+        assert_eq!(
+            socks_greeting(live_port).await,
+            Some(0x00),
+            "the running instance must still serve after a failed reload"
+        );
+
+        live.stop().await.expect("stop");
+        wait_until("the live listener to be released", || {
+            tcp_port_is_free(live_port)
+        })
+        .await;
+        drop(blocker);
+    }
+
+    /// Serves a rule-set body to every request and counts the requests.
+    async fn spawn_ruleset_server() -> (u16, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind rule set server");
+        let port = listener.local_addr().expect("local_addr").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let body = "DOMAIN-SUFFIX,example.com\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, hits)
+    }
+
+    /// Property: `start()`/`stop()` symmetry includes background work. The fetch
+    /// loops are cancelled by `stop()`, so `start()` must hand them a *fresh*
+    /// cancellation token — a `CancellationToken` is one-shot, and reusing the
+    /// cancelled one made every restarted instance silently stop refreshing its
+    /// remote rule sets.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_after_stop_refetches_remote_rulesets() {
+        let (rules_port, hits) = spawn_ruleset_server().await;
+        let inbound_port = free_port();
+        let cache_dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = cache_dir.path().join("rs.txt");
+        let cfg = Config::from_json_str(&format!(
+            r#"{{
+                "inbounds": [{}],
+                "outbounds": [{{"type":"direct","tag":"direct"}}],
+                "route": {{"rule_set": [{{
+                    "tag": "rs",
+                    "type": "remote",
+                    "path": "http://127.0.0.1:{rules_port}/rules.txt",
+                    "cache_path": "{}"
+                }}]}}
+            }}"#,
+            tcp_inbound("in-socks", inbound_port, "socks"),
+            cache_path.display()
+        ))
+        .expect("config must parse");
+        let instance = Instance::new(cfg).expect("instance");
+
+        instance.start().await.expect("start");
+        wait_until("the rule set to be fetched by the first start", || {
+            hits.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        instance.stop().await.expect("stop");
+        wait_until("the listener to be released", || {
+            tcp_port_is_free(inbound_port)
+        })
+        .await;
+
+        instance.start().await.expect("restart");
+        wait_until("the rule set to be fetched again after a restart", || {
+            hits.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        instance.stop().await.expect("stop");
+    }
 }
