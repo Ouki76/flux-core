@@ -54,7 +54,10 @@ pub struct BrutalPacer {
 
 impl BrutalPacer {
     pub fn new(mbps: u64) -> Self {
-        let rate_bps = (mbps.max(1)) * 1_000_000;
+        // Clamp before multiplying: `mbps * 1_000_000` overflows for values above
+        // ~1.8e13 (panic in debug, wrap in release), and a wrapped zero would
+        // divide by zero in `pace()`.
+        let rate_bps = mbps.clamp(1, 1_000_000).saturating_mul(1_000_000);
         Self {
             rate_bps,
             last_send: Instant::now(),
@@ -627,5 +630,32 @@ mod tests {
         // Empty list defaults to 443.
         let empty = PortHopper::new(vec![], 5);
         assert_eq!(empty.ports, vec![443]);
+    }
+}
+
+#[cfg(test)]
+mod pacer_bounds_tests {
+    use super::*;
+
+    /// The rate must be clamped before the multiply: `mbps * 1_000_000` overflows
+    /// for absurd values (panic in debug, wrap to zero in release), and a zero
+    /// rate then divides by zero in `pace()`.
+    #[tokio::test]
+    async fn an_absurd_declared_rate_does_not_overflow_or_divide_by_zero() {
+        for mbps in [0u64, 1, 100, u64::MAX / 2, u64::MAX] {
+            let mut pacer = BrutalPacer::new(mbps);
+            assert!(
+                pacer.rate_bps > 0,
+                "rate {mbps} Mbps produced a zero/overflowed rate_bps"
+            );
+            // Pacing must compute a finite delay, not panic on 0/inf.
+            pacer.pace(1024).await;
+        }
+    }
+
+    /// A normal value must not be clamped away: 100 Mbps stays 100 Mbps.
+    #[test]
+    fn a_normal_rate_is_preserved() {
+        assert_eq!(BrutalPacer::new(100).rate_bps, 100 * 1_000_000);
     }
 }

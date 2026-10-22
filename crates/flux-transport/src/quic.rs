@@ -77,8 +77,12 @@ impl QuicTransport {
         transport.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
         transport.max_concurrent_bidi_streams(256u32.into());
         transport.max_concurrent_uni_streams(256u32.into());
-        transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-        transport.datagram_send_buffer_size(4 * 1024 * 1024);
+        // A datagram receive buffer is the peer's `max_datagram_frame_size`, so
+        // 4 MiB meant quinn would allocate and hand us a 4 MiB datagram per
+        // packet before any inbound got to inspect it. Every inbound drops
+        // anything over a few KiB, so advertise what we will actually accept.
+        transport.datagram_receive_buffer_size(Some(64 * 1024));
+        transport.datagram_send_buffer_size(1024 * 1024);
         if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
             transport.max_idle_timeout(Some(idle));
         }
@@ -156,8 +160,12 @@ impl QuicTransport {
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(256u32.into());
         transport.max_concurrent_uni_streams(256u32.into());
-        transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-        transport.datagram_send_buffer_size(4 * 1024 * 1024);
+        // A datagram receive buffer is the peer's `max_datagram_frame_size`, so
+        // 4 MiB meant quinn would allocate and hand us a 4 MiB datagram per
+        // packet before any inbound got to inspect it. Every inbound drops
+        // anything over a few KiB, so advertise what we will actually accept.
+        transport.datagram_receive_buffer_size(Some(64 * 1024));
+        transport.datagram_send_buffer_size(1024 * 1024);
         if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
             transport.max_idle_timeout(Some(idle));
         }
@@ -199,8 +207,12 @@ impl QuicTransport {
         let mut transport = quinn::TransportConfig::default();
         transport.max_concurrent_bidi_streams(256u32.into());
         transport.max_concurrent_uni_streams(256u32.into());
-        transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-        transport.datagram_send_buffer_size(4 * 1024 * 1024);
+        // A datagram receive buffer is the peer's `max_datagram_frame_size`, so
+        // 4 MiB meant quinn would allocate and hand us a 4 MiB datagram per
+        // packet before any inbound got to inspect it. Every inbound drops
+        // anything over a few KiB, so advertise what we will actually accept.
+        transport.datagram_receive_buffer_size(Some(64 * 1024));
+        transport.datagram_send_buffer_size(1024 * 1024);
         if let Ok(idle) = quinn::IdleTimeout::try_from(std::time::Duration::from_secs(30)) {
             transport.max_idle_timeout(Some(idle));
         }
