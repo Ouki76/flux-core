@@ -17,6 +17,35 @@ const TEST_PORT_MAX: u16 = 32_000;
 
 static NEXT_TCP_PORT: AtomicU16 = AtomicU16::new(TEST_PORT_BASE);
 
+/// True when nothing is listening on `port` and both TCP and UDP bind succeed.
+///
+/// A bare `bind()` probe is not enough: a *foreign* listener can hold the port
+/// with `SO_REUSEPORT` (which every flux listener sets), letting our probe bind
+/// succeed and handing the port out twice. The probe therefore also *connects* —
+/// a free port refuses the connection, an occupied one accepts it.
+#[allow(dead_code)]
+async fn port_is_free(port: u16) -> bool {
+    let addr = format!("127.0.0.1:{}", port);
+    if tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map(|r| r.is_ok())
+    .unwrap_or(false)
+    {
+        return false;
+    }
+    if let Ok(listener) = TcpListener::bind(&addr).await
+        && let Ok(udp) = std::net::UdpSocket::bind(&addr)
+    {
+        drop(udp);
+        drop(listener);
+        return true;
+    }
+    false
+}
+
 /// Returns a unique, non-colliding TCP port below the ephemeral port range.
 ///
 /// A bare `bind()` probe is not enough: a *foreign* process already listening on
@@ -33,25 +62,7 @@ pub async fn get_free_tcp_port() -> u16 {
             NEXT_TCP_PORT.store(TEST_PORT_BASE, Ordering::Relaxed);
             continue;
         }
-        let addr = format!("127.0.0.1:{}", port);
-
-        // Something is already listening (possibly with SO_REUSEPORT) — skip it.
-        if tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            tokio::net::TcpStream::connect(&addr),
-        )
-        .await
-        .map(|r| r.is_ok())
-        .unwrap_or(false)
-        {
-            continue;
-        }
-
-        if let Ok(listener) = TcpListener::bind(&addr).await
-            && let Ok(udp) = std::net::UdpSocket::bind(&addr)
-        {
-            drop(udp);
-            drop(listener);
+        if port_is_free(port).await {
             return port;
         }
     }
@@ -203,12 +214,15 @@ where
 mod port_allocator_tests {
     use super::*;
 
-    /// The allocator must never hand out a port that something is already
-    /// listening on **even when the squatter holds it with `SO_REUSEPORT`** — that
-    /// is the case a bare bind probe cannot see, and every flux listener sets it,
-    /// so a leftover process used to poison the port silently.
+    /// The probe must reject a port a live listener holds **even with
+    /// `SO_REUSEPORT`**, which defeats a bare bind probe. This is the case that
+    /// silently handed out an occupied port and produced `AddrInUse` failures.
+    ///
+    /// Deliberately tests `port_is_free` and not `get_free_tcp_port`: the latter
+    /// mutates a process-global counter that other tests in the same binary are
+    /// using concurrently, so a test that nudged it would corrupt their ports.
     #[tokio::test]
-    async fn never_returns_a_port_with_a_reuseport_listener() {
+    async fn a_reuseport_listener_is_not_considered_free() {
         use socket2::{Domain, Protocol, Socket, Type};
 
         let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
@@ -220,20 +234,16 @@ mod port_allocator_tests {
         sock.listen(1).unwrap();
         let taken = sock.local_addr().unwrap().as_socket().unwrap().port();
 
-        NEXT_TCP_PORT.store(taken, Ordering::Relaxed);
-        let got = get_free_tcp_port().await;
-        assert_ne!(
-            got, taken,
-            "allocator handed out port {taken}, which a SO_REUSEPORT listener holds"
+        assert!(
+            !port_is_free(taken).await,
+            "a port with a SO_REUSEPORT listener was reported free"
         );
         drop(sock);
-    }
 
-    /// Successive calls must not repeat a port within the range.
-    #[tokio::test]
-    async fn successive_calls_are_distinct() {
-        let a = get_free_tcp_port().await;
-        let b = get_free_tcp_port().await;
-        assert_ne!(a, b);
+        // Once the squatter is gone the same port must be reported free again.
+        assert!(
+            port_is_free(taken).await,
+            "the port stayed busy after the listener was dropped"
+        );
     }
 }
