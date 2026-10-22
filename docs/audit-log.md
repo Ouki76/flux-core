@@ -128,6 +128,92 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 6 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 646 tests, audit, deny, doc — green at `e3a68a2`.
+
+### Theme: the pre-authentication surface
+
+Everything audited this cycle consumes **untrusted bytes before authentication** —
+the most exposed code in a proxy. None of it had unit tests. Result: **29 defects**.
+
+#### Inbound protocol parsers — 6 defects (43 tests)
+
+| Defect | Consequence |
+|---|---|
+| VLESS answered an **unknown command** with the response header (the "authenticated, go ahead" signal) and only then dropped the connection | A command we cannot serve was acknowledged as if it were valid |
+| VLESS's mux branch ignored the command | A UDP request to the mux destination was handed to smux, so datagram framing was parsed as mux frames |
+| VLESS accepted Vision addons with a non-TCP command | Flow silently dropped |
+| Trojan read the UDP frame terminator `[addr][len][CRLF][payload]` and threw it away | Any two bytes accepted there — a peer could park another frame's header in the gap |
+| VMess "repaired" an unknown security byte by falling back to AES-128-GCM | security 0/1/2/5/6/15 accepted and dispatched, then decrypted under the wrong cipher |
+| VMess never validated the command or option bits | Global padding and authenticated length change the chunk layout; ignoring them desyncs the stream |
+
+The parsers themselves live in `flux-protocol` and were already hardened by earlier
+cycles; the defects were in the glue and in two inline post-auth UDP frame readers.
+
+#### TUIC + Hysteria 2 inbounds — 22 defects (66 tests)
+
+TUIC: no deadline on the CONNECT header read (an idle bi-stream parked a task for
+the connection's lifetime); the user list consulted **before** the token, returning
+early on an unknown UUID (an oracle for which UUIDs exist); the authenticated
+identity was a bare `bool`, so multi-user sessions carried no `user` in QUIC mode;
+an **unbounded** UDP association table (65 536 slots per connection, each a channel
+and two tasks) freed only on DISSOCIATE, so a dead association leaked its sender
+forever; one oversized reply killing its association; a u16 reply length wrapping
+silently; no cap on the received datagram size.
+
+Hysteria 2: a malformed datagram **panicked** (slice index) instead of erroring;
+destinations of ≥64 bytes were **silently dropped** because the QUIC varint length
+was read as a raw byte, and the reply encoder wrote a byte where the protocol uses
+a varint — a real interop bug on both sides; the password was compared with `==`
+(memcmp early exit); an unknown command silently became TCP; 64 KiB allocated
+pre-auth from a client length; no deadline at any handshake stage; `frag_total == 0`
+accepted as "unfragmented"; `udp_sessions` keyed on a 32-bit client id and never
+removed; `Hysteria-CC-RX` never parsed at all.
+
+Both files were refactored so the parsing/dispatch core is pure functions
+(`parse_connect_header`, `ConnAuth`, `UdpAssocTable`, `parse_udp_datagram`,
+`read_varint`, …) and `start()` is a thin wire-up — that is what made them testable
+at all.
+
+**Premise correction:** the brief assumed both protocols are multi-user. Hysteria 2
+has a single password and no user concept; that is stated rather than papered over.
+
+#### Routed findings, fixed here
+
+- `quic.rs` advertised a **4 MiB datagram receive buffer**, which is the peer's
+  `max_datagram_frame_size`: quinn would allocate and hand an inbound a 4 MiB
+  datagram per packet before any check ran. Now 64 KiB.
+- `BrutalPacer::new` multiplied before clamping, overflowing for `mbps > ~1.8e13`
+  (panic in debug, wrap to zero in release) and then dividing by zero in `pace()`.
+
+#### Management API — request framing
+
+`Content-Length` was parsed last-one-wins and `Transfer-Encoding` was ignored
+entirely. Behind a reverse proxy that is the classic request-smuggling pair. A
+`Transfer-Encoding` header is now refused outright (chunked bodies are not
+implemented, so ignoring it was never safe), a non-numeric `Content-Length` is a
+400, and two conflicting ones are a 400 rather than a choice. Three of the five new
+tests fail on the previous code.
+
+### Open: a ~5 s stall on the first Hysteria 2 request
+
+Measured independently: `test_hy2_salamander_obfs_e2e` takes **5.67 s** although the
+server answers the auth request in **27 µs**, and every Hysteria 2 test (including
+one in `flux-transport`) carries the same ~5.5 s. The deliberate "reject a plain
+client" test takes 10.11 s, which is its own 10 s timeout and is expected. A 5 s
+gap with a microsecond reply smells like a QUIC retransmission timer or a poll
+interval on the first request — it inflates the suite and every real client's first
+request, and deserves its own cycle with a phase-instrumented reproduction.
+
+### State
+
+**762 tests, 0 failed** (was 646). fmt/clippy/audit/deny/doc green.
+
+---
+
 ## Cycle 5 — 2026-10-22
 
 ### Baseline
