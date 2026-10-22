@@ -524,7 +524,13 @@ Full code audit: correctness, security, resource-exhaustion and performance fixe
 
 ### Performance
 
-- **Buffer pool no longer scrubs on release.** Every release performed a full
+- **Buffer pool scrubs on release again (audit cycle 10).** A later audit showed
+  the un-scrubbed pool handed a recycled buffer back to the next caller at full
+  length with the previous tenant's bytes still in it — no in-tree consumer read
+  them, but the invariant was only a doc comment. The memset costs ~6 % of one core
+  on the UDP receive path; a sized release (`release_used(buf, len)`) would make it
+  ~10 ns instead of ~471 ns and is the recorded optimisation. Superseded entry:
+  buffer pool no longer scrubs on release. Every release performed a full
   `memset` of the buffer; the 64 KiB packet pool did so once *per UDP datagram*.
   Measured: **1015 ns → 527 ns** per acquire/release cycle (48% faster).
 - **Buffer-pool shard cursor is thread-local** instead of one shared atomic,

@@ -169,8 +169,10 @@ Raising the floor from 64 KiB to 256 KiB cost 4x per-connection memory
 | **flux-core** (SOCKS5 UDP relay, 1200 B payload) | **130k datagrams/s** — 1.25 Gbit/s, 7.7 µs round-trip |
 
 Micro-benchmarks (median): router lookup over 100 rules 90 ns (hit) / 46 ns
-(miss); pooled 64 KiB buffer acquire+release 519 ns (992 ns if the buffer is
-scrubbed, which it no longer is); TLS client connector 60 ns cached versus 7.7 µs
+(miss); pooled 64 KiB buffer acquire+release 1009 ns — the release scrubs, because
+a recycled buffer that still holds the previous connection's bytes is one careless
+`write_all(&guard)` away from cross-tenant disclosure; TLS client connector 60 ns
+cached versus 7.7 µs
 to build one from scratch. Resource cost per established TCP relay:
 ≈ 4 KB RSS and 6 file descriptors (2 sockets + 4 `splice` pipe ends); idle
 process footprint 7.5 MB.

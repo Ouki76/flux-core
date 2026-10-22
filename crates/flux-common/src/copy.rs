@@ -229,6 +229,62 @@ mod tests {
         t2.await.unwrap();
     }
 
+    /// The pooled copier reads into a full-length pooled buffer and must forward
+    /// only the `n` bytes the reader reported. Poison the pool with a
+    /// recognisable pattern first, so the copier is working from allocations that
+    /// still contain a previous connection's payload: the receiver must get the
+    /// four bytes that were written and nothing else.
+    #[tokio::test]
+    async fn pooled_copy_never_forwards_stale_buffer_contents() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = crate::buffer::BufferPool::default_pool();
+        let poisoned: Vec<Vec<u8>> = (0..16)
+            .map(|_| {
+                let mut b = pool.acquire();
+                b.fill(0xAA);
+                b
+            })
+            .collect();
+        for b in poisoned {
+            pool.release(b);
+        }
+        assert!(
+            pool.acquire().iter().all(|&b| b == 0),
+            "precondition: the pool must hand out scrubbed buffers"
+        );
+
+        let payload = b"four".to_vec();
+        let expected = payload.clone();
+        let (mut client, mut proxy_client) = tokio::io::duplex(64 * 1024);
+        let (mut proxy_server, mut server) = tokio::io::duplex(64 * 1024);
+
+        let relay = tokio::spawn(async move {
+            let _ = copy_bidirectional_pooled(&mut proxy_client, &mut proxy_server).await;
+        });
+        let writer = tokio::spawn(async move {
+            client.write_all(&payload).await.unwrap();
+            client.shutdown().await.unwrap();
+            // Drain the reverse direction so the copier's other half is not
+            // left blocked on us.
+            let mut sink = Vec::new();
+            let _ = client.read_to_end(&mut sink).await;
+        });
+
+        let mut got = Vec::new();
+        server.read_to_end(&mut got).await.unwrap();
+        assert_eq!(
+            got,
+            expected,
+            "copier forwarded {} bytes for a {}-byte message (stale buffer contents leaked)",
+            got.len(),
+            expected.len()
+        );
+
+        relay.abort();
+        let _ = writer.await;
+    }
+
     #[tokio::test]
     async fn test_copy_bidirectional() {
         let (mut client, server) = tokio::io::duplex(1024);
