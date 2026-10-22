@@ -22,11 +22,36 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Inner IP MTU for the tunnel (1500 - 80 bytes of WG/UDP/IP overhead).
 const WG_MTU: usize = 1420;
+
 /// TCP connect timeout inside the tunnel.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Inner TCP buffer per direction. Raising it to 256 KiB was measured and made no
-/// difference (the single-flow limit is the per-packet pipeline, not the window),
-/// so the original size stays.
+/// Inner TCP buffer per direction — i.e. the advertised window, per direction.
+///
+/// Unlike the TUN datapath, whose window was the binding constraint up to
+/// 256 KiB, this one is **not** window-limited, and the difference is the
+/// interleaving: TUN's stack is throttled by a single socket's BDP, while here
+/// the pump already keeps a burst in flight, so a 64 KiB window spans 45
+/// segments and covers the pipeline's bandwidth-delay product.
+///
+/// Swept on `bench_wireguard` (32 MiB verified payload, 9 rounds/measurement,
+/// 4 interleaved passes to beat a measured +-2.5 % A/A noise floor, only this
+/// constant varied):
+///
+/// ```text
+/// window   before GSO        after GSO
+///  64 KiB  97.1 MB/s         203.5-209.9 MB/s   (stable)
+/// 128 KiB  99.1 MB/s         28.3 / 28.3 / 232.5 / 28.1  (bimodal)
+/// 256 KiB 101.2 MB/s          7.7-14.9 MB/s     (collapses)
+/// 384 KiB 100.4 MB/s          15.3-27.8 MB/s
+/// 512 KiB  99.8 MB/s          14.9-15.2 MB/s
+/// ```
+///
+/// Before GSO a wider window bought +4 % for +6 % more CPU (the flow was
+/// already pipelined). After GSO the sender can push a burst that the inbound's
+/// frame channel and stack actor cannot absorb, so a wider window makes the
+/// inbound drop frames and the connection stalls — see the note on
+/// `FRAME_CHANNEL_CAP` in `flux-inbound/src/wireguard.rs`. 64 KiB is the stable
+/// point on both sides of that boundary, so it stays.
 const WG_TCP_BUF: usize = 64 * 1024;
 /// How much data one connection may queue between the proxy task and the inner
 /// socket. Beyond this the proxy is blocked instead of the queue growing.
@@ -188,6 +213,221 @@ impl UdpBatch {
 // pointers are rebuilt from its own heap allocations on every syscall attempt and
 // never outlive the struct, so moving it to another thread is sound.
 unsafe impl Send for UdpBatch {}
+
+// ---------------------------------------------------------------------------
+// UDP segmentation offload (GSO)
+//
+// The tunnel carries one inner IP packet per datagram, so the send side costs
+// one *datagram* of kernel work per packet however well it is batched: a route
+// lookup, an skb allocation, a copy and a checksum. `sendmmsg` amortises the
+// syscall itself but not that work. Measured on this box with a standalone
+// sender/receiver pair at 1452-byte datagrams, 12 datagrams per call:
+//
+//   plain `sendto`            5.0 CPU s/GB
+//   `sendmmsg`, 12 per call   4.2 CPU s/GB
+//   `sendmsg` + `UDP_SEGMENT` 0.8 CPU s/GB   (1717 MB/s of datagrams)
+//
+// `UDP_SEGMENT` hands the kernel one super-packet plus a segment size and lets
+// it do the segmentation on transmit, so N datagrams cost one syscall, one route
+// lookup and one skb. The receiver sees ordinary datagrams — GSO is a
+// *sender-side* offload that needs no negotiation with, or support from, the
+// peer, which is what makes it usable on a real WireGuard path rather than only
+// between two flux endpoints.
+//
+// A super-packet must consist of equal-sized segments (the final one may be
+// short), so the caller groups the burst by datagram length first. If the kernel
+// refuses the cmsg (old kernel, or a socket that cannot do GSO) the run is
+// resent the old way and GSO is disabled for the process.
+// ---------------------------------------------------------------------------
+
+/// `SOL_UDP`, for the GSO control message.
+const SOL_UDP: libc::c_int = 17;
+/// `UDP_SEGMENT`: the segment size for a GSO super-packet.
+const UDP_SEGMENT: libc::c_int = 103;
+/// Largest super-packet worth building: 32 x 1452 = 46 KiB, comfortably under
+/// the 64 KiB per-skb GSO limit.
+const GSO_MAX_BYTES: usize = 48 * 1024;
+
+/// Set once the kernel rejects a GSO cmsg, so a kernel without `UDP_SEGMENT`
+/// pays for the probe exactly once instead of once per burst.
+static GSO_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Escape hatch: set `WG_NO_GSO_RX` / `WG_NO_GSO_TX` to force plain
+/// `sendmmsg` on a kernel or middlebox where GSO misbehaves. GSO also disables
+/// itself permanently after the first rejected control message.
+fn gso_off() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("WG_NO_GSO_TX").is_some())
+}
+
+/// Sends bursts of already-encrypted datagrams, coalescing equal-sized runs into
+/// `UDP_SEGMENT` super-packets.
+pub(crate) struct GsoBatch {
+    /// Concatenated segments for the super-packet currently being sent.
+    buf: Vec<u8>,
+    /// `cmsghdr` scratch. `u64`-backed so the control message is aligned the way
+    /// `CMSG_DATA` requires.
+    cmsg: [u64; 8],
+}
+
+impl GsoBatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(GSO_MAX_BYTES),
+            cmsg: [0; 8],
+        }
+    }
+
+    /// One GSO `sendmsg` for `datagrams`, which must all be exactly
+    /// `datagrams[0].len()` bytes, to `dst`.
+    ///
+    /// Returns `Ok(false)` when the kernel rejected the control message (GSO is
+    /// then disabled for the process and the caller falls back), `Ok(true)` when
+    /// the whole burst went out, and `Err` for a real socket error.
+    async fn send(
+        &mut self,
+        socket: &UdpSocket,
+        fd: RawFd,
+        datagrams: &[Vec<u8>],
+        dst: SocketAddr,
+    ) -> std::io::Result<bool> {
+        debug_assert!(datagrams.len() >= 2);
+        let seg_len = datagrams[0].len();
+        debug_assert!(datagrams.iter().all(|d| d.len() == seg_len));
+
+        self.buf.clear();
+        self.buf.reserve(seg_len * datagrams.len());
+        for d in datagrams {
+            self.buf.extend_from_slice(d);
+        }
+        let total = self.buf.len();
+
+        let (storage, addr_len) = sockaddr_of(dst);
+        // Fill the control message now: it holds no pointers, so the closure
+        // below can point at it without capturing a raw pointer (which would
+        // make the enclosing future non-`Send`).
+        {
+            let base = self.cmsg.as_mut_ptr() as *mut libc::cmsghdr;
+            // SAFETY: `self.cmsg` is 64 bytes of 8-byte-aligned scratch, which
+            // is more than `CMSG_SPACE(size_of::<u16>())` requires.
+            unsafe {
+                (*base).cmsg_len = libc::CMSG_LEN(2) as usize;
+                (*base).cmsg_level = SOL_UDP;
+                (*base).cmsg_type = UDP_SEGMENT;
+                let data = libc::CMSG_DATA(base);
+                std::ptr::copy_nonoverlapping((seg_len as u16).to_ne_bytes().as_ptr(), data, 2);
+            }
+        }
+        let ctrl_len = unsafe { libc::CMSG_SPACE(2) } as usize;
+        let buf = &self.buf;
+        let cmsg = &self.cmsg;
+        // `async_io` retries the closure after the socket becomes writable again.
+        // Everything pointer-shaped is built inside the closure, so no raw
+        // pointer is held across an await.
+        let ret = socket
+            .async_io(Interest::WRITABLE, || {
+                let mut name = storage;
+                let mut iov = libc::iovec {
+                    iov_base: buf.as_ptr() as *mut libc::c_void,
+                    iov_len: total,
+                };
+                // SAFETY: plain C structs; every pointer in it points at `buf`,
+                // `name` or `cmsg`, all alive for the duration of the call.
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_name = &mut name as *mut _ as *mut libc::c_void;
+                msg.msg_namelen = addr_len;
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = cmsg.as_ptr() as *mut libc::c_void;
+                msg.msg_controllen = ctrl_len;
+                let r = unsafe { libc::sendmsg(fd, &msg, 0) };
+                if r < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(r as usize)
+                }
+            })
+            .await;
+        let ret = match ret {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+        if ret != total {
+            // A UDP send is all-or-nothing; a short return means the super-packet
+            // was split, which would silently corrupt the framing.
+            return Err(std::io::Error::other("partial GSO send"));
+        }
+        Ok(true)
+    }
+
+    /// Sends `datagrams` to `dst`, using GSO for runs of equal-sized frames and
+    /// one batched `sendmmsg` for whatever is left. Returns how many datagrams
+    /// went out.
+    pub(crate) async fn send_burst(
+        &mut self,
+        socket: &UdpSocket,
+        fd: RawFd,
+        batch: &mut UdpBatch,
+        datagrams: &[Vec<u8>],
+        dst: SocketAddr,
+    ) -> usize {
+        let mut sent = 0;
+        let mut singles: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < datagrams.len() {
+            let len = datagrams[i].len();
+            let mut j = i + 1;
+            while j < datagrams.len() && datagrams[j].len() == len {
+                j += 1;
+            }
+            if j - i >= 2
+                && !(GSO_DISABLED.load(AtomicOrdering::Relaxed) || gso_off())
+                && len * (j - i) <= GSO_MAX_BYTES
+            {
+                match self.send(socket, fd, &datagrams[i..j], dst).await {
+                    Ok(true) => {
+                        sent += j - i;
+                        i = j;
+                        continue;
+                    }
+                    Ok(false) => {
+                        GSO_DISABLED.store(true, AtomicOrdering::Relaxed);
+                        tracing::debug!("wireguard egress: UDP GSO unavailable, using sendmmsg");
+                    }
+                    Err(e) => {
+                        GSO_DISABLED.store(true, AtomicOrdering::Relaxed);
+                        tracing::debug!(
+                            "wireguard egress: GSO send failed ({}), using sendmmsg",
+                            e
+                        );
+                    }
+                }
+            }
+            singles.push(i);
+            i += 1;
+        }
+        // Leftovers (odd-sized frames, a lone tail segment) go out batched.
+        let mut off = 0;
+        while off < singles.len() {
+            let chunk: Vec<Vec<u8>> = singles[off..]
+                .iter()
+                .take(UDP_BATCH)
+                .map(|&k| datagrams[k].clone())
+                .collect();
+            match socket
+                .async_io(Interest::WRITABLE, || batch.send(fd, &chunk, dst))
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    sent += n;
+                    off += n;
+                }
+                _ => break,
+            }
+        }
+        sent
+    }
+}
 
 /// Request a deep kernel queue for the tunnel socket.
 ///
@@ -670,6 +910,7 @@ impl WgTunnel {
         // Batched datagram scratch, reused for the lifetime of the pump.
         let mut udp_rx = UdpBatch::new();
         let mut udp_tx = UdpBatch::new();
+        let mut gso = GsoBatch::new();
         // Consecutive failed receives; a permanently broken socket must not spin.
         let mut recv_failures = 0u32;
 
@@ -747,9 +988,10 @@ impl WgTunnel {
                 next_ephemeral_port: &mut u16,
                 cmd_tx: &futures_channel::mpsc::Sender<StackCmd>,
             ) {
+                let buf = WG_TCP_BUF;
                 let mut sock = tcp::Socket::new(
-                    tcp::SocketBuffer::new(vec![0u8; WG_TCP_BUF]),
-                    tcp::SocketBuffer::new(vec![0u8; WG_TCP_BUF]),
+                    tcp::SocketBuffer::new(vec![0u8; buf]),
+                    tcp::SocketBuffer::new(vec![0u8; buf]),
                 );
                 let local_port = *next_ephemeral_port;
                 *next_ephemeral_port = next_ephemeral_port.wrapping_add(1).max(49152);
@@ -917,19 +1159,10 @@ impl WgTunnel {
                             }
                         }
                         if !sealed.is_empty() {
-                            let mut off = 0;
-                            while off < sealed.len() {
-                                match sock
-                                    .async_io(Interest::WRITABLE, || {
-                                        udp_tx.send(fd, &sealed[off..], peer)
-                                    })
-                                    .await
-                                {
-                                    Ok(0) => break,
-                                    Ok(n) => off += n,
-                                    Err(_) => break,
-                                }
-                            }
+                            // GSO coalesces the equal-sized runs (which is every
+                            // full-size data frame) into one `sendmsg` each; only
+                            // the odd-sized remainder needs a syscall per group.
+                            let off = gso.send_burst(&sock, fd, &mut udp_tx, &sealed, peer).await;
                             if off > 0 {
                                 self.state.lock().await.last_sent = Some(Instant::now());
                             }

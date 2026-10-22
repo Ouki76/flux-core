@@ -10,10 +10,11 @@ use blake2::digest::{Digest, Mac};
 use blake2::{Blake2s256, Blake2sMac};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce as ChaChaNonce,
-    aead::{Aead, AeadInPlace, KeyInit},
+    aead::{Aead, KeyInit},
 };
 use flux_types::{FluxError, FluxResult, TargetAddress};
 use rand::RngCore;
+use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -207,9 +208,28 @@ impl AntiReplayWindow {
     }
 }
 
+/// Builds the AEAD used for WireGuard *data* packets from a 32-byte transport
+/// key. Called once per session, never per packet: `ring` expands the key
+/// schedule here.
+fn wg_data_key(key: &[u8; 32]) -> LessSafeKey {
+    let unbound = UnboundKey::new(&CHACHA20_POLY1305, key)
+        .expect("WireGuard transport key is exactly CHACHA20_POLY1305_KEY_LEN bytes");
+    LessSafeKey::new(unbound)
+}
+
 pub struct WireGuardSession {
-    pub send_cipher: ChaCha20Poly1305,
-    pub recv_cipher: ChaCha20Poly1305,
+    /// Data-packet AEAD for each direction.
+    ///
+    /// These used to be `chacha20poly1305::ChaCha20Poly1305` (RustCrypto). The
+    /// construction is identical, but RustCrypto re-does the Poly1305 key setup
+    /// per message, and a WireGuard data packet is one short message: measured
+    /// on `bench_wireguard` at MTU 1420, the per-message setup was most of the
+    /// cost. `ring` expands the key schedule once in `UnboundKey::new` (so a
+    /// `LessSafeKey` is built at session setup, never per packet) and its
+    /// ChaCha20 runs four blocks in parallel. Same switch as the shadowsocks-2022
+    /// data plane; see `Ss2022Aead` there.
+    pub send_cipher: LessSafeKey,
+    pub recv_cipher: LessSafeKey,
     pub send_counter: u64,
     pub recv_counter: u64,
     pub sender_index: u32,
@@ -227,8 +247,8 @@ impl WireGuardSession {
         awg: Option<AwgConfig>,
     ) -> Self {
         Self {
-            send_cipher: ChaCha20Poly1305::new_from_slice(&send_key).unwrap(),
-            recv_cipher: ChaCha20Poly1305::new_from_slice(&recv_key).unwrap(),
+            send_cipher: wg_data_key(&send_key),
+            recv_cipher: wg_data_key(&recv_key),
             send_counter: 0,
             recv_counter: 0,
             sender_index,
@@ -287,9 +307,13 @@ impl WireGuardSession {
         let (body, tag_out) = packet[WG_DATA_HEADER_LEN..].split_at_mut(plaintext_len);
         let tag = self
             .send_cipher
-            .encrypt_in_place_detached(ChaChaNonce::from_slice(&nonce_bytes), b"", body)
-            .map_err(|e| FluxError::Crypto(format!("wireguard encrypt data failed: {}", e)))?;
-        tag_out.copy_from_slice(&tag);
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::empty(),
+                body,
+            )
+            .map_err(|_| FluxError::Crypto("wireguard encrypt data failed".into()))?;
+        tag_out.copy_from_slice(tag.as_ref());
 
         self.send_counter = counter.wrapping_add(1);
         Ok(())
@@ -346,17 +370,15 @@ impl WireGuardSession {
         nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
 
         let body_len = packet_len - WG_DATA_HEADER_LEN - WG_AEAD_TAG_LEN;
-        let (body, tag) = packet[WG_DATA_HEADER_LEN..].split_at_mut(body_len);
-        let mut tag_arr = [0u8; WG_AEAD_TAG_LEN];
-        tag_arr.copy_from_slice(tag);
+        // `open_in_place` wants ciphertext||tag as one slice and returns the
+        // plaintext of exactly `body_len` bytes, still at the same offset.
         self.recv_cipher
-            .decrypt_in_place_detached(
-                ChaChaNonce::from_slice(&nonce_bytes),
-                b"",
-                body,
-                chacha20poly1305::Tag::from_slice(&tag_arr),
+            .open_in_place(
+                Nonce::assume_unique_for_key(nonce_bytes),
+                Aad::empty(),
+                &mut packet[WG_DATA_HEADER_LEN..],
             )
-            .map_err(|e| FluxError::Crypto(format!("wireguard decrypt data failed: {}", e)))?;
+            .map_err(|_| FluxError::Crypto("wireguard decrypt data failed: bad tag".into()))?;
 
         // Mutate replay window ONLY after decryption & auth verification succeeds!
         self.replay_window.update(counter);
