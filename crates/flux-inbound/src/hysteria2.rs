@@ -1014,7 +1014,7 @@ mod tests {
         // The real Hysteria 2 HTTP/3 auth exchange. The returned keeper owns the
         // client's HTTP/3 driver: dropping it closes the connection, so it has to
         // stay alive for the rest of the test (exactly as the outbound does).
-        let _keeper = Hysteria2Protocol::client_authenticate_h3(conn.clone(), "e2e-password")
+        let _keeper = flux_transport::h3_lite::client_auth_request(&conn, "e2e-password", 0)
             .await
             .expect("a valid password must authenticate");
 

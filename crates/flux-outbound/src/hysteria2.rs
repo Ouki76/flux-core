@@ -22,7 +22,9 @@ pub struct Hysteria2Outbound {
     pacer: Arc<Mutex<BrutalPacer>>,
     endpoint: Arc<Mutex<Option<quinn::Endpoint>>>,
     connection: Arc<Mutex<Option<quinn::Connection>>>,
-    h3_handle: Arc<Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>>,
+    /// Keeps the HTTP/3 auth request stream open for the connection's lifetime;
+    /// dropping it would reset the stream the server is holding.
+    auth_stream: Arc<Mutex<Option<quinn::SendStream>>>,
     dialer: Option<Arc<dyn flux_types::StreamDialer>>,
     /// Per-connection datagram demultiplexer, tagged with the QUIC connection it
     /// belongs to (`Connection::stable_id`) so a reconnect rebuilds it instead of
@@ -48,7 +50,7 @@ impl Hysteria2Outbound {
             pacer: Arc::new(Mutex::new(pacer)),
             endpoint: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(None)),
-            h3_handle: Arc::new(Mutex::new(None)),
+            auth_stream: Arc::new(Mutex::new(None)),
             dialer: None,
             udp_demux: Arc::new(Mutex::new(None)),
             next_udp_session: Arc::new(std::sync::atomic::AtomicU32::new(1)),
@@ -72,7 +74,7 @@ impl Hysteria2Outbound {
             pacer: Arc::new(Mutex::new(pacer)),
             endpoint: Arc::new(Mutex::new(None)),
             connection: Arc::new(Mutex::new(None)),
-            h3_handle: Arc::new(Mutex::new(None)),
+            auth_stream: Arc::new(Mutex::new(None)),
             dialer: Some(dialer),
             udp_demux: Arc::new(Mutex::new(None)),
             next_udp_session: Arc::new(std::sync::atomic::AtomicU32::new(1)),
@@ -137,9 +139,17 @@ impl Hysteria2Outbound {
             .as_deref()
             .unwrap_or(&self.config.server);
         let conn = QuicTransport::connect(&endpoint, peer_addr, sni).await?;
-        let h3 =
-            Hysteria2Protocol::client_authenticate_h3(conn.clone(), &self.config.password).await?;
-        *self.h3_handle.lock().await = Some(h3);
+        // Authenticate over HTTP/3 with our own minimal client: the `h3` crate
+        // needed ~5.5 s to deliver the response our server produces in ~1 ms.
+        let t_auth = std::time::Instant::now();
+        let h3 = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            flux_transport::h3_lite::client_auth_request(&conn, &self.config.password, 0),
+        )
+        .await
+        .map_err(|_| FluxError::Timeout("HTTP/3 authentication timed out".into()))??;
+        tracing::trace!("hysteria2 auth took {:?}", t_auth.elapsed());
+        *self.auth_stream.lock().await = Some(h3);
         *conn_guard = Some(conn.clone());
         Ok(conn)
     }

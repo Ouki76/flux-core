@@ -769,8 +769,6 @@ dependencies = [
  "flux-common",
  "flux-types",
  "futures",
- "h3",
- "h3-quinn",
  "hkdf",
  "hmac",
  "http",

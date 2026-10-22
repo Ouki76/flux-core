@@ -92,17 +92,15 @@ async fn hy2_phases_are_fast() {
     );
 
     let _ = srv.stop().await;
-    // Characterisation, not the target. Measured on this tree: the QUIC connect
-    // takes 3 ms and our h3 server answers in ~1 ms (see
-    // `h3_lite::latency_tests::raw_quinn_round_trip_is_fast`), yet the `h3` crate
-    // client needs ~5.5 s to deliver that response. The target for `dial` is
-    // 1.5 s; the bound below is what the code actually does today, so a further
-    // regression is caught while the known stall is documented rather than
-    // hidden. See docs/audit-log.md, cycle 7.
+    // A first dial on loopback to a local server must be fast: the QUIC connect
+    // takes ~3 ms and the server answers the auth request in ~1 ms. This asserted
+    // a 7 s bound while the `h3` crate client was in use, because it needed
+    // ~5.5 s to deliver that response; the client is now our own minimal one (see
+    // `h3_lite::client_auth_request`) and the real budget applies.
     assert!(
-        dial < Duration::from_millis(7000),
-        "first dial regressed past the documented stall: {dial:?} \
-         (start {start_srv:?}, echo {echo:?}, second dial {dial2:?})"
+        dial < Duration::from_millis(1500),
+        "first dial took {dial:?} (start {start_srv:?}, echo {echo:?}, \
+         second dial {dial2:?})"
     );
     assert!(echo < Duration::from_millis(500), "echo took {echo:?}");
 }

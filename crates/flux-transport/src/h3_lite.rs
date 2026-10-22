@@ -695,3 +695,153 @@ mod latency_tests {
         let _ = server.await;
     }
 }
+
+#[cfg(test)]
+mod settings_latency_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The `h3` crate client will not deliver a response until it has processed
+    /// the server's SETTINGS. If our server's control stream is slow to arrive,
+    /// every request looks like a 5 s stall — so this measures the SETTINGS
+    /// flight on its own, with no `h3` crate involved.
+    #[tokio::test]
+    async fn server_settings_arrive_promptly() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            cert.cert.der().to_vec(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+        );
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server_ep = crate::quic::QuicTransport::create_server_endpoint(
+            addr,
+            certs,
+            key,
+            vec![b"h3".to_vec()],
+        )
+        .expect("server endpoint");
+
+        let server = tokio::spawn(async move {
+            let incoming = server_ep
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("conn");
+            let _h3 = H3LiteServer::new(incoming);
+            // Hold the connection open so the client can read.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+
+        let client_ep =
+            crate::quic::QuicTransport::create_client_endpoint(false, vec![b"h3".to_vec()], true)
+                .expect("client endpoint");
+        let conn = crate::quic::QuicTransport::connect(&client_ep, addr, "localhost")
+            .await
+            .expect("connect");
+
+        let t = Instant::now();
+        let mut uni = tokio::time::timeout(Duration::from_secs(5), conn.accept_uni())
+            .await
+            .expect("the server must open a control stream promptly")
+            .expect("control stream");
+        let opened = t.elapsed();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), uni.read(&mut buf))
+            .await
+            .expect("SETTINGS must arrive promptly")
+            .expect("read")
+            .expect("data");
+        let arrived = t.elapsed();
+        println!("@@SETTINGS stream_opened={opened:?} settings_arrived={arrived:?} bytes={n}");
+
+        assert!(n >= 2, "SETTINGS frame too short: {n} bytes");
+        assert!(
+            arrived < Duration::from_millis(500),
+            "the server's SETTINGS took {arrived:?} to arrive (stream opened at {opened:?})"
+        );
+        let _ = server.await;
+    }
+}
+
+/// Client side of the Hysteria 2 authentication exchange, on raw quinn.
+///
+/// This replaces the `h3` crate client, which needed ~5.5 s to deliver a response
+/// our server produces in ~1 ms: measured with phase timings, the cost was
+/// entirely inside `recv_response`, while a raw quinn client completes the same
+/// round trip in 1.2 ms (see `latency_tests::raw_quinn_round_trip_is_fast`). The
+/// auth exchange is one request whose status code we read and discard, so a
+/// minimal client is enough — and it keeps the wire bytes identical.
+pub async fn client_auth_request(
+    conn: &quinn::Connection,
+    password: &str,
+    cc_rx: u64,
+) -> FluxResult<quinn::SendStream> {
+    // HTTP/3 requires a control stream with SETTINGS; the peer drains it.
+    let mut ctrl = conn
+        .open_uni()
+        .await
+        .map_err(|e| err(format!("open control stream: {e}")))?;
+    let mut ctrl_buf = vec![H3_STREAM_CONTROL];
+    ctrl_buf.extend_from_slice(&h3_frame(H3_FRAME_SETTINGS, &[]));
+    ctrl.write_all(&ctrl_buf)
+        .await
+        .map_err(|e| err(format!("write SETTINGS: {e}")))?;
+    let _ = ctrl.flush().await;
+
+    let (mut send, mut recv) = conn
+        .open_bi()
+        .await
+        .map_err(|e| err(format!("open request stream: {e}")))?;
+
+    let fields = vec![
+        (":method".to_string(), "POST".to_string()),
+        (":path".to_string(), "/auth".to_string()),
+        (":scheme".to_string(), "https".to_string()),
+        (":authority".to_string(), "hysteria".to_string()),
+        ("hysteria-auth".to_string(), password.to_string()),
+        ("hysteria-cc-rx".to_string(), cc_rx.to_string()),
+    ];
+    let section = qpack_encode_field_section(&fields);
+    let frame = h3_frame(H3_FRAME_HEADERS, &section);
+    send.write_all(&frame)
+        .await
+        .map_err(|e| err(format!("write auth request: {e}")))?;
+    send.flush()
+        .await
+        .map_err(|e| err(format!("flush auth request: {e}")))?;
+
+    // Response: one HEADERS frame, whose :status decides the outcome.
+    let frame_type = read_varint(&mut recv).await?;
+    if frame_type != H3_FRAME_HEADERS {
+        return Err(err(format!(
+            "expected a HEADERS response frame, got type {frame_type}"
+        )));
+    }
+    let len = read_varint(&mut recv).await? as usize;
+    if len > 65536 {
+        return Err(err("auth response headers too large"));
+    }
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload)
+        .await
+        .map_err(|e| err(format!("read auth response: {e}")))?;
+    let resp = qpack_decode_field_section(&payload)?;
+    let status = resp
+        .iter()
+        .find(|(n, _)| n == ":status")
+        .map(|(_, v)| v.as_str())
+        .ok_or_else(|| err("auth response carries no :status"))?;
+    if status != "233" {
+        return Err(FluxError::AuthFailed(format!(
+            "Hysteria 2 authentication rejected with HTTP status {status}"
+        )));
+    }
+    // The request stream stays open: the server holds its side for the life of
+    // the connection, and the caller keeps the handle so it is not reset.
+    Ok(send)
+}
