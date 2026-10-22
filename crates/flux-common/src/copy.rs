@@ -92,47 +92,6 @@ where
     tokio::io::copy_bidirectional(&mut a, &mut b).await
 }
 
-/// One-way copy reading into a pooled 16KB buffer (reused across connections).
-/// On EOF or error the write half is shut down to propagate half-close semantics.
-async fn copy_one_way_pooled<R, W>(
-    r: &mut R,
-    w: &mut W,
-    pool: &'static crate::buffer::BufferPool,
-) -> std::io::Result<u64>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut guard = pool.acquire_guard();
-    let mut total = 0u64;
-    loop {
-        let n = r.read(&mut guard[..]).await?;
-        if n == 0 {
-            break;
-        }
-        w.write_all(&guard[..n]).await?;
-        total += n as u64;
-    }
-    let _ = w.shutdown().await;
-    Ok(total)
-}
-
-/// Bidirectional stream copy between two mutable stream references without mutual
-/// deadlock, using pooled buffers instead of per-connection heap allocations.
-pub async fn copy_bidirectional_pooled<A, B>(a: &mut A, b: &mut B) -> std::io::Result<(u64, u64)>
-where
-    A: AsyncRead + AsyncWrite + Unpin,
-    B: AsyncRead + AsyncWrite + Unpin,
-{
-    let pool = crate::buffer::BufferPool::default_pool();
-    let (mut ar, mut aw) = tokio::io::split(a);
-    let (mut br, mut bw) = tokio::io::split(b);
-    let f1 = copy_one_way_pooled(&mut ar, &mut bw, pool);
-    let f2 = copy_one_way_pooled(&mut br, &mut aw, pool);
-    tokio::try_join!(f1, f2)
-}
-
 /// A stream that prepends a prefix byte buffer before delegating to the inner stream.
 pub struct PrefixedStream<S> {
     inner: S,
@@ -195,7 +154,7 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
-    async fn test_copy_bidirectional_pooled() {
+    async fn test_copy_bidirectional_round_trip() {
         let (mut client, mut server) = tokio::io::duplex(1024);
         let (mut proxy_in, mut proxy_out) = tokio::io::duplex(1024);
 
@@ -219,7 +178,7 @@ mod tests {
             proxy_out.shutdown().await.unwrap();
         });
 
-        let (up, down) = copy_bidirectional_pooled(&mut server, &mut proxy_in)
+        let (up, down) = copy_bidirectional(&mut server, &mut proxy_in)
             .await
             .unwrap();
         assert_eq!(up, 12);
@@ -227,62 +186,6 @@ mod tests {
 
         t1.await.unwrap();
         t2.await.unwrap();
-    }
-
-    /// The pooled copier reads into a full-length pooled buffer and must forward
-    /// only the `n` bytes the reader reported. Poison the pool with a
-    /// recognisable pattern first, so the copier is working from allocations that
-    /// still contain a previous connection's payload: the receiver must get the
-    /// four bytes that were written and nothing else.
-    #[tokio::test]
-    async fn pooled_copy_never_forwards_stale_buffer_contents() {
-        use tokio::io::AsyncReadExt;
-
-        let pool = crate::buffer::BufferPool::default_pool();
-        let poisoned: Vec<Vec<u8>> = (0..16)
-            .map(|_| {
-                let mut b = pool.acquire();
-                b.fill(0xAA);
-                b
-            })
-            .collect();
-        for b in poisoned {
-            pool.release(b);
-        }
-        assert!(
-            pool.acquire().iter().all(|&b| b == 0),
-            "precondition: the pool must hand out scrubbed buffers"
-        );
-
-        let payload = b"four".to_vec();
-        let expected = payload.clone();
-        let (mut client, mut proxy_client) = tokio::io::duplex(64 * 1024);
-        let (mut proxy_server, mut server) = tokio::io::duplex(64 * 1024);
-
-        let relay = tokio::spawn(async move {
-            let _ = copy_bidirectional_pooled(&mut proxy_client, &mut proxy_server).await;
-        });
-        let writer = tokio::spawn(async move {
-            client.write_all(&payload).await.unwrap();
-            client.shutdown().await.unwrap();
-            // Drain the reverse direction so the copier's other half is not
-            // left blocked on us.
-            let mut sink = Vec::new();
-            let _ = client.read_to_end(&mut sink).await;
-        });
-
-        let mut got = Vec::new();
-        server.read_to_end(&mut got).await.unwrap();
-        assert_eq!(
-            got,
-            expected,
-            "copier forwarded {} bytes for a {}-byte message (stale buffer contents leaked)",
-            got.len(),
-            expected.len()
-        );
-
-        relay.abort();
-        let _ = writer.await;
     }
 
     #[tokio::test]
