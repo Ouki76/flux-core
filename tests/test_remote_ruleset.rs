@@ -36,6 +36,12 @@ async fn test_remote_ruleset_fetch_and_route() {
     )
     .await;
     let _api_port = get_free_tcp_port().await;
+    // A private cache file: the default path hashes the URL, and the port
+    // allocator restarts at the same base in every process, so a cache written by
+    // an earlier run would be restored at construction and the rule would already
+    // match before start() — which is exactly what this test asserts it does not.
+    let cache_dir = tempfile::tempdir().unwrap();
+    let cache_path = cache_dir.path().join("rules.cache");
 
     let raw_config = format!(
         r#"{{
@@ -48,7 +54,8 @@ async fn test_remote_ruleset_fetch_and_route() {
                     {{
                         "tag": "remote-rs",
                         "type": "remote",
-                        "path": "http://127.0.0.1:{}/rules.txt"
+                        "path": "http://127.0.0.1:{}/rules.txt",
+                        "cache_path": "{}"
                     }}
                 ],
                 "rules": [
@@ -57,7 +64,8 @@ async fn test_remote_ruleset_fetch_and_route() {
                 "final": "direct"
             }}
         }}"#,
-        rs_port
+        rs_port,
+        cache_path.display()
     );
 
     let cfg = Config::from_json_str(&raw_config).unwrap();
