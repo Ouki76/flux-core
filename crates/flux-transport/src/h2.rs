@@ -376,3 +376,120 @@ mod tests {
         cli.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Builds a client/server H2 tunnel pair over an in-memory duplex.
+    async fn pair() -> (H2Stream, H2Stream) {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server = tokio::spawn(async move { H2Transport::server_handshake(server_io).await });
+        let client = H2Transport::client_handshake(
+            client_io,
+            "example.com",
+            "/tunnel",
+            &std::collections::HashMap::new(),
+        )
+        .await
+        .expect("client handshake");
+        let server = server.await.expect("join").expect("server handshake");
+        (client, server)
+    }
+
+    /// The tunnel must survive payloads spanning many HTTP/2 DATA frames,
+    /// byte-for-byte, in both directions. A frame-boundary copy bug would corrupt
+    /// exactly here and nowhere in a small test.
+    #[tokio::test]
+    async fn multi_frame_payload_is_byte_exact_both_ways() {
+        let (mut client, mut server) = pair().await;
+
+        let up: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        let expected = up.clone();
+        let writer = tokio::spawn(async move {
+            client.write_all(&up).await.expect("client write");
+            client.flush().await.expect("client flush");
+            client
+        });
+
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 8192];
+        while got.len() < expected.len() {
+            let n = server.read(&mut buf).await.expect("server read");
+            assert_ne!(n, 0, "server saw EOF after {} bytes", got.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, expected, "uplink corrupted at frame boundaries");
+
+        let mut client = writer.await.expect("join");
+        let down: Vec<u8> = (0..200 * 1024).map(|i| (i % 239) as u8).collect();
+        let expected = down.clone();
+        tokio::spawn(async move {
+            server.write_all(&down).await.expect("server write");
+            let _ = server.flush().await;
+            // Hold the stream briefly: dropping an H2 response stream sends
+            // RST_STREAM, which can overtake the tail of the data and make the
+            // peer see CANCEL instead of the payload.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        });
+
+        let mut got = Vec::new();
+        while got.len() < expected.len() {
+            let n = client.read(&mut buf).await.expect("client read");
+            assert_ne!(n, 0, "client saw EOF after {} bytes", got.len());
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, expected, "downlink corrupted at frame boundaries");
+    }
+
+    /// Whatever a peer sends, the handshake must fail with an error, in bounded
+    /// time — never hang and never panic.
+    #[tokio::test]
+    async fn garbage_before_the_preface_fails_cleanly() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec(),
+            vec![0x00; 64],
+            b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+            b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\xff\xff\xff\xff\x00\x00\x00\x00\x00".to_vec(),
+        ];
+        for payload in cases {
+            let label = payload.clone();
+            let (client_io, mut peer) = tokio::io::duplex(4096);
+            tokio::spawn(async move {
+                let _ = peer.write_all(&payload).await;
+                let _ = peer.shutdown().await;
+            });
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                H2Transport::server_handshake(client_io),
+            )
+            .await
+            .expect("handshake must not hang on garbage input");
+            assert!(
+                res.is_err(),
+                "server accepted a garbage preface: {label:?}"
+            );
+        }
+    }
+
+    /// A client that vanishes right after the preface must produce an error, not
+    /// a stream the caller can wait on forever.
+    #[tokio::test]
+    async fn a_peer_that_vanishes_after_the_preface_fails_cleanly() {
+        let (client_io, mut peer) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let _ = peer
+                .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+                .await;
+            let _ = peer.shutdown().await;
+        });
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            H2Transport::server_handshake(client_io),
+        )
+        .await
+        .expect("handshake must not hang");
+        assert!(res.is_err(), "server accepted a stream from a vanished peer");
+    }
+}
