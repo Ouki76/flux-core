@@ -21,6 +21,9 @@ pub struct MixedInbound {
     rate_limiter: Option<Arc<flux_common::RateLimiter>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    /// Handles of the listener-owning tasks; `stop()` joins them so that
+    /// returning from `stop()` means the port is actually released.
+    tasks: crate::InboundTasks,
 }
 
 impl MixedInbound {
@@ -33,6 +36,7 @@ impl MixedInbound {
             rate_limiter: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
+            tasks: crate::InboundTasks::new(),
         }
     }
 
@@ -77,7 +81,7 @@ impl Inbound for MixedInbound {
             tag, self.listen_addr
         );
 
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             loop {
                 let (mut socket, client_addr) = tokio::select! {
                     res = listener.accept() => {
@@ -435,7 +439,10 @@ impl Inbound for MixedInbound {
     async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
-        Ok(())
+        // Requesting the shutdown is not enough: the accept/receive loop owns
+        // the listener FD, so returning while it is still running leaves the
+        // port bound (`EADDRINUSE` on an immediate rebind). Join it.
+        self.tasks.join().await
     }
 }
 

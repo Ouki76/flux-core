@@ -42,6 +42,21 @@ pub trait Inbound: Send + Sync {
         None
     }
     async fn start(&self, dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()>;
+
+    /// Stops listening and releases the listening socket.
+    ///
+    /// The contract is *synchronous release*, not "a shutdown was requested":
+    /// when this future resolves, the listener file descriptor must be closed
+    /// and the port bindable again. An implementation that only signals a
+    /// cancellation channel and returns leaves the socket owned by a task that
+    /// may not have been polled yet, and a caller that rebinds the same port
+    /// immediately (`Instance::stop()` followed by `start()`, a SIGHUP reload
+    /// script, a supervisor restart) then races `EADDRINUSE`.
+    ///
+    /// Implementations therefore join the task(s) that own the listener — see
+    /// `flux_inbound::InboundTasks` — rather than dropping the handle. Two
+    /// calls in a row must both succeed, and `stop()` on a never-started
+    /// inbound must be a no-op that returns `Ok`.
     async fn stop(&self) -> FluxResult<()>;
 }
 

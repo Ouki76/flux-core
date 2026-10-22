@@ -611,6 +611,9 @@ impl Instance {
             return Ok(());
         }
         self.reset_fetch_cancel();
+        // The meter's sampler is stopped by `stop()`; re-arm it for every
+        // start cycle (idempotent while it is already running).
+        self.meter.start();
 
         if let Some(api) = &self.api_server
             && let Err(e) = api.start().await
@@ -793,6 +796,15 @@ impl Instance {
         for entry in self.registry.map.iter() {
             entry.value().stop();
         }
+
+        // The speed sampler is spawned by `new()`, not by `start()`, and its
+        // task used to be reachable only through a `Weak<TrafficMeter>`: the
+        // only thing that could stop it was dropping the last `Arc`, so a
+        // stopped-but-alive instance always owned one task and every SIGHUP
+        // reload kept the previous instance's sampler running until then. It is
+        // stopped here unconditionally — like the groups above — so that after
+        // `stop()` the instance owns no tasks at all; `start()` re-arms it.
+        self.meter.stop().await;
 
         match first_error {
             Some(e) => Err(e),
@@ -2002,13 +2014,16 @@ mod lifecycle_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn repeated_start_and_stop_are_idempotent() {
         let port = free_port();
+        // Measured before the instance exists: `stop()` releases the
+        // `TrafficMeter` sampler too, so a baseline taken after `Instance::new`
+        // would be one task stale.
+        let baseline = alive_tasks();
         let instance = Instance::new(config(
             &[tcp_inbound("in-socks", port, "socks")],
             None,
             None,
         ))
         .expect("instance");
-        let baseline = alive_tasks();
 
         // stop() before start(): no panic, no hang, and nothing invented.
         tokio::time::timeout(Duration::from_secs(10), instance.stop())
@@ -2021,8 +2036,9 @@ mod lifecycle_tests {
         let after_start = alive_tasks();
         assert_eq!(
             after_start,
-            baseline + 1,
-            "one inbound must spawn exactly one accept loop"
+            baseline + 2,
+            "one inbound must spawn exactly one accept loop, on top of the \
+             instance's TrafficMeter sampler"
         );
 
         instance
@@ -2265,5 +2281,121 @@ mod lifecycle_tests {
         })
         .await;
         instance.stop().await.expect("stop");
+    }
+
+    /// Property: `stop()` is synchronous with respect to the listening sockets.
+    ///
+    /// A supervisor, a reload script, or `Instance::stop()` followed by
+    /// `start()` binds the same ports in the very next statement, so there must
+    /// be no window in which an old listener is still open. That is why this
+    /// test contains no `wait_until` and no `yield_now`: the binds happen
+    /// immediately after `stop().await` returns.
+    ///
+    /// The runtime is single-threaded on purpose. With more than one worker the
+    /// polled-elsewhere accept loop could close its socket at any moment, and a
+    /// test that "passes" because the other thread happened to win the race
+    /// would prove nothing; here no task can run between `stop()` returning and
+    /// the bind, so the assertions describe the code, not the scheduler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_releases_every_port_before_it_returns() {
+        let socks_port = free_port();
+        let api_port = free_port();
+        let dns_port = free_udp_port();
+        let instance = Instance::new(config(
+            &[tcp_inbound("in-socks", socks_port, "socks")],
+            Some(api_port),
+            Some(dns_port),
+        ))
+        .expect("instance");
+
+        instance.start().await.expect("start");
+        for port in [socks_port, api_port] {
+            assert!(
+                !tcp_port_is_free(port),
+                "start() returned Ok but nothing is bound on {port}"
+            );
+        }
+        assert!(!udp_port_is_free(dns_port), "the DNS socket is not bound");
+
+        instance.stop().await.expect("stop");
+
+        // No polling loop: `stop()` has to have closed these already. All three
+        // are checked before asserting so one run reports every socket that
+        // outlived `stop()`, not just the first.
+        let still_open: Vec<&str> = [
+            (
+                "the TCP listener of 'in-socks'",
+                tcp_port_is_free(socks_port),
+            ),
+            ("the API listener", tcp_port_is_free(api_port)),
+            (
+                "the UDP socket of the DNS inbound",
+                udp_port_is_free(dns_port),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, free)| !*free)
+        .map(|(what, _)| what)
+        .collect();
+        assert!(
+            still_open.is_empty(),
+            "stop() returned with these ports still held: {still_open:?}"
+        );
+    }
+
+    /// Property: `start()`/`stop()` symmetry is absolute — the runtime's task
+    /// count returns to the level it had *before the instance was built*.
+    ///
+    /// The previous baseline was taken after `Instance::new`, which hid the
+    /// `TrafficMeter` speed sampler: it was reachable only through a `Weak`, so
+    /// it could not be stopped and outlived every `stop()`. Measuring from
+    /// before construction is what makes the sampler a test subject rather than
+    /// a constant, and a SIGHUP reload leaks exactly this way — the old
+    /// instance stays alive until its last `Arc` drops.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_returns_the_task_count_to_baseline() {
+        let port = free_port();
+        let baseline = alive_tasks();
+        let instance = Instance::new(config(
+            &[tcp_inbound("in-socks", port, "socks")],
+            None,
+            None,
+        ))
+        .expect("instance");
+        assert!(
+            alive_tasks() > baseline,
+            "constructing an instance must own its sampler task"
+        );
+
+        // A stopped-but-alive instance must own nothing: this is the state a
+        // SIGHUP reload leaves the old instance in, and the unstoppable
+        // sampler is exactly what used to survive it. `start()` re-arms it.
+        instance
+            .stop()
+            .await
+            .expect("stop() before start() must succeed");
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "stop() on a never-started instance must release the sampler too"
+        );
+
+        instance.start().await.expect("start");
+        assert!(
+            alive_tasks() > baseline + 1,
+            "start() must add the accept loop on top of the sampler"
+        );
+
+        instance.stop().await.expect("stop");
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "stop() must join the accept loop *and* the TrafficMeter sampler"
+        );
+
+        // A second cycle must neither leak nor accumulate.
+        instance.start().await.expect("restart");
+        instance.stop().await.expect("stop");
+        assert_eq!(alive_tasks(), baseline, "a restart must be leak-free too");
     }
 }

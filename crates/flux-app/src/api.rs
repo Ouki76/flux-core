@@ -21,15 +21,31 @@ pub struct ActiveConnection {
     pub cancel_tx: tokio::sync::broadcast::Sender<()>,
 }
 
-#[derive(Default)]
+/// Handle to the running speed sampler of a [`TrafficMeter`].
+struct Sampler {
+    cancel: tokio_util::sync::CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 pub struct TrafficMeter {
     pub upload_total: Arc<AtomicU64>,
     pub download_total: Arc<AtomicU64>,
     pub upload_speed: AtomicU64,
     pub download_speed: AtomicU64,
     pub connections: Arc<DashMap<String, Arc<ActiveConnection>>>,
+    /// The 1 s sampler, if it is running.
+    ///
+    /// It used to be spawned in `new()` with only a `Weak` back-reference, so
+    /// the *only* way it could stop was for the whole `Arc<TrafficMeter>` to be
+    /// dropped. A stopped-but-alive instance therefore always held one task,
+    /// and every SIGHUP reload kept the previous instance's sampler alive until
+    /// the last `Arc` went away. It is now owned and joinable.
+    sampler: std::sync::Mutex<Option<Sampler>>,
 }
 
+// No `#[derive(Default)]`: a `Default` meter would be one that never samples,
+// which is not a state any caller should be able to reach by accident. `new()`
+// starts the sampler and `start()`/`stop()` control it from there.
 impl TrafficMeter {
     pub fn new() -> Arc<Self> {
         let this = Arc::new(Self {
@@ -38,13 +54,30 @@ impl TrafficMeter {
             upload_speed: AtomicU64::new(0),
             download_speed: AtomicU64::new(0),
             connections: Arc::new(DashMap::new()),
+            sampler: std::sync::Mutex::new(None),
         });
-        let weak = Arc::downgrade(&this);
-        tokio::spawn(async move {
+        this.start();
+        this
+    }
+
+    /// Starts the speed sampler. Idempotent: a sampler that is already running
+    /// is left alone, so `Instance::start()` can call this on every start.
+    pub fn start(self: &Arc<Self>) {
+        let mut slot = self.sampler_lock();
+        if slot.is_some() {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let stop = cancel.clone();
+        let handle = tokio::spawn(async move {
             let mut last_up = 0u64;
             let mut last_down = 0u64;
             loop {
-                sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = sleep(Duration::from_secs(1)) => {}
+                }
                 let Some(meter) = weak.upgrade() else {
                     break;
                 };
@@ -62,7 +95,31 @@ impl TrafficMeter {
                 last_down = cur_down;
             }
         });
-        this
+        *slot = Some(Sampler { cancel, handle });
+    }
+
+    /// Stops the sampler and waits until its task is gone.
+    ///
+    /// An `async fn` on purpose: "stopped" has to be observable, so this joins
+    /// the task instead of only flipping a flag. `stop()` is idempotent and
+    /// safe before `start()`.
+    pub async fn stop(&self) {
+        // Take the sampler out of the slot first, so the lock is released
+        // before the join (no std-mutex guard is held across an await).
+        let sampler = {
+            let mut slot = self.sampler_lock();
+            slot.take()
+        };
+        if let Some(sampler) = sampler {
+            sampler.cancel.cancel();
+            let _ = sampler.handle.await;
+        }
+    }
+
+    fn sampler_lock(&self) -> std::sync::MutexGuard<'_, Option<Sampler>> {
+        self.sampler
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn record_traffic(&self, up: u64, down: u64) {
@@ -134,6 +191,10 @@ pub struct ApiServer {
     ctx: ApiContext,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    /// The accept loop of the API listener. `stop()` joins it so the port (or
+    /// the unix socket path) is released before `stop()` returns, the same
+    /// guarantee the inbounds give.
+    tasks: flux_inbound::InboundTasks,
 }
 
 impl ApiServer {
@@ -157,6 +218,7 @@ impl ApiServer {
             },
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
+            tasks: flux_inbound::InboundTasks::new(),
         }
     }
 
@@ -205,7 +267,7 @@ impl ApiServer {
             );
 
             let mut shutdown_rx = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 loop {
                     let (socket, _) = tokio::select! {
                         res = listener.accept() => match res {
@@ -260,7 +322,7 @@ impl ApiServer {
         info!("Flux Core Native API server listening on http://{}", addr);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             loop {
                 let (socket, _) = tokio::select! {
                     res = listener.accept() => match res {
@@ -287,7 +349,9 @@ impl ApiServer {
     pub async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
-        Ok(())
+        // Joining the accept loop is what closes the listener; returning before
+        // it has run leaves the port bound for an immediate rebind.
+        self.tasks.join().await
     }
 }
 
@@ -1031,4 +1095,84 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let _ = socket.write_all(response.as_bytes()).await;
     let _ = socket.flush().await;
     let _ = socket.shutdown().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn alive_tasks() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    /// Waits (bounded) until the sampler publishes `expected`, so the test does
+    /// not depend on the CI box being idle at the one-second boundary.
+    async fn wait_for_upload_speed(meter: &TrafficMeter, expected: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let speed = meter.upload_speed.load(Ordering::Relaxed);
+            if speed == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "speed stayed at {speed}, expected {expected}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Property: the speed sampler is stoppable, joinable *and* restartable.
+    ///
+    /// It used to be spawned with only a `Weak` back-reference and no handle,
+    /// so the only thing that could ever stop it was dropping the last
+    /// `Arc<TrafficMeter>` — a stopped instance therefore still owned a task,
+    /// and a SIGHUP reload kept the previous instance's sampler alive. A
+    /// cancellation token is one-shot, so the restart half matters just as
+    /// much: `Instance::start()` must hand the meter a fresh sampler.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_speed_sampler_stops_and_restarts() {
+        let baseline = alive_tasks();
+        let meter = TrafficMeter::new();
+        assert_eq!(
+            alive_tasks(),
+            baseline + 1,
+            "one meter must own exactly one sampler task"
+        );
+
+        meter.record_traffic(1_000, 2_000);
+        wait_for_upload_speed(&meter, 1_000).await;
+
+        meter.stop().await;
+        assert_eq!(
+            alive_tasks(),
+            baseline,
+            "stop() must join the sampler, not just ask it to leave"
+        );
+
+        // A stopped sampler must not keep publishing: the last sample is frozen.
+        meter.record_traffic(5_000, 5_000);
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        assert_eq!(
+            meter.upload_speed.load(Ordering::Relaxed),
+            1_000,
+            "a stopped sampler must not update the speed"
+        );
+
+        // Both calls are idempotent: no second task, no hang on a second stop.
+        meter.start();
+        meter.start();
+        assert_eq!(
+            alive_tasks(),
+            baseline + 1,
+            "a repeated start() must not spawn a second sampler"
+        );
+        wait_for_upload_speed(&meter, 6_000).await;
+        meter.stop().await;
+        meter.stop().await;
+        assert_eq!(alive_tasks(), baseline, "stop() is idempotent");
+    }
 }

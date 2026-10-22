@@ -29,6 +29,9 @@ pub struct ShadowsocksInbound {
     mux: Option<MuxConfig>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    /// Handles of the listener-owning tasks; `stop()` joins them so that
+    /// returning from `stop()` means the port is actually released.
+    tasks: crate::InboundTasks,
 }
 
 impl ShadowsocksInbound {
@@ -48,6 +51,7 @@ impl ShadowsocksInbound {
             mux: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
+            tasks: crate::InboundTasks::new(),
         }
     }
 
@@ -115,7 +119,7 @@ impl Inbound for ShadowsocksInbound {
         let pipeline_tcp = Arc::new(self.pipeline.clone());
         let rate_limiter_tcp = self.rate_limiter.clone();
 
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             loop {
                 let (socket, client_addr) = tokio::select! {
                     res = listener.accept() => {
@@ -349,7 +353,7 @@ impl Inbound for ShadowsocksInbound {
             Arc::new(DashMap::new());
         let master_key_udp = self.master_key.clone();
 
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
                 let (len, client_addr) = tokio::select! {
@@ -477,7 +481,10 @@ impl Inbound for ShadowsocksInbound {
     async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
-        Ok(())
+        // Requesting the shutdown is not enough: the accept/receive loop owns
+        // the listener FD, so returning while it is still running leaves the
+        // port bound (`EADDRINUSE` on an immediate rebind). Join it.
+        self.tasks.join().await
     }
 }
 

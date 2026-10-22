@@ -154,6 +154,9 @@ pub struct TproxyInbound {
     listen_addr: SocketAddr,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    /// Handles of the listener-owning tasks; `stop()` joins them so that
+    /// returning from `stop()` means the port is actually released.
+    tasks: crate::InboundTasks,
 }
 
 impl TproxyInbound {
@@ -164,6 +167,7 @@ impl TproxyInbound {
             listen_addr,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
+            tasks: crate::InboundTasks::new(),
         }
     }
 }
@@ -243,7 +247,7 @@ impl Inbound for TproxyInbound {
         let running_tcp = running.clone();
 
         // TCP Worker
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             loop {
                 let (socket, client_addr) = tokio::select! {
                     res = tcp_listener.accept() => match res {
@@ -281,7 +285,7 @@ impl Inbound for TproxyInbound {
         let tag_udp = tag.clone();
         let udp_socket = udp_listener.clone();
 
-        tokio::spawn(async move {
+        self.tasks.spawn(async move {
             let sessions: Arc<
                 DashMap<(SocketAddr, SocketAddr), tokio::sync::mpsc::Sender<UdpPacket>>,
             > = Arc::new(DashMap::new());
@@ -373,6 +377,9 @@ impl Inbound for TproxyInbound {
     async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
-        Ok(())
+        // Requesting the shutdown is not enough: the accept/receive loop owns
+        // the listener FD, so returning while it is still running leaves the
+        // port bound (`EADDRINUSE` on an immediate rebind). Join it.
+        self.tasks.join().await
     }
 }
