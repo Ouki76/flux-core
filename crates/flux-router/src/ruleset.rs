@@ -33,22 +33,29 @@ impl CompiledRuleSet {
 
         let ip_range_set = crate::ip_range::IpRangeSet::from_cidrs(&parsed_cidrs);
 
+        // Canonical keys, shared with `DomainMatch` and the router's index: root
+        // dot dropped, ASCII lowercased, leading `*.`/`.` stripped, empty
+        // patterns dropped (an empty key would otherwise be reachable by an
+        // empty domain and means "match everything" for a keyword).
         let exact_set = rs
             .domain
             .iter()
-            .map(|d| d.trim().to_ascii_lowercase())
+            .map(|d| crate::rule::canonical_exact(d))
+            .filter(|d| !d.is_empty())
             .collect();
 
         let suffix_set = rs
             .domain_suffix
             .iter()
-            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .map(|s| crate::rule::canonical_suffix(s))
+            .filter(|s| !s.is_empty())
             .collect();
 
-        let keyword_list = rs
+        let keyword_list: Vec<String> = rs
             .domain_keyword
             .iter()
             .map(|k| k.trim().to_ascii_lowercase())
+            .filter(|k| !k.is_empty())
             .collect();
 
         Self {
@@ -140,7 +147,19 @@ impl RuleSet {
                 "DOMAIN-SUFFIX" => self.domain_suffix.push(val.to_string()),
                 "DOMAIN" | "DOMAIN-FULL" => self.domain.push(val.to_string()),
                 "DOMAIN-KEYWORD" => self.domain_keyword.push(val.to_string()),
-                "IP-CIDR" | "IP-CIDR6" | "CIDR" => self.ip_cidr.push(val.to_string()),
+                // A malformed CIDR used to be accepted here, counted as parsed,
+                // and then silently dropped by `CompiledRuleSet::build` — a rule
+                // set that reports itself complete while matching less than the
+                // operator wrote.
+                "IP-CIDR" | "IP-CIDR6" | "CIDR" => {
+                    if Self::is_ip_entry(val) {
+                        self.ip_cidr.push(val.to_string());
+                    } else {
+                        self.stats
+                            .unparsed
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 _ => {
                     // Unsupported Clash rule type (GEOIP, PROCESS-NAME, …): count
                     // it so the operator can see that the rule set is partial.
@@ -152,32 +171,56 @@ impl RuleSet {
             return;
         }
 
-        // Handle V2Ray / Sing-Box prefixes
+        // Handle V2Ray / Sing-Box prefixes. A prefix with an empty value is a
+        // truncated line, not an entry: `keyword:` used to become `""`, which
+        // then matched every domain.
         if let Some(rest) = trimmed
             .strip_prefix("full:")
             .or_else(|| trimmed.strip_prefix("exact:"))
+            && !rest.trim().is_empty()
         {
             self.domain.push(rest.trim().to_string());
         } else if let Some(rest) = trimmed
             .strip_prefix("domain:")
             .or_else(|| trimmed.strip_prefix("suffix:"))
+            && !rest.trim().is_empty()
         {
             self.domain_suffix.push(rest.trim().to_string());
         } else if let Some(rest) = trimmed.strip_prefix("keyword:") {
-            self.domain_keyword.push(rest.trim().to_string());
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.stats
+                    .unparsed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.domain_keyword.push(rest.to_string());
+            }
         } else if let Some(rest) = trimmed
             .strip_prefix("ip-cidr:")
             .or_else(|| trimmed.strip_prefix("cidr:"))
         {
-            self.ip_cidr.push(rest.trim().to_string());
+            let rest = rest.trim();
+            if Self::is_ip_entry(rest) {
+                self.ip_cidr.push(rest.to_string());
+            } else {
+                // Same reasoning as the Clash `IP-CIDR` arm: a bad CIDR must be
+                // visible in the unparsed counter, not silently dropped later.
+                self.stats
+                    .unparsed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         } else if let Some(rest) = trimmed.strip_prefix("+.") {
-            self.domain_suffix.push(rest.trim().to_string());
+            let rest = rest.trim();
+            if rest.is_empty() {
+                self.stats
+                    .unparsed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.domain_suffix.push(rest.to_string());
+            }
         } else if trimmed.parse::<std::net::IpAddr>().is_ok() {
             self.ip_cidr.push(trimmed.to_string());
-        } else if let Some((addr, prefix)) = trimmed.split_once('/')
-            && addr.parse::<std::net::IpAddr>().is_ok()
-            && prefix.parse::<u8>().is_ok()
-        {
+        } else if Self::is_ip_entry(trimmed) && trimmed.contains('/') {
             // A CIDR must actually be `address/prefix`: checking only for a slash
             // made `</html>` from an error page look like an IP rule, so a broken
             // feed produced a "non-empty" rule set that matched nothing.
@@ -195,6 +238,11 @@ impl RuleSet {
                 .unparsed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// True when `s` is a valid CIDR (`addr/prefix`) or a bare IP address.
+    fn is_ip_entry(s: &str) -> bool {
+        s.parse::<IpNet>().is_ok() || s.parse::<std::net::IpAddr>().is_ok()
     }
 
     /// True when `s` can plausibly be a hostname: dot-separated labels of letters,
@@ -331,21 +379,16 @@ impl RuleSet {
                 compiled.ip_range_set.contains(&ip)
             }
             flux_types::TargetAddress::Domain(domain, _) => {
-                // O(1) Exact domain lookup with ASCII case-insensitivity
-                let domain_clean = domain.trim();
-                let domain_lower;
-                let domain_str = if domain_clean.bytes().any(|b| b.is_ascii_uppercase()) {
-                    domain_lower = domain_clean.to_ascii_lowercase();
-                    domain_lower.as_str()
-                } else {
-                    domain_clean
-                };
+                // O(1) exact and O(L) suffix lookups over canonical keys; the
+                // host is normalized the same way the keys were built (root dot
+                // dropped, ASCII lowercased).
+                let domain = crate::rule::normalize_host(domain);
+                let domain_str = domain.as_ref();
 
                 if compiled.exact_set.contains(domain_str) {
                     return true;
                 }
 
-                // O(L) Suffix lookup
                 if compiled.suffix_set.contains(domain_str) {
                     return true;
                 }
@@ -360,7 +403,10 @@ impl RuleSet {
 
                 // Keyword scan
                 if !compiled.keyword_list.is_empty()
-                    && compiled.keyword_list.iter().any(|k| domain_str.contains(k))
+                    && compiled
+                        .keyword_list
+                        .iter()
+                        .any(|k| crate::rule::contains_keyword(domain_str, k))
                 {
                     return true;
                 }
@@ -706,5 +752,243 @@ mod garbage_line_tests {
             0,
             "a legitimate line was rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod adversarial {
+    use super::*;
+    use flux_types::{NetworkType, TargetAddress};
+
+    fn compiled(lines: &str) -> RuleSet {
+        let mut rs = RuleSet::default();
+        for line in lines.lines() {
+            rs.parse_rule_line(line);
+        }
+        rs.rebuild_compiled();
+        rs
+    }
+
+    fn dm(host: &str) -> SessionMeta {
+        SessionMeta::new(
+            "127.0.0.1:1".parse().unwrap(),
+            TargetAddress::domain(host, 443),
+            "in",
+            NetworkType::Tcp,
+        )
+    }
+
+    fn ip(s: &str) -> SessionMeta {
+        SessionMeta::new(
+            "127.0.0.1:1".parse().unwrap(),
+            format!("{s}:80").parse().unwrap(),
+            "in",
+            NetworkType::Tcp,
+        )
+    }
+
+    /// `DOMAIN-SUFFIX` in a set matches at label boundaries only, and an exact
+    /// entry is not a suffix.
+    #[test]
+    fn domain_entries_respect_label_boundaries() {
+        let rs = compiled("DOMAIN-SUFFIX,example.com\nDOMAIN,exact.example\n");
+        assert!(rs.matches(&dm("example.com")));
+        assert!(rs.matches(&dm("www.example.com")));
+        assert!(!rs.matches(&dm("notexample.com")), "label-prefix leak");
+        assert!(!rs.matches(&dm("example.com.evil.net")));
+        assert!(rs.matches(&dm("exact.example")));
+        assert!(!rs.matches(&dm("sub.exact.example")), "exact is exact");
+    }
+
+    /// Public lists ship `*.example.com`. The parser accepted it (into
+    /// `domain_suffix`) but the matcher compared it verbatim, so no host could
+    /// ever contain the `*` and the entry was dead — a list that silently
+    /// matched nothing and let traffic fall through to `final`.
+    #[test]
+    fn wildcard_entries_are_live() {
+        let rs = compiled("*.evil.example\nDOMAIN-SUFFIX,*.suf.example\n");
+        assert!(rs.matches(&dm("a.evil.example")), "bare wildcard entry");
+        assert!(rs.matches(&dm("a.b.evil.example")));
+        assert!(rs.matches(&dm("evil.example")), "documented: apex included");
+        assert!(!rs.matches(&dm("notevil.example")));
+        assert!(rs.matches(&dm("x.suf.example")), "Clash wildcard entry");
+        assert_eq!(rs.unparsed_entry_count(), 0);
+    }
+
+    /// A trailing root dot must not make the name unrecognizable, in either the
+    /// feed or the query.
+    #[test]
+    fn trailing_dots_are_the_same_name() {
+        let rs = compiled("DOMAIN-SUFFIX,example.com\nDOMAIN,exact.example\nip-cidr:10.0.0.0/8\n");
+        assert!(rs.matches(&dm("www.example.com.")), "dotted query");
+        assert!(rs.matches(&dm("exact.example.")));
+        let dotted_feed = compiled("DOMAIN-SUFFIX,example.com.\nDOMAIN,exact.example.\n");
+        assert!(dotted_feed.matches(&dm("www.example.com")));
+        assert!(dotted_feed.matches(&dm("exact.example")));
+    }
+
+    /// `DOMAIN-KEYWORD,` with no value (a truncated line) used to compile to
+    /// `""`; `str::contains("")` is true for every domain, so one broken line
+    /// made its rule set match *everything* — routinely the whole of a user's
+    /// traffic. An empty value is not an entry.
+    #[test]
+    fn an_empty_keyword_is_not_a_match_everything_rule() {
+        let rs = compiled("keyword:\nDOMAIN-KEYWORD,\nDOMAIN-KEYWORD,  \n");
+        assert!(
+            rs.domain_keyword.is_empty(),
+            "empty keyword became an entry"
+        );
+        assert!(
+            !rs.matches(&dm("anything.example")),
+            "an empty keyword matched every domain"
+        );
+        assert!(!rs.matches(&dm("")));
+        assert_eq!(rs.unparsed_entry_count(), 3, "empty values must be counted");
+    }
+
+    /// Truncated V2Ray-style prefixes are counted, not turned into entries.
+    #[test]
+    fn truncated_prefix_lines_are_rejected() {
+        let mut rs = RuleSet::default();
+        for line in [
+            "full:", "exact:", "domain:", "suffix:", "+.", "ip-cidr:", "cidr:",
+        ] {
+            rs.parse_rule_line(line);
+        }
+        assert_eq!(rs.domain.len() + rs.domain_suffix.len(), 0);
+        assert!(rs.ip_cidr.is_empty());
+        assert_eq!(
+            rs.stats.unparsed.load(std::sync::atomic::Ordering::Relaxed),
+            7
+        );
+    }
+
+    /// A malformed CIDR used to be accepted, counted as *parsed*, then dropped
+    /// by the compiler: the rule set looked complete and matched less than the
+    /// operator wrote.
+    #[test]
+    fn malformed_cidrs_are_visible_not_silently_dropped() {
+        let rs = RuleSet::default();
+        assert!(rs.try_apply_content(
+            "IP-CIDR,10.0.0.0/33\nIP-CIDR6,not-an-address\nip-cidr:999.1.1.1/8\nIP-CIDR,1.2.3.4/24,no-resolve\n"
+        ));
+        assert_eq!(
+            rs.parsed_entry_count(),
+            1,
+            "only the valid line is an entry"
+        );
+        assert_eq!(rs.unparsed_entry_count(), 3);
+        assert!(rs.matches(&ip("1.2.3.4")));
+        assert!(!rs.matches(&ip("9.9.9.9")));
+    }
+
+    /// The refresh guard's whole point is that a broken feed must not replace a
+    /// working rule set. A body of truncated lines parses to zero usable entries
+    /// and must be refused — otherwise it replaces a real list with a match-all
+    /// keyword.
+    #[test]
+    fn a_refresh_of_truncated_lines_does_not_replace_a_working_set() {
+        let rs = RuleSet::default();
+        assert!(rs.try_apply_content("DOMAIN-SUFFIX,good.example\n"));
+        assert!(
+            !rs.try_apply_content("keyword:\nfull:\n+.  \n"),
+            "a body of truncated lines was treated as usable content"
+        );
+        assert_eq!(rs.parsed_entry_count(), 1);
+        assert!(rs.matches(&dm("good.example")), "old rule lost");
+        assert!(!rs.matches(&dm("unrelated.example")), "match-all leaked in");
+    }
+
+    /// Empty and single-label entries: `+.` alone must not become a suffix that
+    /// matches trailing-dot hosts, and a TLD entry stays label-bounded.
+    #[test]
+    fn empty_and_single_label_entries() {
+        let rs = compiled("+. \n");
+        assert!(!rs.matches(&dm("a.example.")));
+        assert!(!rs.matches(&dm("a.example")));
+
+        let tld = compiled("DOMAIN-SUFFIX,com\n");
+        assert!(tld.matches(&dm("example.com")));
+        assert!(tld.matches(&dm("a.b.example.com")));
+        assert!(!tld.matches(&dm("xcom")));
+        assert!(!tld.matches(&dm("example.org")));
+    }
+
+    /// A rule set fed random bytes must never panic, and pure garbage must not
+    /// become entries (an HTML error page must not look like a working list).
+    #[test]
+    fn random_lines_never_panic_or_become_entries() {
+        struct Rng(u64);
+        impl Rng {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+        }
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut rs = RuleSet::default();
+        for _ in 0..2000 {
+            let len = (rng.next() % 40) as usize;
+            let mut bytes = vec![0u8; len];
+            for b in bytes.iter_mut() {
+                *b = (rng.next() % 256) as u8;
+            }
+            let line = String::from_utf8_lossy(&bytes);
+            rs.parse_rule_line(&line);
+            // ... and the compilers/matchers must survive whatever was stored.
+            rs.rebuild_compiled();
+        }
+        for probe in ["", "a.example", ".", "xn--x.example"] {
+            let _ = rs.matches(&dm(probe));
+        }
+        // Reaching here without a panic is the assertion.
+    }
+
+    /// The rule-set matcher and the router's `DomainMatch` must agree on what a
+    /// suffix means; a divergence here is a rule that fires for a `rule_set`
+    /// rule but not for the equivalent inline rule (or vice versa).
+    #[test]
+    fn rule_set_suffix_semantics_match_domain_match() {
+        use crate::rule::DomainMatch;
+        for pattern in [
+            "example.com",
+            ".example.com",
+            "*.example.com",
+            "com",
+            "ex-ample.co",
+        ] {
+            let rs = compiled(&format!("DOMAIN-SUFFIX,{pattern}\n"));
+            let m = DomainMatch::suffix(pattern);
+            for host in [
+                "example.com",
+                "www.example.com",
+                "a.b.example.com",
+                "notexample.com",
+                "xcom",
+                "example.com.evil.net",
+                "COM",
+                "WWW.EXAMPLE.COM.",
+            ] {
+                assert_eq!(
+                    rs.matches(&dm(host)),
+                    m.matches(host),
+                    "pattern {pattern:?} on host {host:?}"
+                );
+            }
+        }
+    }
+
+    /// A rule set with only IP entries must not match domains and vice versa —
+    /// no resolution happens in the matcher.
+    #[test]
+    fn rule_sets_do_not_cross_address_families() {
+        let rs = compiled("ip-cidr:10.0.0.0/8\nDOMAIN-SUFFIX,example.com\n");
+        assert!(!rs.matches(&dm("10.0.0.1.corp")));
+        assert!(rs.matches(&ip("10.0.0.1")));
+        assert!(!rs.matches(&ip("93.184.216.34")));
     }
 }
