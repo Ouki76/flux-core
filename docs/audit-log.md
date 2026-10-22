@@ -128,6 +128,79 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 4 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 552 tests, audit, deny, doc — green at `90b5a8c`.
+
+### Theme: the camouflage and the rule engine — code whose bugs are silent
+
+Both areas share a property: when they break, nothing errors. The connection still
+"works" or the config still loads, and the damage shows up somewhere else. Eight
+defects were found this cycle, all proved by tests that fail on the old code.
+
+#### `httpupgrade` — 6 defects (2 → 14 tests)
+
+| # | Defect | Consequence |
+|---|---|---|
+| D1 | The client accepted **any 2xx** as a protocol switch | A captive portal or proxy error page became "a tunnel": the first ciphertext bytes were written into someone's HTML response — silent failure plus a data leak |
+| D2 | Status matched with `contains("101")` | `1010`, `500 Internal Server Error: 101`, `400 101 Switching Protocols` all accepted |
+| D3 | `host`, `path`, header names/values interpolated unvalidated | A `\r\n` in any of them **injected a header or a second request** into the tunnel |
+| D4 | Server accepted a request line with no HTTP version | Request-line smuggling surface |
+| D5 | Server never inspected `Connection`; duplicate `Upgrade` won last-one-wins | A plain `GET` carrying `Upgrade` was promoted to a raw tunnel (RFC 9110 §7.8 wants both tokens) |
+| D6 | Header lines without a colon were silently ignored | obs-fold / smuggling ambiguity |
+
+Everything is now validated **before a single byte is written** (the tests assert
+the peer sees 0 bytes), the client requires `HTTP/1.1 101`, and the server enforces
+the request-line and header grammar. Wire format unchanged: 42 sing-box and 5 xray
+interop tests pass against the stricter server.
+
+#### `ruleset` — a broken feed could silently erase working rules
+
+- `parse_rule_line` accepted almost any line: an HTML error page became a rule
+  (`</html>` contains a slash, so it parsed as an IP-CIDR) and any bare word became
+  a domain suffix. A captive-portal response therefore produced a rule set that
+  looked **non-empty** and matched nothing — the worst outcome, because every
+  `rule_set` rule silently falls through to the final outbound.
+- `apply_content` always swapped, so a refresh that parsed to zero usable entries
+  replaced a working rule set with an empty one. `try_apply_content` now keeps the
+  previous contents and the refresh loop says so.
+
+For a proxy this is a privacy bug in one direction (traffic meant to be tunnelled
+goes direct) or a leak in the other, and it is now covered by 8 tests: five garbage
+shapes must yield zero entries, sixteen legitimate shapes must parse exactly as
+before, an empty refresh keeps the old rules while a partial one is still applied.
+
+#### `reality` — the ClientHello had no ALPN
+
+Every browser offers `h2` and `http/1.1`; ours offered nothing, which is a louder
+non-browser signal than anything the extension set contains. Added, with a test
+that walks the emitted extension block, validates every length, rejects duplicates
+and requires SNI/supported_versions/supported_groups/key_share/signature_algorithms/
+ALPN. Verified by mutation: deleting the ALPN block fails the test with
+"no ALPN extension — a browser always sends one".
+
+### Premise correction: `fingerprint.rs` does not encode a ClientHello
+
+The brief assumed it did. It is 103 lines of policy tables — the profile enum plus
+three provider builders that set only cipher suites and kx groups; rustls owns the
+encoder. Its tests (2 → 8) therefore pin what it actually controls, plus the
+structural integrity of the emitted ClientHello. Two facts had to be measured
+rather than assumed: rustls **shuffles order-insensitive extensions per
+connection** (a fixed-order assertion was flaky and was fixed to assert set
+equality), and it appends the renegotiation SCSV `0x00ff` when TLS 1.2 is enabled.
+
+### Recorded gap (not a code bug): our TLS fingerprint is not a browser's
+
+rustls gives no GREASE, no record padding and no control over extension order; the
+emitted set is 11 extensions against ~15 + 2×GREASE for Chrome, and ALPS,
+`compress_certificate`, `delegated_credentials`, SCT, `renegotiation_info` and ECH
+are absent. JA3/JA4 equivalence needs a uTLS-style encoder — a design change, not a
+test fix. Documented so it is a known limit rather than an assumption of stealth.
+
+---
+
 ## Cycle 3 — 2026-10-22
 
 ### Baseline
