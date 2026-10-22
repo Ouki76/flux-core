@@ -359,8 +359,17 @@ impl GsoBatch {
     }
 
     /// Sends `datagrams` to `dst`, using GSO for runs of equal-sized frames and
-    /// one batched `sendmmsg` for whatever is left. Returns how many datagrams
-    /// went out.
+    /// `sendmmsg` for the rest, **in the order given**.
+    ///
+    /// Order is not a nicety here: these datagrams carry one TCP stream each way,
+    /// and a segment handed to the kernel after one that follows it in the stream
+    /// arrives at the peer as an out-of-order segment. The receiver has to hold it
+    /// for a hole that the next datagram fills — usually microseconds later, but
+    /// with a full receive buffer the hole can close the advertised window and
+    /// only the retransmit timeout (1 s on smoltcp) repairs it. Measured on this
+    /// path: reordering the *tail* of a burst behind it cost 200 MB/s -> 27 MB/s.
+    /// So the leftovers are flushed *before* the super-packet that would overtake
+    /// them, never after.
     pub(crate) async fn send_burst(
         &mut self,
         socket: &UdpSocket,
@@ -370,61 +379,77 @@ impl GsoBatch {
         dst: SocketAddr,
     ) -> usize {
         let mut sent = 0;
-        let mut singles: Vec<usize> = Vec::new();
-        let mut i = 0;
+        // First datagram not yet handed to the kernel. Everything below this
+        // index has left already, so the next send must start at it.
+        let mut flush = 0usize;
+        let mut i = 0usize;
         while i < datagrams.len() {
             let len = datagrams[i].len();
             let mut j = i + 1;
             while j < datagrams.len() && datagrams[j].len() == len {
                 j += 1;
             }
-            if j - i >= 2
-                && !(GSO_DISABLED.load(AtomicOrdering::Relaxed) || gso_off())
-                && len * (j - i) <= GSO_MAX_BYTES
+            // A run of at least two equal-sized datagrams can be one super-packet,
+            // provided the whole super-packet fits under the GSO size limit.
+            if j - i < 2
+                || len * (j - i) > GSO_MAX_BYTES
+                || GSO_DISABLED.load(AtomicOrdering::Relaxed)
+                || gso_off()
             {
-                match self.send(socket, fd, &datagrams[i..j], dst).await {
-                    Ok(true) => {
-                        sent += j - i;
-                        i = j;
-                        continue;
-                    }
-                    Ok(false) => {
-                        GSO_DISABLED.store(true, AtomicOrdering::Relaxed);
-                        tracing::debug!("wireguard egress: UDP GSO unavailable, using sendmmsg");
-                    }
-                    Err(e) => {
-                        GSO_DISABLED.store(true, AtomicOrdering::Relaxed);
-                        tracing::debug!(
-                            "wireguard egress: GSO send failed ({}), using sendmmsg",
-                            e
-                        );
-                    }
+                i = j; // goes out as ordinary datagrams, in place
+                continue;
+            }
+            // Nothing may overtake the frames that precede this run.
+            if flush < i {
+                sent += flush_singles(socket, fd, batch, &datagrams[flush..i], dst).await;
+                flush = i;
+            }
+            match self.send(socket, fd, &datagrams[i..j], dst).await {
+                Ok(true) => {
+                    sent += j - i;
+                    i = j;
+                    flush = i;
+                    continue;
+                }
+                Ok(false) => {
+                    GSO_DISABLED.store(true, AtomicOrdering::Relaxed);
+                    tracing::debug!("wireguard egress: UDP GSO unavailable, using sendmmsg");
+                }
+                Err(e) => {
+                    GSO_DISABLED.store(true, AtomicOrdering::Relaxed);
+                    tracing::debug!("wireguard egress: GSO send failed ({}), using sendmmsg", e);
                 }
             }
-            singles.push(i);
-            i += 1;
+            // GSO refused: this run goes out the ordinary way, still in order.
+            i = j;
         }
-        // Leftovers (odd-sized frames, a lone tail segment) go out batched.
-        let mut off = 0;
-        while off < singles.len() {
-            let chunk: Vec<Vec<u8>> = singles[off..]
-                .iter()
-                .take(UDP_BATCH)
-                .map(|&k| datagrams[k].clone())
-                .collect();
-            match socket
-                .async_io(Interest::WRITABLE, || batch.send(fd, &chunk, dst))
-                .await
-            {
-                Ok(n) if n > 0 => {
-                    sent += n;
-                    off += n;
-                }
-                _ => break,
-            }
-        }
+        sent += flush_singles(socket, fd, batch, &datagrams[flush..], dst).await;
         sent
     }
+}
+
+/// One batched `sendmmsg` (retried until the slice is gone) for datagrams that
+/// are not part of a GSO super-packet.
+async fn flush_singles(
+    socket: &UdpSocket,
+    fd: RawFd,
+    batch: &mut UdpBatch,
+    datagrams: &[Vec<u8>],
+    dst: SocketAddr,
+) -> usize {
+    let mut off = 0;
+    while off < datagrams.len() {
+        match socket
+            .async_io(Interest::WRITABLE, || {
+                batch.send(fd, &datagrams[off..], dst)
+            })
+            .await
+        {
+            Ok(n) if n > 0 => off += n,
+            _ => break,
+        }
+    }
+    off
 }
 
 /// Request a deep kernel queue for the tunnel socket.
@@ -1854,6 +1879,52 @@ mod tests {
         assert_eq!(psrc, "[fd00::2]:1234".parse().unwrap());
         assert_eq!(pdst, dst);
         assert_eq!(ppayload, payload);
+    }
+
+    /// The bug this guards: the burst sender used to hand the *odd-sized* frames
+    /// of a burst to the kernel after the equal-sized run that followed them, so
+    /// a short TCP segment arrived at the peer out of order. The peer holds it for
+    /// a hole, and when its receive buffer is full that hole closes the window
+    /// until a retransmit timeout repairs it — measured as 200 MB/s collapsing to
+    /// 27 MB/s on the WireGuard path (`WG_NO_GSO_TX` proved the reverse).
+    ///
+    /// The shape below is exactly what smoltcp produces at a window edge: a short
+    /// segment, then a run of full-size ones, then a short tail. Emission order is
+    /// observed at the far end of a loopback UDP socket pair, which preserves the
+    /// order of datagrams from one sender to one receiver.
+    #[tokio::test]
+    async fn send_burst_preserves_datagram_order() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fd = tx.as_raw_fd();
+
+        // (tag byte, size) — 300 B short segment, five full-size, one short tail.
+        let mut dgrams = vec![vec![1u8; 300]];
+        for _ in 0..5 {
+            dgrams.push(vec![2u8; 1468]);
+        }
+        dgrams.push(vec![3u8; 700]);
+        let expected: Vec<(u8, usize)> = dgrams.iter().map(|d| (d[0], d.len())).collect();
+
+        let mut gso = GsoBatch::new();
+        let mut batch = UdpBatch::new();
+        let sent = gso.send_burst(&tx, fd, &mut batch, &dgrams, dst).await;
+        assert_eq!(sent, dgrams.len(), "every datagram must be accounted for");
+
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        for _ in 0..dgrams.len() {
+            let n = tokio::time::timeout(Duration::from_secs(5), rx.recv(&mut buf))
+                .await
+                .expect("datagram did not arrive")
+                .unwrap();
+            got.push((buf[0], n));
+        }
+        assert_eq!(
+            got, expected,
+            "datagrams left the sender in a different order than the TCP stream needed"
+        );
     }
 
     #[test]

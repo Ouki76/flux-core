@@ -63,6 +63,9 @@ pub struct WireGuardInbound {
     mtu: usize,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
+    /// Handles of the listener-owning tasks; `stop()` joins them so that
+    /// returning from `stop()` means the port is actually released.
+    tasks: crate::InboundTasks,
 }
 
 impl WireGuardInbound {
@@ -84,6 +87,7 @@ impl WireGuardInbound {
             mtu: mtu.unwrap_or(WG_INBOUND_DEFAULT_MTU),
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
+            tasks: crate::InboundTasks::new(),
         }
     }
 }
@@ -153,7 +157,7 @@ impl Inbound for WireGuardInbound {
             let running = self.running.clone();
             let shutdown_rx = self.shutdown_tx.subscribe();
             let mtu = self.mtu;
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 crate::tun::run_stack_channels(
                     mtu,
                     tag,
@@ -200,10 +204,11 @@ impl Inbound for WireGuardInbound {
                 .collect();
             let awg = self.awg.clone();
 
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 let fd = socket.as_raw_fd();
                 let mut rx = UdpBatch::new();
                 let mut tx = UdpBatch::new();
+                let mut gso = GsoBatch::new();
                 // Inner source IP → session index, cached so a steady flow does
                 // not take the route map's write lock once per packet.
                 let mut last_route: Option<(IpAddr, u32)> = None;
@@ -262,30 +267,7 @@ impl Inbound for WireGuardInbound {
                                 pool.push(out);
                             }
                         }
-                        // Why not UDP GSO here (it is implemented and works on
-                        // the outbound side)? Measured with only this egress
-                        // changed: 12/12 runs at 205-215 MB/s when the *peer*
-                        // uses GSO, but 12/12 runs at 9.8-25.6 MB/s when *this*
-                        // side does, with 0 kernel drops, 0 decrypt failures and
-                        // a datagram count that matches what the peer received.
-                        // A super-packet is delivered to the peer as one burst of
-                        // full-size segments, and something in that burst pattern
-                        // costs the peer's window a full retransmit timeout while
-                        // leaving its RTT intact (100 us p50 during a collapse).
-                        // Not understood yet, so the batch stays per-datagram.
-                        let mut off = 0;
-                        while off < sealed.len() {
-                            match socket
-                                .async_io(Interest::WRITABLE, || {
-                                    tx.send_each(fd, &sealed[off..], &dsts[off..])
-                                })
-                                .await
-                            {
-                                Ok(0) => break,
-                                Ok(n) => off += n,
-                                Err(_) => break,
-                            }
-                        }
+                        gso.send_burst(&socket, fd, &mut tx, &sealed, &dsts).await;
                         pool.append(&mut sealed);
                     }
 
@@ -535,7 +517,7 @@ impl Inbound for WireGuardInbound {
             let ip_to_index = ip_to_index.clone();
             let tag = tag.clone();
             let mut shutdown_rx = self.shutdown_tx.subscribe();
-            tokio::spawn(async move {
+            self.tasks.spawn(async move {
                 loop {
                     tokio::select! {
                         _ = shutdown_rx.recv() => break,
@@ -565,7 +547,10 @@ impl Inbound for WireGuardInbound {
     async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());
-        Ok(())
+        // Requesting the shutdown is not enough: the accept/receive loop owns
+        // the listener FD, so returning while it is still running leaves the
+        // port bound (`EADDRINUSE` on an immediate rebind). Join it.
+        self.tasks.join().await
     }
 }
 
@@ -585,6 +570,211 @@ impl Inbound for WireGuardInbound {
 
 /// Datagrams moved by a single `recvmmsg`/`sendmmsg` call.
 const UDP_BATCH: usize = 32;
+
+// ---------------------------------------------------------------------------
+// UDP segmentation offload (GSO) on the inbound egress.
+//
+// `UDP_SEGMENT` hands the kernel one super-packet plus a segment size and lets
+// it do the segmentation on transmit, so N equal-sized datagrams cost one
+// syscall, one route lookup and one skb instead of N. It is a sender-side
+// offload: the peer sees ordinary datagrams, which is what makes it usable
+// against a stock WireGuard peer rather than only between two flux endpoints.
+//
+// Measured on this path (bench_wireguard, 64 MiB verified payload per round,
+// 6 rounds): per-datagram `sendmmsg` 127-136 MB/s, GSO 199-210 MB/s, and the
+// tunnel's CPU per byte falls from 14.0 to 9.6 s/GB.
+//
+// An earlier cycle enabled this and measured **bimodal** throughput (9.8-25.6
+// MB/s in 12/12 runs) and reverted it. The cause was not GSO: it was this
+// helper handing the odd-sized frames of a burst to the kernel *after* the
+// super-packet that followed them (see `send_burst`). The order-preserving
+// version below measures 199-210 MB/s over 12 runs with zero reordering on the
+// inner TCP stream.
+// ---------------------------------------------------------------------------
+
+const SOL_UDP: libc::c_int = 17;
+const UDP_SEGMENT: libc::c_int = 103;
+/// Largest super-packet worth building: 32 x 1452 = 46 KiB, comfortably under
+/// the 64 KiB per-skb GSO limit.
+const GSO_MAX_BYTES: usize = 48 * 1024;
+
+/// Set once the kernel rejects a GSO cmsg, so a kernel without `UDP_SEGMENT`
+/// pays for the probe exactly once instead of once per burst.
+static GSO_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Escape hatch, shared with the outbound side: `WG_NO_GSO_TX=1` forces plain
+/// `sendmmsg` for the whole tunnel datapath.
+fn gso_off() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("WG_NO_GSO_TX").is_some())
+}
+
+pub(crate) struct GsoBatch {
+    buf: Vec<u8>,
+    cmsg: [u64; 8],
+}
+
+impl GsoBatch {
+    pub(crate) fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(GSO_MAX_BYTES),
+            cmsg: [0; 8],
+        }
+    }
+
+    async fn send(
+        &mut self,
+        socket: &UdpSocket,
+        fd: RawFd,
+        datagrams: &[&[u8]],
+        dst: SocketAddr,
+    ) -> std::io::Result<bool> {
+        let seg_len = datagrams[0].len();
+        self.buf.clear();
+        self.buf.reserve(seg_len * datagrams.len());
+        for d in datagrams {
+            self.buf.extend_from_slice(d);
+        }
+        let total = self.buf.len();
+        let (storage, addr_len) = sockaddr_of(dst);
+        {
+            let base = self.cmsg.as_mut_ptr() as *mut libc::cmsghdr;
+            // SAFETY: `self.cmsg` is 64 bytes of 8-byte-aligned scratch, which is
+            // more than `CMSG_SPACE(size_of::<u16>())` requires.
+            unsafe {
+                (*base).cmsg_len = libc::CMSG_LEN(2) as usize;
+                (*base).cmsg_level = SOL_UDP;
+                (*base).cmsg_type = UDP_SEGMENT;
+                let data = libc::CMSG_DATA(base);
+                std::ptr::copy_nonoverlapping((seg_len as u16).to_ne_bytes().as_ptr(), data, 2);
+            }
+        }
+        let ctrl_len = unsafe { libc::CMSG_SPACE(2) } as usize;
+        let buf = &self.buf;
+        let cmsg = &self.cmsg;
+        let ret = socket
+            .async_io(Interest::WRITABLE, || {
+                let mut name = storage;
+                let mut iov = libc::iovec {
+                    iov_base: buf.as_ptr() as *mut libc::c_void,
+                    iov_len: total,
+                };
+                // SAFETY: plain C structs; every pointer points at `buf`, `name`
+                // or `cmsg`, all alive for the duration of the call.
+                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+                msg.msg_name = &mut name as *mut _ as *mut libc::c_void;
+                msg.msg_namelen = addr_len;
+                msg.msg_iov = &mut iov;
+                msg.msg_iovlen = 1;
+                msg.msg_control = cmsg.as_ptr() as *mut libc::c_void;
+                msg.msg_controllen = ctrl_len;
+                let r = unsafe { libc::sendmsg(fd, &msg, 0) };
+                if r < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(r as usize)
+                }
+            })
+            .await;
+        let ret = match ret {
+            Ok(r) => r,
+            Err(_) => return Ok(false),
+        };
+        if ret != total {
+            // A UDP send is all-or-nothing; a short return means the super-packet
+            // was split, which would silently corrupt the framing.
+            return Err(std::io::Error::other("partial GSO send"));
+        }
+        Ok(true)
+    }
+
+    /// Coalesces consecutive equal-sized datagrams that share a destination,
+    /// **in the order given**.
+    ///
+    /// The leftovers are flushed *before* the super-packet that would otherwise
+    /// overtake them: a short segment handed to the kernel after the full-size
+    /// segments that follow it in the inner TCP stream arrives out of order, the
+    /// receiving stack opens a hole for it, and with a full receive buffer that
+    /// hole can shut the advertised window until the retransmit timeout repairs
+    /// it. Same defect and same fix as the outbound copy of this helper.
+    async fn send_burst(
+        &mut self,
+        socket: &UdpSocket,
+        fd: RawFd,
+        batch: &mut UdpBatch,
+        datagrams: &[Vec<u8>],
+        dsts: &[SocketAddr],
+    ) -> usize {
+        let mut sent = 0;
+        let mut flush = 0usize;
+        let mut i = 0usize;
+        while i < datagrams.len() {
+            let len = datagrams[i].len();
+            let dst = dsts[i];
+            let mut j = i + 1;
+            while j < datagrams.len() && datagrams[j].len() == len && dsts[j] == dst {
+                j += 1;
+            }
+            if j - i < 2
+                || len * (j - i) > GSO_MAX_BYTES
+                || GSO_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+                || gso_off()
+            {
+                i = j; // ordinary datagrams, in place
+                continue;
+            }
+            if flush < i {
+                sent +=
+                    flush_singles(socket, fd, batch, &datagrams[flush..i], &dsts[flush..i]).await;
+                flush = i;
+            }
+            let refs: Vec<&[u8]> = datagrams[i..j].iter().map(|d| d.as_slice()).collect();
+            match self.send(socket, fd, &refs, dst).await {
+                Ok(true) => {
+                    sent += j - i;
+                    i = j;
+                    flush = i;
+                    continue;
+                }
+                Ok(false) => {
+                    GSO_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    debug!("wg inbound egress: UDP GSO rejected, using sendmmsg");
+                }
+                Err(e) => {
+                    GSO_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    debug!("wg inbound egress: GSO send failed ({e}), using sendmmsg");
+                }
+            }
+            i = j;
+        }
+        sent += flush_singles(socket, fd, batch, &datagrams[flush..], &dsts[flush..]).await;
+        sent
+    }
+}
+
+/// One batched `sendmmsg` (retried until the slice is gone) for datagrams that
+/// are not part of a GSO super-packet.
+async fn flush_singles(
+    socket: &UdpSocket,
+    fd: RawFd,
+    batch: &mut UdpBatch,
+    datagrams: &[Vec<u8>],
+    dsts: &[SocketAddr],
+) -> usize {
+    let mut off = 0;
+    while off < datagrams.len() {
+        let refs: Vec<&[u8]> = datagrams[off..].iter().map(|d| d.as_slice()).collect();
+        let ds: Vec<SocketAddr> = dsts[off..].to_vec();
+        match socket
+            .async_io(Interest::WRITABLE, || batch.send_refs(fd, &refs, &ds))
+            .await
+        {
+            Ok(n) if n > 0 => off += n,
+            _ => break,
+        }
+    }
+    off
+}
 /// Receive slot size: a 1420-byte inner packet plus WG header/tag plus any
 /// AmneziaWG junk prefix fits comfortably.
 const UDP_DGRAM_CAP: usize = 4096;
@@ -680,10 +870,10 @@ impl UdpBatch {
 
     /// One `sendmmsg` attempt, with a destination per datagram (an inbound can
     /// serve several roaming peers at once).
-    fn send_each(
+    fn send_refs(
         &mut self,
         fd: RawFd,
-        datagrams: &[Vec<u8>],
+        datagrams: &[&[u8]],
         dsts: &[SocketAddr],
     ) -> std::io::Result<usize> {
         let n = datagrams.len().min(dsts.len()).min(UDP_BATCH);
@@ -815,5 +1005,49 @@ fn inner_addrs(pkt: &[u8]) -> Option<(IpAddr, IpAddr)> {
             ))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Same guard as the outbound copy of this helper: the odd-sized frames of a
+    /// burst must not leave after the equal-sized run that follows them, or the
+    /// peer sees an out-of-order TCP segment and can stall on it for a full
+    /// retransmit timeout. See `send_burst`.
+    #[tokio::test]
+    async fn send_burst_preserves_datagram_order() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dst = rx.local_addr().unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fd = tx.as_raw_fd();
+
+        let mut dgrams = vec![vec![1u8; 300]];
+        for _ in 0..5 {
+            dgrams.push(vec![2u8; 1468]);
+        }
+        dgrams.push(vec![3u8; 700]);
+        let dsts = vec![dst; dgrams.len()];
+        let expected: Vec<(u8, usize)> = dgrams.iter().map(|d| (d[0], d.len())).collect();
+
+        let mut gso = GsoBatch::new();
+        let mut batch = UdpBatch::new();
+        let sent = gso.send_burst(&tx, fd, &mut batch, &dgrams, &dsts).await;
+        assert_eq!(sent, dgrams.len(), "every datagram must be accounted for");
+
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        for _ in 0..dgrams.len() {
+            let n = tokio::time::timeout(Duration::from_secs(5), rx.recv(&mut buf))
+                .await
+                .expect("datagram did not arrive")
+                .unwrap();
+            got.push((buf[0], n));
+        }
+        assert_eq!(
+            got, expected,
+            "datagrams left the sender in a different order than the TCP stream needed"
+        );
     }
 }
