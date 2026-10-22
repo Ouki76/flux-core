@@ -956,6 +956,19 @@ impl Tls13Client {
         ext.push(0);
         ext.extend_from_slice(&(sni.len() as u16).to_be_bytes());
         ext.extend_from_slice(sni);
+        // ALPN: a ClientHello without it is a loud non-browser signal — every
+        // browser offers `h2` and `http/1.1`, and the cover site almost certainly
+        // serves HTTP/2. The REALITY server ignores the contents (it authenticates
+        // the session id), so this only affects what an on-path observer sees.
+        let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
+        let alpn_list_len: usize = alpn.iter().map(|p| 1 + p.len()).sum();
+        ext.extend_from_slice(&0x0010u16.to_be_bytes()); // extension_type
+        ext.extend_from_slice(&((2 + alpn_list_len) as u16).to_be_bytes()); // ext length
+        ext.extend_from_slice(&(alpn_list_len as u16).to_be_bytes()); // protocol list
+        for proto in alpn {
+            ext.push(proto.len() as u8);
+            ext.extend_from_slice(proto);
+        }
         // supported_versions: TLS 1.3
         ext.extend_from_slice(&0x002bu16.to_be_bytes());
         ext.extend_from_slice(&3u16.to_be_bytes());
@@ -2892,5 +2905,136 @@ mod bulk_integrity_tests {
             "client received a short stream"
         );
         assert_eq!(received, expect, "client received corrupted bytes");
+    }
+}
+
+#[cfg(test)]
+mod client_hello_shape_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncRead;
+
+    /// Records everything the client writes and never yields on read, so the
+    /// handshake stalls right after emitting its first flight.
+    struct CapturingStream {
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncRead for CapturingStream {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for CapturingStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Walks the extension block and returns (type, body) pairs, asserting the
+    /// declared lengths are self-consistent on the way.
+    fn parse_extensions(hello: &[u8]) -> Vec<u16> {
+        // First TLS record: type(1) version(2) length(2), then the handshake.
+        assert_eq!(hello[0], 0x16, "not a handshake record");
+        let record_len = u16::from_be_bytes([hello[3], hello[4]]) as usize;
+        assert!(
+            record_len <= hello.len() - 5,
+            "record length {record_len} exceeds the {} bytes written",
+            hello.len() - 5
+        );
+        let hs_len = u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) as usize;
+        assert_eq!(record_len, 4 + hs_len, "record and handshake lengths disagree");
+        let body = &hello[9..9 + hs_len];
+        let sid_len = body[34] as usize;
+        let mut i = 35 + sid_len;
+        let cs_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2 + cs_len;
+        assert_eq!(body[i], 1, "expected exactly one compression method");
+        i += 2;
+        let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2;
+        assert_eq!(i + ext_len, body.len(), "extension block length mismatch");
+        let end = i + ext_len;
+        let mut out = Vec::new();
+        while i < end {
+            let ty = u16::from_be_bytes([body[i], body[i + 1]]);
+            let len = u16::from_be_bytes([body[i + 2], body[i + 3]]) as usize;
+            i += 4;
+            assert!(i + len <= end, "extension {ty:#06x} overruns the block");
+            out.push(ty);
+            i += len;
+        }
+        assert_eq!(i, end, "trailing bytes after the last extension");
+        out
+    }
+
+    /// A ClientHello with no ALPN is a loud non-browser signal, and the shape of
+    /// the block must stay self-consistent or a REALITY server (and any on-path
+    /// observer) sees something no browser emits.
+    #[tokio::test]
+    async fn the_client_hello_is_browser_shaped() {
+        let (sk, pk) = {
+            let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+            let public = x25519_dalek::PublicKey::from(&secret);
+            (secret.to_bytes(), public.to_bytes())
+        };
+        let _ = sk;
+        let cfg = RealityClientConfig {
+            server_name: "www.example.com".into(),
+            public_key: pk,
+            short_id: vec![1, 2, 3, 4],
+        };
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let stream = CapturingStream {
+            written: written.clone(),
+        };
+        let fut = RealityHandshake::client_handshake(stream, &cfg);
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+
+        let hello = written.lock().unwrap().clone();
+        assert!(hello.len() > 60, "nothing was written");
+        let exts = parse_extensions(&hello);
+
+        // ALPN (0x0010) must be present: browsers always send it.
+        let alpn_pos = exts
+            .iter()
+            .position(|t| *t == 0x0010)
+            .expect("ClientHello has no ALPN extension — a browser always sends one");
+        // No duplicate extensions.
+        let mut sorted = exts.clone();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(before, sorted.len(), "duplicate extension in ClientHello: {exts:?}");
+        let _ = alpn_pos;
+
+        for required in [0x0000u16, 0x002b, 0x000a, 0x0033, 0x000d, 0x0010] {
+            assert!(
+                exts.contains(&required),
+                "required extension {required:#06x} missing from {exts:?}"
+            );
+        }
     }
 }
