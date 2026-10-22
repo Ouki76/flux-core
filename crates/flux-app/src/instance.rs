@@ -622,7 +622,18 @@ impl Instance {
                     };
                     match result {
                         Ok(content) => {
-                            rs.apply_content(&content);
+                            // A refresh must never replace a working rule set with
+                            // one that parses to nothing (a broken feed, a captive
+                            // portal): the old rules stay in force instead.
+                            if !rs.try_apply_content(&content) {
+                                tracing::warn!(
+                                    "remote rule set '{}': fetched {} bytes but parsed no usable \
+                                     rules — KEEPING the previous contents",
+                                    rs.tag,
+                                    content.len()
+                                );
+                                continue;
+                            }
                             // A rule set that loads but parses to zero usable
                             // entries makes every `rule_set` rule match nothing,
                             // so traffic silently falls through to the final
