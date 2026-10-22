@@ -134,33 +134,69 @@ port explicitly instead of timing out.
 
 fmt, clippy `-D warnings`, 525 tests, audit, deny, doc — green at `a45d9f5`.
 
-### The weakest measured dimension: WireGuard — now 3.5x its starting point
+### The weakest measured dimension: WireGuard — 58 → 143 MB/s
 
 | | cycle 0 | cycle 1 | cycle 3 |
 |---|---|---|---|
-| throughput | 58 MB/s | 93.6 MB/s | **205.6 MB/s** |
-| CPU per GB | 50.3 s | 21.4 s | **9.34 s** |
+| throughput | 58 MB/s | 93.6 MB/s | **143 MB/s** |
+| CPU per GB | 50.3 s | 21.4 s | **13.5 s** |
 
-What did it, in the order it was found:
+What did it, in the order it was found and attributed:
 
-1. **ring's ChaCha20-Poly1305** instead of the RustCrypto crate (the same 1.9x
-   backend gap that cycle 2 found for AES-GCM in three other protocols), with the
-   key schedule expanded once per session rather than per packet.
-2. **UDP GSO (`UDP_SEGMENT`)**: equal-sized datagrams sharing a destination become
-   one super-packet, so N datagrams cost one syscall, one route lookup and one skb.
-   Measured per datagram: plain `sendto` 5.0 CPU s/GB, `sendmmsg` 4.2,
-   `sendmsg`+`UDP_SEGMENT` **0.8**. Sender-side only, so a stock WireGuard peer
-   sees ordinary datagrams — verified against the real interop peer.
-3. Graceful degradation: the first rejected control message disables GSO
-   permanently and falls back to `sendmmsg`; `WG_NO_GSO_RX`/`TX` force it off.
+1. **ring's ChaCha20-Poly1305** instead of the RustCrypto crate (the same backend
+   gap cycle 2 found for AES-GCM in three other protocols). The profile showed the
+   Poly1305 *per-message key setup*, not bulk throughput; the schedule is now
+   expanded once per session. Isolated with a null-cipher build: AEAD cost
+   5.9 → 2.2 s/GB. `97.6 → 125.5 MB/s`.
+2. **UDP GSO (`UDP_SEGMENT`) on the outbound egress only**: equal-sized datagrams
+   to the peer become one super-packet, so N datagrams cost one syscall, one route
+   lookup and one skb. Kernel floor per datagram, measured standalone: plain
+   `sendto` 5.0 CPU s/GB, `sendmmsg` 4.28, `sendmsg`+`UDP_SEGMENT` **0.80**.
+   Sender-side only, so a stock WireGuard peer sees ordinary datagrams.
+   `125.5 → 143 MB/s`.
+3. Inbound frame channel: backpressure instead of a silent drop (correctness — a
+   dropped frame inside a TCP tunnel costs the flow a retransmit timeout).
 
-Verified independently: 205.6 MB/s over 5x48 MiB (min 202.9, max 211.5 — no
-bimodality), CPU 9.34 s/GB, RSS 25 MiB, byte-for-byte integrity, half-close still
-correct.
+#### Correction: a number in this log was wrong, and here is why
 
-The TCP-window hypothesis (from the TUN finding) was **tested and rejected here**:
-`WG_TCP_BUF` stayed at 64 KiB because widening it did not pay on this path. Worth
-recording, because it was the prior I gave the agent and it was wrong.
+An earlier revision of this entry claimed **205.6 MB/s at 9.34 s/GB** and committed
+it (`317f057`). That figure is **not reproducible** and has been withdrawn.
+
+What happened: the build in that commit also enabled GSO on the *inbound* egress.
+That configuration is **bimodal** — 12/12 runs at 205–215 MB/s when only the
+outbound uses GSO, 12/12 runs at 9.8–25.6 MB/s when the inbound does too. The
+first measurement recorded showed `min 14.9 MB/s`, which is the collapse mode in
+plain sight; it was dismissed as cold-start, and a second run at a different size
+happened to land entirely in the fast mode. The commit was made on one lucky
+sample.
+
+Corrected state (`2e24dfc`): inbound GSO reverted, per-datagram `sendmmsg` kept
+there, evidence written at the call site. Re-measured independently three times
+after the revert: 143.3 / 142.8 / 143.9 MB/s (min 139.5), CPU 13.1–13.6 s/GB,
+integrity byte-verified, RSS 28 MiB.
+
+The lesson is recorded deliberately: an outlier in the minimum is a signal about
+the *configuration*, not about the first round being cold — and a single lucky
+sample is not a measurement.
+
+#### The TUN window prior did not transfer
+
+A window sweep was run first, as the TUN finding from cycle 2 suggested
+(9 rounds per point, 4 interleaved passes, A/A noise ±1.2 %): 64 KiB 97.1,
+128 KiB 99.1, 256 KiB 101.2, 384 KiB 100.4, 512 KiB 99.8 MB/s — +4 % total and CPU
+per byte *rising*. Unlike TUN, this pump already keeps a burst in flight, so 64 KiB
+covers the bandwidth-delay product. `WG_TCP_BUF` stays 64 KiB and the stale
+"measured, no effect" comment was replaced with this table.
+
+#### Honest ceiling
+
+At MTU 1420 the kernel alone charges ~4.25 CPU s/GB per direction to move one
+datagram per packet even when batched; plus 2.2 for the AEAD ⇒ ~10.7 s/GB ⇒
+**~190 MB/s** is the limit of a per-datagram design at that MTU, and only if the
+inbound send path also gets GSO (the work that had to be given back). The same code
+at inner MTU 8192 measures **231 MB/s at 9.1 s/GB**, so the honest lever past 200
+is a configurable inner MTU — left at the interop value 1420 and recorded as the
+next item rather than silently changed.
 
 ### Fixed: the mux teardown race (closed, not deferred)
 
