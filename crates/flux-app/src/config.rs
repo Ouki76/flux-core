@@ -330,6 +330,9 @@ pub enum SecurityConfig {
     },
     #[serde(rename = "shadowtls")]
     ShadowTls {
+        /// Only v3 is implemented; anything else is refused at load time rather
+        /// than silently served as v3.
+        #[serde(default = "default_shadowtls_version")]
         version: u8,
         password: String,
         sni: String,
@@ -343,6 +346,12 @@ pub enum SecurityConfig {
         #[serde(default = "default_interval_ms")]
         interval_ms: u64,
     },
+}
+
+/// ShadowTLS is only implemented at v3; this is the default when the config omits
+/// the field, and any other value is rejected when the instance is built.
+fn default_shadowtls_version() -> u8 {
+    3
 }
 
 fn default_length_min() -> usize {
@@ -377,9 +386,15 @@ pub enum InboundSecurityConfig {
     },
     #[serde(rename = "shadowtls")]
     ShadowTls {
+        /// Only v3 is implemented; anything else is refused at load time.
+        #[serde(default = "default_shadowtls_version")]
         version: u8,
         password: String,
         fallback: String,
+        /// Cover host names this server will accept in the SNI. Empty disables
+        /// the check (the previous behaviour); a configured list is fail-closed.
+        #[serde(default)]
+        server_names: Vec<String>,
     },
 }
 

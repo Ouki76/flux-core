@@ -135,3 +135,80 @@ fn test_config_env_var_substitution() {
     assert_eq!(api_cfg.secret.as_deref(), Some("supersecret123"));
     assert_eq!(api_cfg.listen.as_deref(), Some("127.0.0.1:9099"));
 }
+
+// ---------------------------------------------------------------------------
+// ShadowTLS config wiring
+// ---------------------------------------------------------------------------
+
+fn shadowtls_outbound(version_line: &str) -> String {
+    format!(
+        r#"{{
+            "outbounds": [{{
+                "tag": "out",
+                "carrier": {{ "type": "tcp", "address": "127.0.0.1:24801" }},
+                "protocol": {{ "type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }},
+                "security": {{ "type": "shadowtls"{version_line}, "password": "hunter2", "sni": "cover.example.com" }}
+            }}]
+        }}"#
+    )
+}
+
+/// Only ShadowTLS v3 is implemented. A config asking for v1/v2 must be refused
+/// instead of silently being served as v3 — the previous code dropped the field
+/// in destructuring, so the client negotiated v3 while the operator believed
+/// otherwise.
+#[tokio::test]
+async fn shadowtls_rejects_an_unimplemented_version() {
+    let cfg = flux_app::Config::from_json_str(&shadowtls_outbound(r#", "version": 2"#))
+        .expect("config must parse");
+    let err = flux_app::Instance::new(cfg)
+        .err()
+        .expect("a v2 shadowtls layer must be refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("version 2") && msg.contains("only 3"),
+        "the error must name the version and the supported one, got: {msg}"
+    );
+}
+
+/// Omitting `version` must default to 3 rather than fail.
+#[tokio::test]
+async fn shadowtls_version_defaults_to_three() {
+    let cfg = flux_app::Config::from_json_str(&shadowtls_outbound("")).expect("config must parse");
+    if let Err(e) = flux_app::Instance::new(cfg) {
+        let msg = format!("{e}");
+        assert!(
+            !msg.contains("version"),
+            "an omitted version must default to 3, got: {msg}"
+        );
+    }
+}
+
+/// The inbound's cover-host allow-list was hardcoded to an empty vector, so a
+/// configured list could never take effect.
+#[tokio::test]
+async fn shadowtls_inbound_accepts_a_server_names_list() {
+    let json = r#"{
+        "inbounds": [{
+            "tag": "st-in",
+            "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": 24801 },
+            "security": {
+                "type": "shadowtls",
+                "version": 3,
+                "password": "hunter2",
+                "fallback": "127.0.0.1:24802",
+                "server_names": ["cover.example.com", "www.example.com"]
+            },
+            "protocol": { "type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }
+        }],
+        "outbounds": [{ "type": "direct", "tag": "direct" }]
+    }"#;
+    let cfg = flux_app::Config::from_json_str(json).expect("config with server_names must parse");
+    if let Err(e) = flux_app::Instance::new(cfg) {
+        let msg = format!("{e}");
+        assert!(
+            !msg.contains("server_names") && !msg.contains("unknown field"),
+            "server_names must be a recognized field, got: {msg}"
+        );
+    }
+}

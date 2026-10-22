@@ -899,7 +899,17 @@ fn compile_client_securities(
                     },
                 ));
             }
-            SecurityConfig::ShadowTls { password, sni, .. } => {
+            SecurityConfig::ShadowTls {
+                version,
+                password,
+                sni,
+            } => {
+                if version != 3 {
+                    return Err(FluxError::Config(format!(
+                        "shadowtls outbound: version {version} is not supported (only 3); \
+                         serving it as v3 would silently mis-negotiate"
+                    )));
+                }
                 list.push(flux_transport::pipeline::SecurityLayer::ShadowTls(
                     flux_transport::shadowtls::ShadowTlsClientConfig {
                         server_name: sni,
@@ -1378,8 +1388,17 @@ fn compile_server_securities(
                 ));
             }
             InboundSecurityConfig::ShadowTls {
-                password, fallback, ..
+                version,
+                password,
+                fallback,
+                server_names,
             } => {
+                if version != 3 {
+                    return Err(FluxError::Config(format!(
+                        "shadowtls inbound: version {version} is not supported (only 3); \
+                         serving it as v3 would silently mis-negotiate"
+                    )));
+                }
                 let fb_target = if let Ok(sa) = fallback.parse::<SocketAddr>() {
                     flux_transport::shadowtls::TargetFallback::Address(sa)
                 } else if let Some((host, port_str)) = fallback.rsplit_once(':')
@@ -1394,7 +1413,7 @@ fn compile_server_securities(
                 };
                 list.push(flux_transport::pipeline::ServerSecurityLayer::ShadowTls(
                     flux_transport::shadowtls::ShadowTlsServerConfig {
-                        server_names: vec![],
+                        server_names: server_names.clone(),
                         password,
                         fallback_address: fb_target,
                     },
