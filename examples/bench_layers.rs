@@ -8,11 +8,17 @@
 //!
 //! Usage: `cargo run --release --example bench_layers -- --rounds 5 --mb 32 --chunk 65536`
 //!
-//! Caveat: this measures an **echo** loop, so the client writes and reads
-//! concurrently over one connection. That is representative of a proxy tunnel but
-//! it couples the two directions through the layer's flow control, which is why
-//! the numbers are lower than a one-way stream and can be noisy — run several
-//! rounds and compare medians, never a single round.
+//! Two modes, and the difference matters:
+//!
+//! * `--one-way` is the number to quote. The client writes and the server drains;
+//!   this is what a tunnel carries per direction.
+//! * the default echo mode splits ONE stream with `tokio::io::split`, which in
+//!   tokio is a `Mutex` around the whole stream taken on every poll — so the
+//!   reading and writing halves take turns by construction. Its numbers are lower
+//!   for that reason as much as for any property of the transport, and must not be
+//!   quoted as "full-duplex throughput".
+//!
+//! Run several rounds and compare medians, never a single round.
 
 use flux_transport::pipeline::{
     FramingLayer, LayeredTransportPipeline, ServerFramingLayer, ServerSecurityLayer,

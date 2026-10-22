@@ -128,6 +128,78 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 11 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 893 tests, audit, deny, doc — green at `0fa7c58`.
+
+### Correction: my "h2/gRPC at 6 % of raw" was an artefact of my own harness
+
+Cycle 10 reported full-duplex HTTP/2 and gRPC at ~6 % of raw throughput. That
+number is withdrawn. The echo mode of the new benchmark splits one stream with
+`tokio::io::split`, and in tokio that is a **`Mutex` around the whole stream taken on
+every poll** — the two halves take turns by construction, so the figure measured the
+split as much as the transport.
+
+The honest per-direction numbers (one-way, 5 rounds, 64 MiB):
+
+| layer | MB/s | vs raw |
+|---|---|---|
+| raw | 3731 | — |
+| httpupgrade | 3037 | 81 % |
+| ws | 1101 | 30 % |
+| h2 | 648 | 17 % |
+| grpc | 414 | 11 % |
+
+At a typical 1 Gbps link (125 MB/s) gRPC still has 3.3x headroom, so it is not a
+practical bottleneck. The benchmark header now says which number to quote and why.
+Two real defects did come out of that work: the gRPC capacity fix (cycle 10) and the
+dedup below.
+
+### Code quality: one h2 handshake instead of two
+
+109 duplicated lines (handshake, window config, REFUSED_STREAM driver) now live once
+in `h2::shared`. What is genuinely different stays per layer — gRPC reads headers and
+trailers, h2 must not. h2spec: 108 applicable cases, 108 passed, **before and after**;
+196 transport tests, 42 interop tests and the layered test identical in count and
+outcome. The net file delta is +9 lines, so this is a dedup, not a line-count win,
+and the report says so.
+
+### The `AddrInUse` flake: cause found, failures now attributed
+
+The allocator claims a block of ports and, on failure, reports which configured
+listener is occupied, by whom (from `/proc/net/tcp{,6}` with uid), and whether this
+process handed that port out. What it showed: **foreign processes were listening on
+ports inside the claimed block** — a non-cooperating service walking the same range,
+which is exactly why the failure never reproduced in isolation and left nothing
+behind when checked. The allocator now prefers a quiet block instead of trusting a
+candidate it probed a moment earlier.
+
+Also fixed an honesty problem in my own bookkeeping: the allocator's own tests sat
+inside `tests/common/mod.rs`, which is compiled into every integration binary, so six
+tests were counted 24 times and the suite total drifted upward for no reason. They
+are now their own binary and the per-binary counts are comparable across cycles.
+
+### Also fixed
+
+- `"1.2.3.4.:80"` parsed as a **domain**, so every `IP-CIDR` rule silently stopped
+  applying to it and the dial path would have tried to resolve a literal. The
+  literal check now ignores a trailing root dot; a real domain keeps it and stays a
+  domain. Mutation-verified.
+- `docs/configuration.md` now says plainly that routing decides **without resolving**
+  the destination, so an `IP-CIDR` rule only fires for address literals (SOCKS5/VLESS
+  with an IP, or a TUN packet). Anyone expecting "block this IP range" to catch a
+  domain destination would silently get no match — a deliberate trade, now documented
+  with the two ways around it.
+
+### State
+
+**878 tests, 0 failed.** The number *fell* from 893 because the duplicated counting
+was removed; per-binary counts are unchanged.
+
+---
+
 ## Cycle 10 — 2026-10-22
 
 ### Baseline
