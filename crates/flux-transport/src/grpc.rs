@@ -299,10 +299,16 @@ impl GrpcStream {
         cx: &mut Context<'_>,
         remaining: usize,
     ) -> Poll<io::Result<usize>> {
+        // Use the capacity h2 has *already* granted before asking for more.
+        // `poll_capacity` reports newly granted capacity and stays `Pending` when
+        // nothing new arrived, so calling it unconditionally made every frame wait
+        // for the next WINDOW_UPDATE — a scheduler round trip per 16 KiB message,
+        // which is what capped this transport at ~280 MB/s instead of ~3 GB/s.
         let capacity = self.send.capacity();
-        if capacity < remaining {
-            self.send.reserve_capacity(remaining - capacity);
+        if capacity > 0 {
+            return Poll::Ready(Ok(capacity));
         }
+        self.send.reserve_capacity(remaining);
         match self.send.poll_capacity(cx) {
             Poll::Ready(Some(Ok(capacity))) => {
                 if capacity == 0 {

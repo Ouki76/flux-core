@@ -62,7 +62,7 @@ fn framing(name: &str, path: &str) -> (FramingLayer, ServerFramingLayer) {
     }
 }
 
-async fn measure(name: &str, mb: usize, chunk: usize) -> f64 {
+async fn measure(name: &str, mb: usize, chunk: usize, one_way: bool) -> f64 {
     let (client_framing, server_framing) = framing(name, "/bench");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -74,16 +74,18 @@ async fn measure(name: &str, mb: usize, chunk: usize) -> f64 {
                 .unwrap(socket)
                 .await
                 .expect("server handshake");
-        // Echo loop back so the client has a reader.
+        // Echo back (default) or just drain (one-way mode).
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match stream.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if stream.write_all(&buf[..n]).await.is_err() {
-                        break;
+                    if !one_way {
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                        let _ = stream.flush().await;
                     }
-                    let _ = stream.flush().await;
                 }
             }
         }
@@ -116,13 +118,18 @@ async fn measure(name: &str, mb: usize, chunk: usize) -> f64 {
     });
     let mut buf = vec![0u8; 64 * 1024];
     let mut got = 0usize;
-    while got < total {
-        match rd.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => got += n,
+    if one_way {
+        // Nothing comes back; just wait for the writer to finish.
+        let _ = writer.await;
+    } else {
+        while got < total {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
         }
+        let _ = writer.await;
     }
-    let _ = writer.await;
     let elapsed = t.elapsed().as_secs_f64();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     (mb as f64) / elapsed
@@ -144,18 +151,22 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
 
+    let one_way = args.iter().any(|a| a == "--one-way");
     let chunk = args
         .iter()
         .position(|a| a == "--chunk")
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(64 * 1024);
-    println!("chunk = {chunk} bytes");
+    println!(
+        "chunk = {chunk} bytes, mode = {}",
+        if one_way { "one-way" } else { "echo" }
+    );
     println!("layer            round 1        round 2        round 3        median MB/s");
     for name in ["raw", "ws", "upgrade", "h2", "grpc"] {
         let mut vals = Vec::new();
         for _ in 0..rounds {
-            vals.push(measure(name, mb, chunk).await);
+            vals.push(measure(name, mb, chunk, one_way).await);
         }
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         // Median over all rounds (run at least 5 for a stable number).
