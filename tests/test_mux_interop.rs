@@ -208,10 +208,24 @@ macro_rules! require_singbox {
 }
 
 /// Starts a flux instance from JSON and waits until `port` accepts connections.
+///
+/// A failed start is the one failure mode whose OS error carries no context at
+/// all (`Io(Os { code: 98, kind: AddrInUse })`, with no port and no inbound), so
+/// the panic prints [`common::diagnose_bind_failure`]: which configured listener
+/// failed, whether this process's allocator handed that port out (and to which
+/// test thread), what the kernel says holds it (`/proc/net/*` state, uid, inode,
+/// owning pid, plus `ss` when it is usable), what else is sitting in the test
+/// range, and whether that range overlaps the kernel's ephemeral range. See
+/// "Port forensics" in `tests/common/mod.rs`.
 async fn start_flux(json: &str, port: u16) -> Instance {
     let instance = Instance::new(Config::from_json_str(json).expect("parse flux config"))
         .expect("build flux instance");
-    instance.start().await.expect("start flux instance");
+    if let Err(e) = instance.start().await {
+        let report = common::diagnose_bind_failure(json, port, &e.to_string());
+        // `{e:?}` keeps the historical `Io(Os { code: 98, kind: AddrInUse, … })`
+        // shape, so old and new logs of this failure stay comparable.
+        panic!("start flux instance: {e:?}\n{report}");
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_err() {
         assert!(
@@ -222,6 +236,81 @@ async fn start_flux(json: &str, port: u16) -> Instance {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     instance
+}
+
+/// The failure mode that stayed unattributable for a dozen full-suite runs: a
+/// bare `Io(Os { code: 98 })` with no port, no inbound, no holder.
+///
+/// Deterministic, not a flake hunt: this test *holds* the port the config
+/// declares with a plain listener (std sets `SO_REUSEADDR` but not
+/// `SO_REUSEPORT`, so flux's `SO_REUSEPORT` bind is refused exactly as it is
+/// against a foreign squatter). The failure is therefore guaranteed; what is
+/// asserted is that it explains itself — the inbound tag and port, the
+/// allocator's involvement, and the kernel's view of the holder.
+#[tokio::test]
+async fn test_start_flux_failure_is_self_diagnosing() {
+    use futures_util::FutureExt;
+
+    let port = get_free_tcp_port().await;
+    let cfg = format!(
+        r#"{{
+            "inbounds": [{{
+                "tag": "flux-vless-in",
+                "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                "protocol": {{ "type": "vless", "uuid": "{}" }}
+            }}],
+            "outbounds": [{{"type": "direct", "tag": "direct"}}]
+        }}"#,
+        port, UUID
+    );
+    // The allocator just probed this port; if it is already gone, say who took it
+    // instead of failing on a bare errno. (That is itself a diagnostic of the
+    // allocator's probe-to-bind window, so it gets the same report.)
+    let squatter = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => listener,
+        Err(e) => panic!(
+            "cannot hold the port the allocator just handed out: {e}\n{}",
+            common::diagnose_bind_failure(&cfg, port, &e.to_string())
+        ),
+    };
+
+    let payload = std::panic::AssertUnwindSafe(start_flux(&cfg, port))
+        .catch_unwind()
+        .await
+        .err()
+        .expect("start_flux must fail while another socket holds its port");
+    drop(squatter);
+
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("<panic payload was not a string>");
+
+    // The OS error is still there, verbatim, so existing expectations hold.
+    assert!(
+        message.contains("AddrInUse") || message.contains("code: 98"),
+        "the original bind error vanished from the panic:\n{message}"
+    );
+    // Which inbound, on which port.
+    assert!(
+        message.contains("tag='flux-vless-in'") && message.contains(&format!(":{port}")),
+        "the panic does not name the inbound and its port:\n{message}"
+    );
+    assert!(
+        message.contains("the inbound that failed is configured[0] tag='flux-vless-in'"),
+        "the panic does not identify the failing listener:\n{message}"
+    );
+    // Whether the allocator handed the port out in this process (it did).
+    assert!(
+        message.contains("handed out 1 time(s) by this process's allocator"),
+        "the panic does not report the allocator's involvement:\n{message}"
+    );
+    // What the kernel says holds it: this process, because of the test listener.
+    assert!(
+        message.contains("OCCUPIED") && message.contains("THIS PROCESS"),
+        "the panic does not attribute the holder:\n{message}"
+    );
 }
 
 fn meta(destination: TargetAddress) -> SessionMeta {
