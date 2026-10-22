@@ -92,7 +92,7 @@ async fn measure(name: &str, mb: usize, chunk: usize) -> f64 {
 
     let client = LayeredTransportPipeline::new(TargetAddress::domain("bench.local", 443), addr)
         .with_framing(client_framing);
-    let mut stream = client.dial().await.expect("client handshake");
+    let stream = client.dial().await.expect("client handshake");
 
     let payload = vec![0x41u8; chunk];
     let total = mb * 1024 * 1024;
