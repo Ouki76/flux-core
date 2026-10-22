@@ -27,31 +27,28 @@ const WG_MTU: usize = 1420;
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Inner TCP buffer per direction — i.e. the advertised window, per direction.
 ///
-/// Unlike the TUN datapath, whose window was the binding constraint up to
-/// 256 KiB, this one is **not** window-limited, and the difference is the
-/// interleaving: TUN's stack is throttled by a single socket's BDP, while here
-/// the pump already keeps a burst in flight, so a 64 KiB window spans 45
-/// segments and covers the pipeline's bandwidth-delay product.
-///
-/// Swept on `bench_wireguard` (32 MiB verified payload, 9 rounds/measurement,
-/// 4 interleaved passes to beat a measured +-2.5 % A/A noise floor, only this
-/// constant varied):
+/// The TUN datapath on the same smoltcp stack turned out to be *window*-limited
+/// and needed a 256 KiB floor (+33 % at MTU 1500). This one is not: the window
+/// was the wrong suspect here, and the sweep below is why it was re-tested
+/// before anything else. `bench_wireguard`, 32 MiB of byte-verified payload per
+/// measurement, 9 rounds each, 4 interleaved passes against a measured +-2.5 %
+/// A/A noise floor, one binary with only this constant varied:
 ///
 /// ```text
-/// window   before GSO        after GSO
-///  64 KiB  97.1 MB/s         203.5-209.9 MB/s   (stable)
-/// 128 KiB  99.1 MB/s         28.3 / 28.3 / 232.5 / 28.1  (bimodal)
-/// 256 KiB 101.2 MB/s          7.7-14.9 MB/s     (collapses)
-/// 384 KiB 100.4 MB/s          15.3-27.8 MB/s
-/// 512 KiB  99.8 MB/s          14.9-15.2 MB/s
+/// window    throughput            CPU s/GB      verdict
+///  64 KiB   97.1 97.0 98.9 96.4   21.7          baseline
+/// 128 KiB   99.2 98.8 99.1 99.6   23.2          +2 %, same cost story
+/// 256 KiB  100.8 101.7 101.0 101.7 23.0         +4 % for +6 % CPU
+/// 384 KiB  101.0 100.8  98.7  99.7 23.0         no further gain
+/// 512 KiB  100.4  98.1  99.7  99.8 22.9         no further gain
 /// ```
 ///
-/// Before GSO a wider window bought +4 % for +6 % more CPU (the flow was
-/// already pipelined). After GSO the sender can push a burst that the inbound's
-/// frame channel and stack actor cannot absorb, so a wider window makes the
-/// inbound drop frames and the connection stalls — see the note on
-/// `FRAME_CHANNEL_CAP` in `flux-inbound/src/wireguard.rs`. 64 KiB is the stable
-/// point on both sides of that boundary, so it stays.
+/// So the whole sweep is worth +4 % and *increases* CPU per byte, unlike TUN:
+/// the pump here already keeps a burst in flight, so 64 KiB (45 segments) covers
+/// the bandwidth-delay product and the flow was never stop-and-wait. The limit
+/// was per-packet cost, which is what GSO and the AEAD change attack. (A wider
+/// window also destabilised later GSO measurements — same bimodality the TUN
+/// agent saw at 512 KiB — so 64 KiB remains the operating point on both counts.)
 const WG_TCP_BUF: usize = 64 * 1024;
 /// How much data one connection may queue between the proxy task and the inner
 /// socket. Beyond this the proxy is blocked instead of the queue growing.
@@ -252,9 +249,10 @@ const GSO_MAX_BYTES: usize = 48 * 1024;
 /// pays for the probe exactly once instead of once per burst.
 static GSO_DISABLED: AtomicBool = AtomicBool::new(false);
 
-/// Escape hatch: set `WG_NO_GSO_RX` / `WG_NO_GSO_TX` to force plain
-/// `sendmmsg` on a kernel or middlebox where GSO misbehaves. GSO also disables
-/// itself permanently after the first rejected control message.
+/// Escape hatch: `WG_NO_GSO_TX=1` forces plain `sendmmsg`, for a kernel where
+/// GSO misbehaves. GSO also disables itself permanently after the first
+/// rejected control message, so a peer or kernel without `UDP_SEGMENT` costs one
+/// probe and then nothing.
 fn gso_off() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var_os("WG_NO_GSO_TX").is_some())

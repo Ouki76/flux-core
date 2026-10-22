@@ -204,7 +204,6 @@ impl Inbound for WireGuardInbound {
                 let fd = socket.as_raw_fd();
                 let mut rx = UdpBatch::new();
                 let mut tx = UdpBatch::new();
-                let mut gso = GsoBatch::new();
                 // Inner source IP → session index, cached so a steady flow does
                 // not take the route map's write lock once per packet.
                 let mut last_route: Option<(IpAddr, u32)> = None;
@@ -263,9 +262,30 @@ impl Inbound for WireGuardInbound {
                                 pool.push(out);
                             }
                         }
-                        // GSO coalesces equal-sized runs to the same peer
-                        // (every full-size data frame) into one syscall each.
-                        let _ = gso.send_burst(&socket, fd, &mut tx, &sealed, &dsts).await;
+                        // Why not UDP GSO here (it is implemented and works on
+                        // the outbound side)? Measured with only this egress
+                        // changed: 12/12 runs at 205-215 MB/s when the *peer*
+                        // uses GSO, but 12/12 runs at 9.8-25.6 MB/s when *this*
+                        // side does, with 0 kernel drops, 0 decrypt failures and
+                        // a datagram count that matches what the peer received.
+                        // A super-packet is delivered to the peer as one burst of
+                        // full-size segments, and something in that burst pattern
+                        // costs the peer's window a full retransmit timeout while
+                        // leaving its RTT intact (100 us p50 during a collapse).
+                        // Not understood yet, so the batch stays per-datagram.
+                        let mut off = 0;
+                        while off < sealed.len() {
+                            match socket
+                                .async_io(Interest::WRITABLE, || {
+                                    tx.send_each(fd, &sealed[off..], &dsts[off..])
+                                })
+                                .await
+                            {
+                                Ok(0) => break,
+                                Ok(n) => off += n,
+                                Err(_) => break,
+                            }
+                        }
                         pool.append(&mut sealed);
                     }
 
@@ -583,204 +603,6 @@ struct UdpBatch {
 // pointers are rebuilt from its own heap allocations on every syscall attempt and
 // never outlive the struct, so moving it to another thread is sound.
 unsafe impl Send for UdpBatch {}
-
-// ---------------------------------------------------------------------------
-// UDP segmentation offload (GSO)
-//
-// One inner IP packet per datagram means the send side pays a route lookup, an
-// skb allocation, a copy and a checksum per packet no matter how well the
-// syscalls are batched. Measured on this box with a standalone sender/receiver
-// pair at 1452-byte datagrams, 12 per call:
-//
-//   plain `sendto`            5.0 CPU s/GB
-//   `sendmmsg`, 12 per call   4.2 CPU s/GB
-//   `sendmsg` + `UDP_SEGMENT` 0.8 CPU s/GB   (1717 MB/s of datagrams)
-//
-// `UDP_SEGMENT` gives the kernel one super-packet plus a segment size and lets
-// it segment on transmit, so N datagrams cost one syscall, one route lookup and
-// one skb. The peer sees ordinary datagrams: GSO is a sender-side offload with
-// no negotiation, so it works against a stock WireGuard peer as well.
-//
-// Segments in a super-packet must be equal-sized, and this inbound may serve
-// several roaming peers, so bursts are grouped by (destination, length).
-// ---------------------------------------------------------------------------
-
-/// `SOL_UDP`, for the GSO control message.
-const SOL_UDP: libc::c_int = 17;
-/// `UDP_SEGMENT`: the segment size for a GSO super-packet.
-const UDP_SEGMENT: libc::c_int = 103;
-/// Largest super-packet worth building: 32 x 1452 = 46 KiB, under the 64 KiB
-/// per-skb GSO limit.
-const GSO_MAX_BYTES: usize = 12 * 1024;
-
-/// Set once the kernel rejects a GSO cmsg, so a kernel without `UDP_SEGMENT`
-/// pays for the probe exactly once.
-static GSO_DISABLED: AtomicBool = AtomicBool::new(false);
-
-/// Escape hatch: set `WG_NO_GSO_RX` / `WG_NO_GSO_TX` to force plain
-/// `sendmmsg` on a kernel or middlebox where GSO misbehaves. GSO also disables
-/// itself permanently after the first rejected control message.
-fn gso_off() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var_os("WG_NO_GSO_RX").is_some())
-}
-
-/// Sends bursts of already-encrypted datagrams, coalescing equal-sized runs that
-/// share a destination into `UDP_SEGMENT` super-packets.
-struct GsoBatch {
-    buf: Vec<u8>,
-    /// `cmsghdr` scratch, `u64`-backed so the control message is aligned the way
-    /// `CMSG_DATA` requires.
-    cmsg: [u64; 8],
-}
-
-impl GsoBatch {
-    fn new() -> Self {
-        Self {
-            buf: Vec::with_capacity(GSO_MAX_BYTES),
-            cmsg: [0; 8],
-        }
-    }
-
-    /// One GSO `sendmsg` for `datagrams` (all `seg_len` bytes) to `dst`.
-    /// `Ok(false)` means the kernel refused the control message.
-    async fn send(
-        &mut self,
-        socket: &UdpSocket,
-        fd: RawFd,
-        datagrams: &[Vec<u8>],
-        dst: SocketAddr,
-    ) -> std::io::Result<bool> {
-        debug_assert!(datagrams.len() >= 2);
-        let seg_len = datagrams[0].len();
-        debug_assert!(datagrams.iter().all(|d| d.len() == seg_len));
-
-        self.buf.clear();
-        self.buf.reserve(seg_len * datagrams.len());
-        for d in datagrams {
-            self.buf.extend_from_slice(d);
-        }
-        let total = self.buf.len();
-
-        let (storage, addr_len) = sockaddr_of(dst);
-        {
-            let base = self.cmsg.as_mut_ptr() as *mut libc::cmsghdr;
-            // SAFETY: `self.cmsg` is 64 bytes of 8-byte-aligned scratch, more
-            // than `CMSG_SPACE(size_of::<u16>())` needs.
-            unsafe {
-                (*base).cmsg_len = libc::CMSG_LEN(2) as usize;
-                (*base).cmsg_level = SOL_UDP;
-                (*base).cmsg_type = UDP_SEGMENT;
-                let data = libc::CMSG_DATA(base);
-                std::ptr::copy_nonoverlapping((seg_len as u16).to_ne_bytes().as_ptr(), data, 2);
-            }
-        }
-        let ctrl_len = unsafe { libc::CMSG_SPACE(2) } as usize;
-        let buf = &self.buf;
-        let cmsg = &self.cmsg;
-        // Every pointer is built inside the closure, so nothing raw is held
-        // across the await.
-        let ret = socket
-            .async_io(Interest::WRITABLE, || {
-                let mut name = storage;
-                let mut iov = libc::iovec {
-                    iov_base: buf.as_ptr() as *mut libc::c_void,
-                    iov_len: total,
-                };
-                // SAFETY: plain C structs pointing at `buf`, `name` and `cmsg`,
-                // all alive for the duration of the call.
-                let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-                msg.msg_name = &mut name as *mut _ as *mut libc::c_void;
-                msg.msg_namelen = addr_len;
-                msg.msg_iov = &mut iov;
-                msg.msg_iovlen = 1;
-                msg.msg_control = cmsg.as_ptr() as *mut libc::c_void;
-                msg.msg_controllen = ctrl_len;
-                let r = unsafe { libc::sendmsg(fd, &msg, 0) };
-                if r < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(r as usize)
-                }
-            })
-            .await;
-        let ret = match ret {
-            Ok(r) => r,
-            Err(_) => return Ok(false),
-        };
-        if ret != total {
-            return Err(std::io::Error::other("partial GSO send"));
-        }
-        Ok(true)
-    }
-
-    /// Sends `sealed` (with its per-datagram destinations), using GSO for runs
-    /// that share a destination and a length, and one `sendmmsg` for the rest.
-    /// Returns how many datagrams went out.
-    async fn send_burst(
-        &mut self,
-        socket: &UdpSocket,
-        fd: RawFd,
-        batch: &mut UdpBatch,
-        sealed: &[Vec<u8>],
-        dsts: &[SocketAddr],
-    ) -> usize {
-        let mut sent = 0;
-        let mut singles: Vec<usize> = Vec::new();
-        let mut i = 0;
-        while i < sealed.len() {
-            let len = sealed[i].len();
-            let dst = dsts[i];
-            let mut j = i + 1;
-            while j < sealed.len()
-                && sealed[j].len() == len
-                && dsts[j] == dst
-                && len * (j - i + 1) <= GSO_MAX_BYTES
-            {
-                j += 1;
-            }
-            if j - i >= 2 && !(GSO_DISABLED.load(Ordering::Relaxed) || gso_off()) {
-                match self.send(socket, fd, &sealed[i..j], dst).await {
-                    Ok(true) => {
-                        sent += j - i;
-                        i = j;
-                        continue;
-                    }
-                    Ok(false) => {
-                        GSO_DISABLED.store(true, Ordering::Relaxed);
-                        debug!("wireguard egress: UDP GSO unavailable, using sendmmsg");
-                    }
-                    Err(e) => {
-                        GSO_DISABLED.store(true, Ordering::Relaxed);
-                        debug!("wireguard egress: GSO send failed ({}), using sendmmsg", e);
-                    }
-                }
-            }
-            singles.push(i);
-            i += 1;
-        }
-        let mut off = 0;
-        while off < singles.len() {
-            let mut dats: Vec<Vec<u8>> = Vec::with_capacity(singles.len() - off);
-            let mut addrs: Vec<SocketAddr> = Vec::with_capacity(singles.len() - off);
-            for &k in &singles[off..] {
-                dats.push(sealed[k].clone());
-                addrs.push(dsts[k]);
-            }
-            match socket
-                .async_io(Interest::WRITABLE, || batch.send_each(fd, &dats, &addrs))
-                .await
-            {
-                Ok(n) if n > 0 => {
-                    sent += n;
-                    off += n;
-                }
-                _ => break,
-            }
-        }
-        sent
-    }
-}
 
 impl UdpBatch {
     fn new() -> Self {
