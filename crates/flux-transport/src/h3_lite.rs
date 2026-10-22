@@ -599,3 +599,99 @@ mod huffman_tests {
         assert_eq!(huffman_decode(&bytes).unwrap(), original);
     }
 }
+
+#[cfg(test)]
+mod latency_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Measures where a request/response round trip actually spends its time.
+    ///
+    /// The Hysteria 2 e2e test takes ~5.5 s while the server answers in
+    /// microseconds. This test drives the same server with a **raw quinn client**
+    /// (no `h3` crate) so a slow phase can be attributed either to our server or
+    /// to the client wrapper.
+    #[tokio::test]
+    async fn raw_quinn_round_trip_is_fast() {
+        // Self-signed cert for "localhost", exactly as the sibling test does.
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let certs = vec![rustls::pki_types::CertificateDer::from(
+            cert.cert.der().to_vec(),
+        )];
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+        );
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server_ep = crate::quic::QuicTransport::create_server_endpoint(
+            addr,
+            certs,
+            key,
+            vec![b"h3".to_vec()],
+        )
+        .expect("server endpoint");
+
+        let server = tokio::spawn(async move {
+            let incoming = server_ep
+                .accept()
+                .await
+                .expect("incoming")
+                .await
+                .expect("conn");
+            let h3 = H3LiteServer::new(incoming);
+            let ev = h3.accept().await.expect("event");
+            match ev {
+                H3Event::Request { mut send, .. } => {
+                    write_response_headers(&mut send, 233, &[])
+                        .await
+                        .expect("response");
+                    let _ = send.finish();
+                }
+                _ => panic!("expected request"),
+            }
+            // Hold the connection so the client can read the response.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let client_ep =
+            crate::quic::QuicTransport::create_client_endpoint(false, vec![b"h3".to_vec()], true)
+                .expect("client endpoint");
+        let t_connect = Instant::now();
+        let conn = crate::quic::QuicTransport::connect(&client_ep, addr, "localhost")
+            .await
+            .expect("connect");
+        let connect = t_connect.elapsed();
+
+        let t_req = Instant::now();
+        let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+        let fields = vec![
+            (":method".to_string(), "POST".to_string()),
+            (":path".to_string(), "/auth".to_string()),
+            (":scheme".to_string(), "https".to_string()),
+            (":authority".to_string(), "hysteria".to_string()),
+        ];
+        let section = qpack_encode_field_section(&fields);
+        let frame = h3_frame(H3_FRAME_HEADERS, &section);
+        send.write_all(&frame).await.expect("write headers");
+        send.flush().await.expect("flush");
+        let request = t_req.elapsed();
+
+        let t_resp = Instant::now();
+        let mut buf = vec![0u8; 256];
+        let n = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf))
+            .await
+            .expect("server must answer promptly")
+            .expect("read")
+            .expect("stream");
+        let response = t_resp.elapsed();
+        assert!(n > 0, "empty response");
+
+        println!("@@LAT raw: connect={connect:?} request={request:?} response={response:?}");
+        assert!(
+            response < Duration::from_millis(500),
+            "raw quinn round trip took {response:?} (connect {connect:?}, request {request:?})"
+        );
+        let _ = server.await;
+    }
+}
