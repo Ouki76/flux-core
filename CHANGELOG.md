@@ -4,6 +4,65 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.4] - 2026-10-22
+
+Audit cycles 4–8. Five cycles of testing the security-sensitive surfaces against
+their specifications found **60 defects**, all proved by tests that fail without the
+fix, and one latency bug that made every Hysteria 2 connection slow.
+
+### Performance
+
+- **Hysteria 2 connections: 5.16 s → 5.5 ms.** Authentication used the `h3` crate's
+  client, which needed ~5 s to deliver a response our own server produced in ~1 ms.
+  The auth exchange is one request whose status code we read and discard, so it is
+  now implemented on raw quinn — the same code path the tunnel streams already used.
+
+### Fixed (security)
+
+Seventy-plus defects across the transport and inbound surfaces. The most serious:
+
+- **WebSocket (13 groups)**: `poll_shutdown` never sent a close frame; a bare TCP EOF
+  looked like a clean end; masking was never checked against our role; no UTF-8
+  validation; a frame declaring 2^63-1 bytes parked the stream forever.
+- **gRPC (13 groups)**: trailers were never read, so `grpc-status: 7` (aborted)
+  arrived as a clean end of stream — a failed or truncated tunnel looked successful.
+  The compression flag was never read, and the server accepted **any** HTTP/2
+  request as a tunnel.
+- **ShadowTLS (10)**: no replay protection at all (a captured hello authenticated
+  again); the SNI allow-list was never enforced; three tag comparisons were
+  non-constant-time; a decoy record split across polls consumed the next record's
+  bytes.
+- **httpupgrade (6)**: the client accepted any 2xx as a protocol switch, so a
+  captive portal became a tunnel and ciphertext was written into someone's HTML; the
+  status was matched with `contains("101")`; CRLF in the configured host or path
+  split the request on the wire.
+- **VLESS/Trojan/VMess inbounds (6)**: an unknown command was answered with the
+  "authenticated, go ahead" header; a UDP request to the mux destination was parsed
+  as mux frames; Trojan's UDP frame terminator was read and discarded; VMess
+  "repaired" an unknown security byte by falling back to AES-128-GCM.
+- **TUIC/Hysteria 2 inbounds (22)**: an unbounded UDP association table per
+  connection, a multi-user oracle, a **panic** on a malformed Hysteria 2 datagram,
+  destinations of 64+ bytes silently dropped because a varint was read as a byte,
+  and a password compared with `==`.
+- **Lifecycle (4)**: a half-started instance leaked listeners; **a failed reload
+  candidate kept accepting half the connections for the old config**; `start()`
+  twice spawned a second accept loop per inbound; a restart silently stopped
+  refreshing remote rule sets.
+- **Remote rule sets**: a broken feed could erase working rules (`</html>` parsed as
+  an IP-CIDR, and any bare word as a domain), and an empty refresh replaced a
+  working set with nothing — silently sending traffic to the final outbound.
+- **Management API**: `Content-Length` was last-one-wins and `Transfer-Encoding`
+  ignored — the classic request-smuggling pair.
+- **REALITY**: the ClientHello had no ALPN, a louder non-browser signal than
+  anything in its extension set.
+
+### Added
+
+- `docs/audit-log.md` now records eight cycles with per-defect evidence, the
+  measurement mistakes made along the way (a withdrawn 205 MB/s figure from a
+  bimodal configuration, a stale-binary measurement), and every remaining gap.
+- Test count 478 → 826.
+
 ## [1.3.3] - 2026-10-22
 
 Audit cycle 3. The weakest measured path was WireGuard; it is now at 143 MB/s and

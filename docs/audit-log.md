@@ -128,6 +128,51 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 8 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 825 tests, audit, deny, doc — green at `53fae33`.
+
+### Closed: the Hysteria 2 stall — 5.16 s → 5.5 ms
+
+Cycle 7 diagnosed it (server answers in ~1 ms, the `h3` crate client takes ~5.5 s
+to deliver that response) and cycle 8 fixed it. Two hypotheses were tested and
+refuted first: the client does allow uni streams (256), and the server's SETTINGS
+arrives in 1.06 ms — measured with a raw quinn client reading the control stream.
+
+The deciding fact was already in the code: `open_bi_stream` on raw quinn is what
+opens tunnel streams, so the `h3` crate was used **only** for the auth exchange —
+one request whose status code we read and discard. It is now implemented on raw
+quinn (`h3_lite::client_auth_request`), which is ~40 lines against primitives we
+already had.
+
+| measurement | before | after |
+|---|---|---|
+| first dial (loopback, local server) | 5.16 s | **5.47 ms** |
+| `test_hy2_salamander_obfs_e2e` | 5.67 s | **0.11 s** |
+
+The latency test's budget is tightened from a 7 s characterisation bound to the
+real 1.5 s target, and the `h3`/`h3-quinn` crates moved from a normal dependency of
+`flux-protocol` to a dev-dependency of `flux-transport`, where a single test still
+uses a third-party client to prove our server accepts one.
+
+The one test that remains slow (`test_h3_lite_accepts_h3_crate_post`, 5.3 s) does
+so by design: it deliberately drives our server with the third-party `h3` client.
+
+### Test infrastructure: a flake that is not a product defect
+
+One full-suite run failed with `AddrInUse` in two mux interop tests; three isolated
+runs and a full retry were green, and no leftover process existed at the time. The
+port allocator was already hardened (it connects to a candidate port to see a
+`SO_REUSEPORT` squatter), and `SingboxProcess::drop` already kills *and waits*. The
+observed rate is 2 occurrences in ~12 full-suite runs, always transient. Recorded
+rather than papered over: the next occurrence should capture which inbound failed
+to bind and on which port, because guessing further without that data is not
+auditing.
+
+---
+
 ## Cycle 7 — 2026-10-22
 
 ### Baseline
