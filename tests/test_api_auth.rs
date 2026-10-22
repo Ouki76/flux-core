@@ -210,3 +210,115 @@ async fn rejected_request_does_not_execute_its_side_effect() {
     );
     let _ = instance.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Request framing: smuggling pairs and method discipline
+// ---------------------------------------------------------------------------
+
+/// `Content-Length` + `Transfer-Encoding` in one request is the classic request
+/// smuggling pair. We do not implement chunked bodies, so the header must be
+/// refused rather than ignored: ignoring it makes the body length zero here while
+/// a front-end proxy may forward a body that becomes the next request.
+#[tokio::test]
+async fn transfer_encoding_is_refused() {
+    let (instance, port) = start_api().await;
+    let (resp, _body) = request(
+        port,
+        &format!(
+            "POST /api/v1/route/test HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {SECRET}\r\n\
+             Content-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        resp.starts_with("HTTP/1.1 400"),
+        "a Transfer-Encoding header must be refused, got: {resp}"
+    );
+    let _ = instance.stop().await;
+}
+
+/// Two conflicting `Content-Length` headers must be a hard error, not a
+/// last-one-wins decision.
+#[tokio::test]
+async fn conflicting_content_lengths_are_refused() {
+    let (instance, port) = start_api().await;
+    let (resp, _body) = request(
+        port,
+        &format!(
+            "POST /api/v1/route/test HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {SECRET}\r\n\
+             Content-Length: 2\r\nContent-Length: 40\r\n\r\n{{}}"
+        ),
+    )
+    .await;
+    assert!(
+        resp.starts_with("HTTP/1.1 400"),
+        "conflicting Content-Length headers must be refused, got: {resp}"
+    );
+    let _ = instance.stop().await;
+}
+
+/// A non-numeric Content-Length must be rejected, not silently treated as zero.
+#[tokio::test]
+async fn a_non_numeric_content_length_is_refused() {
+    let (instance, port) = start_api().await;
+    let (resp, _body) = request(
+        port,
+        &format!(
+            "POST /api/v1/route/test HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {SECRET}\r\n\
+             Content-Length: abc\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(
+        resp.starts_with("HTTP/1.1 400"),
+        "a non-numeric Content-Length must be refused, got: {resp}"
+    );
+    let _ = instance.stop().await;
+}
+
+/// A `..` segment must not be normalised into a different endpoint.
+#[tokio::test]
+async fn a_dot_segment_does_not_reach_another_endpoint() {
+    let (instance, port) = start_api().await;
+    for uri in [
+        "/api/v1/outbounds/../status",
+        "/api/v1/./status",
+        "/api/v1/status/",
+        "/api/v1//status",
+    ] {
+        let (resp, _body) = request(
+            port,
+            &format!("GET {uri} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert!(
+            !resp.contains("uptime") && !resp.contains("version"),
+            "{uri} reached an endpoint it should not: {resp}"
+        );
+    }
+    let _ = instance.stop().await;
+}
+
+/// An unknown method on a known path must be a 4xx, never a silent success.
+#[tokio::test]
+async fn an_unknown_method_is_not_dispatched() {
+    let (instance, port) = start_api().await;
+    for method in ["DELETE", "PATCH", "TRACE", "FOOBAR"] {
+        let (resp, _body) = request(
+            port,
+            &format!(
+                "{method} /api/v1/status HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {SECRET}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 4") || resp.starts_with("HTTP/1.1 5"),
+            "{method} on /status returned {resp}"
+        );
+        assert!(
+            !resp.contains("uptime"),
+            "{method} dispatched a GET handler: {resp}"
+        );
+    }
+    let _ = instance.stop().await;
+}

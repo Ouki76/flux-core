@@ -402,16 +402,48 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     let method = parts.next().unwrap_or("GET").to_string();
     let uri = parts.next().unwrap_or("/").to_string();
 
-    // Parse Content-Length with strict bounds checking
+    // Parse Content-Length with strict bounds checking.
+    //
+    // Ambiguity is rejected rather than resolved: two Content-Length headers, or
+    // a Content-Length together with Transfer-Encoding, is the classic request
+    // smuggling pair when a reverse proxy sits in front of this API and disagrees
+    // with us about where the body ends. We do not implement chunked bodies, so a
+    // Transfer-Encoding header is refused outright instead of being ignored (an
+    // ignored `chunked` makes the body length zero here while the front end
+    // forwards a body that then becomes the next request).
     const MAX_API_BODY_SIZE: usize = 1024 * 1024; // 1 MB
-    let mut content_length = 0usize;
+    let mut content_length: Option<usize> = None;
     for line in &lines {
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("content-length")
-        {
-            content_length = v.trim().parse().unwrap_or(0);
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.eq_ignore_ascii_case("transfer-encoding") {
+            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"transfer-encoding is not supported\"}";
+            let _ = socket.write_all(resp.as_bytes()).await;
+            let _ = socket.shutdown().await;
+            return;
+        }
+        if key.eq_ignore_ascii_case("content-length") {
+            let Ok(parsed) = v.trim().parse::<usize>() else {
+                let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"invalid content-length\"}";
+                let _ = socket.write_all(resp.as_bytes()).await;
+                let _ = socket.shutdown().await;
+                return;
+            };
+            match content_length {
+                None => content_length = Some(parsed),
+                Some(prev) if prev == parsed => {}
+                Some(_) => {
+                    let resp = "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"conflicting content-length headers\"}";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                    return;
+                }
+            }
         }
     }
+    let content_length = content_length.unwrap_or(0);
 
     if content_length > MAX_API_BODY_SIZE {
         let resp = "HTTP/1.1 413 Payload Too Large\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":\"payload too large\"}";
