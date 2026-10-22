@@ -901,6 +901,67 @@ mod tests {
         assert_eq!(addr.port(), 8080);
     }
 
+    /// The scheme in `dns.servers` decides which transport a query takes.
+    ///
+    /// This is the wiring the three encrypted clients are reachable through: an
+    /// unhandled scheme falls through to `parse_udp_server`, which rejects it,
+    /// so "the right client was cached" and "the query failed in the transport"
+    /// together prove the URL really was dispatched.
+    #[tokio::test]
+    async fn encrypted_schemes_select_their_transport() {
+        let name = Name::from_str("example.com").unwrap();
+
+        for server in [
+            "tls://127.0.0.1:1",
+            "quic://127.0.0.1:1",
+            "https://127.0.0.1:1/dns-query",
+        ] {
+            let resolver = DnsResolver::new(None);
+            // Port 1 is closed, so every transport fails — but it fails *after*
+            // being selected, which is what is asserted here.
+            let err = resolver
+                .exchange(server, &name, None, QTYPE_A)
+                .await
+                .expect_err("a closed port cannot answer");
+            assert!(
+                !err.to_string()
+                    .contains("invalid upstream DNS server address"),
+                "{server} must be recognised as an encrypted scheme, got: {err}"
+            );
+        }
+
+        let resolver = DnsResolver::new(None);
+        let _ = resolver
+            .exchange("tls://127.0.0.1:1", &name, None, QTYPE_A)
+            .await;
+        let _ = resolver
+            .exchange("quic://127.0.0.1:1", &name, None, QTYPE_A)
+            .await;
+        let _ = resolver
+            .exchange("https://127.0.0.1:1/dns-query", &name, None, QTYPE_A)
+            .await;
+        assert!(resolver.inner.dot_clients.contains_key("tls://127.0.0.1:1"));
+        assert!(resolver.inner.doq_clients.contains_key("quic://127.0.0.1:1"));
+        assert!(
+            resolver
+                .inner
+                .doh_clients
+                .contains_key("https://127.0.0.1:1/dns-query")
+        );
+
+        // An unknown scheme is still a configuration error, never a silent
+        // reroute to the system resolver.
+        let err = resolver
+            .exchange("bogus://127.0.0.1", &name, None, QTYPE_A)
+            .await
+            .expect_err("an unknown scheme must not be treated as a UDP server");
+        assert!(
+            err.to_string()
+                .contains("invalid upstream DNS server address"),
+            "got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_resolver_cache() {
         let resolver = DnsResolver::new(None);

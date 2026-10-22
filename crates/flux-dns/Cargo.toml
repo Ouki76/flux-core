@@ -21,3 +21,8 @@ tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 serde = { workspace = true }
 dashmap = { workspace = true }
+
+[dev-dependencies]
+# Local DoT/DoQ servers for the transport tests: a throwaway CA + server cert,
+# so certificate verification and the happy path are both exercisable offline.
+rcgen = { workspace = true }
