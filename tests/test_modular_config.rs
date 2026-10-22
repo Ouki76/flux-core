@@ -212,3 +212,55 @@ async fn shadowtls_inbound_accepts_a_server_names_list() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Inert and silently-substituted configuration must be refused
+// ---------------------------------------------------------------------------
+
+/// An unknown Shadowsocks method used to fall back to ChaCha20 silently, so a
+/// config asking for a cipher we do not implement negotiated something else
+/// entirely — the config was a lie and the failure surfaced as "wrong cipher" on
+/// the wire.
+#[tokio::test]
+async fn an_unknown_shadowsocks_method_is_refused() {
+    let json = r#"{
+        "outbounds": [{
+            "tag": "ss",
+            "carrier": { "type": "tcp", "address": "127.0.0.1:8388" },
+            "protocol": { "type": "shadowsocks", "password": "pw", "method": "aes-192-ctr" }
+        }]
+    }"#;
+    let cfg = flux_app::Config::from_json_str(json).expect("config must parse");
+    let err = flux_app::Instance::new(cfg)
+        .err()
+        .expect("an unsupported cipher must be refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("aes-192-ctr") && msg.contains("unsupported shadowsocks method"),
+        "the error must name the method, got: {msg}"
+    );
+}
+
+/// The methods we do implement must still be accepted.
+#[tokio::test]
+async fn a_supported_shadowsocks_method_is_accepted() {
+    for method in ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305"] {
+        let json = format!(
+            r#"{{
+                "outbounds": [{{
+                    "tag": "ss",
+                    "carrier": {{ "type": "tcp", "address": "127.0.0.1:8388" }},
+                    "protocol": {{ "type": "shadowsocks", "password": "pw", "method": "{method}" }}
+                }}]
+            }}"#
+        );
+        let cfg = flux_app::Config::from_json_str(&json).expect("config must parse");
+        if let Err(e) = flux_app::Instance::new(cfg) {
+            let msg = format!("{e}");
+            assert!(
+                !msg.contains("unsupported shadowsocks method"),
+                "{method} must be accepted, got: {msg}"
+            );
+        }
+    }
+}

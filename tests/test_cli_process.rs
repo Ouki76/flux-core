@@ -507,7 +507,10 @@ async fn log_level_sources_are_resolved_without_panicking() {
 
     // `off` is a legitimate way to silence a process: it must be accepted (no
     // warning) and must suppress the log lines without suppressing the result.
-    let out = cli_env(&["check", "-c", quiet.to_str().unwrap()], &[("RUST_LOG", "off")]);
+    let out = cli_env(
+        &["check", "-c", quiet.to_str().unwrap()],
+        &[("RUST_LOG", "off")],
+    );
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(
         stdout(&out).contains("Configuration is valid!"),
@@ -761,6 +764,37 @@ impl Drop for FifoFeeder {
     }
 }
 
+/// Opens `path` for writing and **keeps it open**, which is a precise readiness
+/// signal that the child has already opened the FIFO for reading (and therefore
+/// installed its signal handlers, which happens before the config load).
+///
+/// Two details matter: a probe that *closes* the descriptor gives the child EOF
+/// (it then reads zero bytes and exits), and a log-based wait does not work
+/// because the child's stdout is block-buffered when redirected to a file.
+fn hold_fifo_open(path: &Path, deadline: Duration) -> std::fs::File {
+    use std::os::unix::ffi::OsStrExt as _;
+    let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+    let start = std::time::Instant::now();
+    loop {
+        let fd = unsafe { libc::open(raw.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        if fd >= 0 {
+            use std::os::fd::FromRawFd as _;
+            return unsafe { std::fs::File::from_raw_fd(fd) };
+        }
+        let err = std::io::Error::last_os_error();
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ENXIO),
+            "unexpected error probing the FIFO: {err}"
+        );
+        assert!(
+            start.elapsed() < deadline,
+            "no process opened the FIFO for reading within {deadline:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn make_fifo(path: &Path) {
     use std::os::unix::ffi::OsStrExt as _;
     let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path");
@@ -780,10 +814,11 @@ async fn sighup_during_config_load_is_queued_not_fatal() {
 
     let mut proxy = Proxy::spawn(&fifo, &[]);
 
-    // The process is blocked opening/reading the FIFO. Give it time to install
-    // its signal handlers (which happens before the config is read) and to reach
-    // the blocking read.
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    // Wait until the child has actually opened the FIFO for reading: at that point
+    // its signal handlers are installed (they are installed before the config
+    // load), so the SIGHUP below lands where the test intends. The held writer
+    // stays open — closing it would give the child EOF and a zero-byte config.
+    let _held = hold_fifo_open(&fifo, Duration::from_secs(10));
     assert!(
         proxy.is_running(),
         "the process exited while reading the config"
@@ -800,6 +835,11 @@ async fn sighup_during_config_load_is_queued_not_fatal() {
     // Now let the read complete. The queued SIGHUP must be delivered afterwards
     // and produce a real reload instead of being lost.
     let feeder = FifoFeeder::start(fifo.clone(), config_with_inbound(port, "in"));
+    // The held writer keeps the FIFO from reporting EOF, so the child sees the
+    // feeder's bytes without a premature end-of-file; drop it once those bytes are
+    // in the pipe, which is what makes the reader stop.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    drop(_held);
 
     wait_until("the listener", Duration::from_secs(10), || {
         socks5_greeting(port)

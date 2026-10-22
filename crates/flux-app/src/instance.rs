@@ -1081,10 +1081,18 @@ fn build_layered_outbound(
     if is_udp {
         match node.protocol {
             ProtocolConfig::Shadowsocks { password, method } => {
-                let cipher_kind = method
-                    .as_deref()
-                    .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
-                    .unwrap_or_default();
+                let cipher_kind = match method.as_deref() {
+                    // An omitted method means the documented default.
+                    None => flux_protocol::shadowsocks::CipherKind::default(),
+                    Some(name) => flux_protocol::shadowsocks::CipherKind::parse_str(name)
+                        .ok_or_else(|| {
+                            FluxError::Config(format!(
+                                "unsupported shadowsocks method {name:?} (expected \
+                                 chacha20-ietf-poly1305, aes-128-gcm or aes-256-gcm); silently \
+                                 substituting a different cipher would make the config a lie"
+                            ))
+                        })?,
+                };
                 let out = flux_outbound::ShadowsocksOutbound::new_datagram(
                     tag.clone(),
                     target,
@@ -1246,10 +1254,19 @@ fn build_layered_outbound(
             registry.insert(tag, Arc::new(out));
         }
         ProtocolConfig::Shadowsocks { password, method } => {
-            let cipher_kind = method
-                .as_deref()
-                .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
-                .unwrap_or_default();
+            let cipher_kind = match method.as_deref() {
+                // An omitted method means the documented default.
+                None => flux_protocol::shadowsocks::CipherKind::default(),
+                Some(name) => {
+                    flux_protocol::shadowsocks::CipherKind::parse_str(name).ok_or_else(|| {
+                        FluxError::Config(format!(
+                            "unsupported shadowsocks method {name:?} (expected \
+                                 chacha20-ietf-poly1305, aes-128-gcm or aes-256-gcm); silently \
+                                 substituting a different cipher would make the config a lie"
+                        ))
+                    })?
+                }
+            };
             let mut out = flux_outbound::ShadowsocksOutbound::new(
                 tag.clone(),
                 target,
@@ -1591,10 +1608,18 @@ fn build_layered_inbound(
     if is_udp {
         match node.protocol {
             ProtocolConfig::Shadowsocks { password, method } => {
-                let cipher_kind = method
-                    .as_deref()
-                    .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
-                    .unwrap_or_default();
+                let cipher_kind = match method.as_deref() {
+                    // An omitted method means the documented default.
+                    None => flux_protocol::shadowsocks::CipherKind::default(),
+                    Some(name) => flux_protocol::shadowsocks::CipherKind::parse_str(name)
+                        .ok_or_else(|| {
+                            FluxError::Config(format!(
+                                "unsupported shadowsocks method {name:?} (expected \
+                                 chacha20-ietf-poly1305, aes-128-gcm or aes-256-gcm); silently \
+                                 substituting a different cipher would make the config a lie"
+                            ))
+                        })?,
+                };
                 inbounds.push(Arc::new(
                     flux_inbound::ShadowsocksInbound::new(tag, addr, &password)
                         .with_cipher_kind(cipher_kind),
@@ -1667,10 +1692,19 @@ fn build_layered_inbound(
             inbounds.push(Arc::new(ib));
         }
         ProtocolConfig::Shadowsocks { password, method } => {
-            let cipher_kind = method
-                .as_deref()
-                .and_then(flux_protocol::shadowsocks::CipherKind::parse_str)
-                .unwrap_or_default();
+            let cipher_kind = match method.as_deref() {
+                // An omitted method means the documented default.
+                None => flux_protocol::shadowsocks::CipherKind::default(),
+                Some(name) => {
+                    flux_protocol::shadowsocks::CipherKind::parse_str(name).ok_or_else(|| {
+                        FluxError::Config(format!(
+                            "unsupported shadowsocks method {name:?} (expected \
+                                 chacha20-ietf-poly1305, aes-128-gcm or aes-256-gcm); silently \
+                                 substituting a different cipher would make the config a lie"
+                        ))
+                    })?
+                }
+            };
             let mut ib = flux_inbound::ShadowsocksInbound::new(tag, addr, &password)
                 .with_cipher_kind(cipher_kind)
                 .with_pipeline(pipeline);
