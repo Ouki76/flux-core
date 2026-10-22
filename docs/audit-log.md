@@ -128,6 +128,85 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 9 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 826 tests, audit, deny, doc — green at `39fed6a`.
+
+### Solved: the "GSO stall" was frames arriving out of order
+
+Three cycles had it as "reproducible, mechanism unknown". It is now closed, and the
+lesson is that every counter being watched was looking at the wrong thing.
+
+`send_burst` coalesced equal-sized runs into `UDP_SEGMENT` super-packets but pushed
+the indices of every frame it *could not* coalesce onto a `singles` vector and sent
+that vector **after** the loop. A burst shaped `[300 B, 1468 B × 30]` reached the
+peer as packets 1..30, then 0. The receiver then held data behind a hole, `rcv_nxt`
+could not advance, the advertised window collapsed to zero with a send buffer full
+of unreleasable data, nothing was in flight, so no duplicate ACKs and no fast
+retransmit — one 1 s RTO repaired the hole. Ordering damage is invisible to drop
+counters, AEAD counters and RTT.
+
+Decisive evidence, per-frame TCP sequence check where decrypted frames enter the
+client's stack:
+
+| | frames/s | gaps | dups |
+|---|---|---|---|
+| inbound GSO **off** | 97 698 | **0** | **0** |
+| inbound GSO **on** | 142 992 | 663 | 862 |
+
+| | min | median | max | CPU s/GB |
+|---|---|---|---|---|
+| pre-fix, inbound GSO | 47.8 | 76.7 | 110.0 | 9.8–11.3 |
+| shipped until now (`sendmmsg`) | 118.8 | 122.2 | 126.6 | 17.6 |
+| **post-fix** | **189.1** | **213.0** | **217.6** | **8.9–9.5** |
+
+Re-measured independently here over three invocations: 210.5 / 209.6 / 210.1 MB/s,
+min 205.7, max 215.3 — no collapse mode in any round.
+
+**The same unrelated frame order existed in the outbound copy**, so the 143 MB/s path
+was silently reordering the inner stream as well; it never collapsed only because
+that direction faces a 256 KiB receive buffer instead of the client's 64 KiB. Both
+are fixed, each with a `send_burst_preserves_datagram_order` test that fails on the
+old ordering.
+
+### Closed: lifecycle — `stop()` now means stopped
+
+`Instance::stop()` returned before the listener FD was closed, so a caller binding
+the same port in the next statement raced `EADDRINUSE`. Every inbound now joins the
+tasks that own its listener (all 14, plus the API server), and the trait documents
+the contract. `TrafficMeter` gained a real stop, so a stopped instance owns zero
+tasks instead of one.
+
+Both proofs run on a `current_thread` runtime with no sleep or yield between
+`stop()` returning and the rebind — they describe the code, not a scheduler race —
+and reverting the fix fails them with "stop() returned with these ports still held".
+
+### New: a benchmark for the framing layers
+
+There was no way to measure WebSocket/gRPC framing at all, which matters because
+four cycles of hardening added per-frame validation there. First numbers (median of
+5 rounds, 32 MiB echoed, 64 KiB writes):
+
+| layer | MB/s |
+|---|---|
+| raw | 1499 |
+| httpupgrade | 1737 |
+| ws | 390 |
+| h2 | 91 |
+| grpc | 101 |
+
+HTTP/2 and gRPC cap at ~6 % of raw throughput — a real weakness for anyone
+tunnelling through them, and **not** a message-size effect: raising the chunk from
+16 KiB to 256 KiB made it worse (82 → 7 MB/s) and a 4–64 KiB sweep was
+non-monotonic, so the cost is in the h2 send/receive pacing, not per-message
+framing. The harness echoes through one connection, which couples the directions
+through flow control and makes it noisy (ws varies 389–746), so the next step is a
+one-way variant before changing any code. Recorded, not guessed at.
+
+---
+
 ## Cycle 8 — 2026-10-22
 
 ### Baseline
