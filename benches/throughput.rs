@@ -200,8 +200,13 @@ fn bench_tls_connector(c: &mut Criterion) {
     group.finish();
 }
 
-/// Cost of the relay copy itself: 1 MiB pushed through a pair of duplex streams
-/// by (a) `tokio::io::copy_bidirectional` and (b) the pooled-buffer variant.
+/// Cost of the relay copy itself: 1 MiB pushed through a pair of duplex streams.
+///
+/// The pooled-split variant was removed from the product: `tokio::io::split` wraps
+/// the stream in a mutex that both directions contend for, and the dispatcher's
+/// A/B measured +13.5 % throughput and −9.5 % CPU without it. The "pooled_buffers"
+/// benchmark therefore now measures the *datagram* pool lifecycle (see
+/// `bench_pool_lifecycle`); this group measures the copy path alone.
 ///
 /// This is the floor under every TCP-path number the project reports: the proxy
 /// burns this much CPU per byte before it does any protocol work. It is also why
@@ -222,7 +227,7 @@ fn bench_copy_paths(c: &mut Criterion) {
 
     // Runs one relay pass: `server` writes BYTES, the copy shuttles it, and
     // `client` reads BYTES back. Both directions are exercised.
-    async fn one_pass(pooled: bool) {
+    async fn one_pass() {
         let (mut client, proxy_in) = tokio::io::duplex(64 * 1024);
         let (proxy_out, mut server) = tokio::io::duplex(64 * 1024);
         let payload = vec![0x5Au8; BYTES];
@@ -237,27 +242,14 @@ fn bench_copy_paths(c: &mut Criterion) {
             buf.len()
         });
 
-        if pooled {
-            let mut a = proxy_in;
-            let mut b = proxy_out;
-            let _ = flux_common::copy::copy_bidirectional_pooled(&mut a, &mut b)
-                .await
-                .unwrap();
-        } else {
-            let _ = flux_common::copy::copy_bidirectional(proxy_in, proxy_out)
-                .await
-                .unwrap();
-        }
+        let _ = flux_common::copy::copy_bidirectional(proxy_in, proxy_out)
+            .await
+            .unwrap();
         assert_eq!(writer.await.unwrap(), ());
         assert_eq!(reader.await.unwrap(), BYTES);
     }
 
-    group.bench_function("default_tokio", |b| {
-        b.to_async(&rt).iter(|| one_pass(false))
-    });
-    group.bench_function("pooled_buffers", |b| {
-        b.to_async(&rt).iter(|| one_pass(true))
-    });
+    group.bench_function("bidirectional", |b| b.to_async(&rt).iter(one_pass));
     group.finish();
 }
 

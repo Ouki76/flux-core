@@ -18,7 +18,7 @@ flux-core terminates untrusted network input on every inbound. All protocol pars
 | VLESS / Trojan | An empty credential list is rejected rather than treated as "no authentication" |
 | Configuration | Undefined `${VAR}` is an error; rule-set cache paths are sanitised; invalid port ranges/globs are rejected |
 | REALITY | X25519 auth via TLS session_id, Ed25519 HMAC-tagged certificate, transparent decoy fallback relay |
-| Management API | Secret token (constant-time comparison, empty secret treated as unset), CSRF/cross-origin rejection **before** dispatch with exact host matching (`http://localhost.attacker.tld` is rejected), bounded header/body sizes, public-listener-without-secret startup refusal, single-owner bind (no `SO_REUSEPORT`) |
+| Management API | Secret token (constant-time comparison, empty secret treated as unset), CSRF/cross-origin rejection **before** dispatch with exact host matching (`http://localhost.attacker.tld` is rejected), bounded header/body sizes, `Transfer-Encoding` and conflicting `Content-Length` refused, refusal to bind `0.0.0.0`/`::` without a secret (a specific non-loopback address only warns), single-owner bind (no `SO_REUSEPORT`) |
 | Outbound probing | Delay-probe destinations are checked against private/link-local ranges and **fail closed** when a name cannot be resolved |
 | DNS | Strict upstream error handling, bounded wireformat parser, Fake-IP pool isolation (`198.18.0.0/15`), per-query and overall deadlines so a stalled upstream cannot wedge resolution |
 | WireGuard | Runt/truncated datagrams are rejected before parsing; session table is capped and indices are collision-checked |
@@ -28,18 +28,18 @@ flux-core terminates untrusted network input on every inbound. All protocol pars
 
 ## Deployment checklist
 
-1. **Management API**: keep on `127.0.0.1` or a unix socket. If it must be remote, set `secret` and use TLS-terminating reverse proxy; the process refuses a public bind without a secret unless `allow_insecure_api: true` is set explicitly. An empty or whitespace-only `secret` is treated as *unset*: `${VAR}` with an undefined variable expands to `""`, which would otherwise silently satisfy both the bind guard and the bearer check.
+1. **Management API**: keep on `127.0.0.1` or a unix socket. If it must be remote, set `secret` and use a TLS-terminating reverse proxy. The process refuses to bind the unspecified address (`0.0.0.0`/`::`) without a secret unless `allow_insecure_api: true` is set explicitly; binding a *specific* non-loopback address without a secret is allowed but logs a warning, so it is not a safe default either. An empty or whitespace-only `secret` is treated as *unset* (an unset `${VAR}` is a load error, so a typo cannot silently produce an empty secret).
 2. **Public inbounds**: always configure `rate_limit`. Start with `max_conn_per_ip_per_sec: 5`, `burst: 10`, `max_concurrent` sized to your RAM budget.
 3. **Secrets**: use `${ENV_VAR}` expansion; never commit keys. REALITY private keys, WG private keys, SS passwords belong in a secret store.
 4. **Least privilege**: run as an unprivileged user with only the capabilities you need (see [deployment.md](deployment.md)). Root is not required for plain TCP/UDP listeners.
 5. **Remote rule sets**: fetch over HTTPS only; they are size-capped and failure-safe, but treat the source as part of your trust boundary. Watch for the "no usable rules parsed" warning — a rule set that loads but matches nothing makes the rules referencing it fail open to `final`.
 6. **QUIC nodes**: leave certificate verification enabled. Self-signed servers are a deliberate opt-in (`insecure: true`) rather than the default.
-6. **DoH upstreams**: prefer `https://IP/dns-query` endpoints with pinned IPs to avoid bootstrap loops.
-7. **Supply chain**: CI runs `cargo audit` against the RustSec advisory database; review `deny.toml` policy before relaxing any lint.
+7. **DoH upstreams**: prefer `https://IP/dns-query` endpoints with pinned IPs to avoid bootstrap loops.
+8. **Supply chain**: CI runs `cargo audit` against the RustSec advisory database; review `deny.toml` policy before relaxing any lint.
 
 ## Fuzzing
 
-8 libFuzzer targets cover the highest-risk parsers (VLESS/Trojan/VMess headers, DNS wire format, SOCKS5 UDP, WG initiation, proxy URIs, config, rule-set lines):
+8 libFuzzer targets cover the highest-risk parsers (VLESS/Trojan/VMess headers, DNS wire format, SOCKS5 UDP, WG initiation, proxy URIs, rule-set lines):
 
 ```bash
 cargo +nightly fuzz run fuzz_vless_header -- -max_total_time=300

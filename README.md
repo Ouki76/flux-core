@@ -9,8 +9,8 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **Trojan**: SHA-224 password hashing over TLS (Inbound & Outbound).
 - **VMess**: AEAD header authentication, AES-128-GCM and ChaCha20-Poly1305 ciphers (Inbound & Outbound).
 - **Shadowsocks & Shadowsocks-2022**: AEAD (ChaCha20-Poly1305, AES-256-GCM), 2022 Blake3-ciphers, ReplayFilter defense (Inbound & Outbound).
-- **TUIC v5**: Spec-compliant QUIC carrier (TLS EKM auth, per-flow bi-streams, datagram UDP), BBR congestion control (Inbound & Outbound; interoperable with sing-box).
-- **Hysteria 2**: Spec-compliant QUIC carrier with HTTP/3 auth (minimal built-in H3/QPACK server), Brutal pacer, port-hopping, **Salamander obfuscation** (custom quinn runtime wrapping every UDP datagram), TCP stream & datagram UDP relay (Inbound & Outbound; interoperable with sing-box).
+- **TUIC v5**: Spec-compliant QUIC carrier (TLS EKM auth, per-flow bi-streams, datagram UDP; inbound and outbound, interoperable with sing-box).
+- **Hysteria 2**: Spec-compliant QUIC carrier with HTTP/3 auth (minimal built-in H3/QPACK server), Brutal pacer, **Salamander obfuscation** (custom quinn runtime wrapping every UDP datagram), TCP stream & datagram UDP relay (Inbound & Outbound; interoperable with sing-box).
 - **SOCKS5**: TCP CONNECT and UDP ASSOCIATE support with user/password authentication (Inbound & Outbound).
 - **HTTP / HTTP CONNECT**: Forward proxy, tunneling, Basic authentication (Inbound & Outbound).
 - **Mixed Inbound**: Auto-detection of SOCKS5 and HTTP protocols on a single port.
@@ -45,15 +45,15 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - Handshake timeouts on every TCP inbound (slow-loris protection), bounded header/body sizes on the management API, anti-replay windows for SS-2022 and WireGuard, TAI64N freshness validation, MAC1 pre-screening for WireGuard initiations.
 
 ### Testing & Verification
-- **libFuzzer targets** (`fuzz/`): VLESS/Trojan/VMess headers, DNS wire format, SOCKS5 UDP, WG initiation, URI/config/ruleset parsing. Run: `cargo +nightly fuzz run fuzz_vless_header`.
+- **libFuzzer targets** (`fuzz/`): VLESS/Trojan/VMess headers, DNS wire format, SOCKS5 UDP, WG initiation, URI and rule-set parsing. Run: `cargo +nightly fuzz run fuzz_vless_header`.
 - **Deterministic parser fuzz regression suite** (`tests/test_fuzz_parsers.rs`) — runs in CI without nightly.
 - **Soak / leak detection**: `scripts/soak.sh [duration_secs]` (default 24h) — sustained load with RSS/FD/thread sampling and leak assertion.
-- 39 sing-box interop tests plus 15 mux interop tests run against the real `sing-box` binary (graceful skip when absent), including Salamander-obfuscated Hysteria 2 **in both directions**.
-- 6 Xray interop tests run against the real `xray` binary: XTLS Vision **and** REALITY (plain and Vision), both directions.
+- 41 sing-box interop tests plus 17 mux interop tests run against the real `sing-box` binary (graceful skip when absent), including Salamander-obfuscated Hysteria 2 **in both directions**.
+- 4 Xray interop tests run against the real `xray` binary: REALITY plain and REALITY + XTLS Vision, both directions.
 - `h2spec` 2.6.0 against the H2 listener: 108/108 applicable cases pass.
 - TUN, REDIRECT and TPROXY are tested end-to-end inside a user network namespace, so they are no longer skipped.
 - **UDP relay e2e** for every UDP-capable protocol (SOCKS5, Trojan, VMess, SS/SS-2022, VLESS, TUIC, Hy2), including reply-address-header correctness.
-- **Transparent inbound e2e** (TUN/REDIRECT/TPROXY) — six tests that re-exec into a user network namespace, so they run unprivileged here and in the CI `privileged-tests` job. A missing environment is a hard failure, never a silent pass.
+- **Transparent inbound e2e** (TUN/REDIRECT/TPROXY) — seven tests that re-exec into a user network namespace, so they run unprivileged here and in the CI `privileged-tests` job. A missing environment is a hard failure, never a silent pass.
 - **SIGHUP hot-reload e2e**: listener swap and invalid-config rollback against the real binary.
 
 ### Management & Control
@@ -63,7 +63,7 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 ## Architecture
 
 The project is designed around a strictly decoupled, modular 4-tier network stack:
-1. **L4 Carrier**: Transport delivery (`tcp`, `udp`, `quic`, Unix domain sockets).
+1. **L4 Carrier**: Transport delivery (`tcp` or `udp` in config; QUIC is a `udp` carrier with its own TLS, and Unix domain sockets carry the management API).
 2. **L5 Security**: Encryption & anti-censorship camouflage (`tls`, `reality` with decoy fallback, `shadowtls`, `fragment`, Salamander obfs).
 3. **L6 Framing**: Stream & multiplexing framing (`websocket`, `httpupgrade`, `http2`, `grpc`).
 4. **L7 Protocol**: Application proxy layer (`vless`, `trojan`, `vmess`, `shadowsocks`, `hysteria2`, `tuic`, `wireguard`, `socks5`, `http`).
@@ -92,7 +92,7 @@ Any protocol can be layered arbitrarily over any compatible security or framing 
 ## Building
 
 ### Prerequisites
-- Rust 1.85+ (Edition 2024)
+- Rust 1.91+ (Edition 2024; `rust-version` in `Cargo.toml` is 1.91)
 - Linux x86_64 / aarch64
 
 ### Build Release Binary
@@ -104,7 +104,7 @@ The optimized binary will be located at `target/release/flux-core`.
 
 ## Benchmarking
 
-Three harnesses ship with the tree; all are self-contained and need no external
+The harnesses ship with the tree; all are self-contained and need no external
 tooling (the native ones compare against `sing-box` when it is installed):
 
 ```bash
@@ -117,6 +117,9 @@ cargo run --release --example bench_native -- --rounds 5 --streams 8
 # UDP relay: datagrams/second and round-trip latency (SOCKS5 UDP ASSOCIATE)
 cargo run --release --example bench_udp -- --rounds 5 --count 20000
 
+# Framing layers, one direction at a time (raw/ws/upgrade/h2/grpc)
+cargo run --release --example bench_layers -- --one-way --rounds 5 --mb 64
+
 # Micro-benchmarks: router, buffer pool, SOCKS5 proxy throughput
 cargo bench --bench throughput
 ```
@@ -127,32 +130,30 @@ is not a basis for comparing implementations.
 
 ### Reference numbers
 
-Loopback, 16-core desktop, `--rounds 5` (median):
+Loopback, 16-core desktop, release build, byte-verified, median of interleaved
+rounds. Only numbers re-measured against the current tree are listed; earlier
+side-by-side comparisons (sing-box, direct echo, multi-stream aggregates) were
+removed rather than left to rot — the harness still prints them when `sing-box`
+is installed on the machine.
 
-Single stream, 300 MB per round, median of 7:
+Single stream:
 
-| Path | Throughput | CPU per GB | Peak RSS |
-|---|---|---|---|
-| Direct TCP echo (no proxy) | 2.8 GB/s | — | — |
-| **flux-core** (SOCKS5 → direct) | **2.22 GB/s** | **0.59 s** | **7 MiB** |
-| sing-box (SOCKS → direct) | 2.08 GB/s | 0.93 s | 25 MiB |
-
-8 concurrent streams, 120 MB each, median of 3:
-
-| Path | Aggregate throughput | CPU per GB | Peak RSS |
-|---|---|---|---|
-| Direct TCP echo | 5095 MB/s | — | — |
-| **flux-core** | **4171 MB/s** | **0.51 s** | **8 MiB** |
-| sing-box | 4005 MB/s | 0.57 s | 28 MiB |
+| Path | Throughput |
+|---|---|
+| TCP relay (SOCKS5 → direct) | **2622 MB/s** |
+| VLESS + REALITY | 729 MB/s |
+| VLESS + TLS | 660 MB/s |
+| VMess (AES-128-GCM) | 3676 MB/s |
+| Shadowsocks-2022 (blake3-aes-128-gcm) | 3792 MB/s |
+| Shadowsocks-AEAD (aes-256-gcm) | 3323 MB/s |
 
 Userspace datapaths (the two that run their own TCP/IP stack):
 
 | Path | Throughput | CPU per GB |
 |---|---|---|
-| **TUN** (smoltcp, default jumbo MTU 9000) | **1259 MiB/s** | **2.49 s** |
-| TUN (same code, MTU 1500) | 464 MiB/s | 6.10 s |
-| **WireGuard** (Noise + smoltcp) | **143 MB/s** | **13.5 s** |
-| kernel loopback reference | 2.8 GiB/s | 0.31 s |
+| **TUN** (smoltcp, default jumbo MTU 9000) | **1259 MiB/s** | not re-measured |
+| TUN (same code, MTU 1500) | 464 MiB/s | not re-measured |
+| **WireGuard** (Noise + smoltcp) | **210 MB/s** | **9.3 s** |
 
 A TUN device supports no read/write batching (verified with `readv`/`writev`
 probes: it returns exactly one packet per call), so these paths are syscall-bound
@@ -163,24 +164,31 @@ Raising the floor from 64 KiB to 256 KiB cost 4x per-connection memory
 (128 → 512 KiB) and bought +33 % at MTU 1500 and +65 % at jumbo; lower
 `TCP_SOCKET_BUF_MIN` in `crates/flux-inbound/src/tun.rs` to trade it back.
 
+Framing layers, one-way (an echo benchmark splits one stream, and in tokio the
+split is a per-poll mutex, so full-duplex figures measure the harness):
+
+| Layer | Throughput |
+|---|---|
+| h2 | **648 MB/s** |
+| gRPC | **414 MB/s** |
+
+(`cargo run --release --example bench_layers -- --one-way --rounds 5 --mb 64`.)
+
+UDP relay:
+
 | Path | Throughput |
 |---|---|
-| Direct UDP echo (no proxy) | 167k datagrams/s |
-| **flux-core** (SOCKS5 UDP relay, 1200 B payload) | **130k datagrams/s** — 1.25 Gbit/s, 7.7 µs round-trip |
+| **flux-core** (SOCKS5 UDP relay, 1200 B payload) | **118k datagrams/s** |
 
-Micro-benchmarks (median): router lookup over 100 rules 90 ns (hit) / 46 ns
-(miss); pooled 64 KiB buffer acquire+release 1009 ns — the release scrubs, because
-a recycled buffer that still holds the previous connection's bytes is one careless
-`write_all(&guard)` away from cross-tenant disclosure; TLS client connector 60 ns
-cached versus 7.7 µs
-to build one from scratch. Resource cost per established TCP relay:
-≈ 4 KB RSS and 6 file descriptors (2 sockets + 4 `splice` pipe ends); idle
-process footprint 7.5 MB.
+Micro-benchmarks (median): pooled 64 KiB buffer acquire+release **1009 ns** — the
+release scrubs, because a recycled buffer that still holds the previous
+connection's bytes is one careless `write_all(&guard)` away from cross-tenant
+disclosure. Resource cost per established TCP relay: ≈ 4 KB RSS and 6 file
+descriptors (2 sockets + 4 `splice` pipe ends); idle process footprint 7.5 MB.
 
 Absolutes depend on the machine and drift by ~10% between runs even on an idle
-box, which is why the harness interleaves rounds and reports medians — compare the
-ratios and the cost columns, not a single absolute. Measured on a 16-core desktop
-with the desktop session running.
+box, which is why the harness interleaves rounds and reports medians. Measured on
+a 16-core desktop with the desktop session running.
 
 ### Running Tests
 ```bash
@@ -197,6 +205,9 @@ cargo bench --bench throughput
 ```bash
 # Validate a configuration file (supports .yaml, .json, .jsonc)
 ./target/release/flux-core check -c examples/config.yaml
+
+# Show which outbound a destination would use, without starting anything
+./target/release/flux-core trace -c examples/config.yaml -d example.com:443 -n tcp
 
 # Run the core
 ./target/release/flux-core run -c examples/config.yaml

@@ -2,7 +2,7 @@
 
 ## Artifacts
 
-- **Static-ish Linux binary**: `cargo build --release` → `target/release/flux-core` (~9.4 MB, stripped, `lto=fat`, `codegen-units=1`).
+- **Static-ish Linux binary**: `cargo build --release` → `target/release/flux-core` (~10 MiB, stripped, `lto=fat`, `codegen-units=1`).
 - **Container image**: multi-stage `Dockerfile` (Debian slim runtime with `ca-certificates`, `iptables`, `iproute2`).
 
 ## System requirements
@@ -31,17 +31,21 @@ Container:
 ```bash
 docker build -t flux-core .
 # Plain listeners only:
-docker run -d -v $PWD/config.yaml:/etc/flux-core/config.json flux-core
+docker run -d -v $PWD/config.yaml:/etc/flux-core/config.yaml \
+  flux-core run -c /etc/flux-core/config.yaml
 # Transparent proxying:
 docker run -d --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE \
-  --device /dev/net/tun -v $PWD/config.yaml:/etc/flux-core/config.json flux-core
+  --device /dev/net/tun -v $PWD/config.yaml:/etc/flux-core/config.yaml \
+  flux-core run -c /etc/flux-core/config.yaml
 ```
 
 > **SELinux hosts (Fedora/RHEL/CentOS):** append `:Z` to volume mounts,
 > otherwise the container cannot read the config (`Permission denied`):
-> `-v $PWD/config.yaml:/etc/flux-core/config.json:Z`
+> `-v $PWD/config.yaml:/etc/flux-core/config.yaml:Z`
 
-The image ships a `HEALTHCHECK` running `flux-core check -c /etc/flux-core/config.json`.
+The image's default `CMD` and `HEALTHCHECK` point at `/etc/flux-core/config.json`;
+either mount the file under that name (the format is auto-detected by content, so
+YAML works there too) or override the command as above.
 
 ## systemd
 
@@ -54,7 +58,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/flux-core run -c /etc/flux-core/config.yaml
-ExecReload=/bin/kill -HUP $MAINPID   # config reload (see below)
+# config reload (see below)
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=1048576
@@ -69,7 +74,7 @@ WantedBy=multi-user.target
 
 1. `flux-core check -c config.yaml` — config valid.
 2. Secrets come from environment (`${VAR}` expansion), never committed.
-3. Management API is loopback-only **or** has `secret` set (the process refuses a public listener without one unless `allow_insecure_api: true`).
+3. Management API is loopback-only **or** has `secret` set (the process refuses to bind `0.0.0.0`/`::` without one unless `allow_insecure_api: true`; a specific non-loopback bind without a secret only warns).
 4. Public inbounds have `rate_limit` configured.
 5. `LimitNOFILE` raised for high connection counts.
 6. Log level `info` (or `warn`) in production; `debug`/`trace` for diagnosis only.

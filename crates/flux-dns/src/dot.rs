@@ -40,9 +40,10 @@ pub(crate) fn split_host_port(clean: &str, default_port: u16) -> (String, u16) {
     match clean.rsplit_once(':') {
         // Exactly one colon: `host:port`. More than one means a bare IPv6
         // address, which must not be split.
-        Some((host, port)) if !host.contains(':') => {
-            (host.to_string(), port.parse::<u16>().unwrap_or(default_port))
-        }
+        Some((host, port)) if !host.contains(':') => (
+            host.to_string(),
+            port.parse::<u16>().unwrap_or(default_port),
+        ),
         _ => (clean.to_string(), default_port),
     }
 }
@@ -58,7 +59,9 @@ where
             "DNS query does not fit the two-byte length prefix",
         ));
     }
-    writer.write_all(&(query.len() as u16).to_be_bytes()).await?;
+    writer
+        .write_all(&(query.len() as u16).to_be_bytes())
+        .await?;
     writer.write_all(query).await?;
     writer.flush().await
 }
@@ -199,7 +202,9 @@ impl DotClient {
             }
 
             let exchange = {
-                let Some(stream) = guard.as_mut() else { continue };
+                let Some(stream) = guard.as_mut() else {
+                    continue;
+                };
                 tokio::time::timeout(DOT_IO_TIMEOUT, async {
                     write_message(&mut **stream, &query).await?;
                     read_message(&mut **stream).await
@@ -301,12 +306,22 @@ pub(crate) mod test_support {
         out.extend_from_slice(&query[12..]); // question, verbatim
         for i in 0..answers {
             out.extend_from_slice(&[
-                0xc0, 0x0c, // name pointer to the question
-                0x00, 0x01, // TYPE A
-                0x00, 0x01, // CLASS IN
-                0x00, 0x00, 0x01, 0x2c, // TTL 300
-                0x00, 0x04, // RDLENGTH
-                10, 0, 0, (i % 256) as u8,
+                0xc0,
+                0x0c, // name pointer to the question
+                0x00,
+                0x01, // TYPE A
+                0x00,
+                0x01, // CLASS IN
+                0x00,
+                0x00,
+                0x01,
+                0x2c, // TTL 300
+                0x00,
+                0x04, // RDLENGTH
+                10,
+                0,
+                0,
+                (i % 256) as u8,
             ]);
         }
         out
@@ -392,8 +407,11 @@ pub(crate) mod test_support {
     impl FakeDotServer {
         /// A client that trusts this server (the happy path).
         pub(crate) fn client(&self) -> super::DotClient {
-            super::DotClient::new(&format!("tls://{}", self.addr))
-                .with_connector(tls_connector(self.addr, vec![self.cert.clone()], "dot"))
+            super::DotClient::new(&format!("tls://{}", self.addr)).with_connector(tls_connector(
+                self.addr,
+                vec![self.cert.clone()],
+                "dot",
+            ))
         }
 
         /// A client that has *not* been told to trust this server.
@@ -830,7 +848,10 @@ mod tests {
         assert_eq!(plain.server_port, 853);
 
         let host = DotClient::new("dot://dns.google");
-        assert!(format!("{host:?}").contains("DotClient"), "Debug must name the client");
+        assert!(
+            format!("{host:?}").contains("DotClient"),
+            "Debug must name the client"
+        );
         assert_eq!(host.server_host, "dns.google");
         assert_eq!(host.server_port, 853);
         assert_eq!(host.sni, "dns.google");

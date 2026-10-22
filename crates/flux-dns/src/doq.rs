@@ -79,10 +79,7 @@ impl DoqClient {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_trust_anchors(
-        mut self,
-        roots: tokio_rustls::rustls::RootCertStore,
-    ) -> Self {
+    pub(crate) fn with_trust_anchors(mut self, roots: tokio_rustls::rustls::RootCertStore) -> Self {
         self.test_roots = Some(roots);
         self
     }
@@ -219,7 +216,10 @@ impl DoqClient {
                 }
             };
 
-            match self.exchange_once(&connection, &query, tx_id, name, qtype).await {
+            match self
+                .exchange_once(&connection, &query, tx_id, name, qtype)
+                .await
+            {
                 Ok(answer) => return Ok(answer),
                 Err((error, stale)) => {
                     if stale {
@@ -254,10 +254,12 @@ impl DoqClient {
         name: &Name,
         qtype: u16,
     ) -> Result<Answer, (QueryError, bool)> {
-        let (mut send_stream, mut recv_stream) = connection
-            .open_bi()
-            .await
-            .map_err(|e| (QueryError::Transport(FluxError::Network(e.to_string())), true))?;
+        let (mut send_stream, mut recv_stream) = connection.open_bi().await.map_err(|e| {
+            (
+                QueryError::Transport(FluxError::Network(e.to_string())),
+                true,
+            )
+        })?;
 
         send_stream
             .write_all(&(query.len() as u16).to_be_bytes())
@@ -509,9 +511,11 @@ mod tests {
             .unwrap();
         cfg.alpn_protocols = vec![b"doq".to_vec()];
         let quic_cfg = quinn::crypto::rustls::QuicServerConfig::try_from(cfg).unwrap();
-        let endpoint =
-            quinn::Endpoint::server(quinn::ServerConfig::with_crypto(Arc::new(quic_cfg)), "127.0.0.1:0".parse().unwrap())
-                .unwrap();
+        let endpoint = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(quic_cfg)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
         let addr = endpoint.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -521,9 +525,14 @@ mod tests {
             let (mut send, mut recv) = conn.accept_bi().await.unwrap();
             // `read_to_end` only returns once the peer sent FIN: if the client
             // kept the send side open this would hang.
-            let framed = recv.read_to_end(4096).await.expect("stream must be closed by the client");
+            let framed = recv
+                .read_to_end(4096)
+                .await
+                .expect("stream must be closed by the client");
             let resp = response_for(&framed[2..], None, 1);
-            send.write_all(&(resp.len() as u16).to_be_bytes()).await.unwrap();
+            send.write_all(&(resp.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
             send.write_all(&resp).await.unwrap();
             send.finish().ok();
             let _ = tx.send(framed);
@@ -542,7 +551,11 @@ mod tests {
 
         let framed = rx.await.unwrap();
         let announced = u16::from_be_bytes([framed[0], framed[1]]) as usize;
-        assert_eq!(announced, framed.len() - 2, "the 2-byte prefix must cover the whole message");
+        assert_eq!(
+            announced,
+            framed.len() - 2,
+            "the 2-byte prefix must cover the whole message"
+        );
     }
 
     /// Same 64 KiB ceiling as DoT: an answer above the old 4 KiB cap is legal.
@@ -656,7 +669,11 @@ mod tests {
             .expect("a resetted stream must not hang")
             .expect("a reset stream on a healthy connection must be retried");
         assert_eq!(answer, expected_address());
-        assert_eq!(srv.accepts(), 1, "the connection itself was fine: no redial");
+        assert_eq!(
+            srv.accepts(),
+            1,
+            "the connection itself was fine: no redial"
+        );
     }
 
     // -- reuse and pooling ------------------------------------------------
@@ -705,7 +722,11 @@ mod tests {
             .expect("the recovery query must not hang")
             .expect("a timed-out connection must be evicted, not reused");
         assert_eq!(recovered, expected_address());
-        assert_eq!(srv.accepts(), 2, "the client must have dialled a new connection");
+        assert_eq!(
+            srv.accepts(),
+            2,
+            "the client must have dialled a new connection"
+        );
     }
 
     #[test]
@@ -756,7 +777,10 @@ mod tests {
         let name = Name::from_str("example.com").unwrap();
         match client.query_doq(&name, None, QTYPE_A).await {
             Ok(Answer::Address { ip, .. }) => {
-                assert!(matches!(ip, IpAddr::V4(_)), "expected an A record, got {ip}");
+                assert!(
+                    matches!(ip, IpAddr::V4(_)),
+                    "expected an A record, got {ip}"
+                );
             }
             Ok(other) => panic!("expected an A record, got {other:?}"),
             Err(e) => panic!("a real DoQ resolver must answer: {e}"),

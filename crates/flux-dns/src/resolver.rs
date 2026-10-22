@@ -941,7 +941,12 @@ mod tests {
             .exchange("https://127.0.0.1:1/dns-query", &name, None, QTYPE_A)
             .await;
         assert!(resolver.inner.dot_clients.contains_key("tls://127.0.0.1:1"));
-        assert!(resolver.inner.doq_clients.contains_key("quic://127.0.0.1:1"));
+        assert!(
+            resolver
+                .inner
+                .doq_clients
+                .contains_key("quic://127.0.0.1:1")
+        );
         assert!(
             resolver
                 .inner

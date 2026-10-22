@@ -21,7 +21,7 @@
 
 **TUN stalls under reordering** — fixed in RFC 793 OOO reassembly with u32 wraparound handling. Upgrade if on an older build.
 
-**Remote rule set not updating** — fetch failures are silent-by-design (routing must not break). Check logs at `warn` level; verify the URL returns the expected format and is within the size cap; delete the disk cache file to force a clean fetch.
+**Remote rule set not updating** — a failed fetch never breaks routing (the previous matcher stays active) and is logged at `warn`, so check logs at that level. Verify the URL returns the expected format and is within the 16 MiB cap; delete the disk cache file to force a clean fetch.
 
 **Rule set loads but rules do not match** — look for `no usable rules parsed` or `N line(s) ignored` warnings. A rule set that parses to zero entries makes every `rule_set` rule match nothing, so traffic falls through to `final`. Compressed responses are rejected (only `identity` encoding is supported), and both `Content-Length` and chunked bodies are handled.
 

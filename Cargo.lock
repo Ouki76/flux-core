@@ -688,6 +688,7 @@ dependencies = [
  "parking_lot",
  "quinn",
  "rand 0.8.8",
+ "rcgen",
  "serde",
  "tokio",
  "tokio-rustls",

@@ -119,8 +119,8 @@ where
             break;
         }
     }
-    let h_end = header_end
-        .ok_or_else(|| DoHFailure::Fatal("DoH response headers exceed 8 KiB".into()))?;
+    let h_end =
+        header_end.ok_or_else(|| DoHFailure::Fatal("DoH response headers exceed 8 KiB".into()))?;
     let header_str = String::from_utf8_lossy(&header_buf[..h_end]);
 
     // A captive portal or an error page returns a 200-less body that must not
@@ -152,9 +152,10 @@ where
             // Present but unparseable is not the same as absent: treating it as
             // absent would take the close-delimited path on a keep-alive
             // connection, which never ends.
-            content_length = Some(v.parse().map_err(|_| {
-                DoHFailure::Fatal(format!("invalid DoH Content-Length '{v}'"))
-            })?);
+            content_length = Some(
+                v.parse()
+                    .map_err(|_| DoHFailure::Fatal(format!("invalid DoH Content-Length '{v}'")))?,
+            );
         } else if k.eq_ignore_ascii_case("transfer-encoding")
             && v.to_ascii_lowercase().contains("chunked")
         {
@@ -739,12 +740,18 @@ mod framing_tests {
         let srv = spawn_doh_server(|req| doh_answer(req, 1), false).await;
         let client = srv.client();
 
-        let answer = ask(&client).await.expect("a conforming server must be answered");
+        let answer = ask(&client)
+            .await
+            .expect("a conforming server must be answered");
         assert_eq!(answer, expected_address());
 
         let req = srv.last_request();
-        let head = String::from_utf8_lossy(&req[..req.len() - request_body(&req).len()]).to_string();
-        assert!(head.starts_with("POST /dns-query HTTP/1.1\r\n"), "head: {head}");
+        let head =
+            String::from_utf8_lossy(&req[..req.len() - request_body(&req).len()]).to_string();
+        assert!(
+            head.starts_with("POST /dns-query HTTP/1.1\r\n"),
+            "head: {head}"
+        );
         assert!(
             head.to_ascii_lowercase()
                 .contains("content-type: application/dns-message"),
@@ -801,7 +808,8 @@ mod framing_tests {
     /// A response with no `Content-Type` at all is equally unusable.
     #[tokio::test]
     async fn rejects_a_response_without_a_content_type() {
-        let srv = spawn_doh_server(|req| http_response(200, None, &answer_for(req, 1)), false).await;
+        let srv =
+            spawn_doh_server(|req| http_response(200, None, &answer_for(req, 1)), false).await;
         let client = srv.client();
 
         let err = tokio::time::timeout(Duration::from_secs(15), ask(&client))
@@ -816,7 +824,8 @@ mod framing_tests {
 
     #[tokio::test]
     async fn rejects_a_non_200_status() {
-        let srv = spawn_doh_server(|_| http_response(503, Some("text/plain"), b"busy"), false).await;
+        let srv =
+            spawn_doh_server(|_| http_response(503, Some("text/plain"), b"busy"), false).await;
         let client = srv.client();
 
         let err = tokio::time::timeout(Duration::from_secs(15), ask(&client))
@@ -967,7 +976,9 @@ mod framing_tests {
         let srv = spawn_doh_server(
             |req| {
                 let mut resp = Vec::new();
-                resp.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\r\n");
+                resp.extend_from_slice(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\r\n",
+                );
                 resp.extend_from_slice(&answer_for(req, 1));
                 resp
             },

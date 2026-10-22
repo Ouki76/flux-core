@@ -134,7 +134,7 @@ that users actually depend on, in order of practical importance, is:
 
 1. the **configuration schema** (YAML/JSON/JSONC — see
    [`docs/configuration.md`](configuration.md)),
-2. the **CLI** (`run`, `check`, `version`) and its exit codes,
+2. the **CLI** (`run`, `check`, `trace`, `version`) and its exit codes,
 3. the **management API** ([`docs/api.md`](api.md)),
 4. the **wire behaviour** of every inbound/outbound,
 5. the Rust library API of the workspace crates.
@@ -288,11 +288,11 @@ Each gap is stated with what would be required to close it. None of them is
 hidden by a green check.
 
 **G1 — No documentation gate.** `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
---workspace` currently fails: `crates/flux-outbound/src/hysteria2.rs:240` contains
-`[data]` in a doc comment, which rustdoc reads as an intra-doc link ("unresolved
-link to `data`"). Gating docs is a one-line change to `ci.yml` *after* that (and
-any further) broken link is escaped as `\[data\]`. Until then, doc quality is
-reviewed, not enforced.
+--workspace` is not part of CI, so broken intra-doc links are reviewed, not
+enforced. (The previously recorded example — `[data]` in a doc comment at
+`crates/flux-outbound/src/hysteria2.rs` — has since been moved inside a code span
+and no longer resolves as a link; the gap itself remains until the gate is added
+to `ci.yml`.)
 
 **G2 — Conformance is not in CI.** `scripts/run_conformance.sh` needs `h2spec`,
 which is not installed on GitHub runners and is not a Rust tool this project can

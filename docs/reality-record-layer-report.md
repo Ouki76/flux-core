@@ -1,5 +1,11 @@
 # REALITY record layer: 375 → 729 MB/s
 
+> **Dated experiment report.** The figures below are that cycle's interleaved
+> runs, kept for the attribution argument. Re-measured against the current tree:
+> **REALITY 729 MB/s** and **VLESS+TLS 660 MB/s** (the 645/654 values here were
+> the same code at a different moment, inside the ±5 % noise band this report
+> states).
+
 **File touched:** `crates/flux-transport/src/reality.rs` only (plus nothing else — see
 "Files I did not touch").  Net diff: +253 / −202 lines, including one new test.
 

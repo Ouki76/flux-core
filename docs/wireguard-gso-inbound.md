@@ -1,5 +1,9 @@
 # The inbound-GSO stall: a burst sender that reordered its own stream
 
+> **Dated experiment report.** Re-measured against the current tree, the WireGuard
+> path runs at **210 MB/s / 9.3 CPU s/GB** — the post-fix range (189–217 MB/s,
+> 8.9–9.5 s/GB) recorded below.
+
 *Cycle 4, 2026-10-22. Closes the entry "Open: the inbound-GSO stall (investigated,
 not solved)" in [audit-log.md](audit-log.md#open-the-inbound-gso-stall-investigated-not-solved).*
 

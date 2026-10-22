@@ -9,7 +9,10 @@ When `secret` is configured, authenticate with either:
 - `Authorization: Bearer <secret>` header (preferred), or
 - `?token=<secret>` query parameter (rejected from cross-origin browser contexts).
 
-Requests with an external `Origin` header and no `Authorization` are rejected with `403` before any dispatch (CSRF protection).
+Requests carrying an external `Origin` header are rejected with `403` before any
+dispatch (CSRF protection) when no `secret` is configured, or when the request
+authenticates via `?token=`; a `Bearer` request from an external origin is
+accepted because it cannot be forged cross-site.
 
 ## Endpoints
 
@@ -39,6 +42,11 @@ Requests with an external `Origin` header and no `Authorization` are rejected wi
   HTTP origins whose host is exactly `localhost`, `127.0.0.1` or `::1` count as
   local — `http://localhost.attacker.tld` does not.
 - Requests are bounded: 16 KiB of headers, 1 MiB of body, 15 s per connection.
+- `Transfer-Encoding` is **refused** with `400` (chunked request bodies are not
+  implemented, and ignoring the header would make the body length zero here while
+  a front proxy forwards one — the classic request-smuggling pair). Conflicting
+  `Content-Length` headers are also `400` (identical duplicates are tolerated); a
+  body over 1 MiB is `413`.
 - The API listener binds exclusively (no `SO_REUSEPORT`), so another process
   cannot race or hijack the port.
 - `GET /api/v1/outbounds/{tag}/delay` (probe) refuses private, loopback,
