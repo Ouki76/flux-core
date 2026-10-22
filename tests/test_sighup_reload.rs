@@ -272,3 +272,110 @@ async fn test_sighup_reload_with_dns_inbound() {
         assert!(!logs.contains(bad), "reload rejected ({bad}); log:\n{logs}");
     }
 }
+
+/// Two SIGHUPs in a row must leave the process serving the *last* configuration.
+///
+/// The second signal usually lands while the first reload is still running. The
+/// signal loop awaits each reload instead of detaching it, so the next signal is
+/// delivered as soon as the reload returns (tokio counts deliveries that arrive
+/// while nobody is polling). Deliveries that pile up before the loop polls again
+/// are coalesced into one — that is sound for a level-triggered reload, because
+/// every reload re-reads the whole file, so one reload per batch still applies
+/// the newest content. What is *not* acceptable, and is what this test guards,
+/// is a crash, a hang, or a reload that leaves the process on a stale listener.
+#[tokio::test]
+async fn test_sighup_burst_keeps_the_last_configuration() {
+    let port_a = get_free_tcp_port().await;
+    let port_b = get_free_tcp_port().await;
+    let port_c = get_free_tcp_port().await;
+
+    let dir = std::env::temp_dir().join(format!("flux-sighup-burst-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg_path = dir.join("config.json");
+    // Log at info here: this test asserts on the reload's own log lines, which
+    // the shared `write_config` (level=warn) deliberately suppresses.
+    let write_cfg = |port: u16, marker: &str| {
+        let mut f = std::fs::File::create(&cfg_path).unwrap();
+        write!(
+            f,
+            r#"{{
+                "log": {{ "level": "info" }},
+                "inbounds": [{{
+                    "tag": "{}",
+                    "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
+                    "protocol": {{ "type": "socks" }}
+                }}],
+                "outbounds": [{{ "type": "direct", "tag": "direct" }}]
+            }}"#,
+            marker, port
+        )
+        .unwrap();
+    };
+    write_cfg(port_a, "in-a");
+
+    let bin = env!("CARGO_BIN_EXE_flux-core");
+    let log_path = dir.join("flux.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let log_err = log.try_clone().unwrap();
+    let child = Command::new(bin)
+        .args(["run", "-c", cfg_path.to_str().unwrap(), "-f", "json"])
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err))
+        .spawn()
+        .expect("failed to spawn flux-core");
+    let mut child = ChildGuard(child);
+
+    assert!(
+        wait_port_open(port_a, Duration::from_secs(5)).await,
+        "initial listener did not start"
+    );
+
+    // First reload, brought to completion so the burst starts from a known state.
+    write_cfg(port_b, "in-b");
+    let pid = child.0.id() as i32;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    assert!(
+        wait_port_open(port_b, Duration::from_secs(5)).await,
+        "first reload did not take effect"
+    );
+
+    // Write C, then send two SIGHUPs back to back: the second arrives either
+    // during the reload or immediately after it.
+    write_cfg(port_c, "in-c");
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+
+    assert!(
+        wait_port_open(port_c, Duration::from_secs(10)).await,
+        "the burst did not apply the last configuration"
+    );
+    socks5_roundtrip(port_c).await;
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the process died during the burst"
+    );
+    assert!(
+        wait_port_closed(port_b, Duration::from_secs(10)).await,
+        "port {} was never released after the burst",
+        port_b
+    );
+
+    let logs = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        logs.contains("Configuration hot-reloaded successfully"),
+        "no reload was applied; log:\n{logs}"
+    );
+    for bad in [
+        "hot reload FAILED",
+        "hot reload REJECTED",
+        "panicked",
+        "thread 'main'",
+    ] {
+        assert!(
+            !logs.contains(bad),
+            "burst broke the process ({bad}); log:\n{logs}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
