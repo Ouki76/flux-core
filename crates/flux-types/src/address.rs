@@ -120,7 +120,13 @@ impl FromStr for TargetAddress {
                 )));
             }
 
-            if let Ok(ip) = host_clean.parse::<IpAddr>() {
+            // A trailing root dot is legal in a DNS name and meaningless on a
+            // literal, but `"1.2.3.4.".parse::<IpAddr>()` fails — so without this
+            // the address became a `Domain("1.2.3.4.")`, every `IP-CIDR` rule
+            // silently stopped applying to it, and the dial path would have tried
+            // to resolve it.
+            let ip_candidate = host_clean.strip_suffix('.').unwrap_or(host_clean);
+            if let Ok(ip) = ip_candidate.parse::<IpAddr>() {
                 Ok(Self::Ip(SocketAddr::new(ip, port)))
             } else {
                 Ok(Self::Domain(host_clean.to_string(), port))
@@ -222,5 +228,38 @@ mod tests {
 
         // Bare unbracketed IPv6 address without port must be rejected
         assert!("2001:db8::1".parse::<TargetAddress>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod address_literal_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    /// `1.2.3.4.:80` is an IP with a root dot, not a domain: as a domain it never
+    /// matches an `IP-CIDR` rule and the dial path tries to resolve it.
+    #[test]
+    fn an_ip_literal_with_a_root_dot_is_still_an_ip() {
+        for (input, expected) in [
+            ("1.2.3.4.:80", "1.2.3.4:80"),
+            ("192.168.0.1.:443", "192.168.0.1:443"),
+        ] {
+            match TargetAddress::from_str(input).expect("must parse") {
+                TargetAddress::Ip(addr) => assert_eq!(addr.to_string(), expected),
+                other => panic!("{input} parsed as {other:?}, expected an Ip"),
+            }
+        }
+    }
+
+    /// A real domain must keep its root dot and stay a domain.
+    #[test]
+    fn a_domain_with_a_root_dot_stays_a_domain() {
+        match TargetAddress::from_str("example.com.:443").expect("must parse") {
+            TargetAddress::Domain(host, port) => {
+                assert_eq!(port, 443);
+                assert!(host.starts_with("example.com"), "unexpected host {host}");
+            }
+            other => panic!("parsed as {other:?}, expected a Domain"),
+        }
     }
 }
