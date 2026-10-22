@@ -736,42 +736,6 @@ fn validate_request(request: &Request<RecvStream>) -> Result<(), String> {
     Ok(())
 }
 
-/// Keeps an HTTP/2 connection polled for the lifetime of the tunnel, so the
-/// library can flush what the stream writes. Extra streams are refused one by
-/// one (this endpoint carries exactly one) rather than by killing the socket.
-fn spawn_connection_driver<T>(
-    mut connection: h2::server::Connection<T, Bytes>,
-    linger: Option<std::time::Duration>,
-) where
-    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut consecutive_errors = 0u32;
-        let run = async {
-            while let Some(result) = connection.accept().await {
-                match result {
-                    Ok((_request, mut respond)) => respond.send_reset(h2::Reason::REFUSED_STREAM),
-                    Err(e) if e.is_io() => break,
-                    Err(_) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors > 8 {
-                            break;
-                        }
-                    }
-                }
-            }
-        };
-        match linger {
-            // A rejected request only needs the connection long enough for its
-            // refusal to reach the peer.
-            Some(linger) => {
-                let _ = tokio::time::timeout(linger, run).await;
-            }
-            None => run.await,
-        }
-    });
-}
-
 pub struct GrpcTransport;
 
 impl GrpcTransport {
@@ -791,16 +755,7 @@ impl GrpcTransport {
         })?;
         let path = format!("/{service_name}/Tun");
 
-        let (mut client, connection) =
-            h2::client::handshake(stream)
-                .await
-                .map_err(|e| FluxError::Protocol {
-                    protocol: "grpc",
-                    message: format!("H2 handshake failed: {e}"),
-                })?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
+        let mut client = crate::h2::shared::client_handshake(stream, "grpc").await?;
 
         let mut builder = Request::builder()
             .method(Method::POST)
@@ -838,17 +793,7 @@ impl GrpcTransport {
     where
         S: AsyncStream + 'static,
     {
-        let mut builder = h2::server::Builder::new();
-        builder.initial_window_size(1024 * 1024);
-        builder.initial_connection_window_size(2 * 1024 * 1024);
-
-        let mut connection = builder
-            .handshake(stream)
-            .await
-            .map_err(|e| FluxError::Protocol {
-                protocol: "grpc",
-                message: format!("server H2 handshake failed: {e}"),
-            })?;
+        let mut connection = crate::h2::shared::server_handshake(stream, "grpc").await?;
         let (request, mut respond) = connection
             .accept()
             .await
@@ -870,7 +815,7 @@ impl GrpcTransport {
                 .body(())
                 .expect("static refusal response");
             let _ = respond.send_response(refusal, true);
-            spawn_connection_driver(connection, Some(REJECT_LINGER));
+            crate::h2::shared::spawn_connection_driver(connection, Some(REJECT_LINGER));
             return Err(FluxError::Protocol {
                 protocol: "grpc",
                 message,
@@ -894,7 +839,7 @@ impl GrpcTransport {
             })?;
 
         let recv = request.into_body();
-        spawn_connection_driver(connection, None);
+        crate::h2::shared::spawn_connection_driver(connection, None);
         Ok(GrpcStream::new_server(send, recv))
     }
 }

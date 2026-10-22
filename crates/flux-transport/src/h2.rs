@@ -198,19 +198,7 @@ impl H2Transport {
     where
         S: AsyncStream + 'static,
     {
-        let (mut client, h2_conn) =
-            h2::client::handshake(stream)
-                .await
-                .map_err(|e| FluxError::Protocol {
-                    protocol: "http2",
-                    message: format!("H2 handshake failed: {}", e),
-                })?;
-
-        // Spawn connection driver in background
-        tokio::spawn(async move {
-            let _ = h2_conn.await;
-        });
-
+        let mut client = shared::client_handshake(stream, "http2").await?;
         Self::create_client_stream(&mut client, host, path, headers).await
     }
 
@@ -253,18 +241,7 @@ impl H2Transport {
     where
         S: AsyncStream + 'static,
     {
-        let mut server_builder = h2::server::Builder::new();
-        server_builder.initial_window_size(1024 * 1024);
-        server_builder.initial_connection_window_size(2 * 1024 * 1024);
-
-        let mut server_conn =
-            server_builder
-                .handshake(stream)
-                .await
-                .map_err(|e| FluxError::Protocol {
-                    protocol: "http2",
-                    message: format!("server H2 handshake failed: {}", e),
-                })?;
+        let mut server_conn = shared::server_handshake(stream, "http2").await?;
 
         let (request, mut respond) = server_conn
             .accept()
@@ -297,38 +274,125 @@ impl H2Transport {
 
         let recv_stream = request.into_body();
 
-        // Server connection driver: keeps the H2 connection's frames flowing for
-        // the lifetime of the tunnel stream.
-        //
-        // Only I/O-level failures are fatal. A stream-level or protocol-level
-        // error concerns the offending stream, not the connection: tearing the
-        // whole connection down there reset the underlying TCP socket, so a peer
-        // saw `ECONNRESET` instead of `RST_STREAM`/`GOAWAY` (h2spec 3.4/1, 5.1/9,
-        // 7/2). Extra streams are refused individually with REFUSED_STREAM —
-        // this endpoint carries exactly one tunnel stream.
+        shared::spawn_connection_driver(server_conn, None);
+
+        Ok(H2Stream::new(send_stream, recv_stream))
+    }
+}
+
+/// Connection-level plumbing shared by the raw HTTP/2 tunnel ([`H2Stream`]) and
+/// the gRPC tunnel in [`crate::grpc`].
+///
+/// The two layers must differ *inside* a stream: a gRPC tunnel has to read the
+/// response HEADERS and the terminal trailers, a raw h2 tunnel must not. That is
+/// why there are two stream types. Everything that establishes the connection
+/// and keeps it polled afterwards is identical, and lives here exactly once.
+pub(crate) mod shared {
+    use super::{AsyncRead, AsyncWrite, Bytes, FluxError, FluxResult, SendRequest};
+    use flux_types::AsyncStream;
+
+    /// `SETTINGS_INITIAL_WINDOW_SIZE` advertised to the peer, in bytes.
+    const INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
+    /// Connection-level window advertised to the peer, in bytes.
+    const INITIAL_CONNECTION_WINDOW: u32 = 2 * 1024 * 1024;
+    /// Consecutive non-I/O `accept()` failures tolerated before the driver gives
+    /// up on a connection that is otherwise still open.
+    const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 8;
+
+    /// Runs the client half of the HTTP/2 handshake and keeps the client
+    /// connection polled in the background for the lifetime of the tunnel.
+    pub(crate) async fn client_handshake<S>(
+        stream: S,
+        protocol: &'static str,
+    ) -> FluxResult<SendRequest<Bytes>>
+    where
+        S: AsyncStream + 'static,
+    {
+        let (client, connection) =
+            h2::client::handshake(stream)
+                .await
+                .map_err(|e| FluxError::Protocol {
+                    protocol,
+                    message: format!("H2 handshake failed: {e}"),
+                })?;
         tokio::spawn(async move {
-            let mut conn = server_conn;
-            // A non-IO error is per-stream, but a *persistent* one would spin this
-            // loop forever (accept() returning instantly with the same error), so
-            // give up after a short run of consecutive failures.
+            let _ = connection.await;
+        });
+        Ok(client)
+    }
+
+    /// Runs the server half of the HTTP/2 handshake with this crate's window
+    /// configuration and hands the connection back, so the caller can accept and
+    /// answer the tunnel's request before the driver takes it over.
+    pub(crate) async fn server_handshake<S>(
+        stream: S,
+        protocol: &'static str,
+    ) -> FluxResult<h2::server::Connection<S, Bytes>>
+    where
+        S: AsyncStream + 'static,
+    {
+        let mut builder = h2::server::Builder::new();
+        // A tunnel carries bulk data in both directions: give it room to run
+        // ahead of a WINDOW_UPDATE round trip, but keep the advertised window
+        // small enough that an idle peer cannot pin unbounded memory.
+        builder.initial_window_size(INITIAL_STREAM_WINDOW);
+        builder.initial_connection_window_size(INITIAL_CONNECTION_WINDOW);
+        builder
+            .handshake(stream)
+            .await
+            .map_err(|e| FluxError::Protocol {
+                protocol,
+                message: format!("server H2 handshake failed: {e}"),
+            })
+    }
+
+    /// Keeps an HTTP/2 server connection polled for the lifetime of the tunnel,
+    /// so the library can flush what the stream writes. Extra streams are
+    /// refused one by one (an endpoint carries exactly one tunnel stream)
+    /// rather than by killing the socket.
+    ///
+    /// Only I/O-level failures are fatal. A stream-level or protocol-level error
+    /// concerns the offending stream, not the connection: tearing the whole
+    /// connection down there reset the underlying TCP socket, so a peer saw
+    /// `ECONNRESET` instead of `RST_STREAM`/`GOAWAY` (h2spec 3.4/1, 5.1/9, 7/2).
+    ///
+    /// `linger` bounds how long a *rejected* request keeps the connection open
+    /// so its refusal actually reaches the peer; `None` drives it until the peer
+    /// goes away.
+    pub(crate) fn spawn_connection_driver<T>(
+        mut connection: h2::server::Connection<T, Bytes>,
+        linger: Option<std::time::Duration>,
+    ) where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            // A non-IO error is per-stream, but a *persistent* one would spin
+            // this loop forever (accept() returning instantly with the same
+            // error), so give up after a short run of consecutive failures.
             let mut consecutive_errors = 0u32;
-            while let Some(res) = conn.accept().await {
-                match res {
-                    Ok((_request, mut respond)) => {
-                        respond.send_reset(h2::Reason::REFUSED_STREAM);
-                    }
-                    Err(e) if e.is_io() => break,
-                    Err(_) => {
-                        consecutive_errors += 1;
-                        if consecutive_errors > 8 {
-                            break;
+            let run = async {
+                while let Some(result) = connection.accept().await {
+                    match result {
+                        Ok((_request, mut respond)) => {
+                            respond.send_reset(h2::Reason::REFUSED_STREAM);
+                        }
+                        Err(e) if e.is_io() => break,
+                        Err(_) => {
+                            consecutive_errors += 1;
+                            if consecutive_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS {
+                                break;
+                            }
                         }
                     }
                 }
+            };
+            match linger {
+                Some(linger) => {
+                    let _ = tokio::time::timeout(linger, run).await;
+                }
+                None => run.await,
             }
         });
-
-        Ok(H2Stream::new(send_stream, recv_stream))
     }
 }
 
