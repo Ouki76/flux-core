@@ -128,6 +128,78 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 5 — 2026-10-22
+
+### Baseline
+
+fmt, clippy `-D warnings`, 576 tests, audit, deny, doc — green at `6f8b7a4`.
+
+### Theme: the two least-tested transports, and they were the worst yet
+
+Cycle 4's method — test the camouflage layers against their specs — was applied to
+the files it had not reached. **23 defect groups** between them.
+
+#### `websocket.rs` — 13 defect groups (4 → 44 tests)
+
+The silent ones:
+
+| Defect | Consequence |
+|---|---|
+| `poll_shutdown` never sent a close frame | A peer could only ever report abnormal closure `1006` |
+| A bare TCP EOF was `Ok(0)` | Reported as a clean end of stream instead of abnormal closure |
+| Masking never checked against our role | The server accepted unmasked client frames; the client accepted masked server frames |
+| No UTF-8 validation at all | Invalid text frames delivered verbatim; a code point split across fragments was never checked |
+| A frame declaring `2^63-1` bytes | Parked the stream **forever** instead of being refused; non-minimal lengths and a 64-bit length with the high bit set accepted |
+| Fragmentation sequencing unenforced | An orphan continuation was delivered as data; a new data frame inside a fragmented message was merged into it |
+| Close frames never read, replied to or validated | Codes `0, 999, 1005, 1006, 1015, 5000, 65535` all accepted |
+| Client accepted `HTTP/1.0 101` and a 101 with no `Upgrade`/`Connection` | A captive portal could be taken for a tunnel |
+| CRLF in host/path/header value | Split the request on the wire — the same class as cycle 4's httpupgrade finding |
+| Server upgraded 8 malformed requests | Duplicate key/version headers resolved last-wins, no `Host`, key not 16 bytes, colon-less header |
+
+Streaming is preserved: validation is per-frame with an incremental UTF-8 state
+machine carried across fragments, so a tunnel keeps its unbounded-message property.
+
+#### `shadowtls.rs` — 10 defects (2 → 26 tests)
+
+- **No replay protection at all** — the hello's HMAC is a bearer credential, so a
+  captured hello authenticated again. Fixed with a bounded session-id LRU.
+- **The `server_names` allow-list was never enforced**: the SNI was not even parsed.
+- **Three tag comparisons were short-circuiting slice equality** — a timing oracle
+  on a 32-bit tag. Replaced with an OR-reduction and proved by a test that counts
+  bytes touched.
+- Two buffered-byte bugs of the class already found in `reality.rs` and TUN: a
+  poll-local decoy-skip counter that consumed the next record's bytes, and an
+  authenticated empty frame not recognised as the switch point (relayed to the
+  cover site, chain desynced, hang until timeout).
+- `poll_write` could report **more bytes than the caller supplied** (panics
+  `write_all`), spun forever on an inner `Ok(0)`, and the length check ran after
+  reading the tag.
+
+#### Config: two fields that went nowhere
+
+The ShadowTLS `version` was destructured away (`{ password, sni, .. }`), so a v1/v2
+config was **silently served as v3**; and the inbound's `server_names` was a
+`vec![]` literal in the builder, so the allow-list added in the transport could not
+be configured at all. Both fixed: an unimplemented version is refused with an error
+naming both values, the field defaults to 3, and `server_names` is a real config
+field. Mutation-tested.
+
+### Also fixed: my own flaky test
+
+`test_tls_fingerprint_length_fields_are_enforced` asserted that shortening the last
+extension's length field must be rejected — but rustls shuffles extension order per
+connection and emits some extensions (e.g. `session_ticket`) with an empty body, so
+when a zero-length extension lands last the "mutation" is a no-op and the assertion
+compares 0 with 0. The test now skips the degenerate case, with the reason in a
+comment. It was caught by the full run after passing in isolation — which is the
+argument for running the whole suite before claiming anything.
+
+### State
+
+**646 tests, 0 failed** (was 576). fmt/clippy/audit/deny/doc green.
+
+---
+
 ## Cycle 4 — 2026-10-22
 
 ### Baseline
