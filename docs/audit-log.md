@@ -1940,3 +1940,48 @@ The copier now runs a ticker that re-polls it *only* after 500 ms with no poll a
 logs when it fires. A healthy transfer never sees it; a stalled one now costs 250 ms
 instead of a 120 s timeout, and the warning names the path. It is a backstop, not a fix —
 said plainly in the commit, because the missed wakeup is still in there.
+
+---
+
+## Cycle 31 — 2026-10-24
+
+### REALITY: the same defect a third time
+
+The REALITY TLS stream returned one 16 KiB record per `poll_read` while the relay reads
+with 64 KiB. Fixed: **239 → 279 MB/s**, −21.5 % → **−5.2 %** against sing-box, CPU
+−20.5 % → **−34.6 %**.
+
+At this point the "one framing unit per poll" bug has been found in WebSocket, both
+Shadowsocks variants, gRPC and REALITY. It is the most repeated defect in this codebase
+and the single most valuable thing this audit has produced.
+
+## Cycle 32 — 2026-10-24
+
+### Vision: the padding phase never ended
+
+Vision pads while it sees a TLS handshake and must switch to direct copy as soon as the
+inner stream stops being one. The switch specifically required **ApplicationData**, so
+when the transport is already REALITY or TLS — the normal case — it never matched. The
+padding phase never ended and every byte went through 8 KiB padded frames for the life of
+the tunnel.
+
+The tell was the CPU column: this was the only row where flux spent *more* CPU per byte
+than sing-box (+72 %), while every other row is cheaper and slower. `strace` confirmed
+it: **3 691 writes of exactly 8 192 bytes** for 16 MiB.
+
+| | before | after |
+|---|---|---|
+| REALITY + Vision | 118 MB/s, −62 % vs sing-box | **252 MB/s, −24 %** |
+| vs xray | — | **−0.2 %** (233 vs 234) |
+| CPU vs sing-box | **+72 % worse** | **−22 % better** |
+
+After the fix the write sizes are 3 742 of 16 KiB and 2 489 of 16 406 — real records.
+Interop against xray still passes, which is what makes the early END frame safe.
+
+### Method note worth keeping
+
+The pattern that found both of this cycle's bugs: **when a path is slower than the
+competitor, ask which is true — are we doing more work, or the same work with more round
+trips?** More CPU means wasted work (Vision's endless padding); less CPU with less
+throughput means round trips per buffer (everything else). The matrix's CPU column, not
+its throughput column, is what separates the two cases.
