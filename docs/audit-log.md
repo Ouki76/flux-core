@@ -1808,7 +1808,6 @@ than one per buffer.
 
 ---
 
-## Cycle 28 — 2026-10-24
 
 ### The port race closed at the root
 
@@ -1843,3 +1842,42 @@ latency in the h2 driver, not after our framing.
 **1051 tests, 0 failed.** Shadowsocks-2022 is now −2.7 % against sing-box (from −48 % at
 the start of the audit) with 28 % less CPU; every other path is within 22 % on throughput
 and ahead on CPU.
+
+---
+
+## Cycle 29 — 2026-10-24
+
+### mKCP cannot be benchmarked end-to-end yet, and the attempt found why
+
+I tried to add a `VLESS / mKCP` row to the matrix. Xray's side runs (19 MB/s, which is
+what mKCP with `tti: 20` gives), but flux's own server cannot serve it: `carrier: kcp`
+existed only on the *outbound* side.
+
+Serving it needs every inbound to accept an already-established stream instead of binding
+its own TCP listener — every `Inbound::start` binds a `TcpListener` today. That is a
+cross-cutting change to the inbound contract, not a config detail, so it is not something
+to bolt on at the end of a cycle. The row was dropped rather than reported as a number.
+
+What landed instead: `carrier: kcp` on an inbound now parses and refuses with a sentence
+that says what works and what does not, instead of serde's untagged-enum message.
+
+**Honest state of mKCP:** the transport is implemented, the wire format is byte-exact
+against Xray 26.3.27, interop is proven **in both directions** (`tests/test_kcp_interop.rs`
+drives the real binary, including a full relay through an Xray node), and it is selectable
+as an outbound carrier. It is client-only.
+
+### Tooling truth for the next cycles
+
+`perf` cannot sample on this host at all — zero events for a busy process, with
+`CONFIG_PERF_EVENTS=y`, `perf_event_paranoid=2`, and no seccomp. It looks like a VM with
+no usable PMU. **`valgrind --tool=callgrind` works** (48.6M instruction refs collected on
+a 2 MiB transfer), so instruction-level attribution is available; that is the tool to
+reach for, together with `strace -c`, which is what found the two biggest wins so far.
+
+### State
+
+**1052 tests, 0 failed.**
+
+---
+
+## Cycle 28 — 2026-10-24
