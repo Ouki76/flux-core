@@ -714,3 +714,85 @@ mod eof_tests {
         assert_eq!(&out, b"short", "short non-vision tails must not be dropped");
     }
 }
+
+#[cfg(test)]
+mod padding_phase_guard {
+    //! The bug this guards against shipped for a long time and was invisible except in
+    //! the benchmark: Vision only left its padding phase on TLS ApplicationData, so a
+    //! non-TLS inner stream — the normal case under REALITY or TLS — was framed into
+    //! 8 KiB padded frames for the entire life of the tunnel. `strace` showed 3 691
+    //! writes of exactly 8 192 bytes per 16 MiB and this was the only path where flux
+    //! spent *more* CPU per byte than sing-box.
+
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Default)]
+    struct Counting {
+        writes: Vec<usize>,
+    }
+
+    impl AsyncWrite for Counting {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for Counting {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    const UUID: [u8; UUID_LEN] = [
+        0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55, 0x55,
+        0x55,
+    ];
+
+    /// A plain (non-TLS) payload must end the padding phase, and a 64 KiB write after
+    /// that must reach the transport as one write of the same size — not as eight
+    /// 8 KiB padded frames.
+    #[tokio::test]
+    async fn a_non_tls_payload_ends_the_padding_phase() {
+        let inner = Counting::default();
+        let mut stream = VisionStream::new(inner, UUID);
+
+        // First write ends the padding phase (a non-TLS payload). Whatever it does,
+        // the write after it must be raw pass-through.
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"start")
+            .await
+            .expect("first write");
+        let after_phase = stream.inner.writes.len();
+
+        let payload = vec![0x42u8; 64 * 1024];
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &payload)
+            .await
+            .expect("write payload");
+
+        let writes = stream.inner.writes[after_phase..].to_vec();
+        assert_eq!(
+            writes,
+            vec![payload.len()],
+            "after the padding phase, a {} byte write must reach the transport verbatim; \
+             got {writes:?} (padded frames are ≤ {MAX_CONTENT} bytes plus headers)",
+            payload.len()
+        );
+    }
+}
