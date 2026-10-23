@@ -222,6 +222,52 @@ handshake against a real rustls fallback and fails without the fix with
 
 ---
 
+## Cycle 20 — 2026-10-23
+
+### mKCP: interoperable with a real Xray node, both directions
+
+The previous cycle left this as "xray creates a session and immediately closes it",
+and I was about to go looking for a field-level difference in our segment codec. The
+thing that resolved it was the control experiment I had skipped: **xray → xray** on
+the same harness. It failed too.
+
+The harness was wrong. `freedom` with a `kcp` transport dials the *requested
+destination* over KCP — it is not a tunnel — so pairing it with a `dokodemo-door`
+inbound measures nothing. With a real pair (VLESS inbound server, VLESS outbound
+client):
+
+- **Our client → Xray server**: xray logs `firstLen = 4122` and `received request for
+  tcp:127.0.0.1:19000`; 4096 bytes come back byte-exact.
+- **Xray client → our `accept()`**: the client's payload arrives, our echo returns,
+  xray receives it.
+
+So the segment codec (u16 conv, cmd 0..3, big-endian, 18-byte DATA overhead), the ACK
+path, the ARQ and the `header-srtp` + `mkcp-original` obfuscation are byte-compatible
+with Xray 26.3.27. `tests/test_kcp_interop.rs` drives the real binary, so this cannot
+regress silently.
+
+**The lesson is the same one that cost a cycle in the REALITY work:** when a
+measurement says "the other implementation rejects us", first prove the measurement
+works by running the reference implementation against itself. I have now been bitten
+by this twice.
+
+Not yet done: `carrier: {type: kcp}` does not exist, so no user can select mKCP. The
+transport is a library module with a proven wire format and no configuration path.
+
+### Also this cycle
+
+- Environment: all builds, tests and benchmarks moved to a 24-core homelab server
+  (`cargo`/`rustc` on the workstation now refuse to run), because repeated full-suite
+  runs plus release builds plus benchmarks were making the desktop unusable.
+- `kcp::debug_parse` — parses a captured datagram into its fields. Reading foreign
+  bytes by hand was the reason two cycles went into guessing.
+
+### State
+
+**1049 tests, 0 failed.**
+
+---
+
 ## Cycle 19 — 2026-10-23
 
 ### Functional gap closed: a UDP association is a connection
