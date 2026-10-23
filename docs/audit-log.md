@@ -222,6 +222,37 @@ handshake against a real rustls fallback and fails without the fix with
 
 ---
 
+## Cycle 19 — 2026-10-23
+
+### Functional gap closed: a UDP association is a connection
+
+`dispatch_packet` registered nothing in the traffic meter, so every UDP relay — QUIC,
+DNS, WireGuard, anything through a `udp` carrier — was invisible to
+`GET /api/v1/connections`, uncounted by `flux_active_connections`, impossible to close
+with `DELETE /api/v1/connections/<id>`, and its bytes were only in the global totals
+with no way to attribute them to a client. An operator watching a bandwidth graph saw
+traffic they could not find a source for.
+
+The association now registers on entry and unregisters on every exit path, upload is
+counted where the datagram is forwarded, download inside the reply pumps (one pump per
+endpoint, so the counter is shared rather than copied), and the API's cancel signal is
+a third branch in the receive loop — closing it tears down the association and every
+endpoint behind it through the same cancellation token that stops the pumps.
+
+Two tests: the entry appears with `NetworkType::Udp`, reaches the global counter and
+disappears when the association ends; and closing it through the API ends the relay
+task — that one fails with "closing the association through the API must end the relay
+task" when the cancel branch is removed.
+
+### State
+
+**1016 tests, 0 failed.**
+
+Remaining from the functional list: mKCP and XHTTP transports, IDNA, a GeoIP test
+fixture, nested config-key typo detection, and a browser-grade TLS fingerprint.
+
+---
+
 ## Cycle 18 — 2026-10-23
 
 ### Functional gap closed: a private CA can be pinned
