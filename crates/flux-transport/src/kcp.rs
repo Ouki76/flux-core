@@ -479,6 +479,55 @@ fn encode_segment(conv: u16, seg: &Segment, out: &mut Vec<u8>) {
 /// `None` means these bytes are not a well-formed segment for `conv`: too short,
 /// a foreign conversation id, an unknown command, or a length field that runs
 /// past the datagram (which covers truncation and an inflated `len` alike).
+/// Parses a captured datagram and describes it, for diagnosing a foreign peer.
+///
+/// Exists because "our mKCP is self-consistent" proves nothing: when an Xray node
+/// refuses our traffic, the only useful evidence is what the bytes actually mean.
+/// Feed it a hex dump from a capture and it prints the header, the mask envelope and
+/// every segment field.
+#[doc(hidden)]
+pub fn debug_parse(obfs: KcpObfs, datagram: &[u8]) -> String {
+    let header_len = obfs.header_len();
+    if datagram.len() < header_len {
+        return format!("datagram of {} bytes is shorter than the {header_len}-byte header", datagram.len());
+    }
+    let header = &datagram[..header_len];
+    let Some(plain) = envelope::open(&datagram[header_len..]) else {
+        return format!(
+            "header={} — mask envelope rejected (bad hash or length); first bytes {:02x?}",
+            hex(header),
+            &datagram[header_len..datagram.len().min(header_len + 8)]
+        );
+    };
+    if plain.len() < 4 {
+        return format!("header={} envelope payload {} bytes, too short", hex(header), plain.len());
+    }
+    let conv = u16::from_be_bytes([plain[0], plain[1]]);
+    match decode_segment(conv, &plain) {
+        Some((seg, used)) => format!(
+            "header={} conv={conv} cmd={} option={} ts={} sn={} sending_next={} received_next={} \
+             data={} bytes, segment={used} bytes",
+            hex(header),
+            seg.cmd,
+            seg.option,
+            seg.ts,
+            seg.sn,
+            seg.sending_next,
+            seg.receiving_next,
+            seg.data.len()
+        ),
+        None => format!(
+            "header={} conv={conv} but the segment did not decode; raw {:02x?}",
+            hex(header),
+            &plain[2..plain.len().min(2 + 20)]
+        ),
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn decode_segment(conv: u16, buf: &[u8]) -> Option<(Segment, usize)> {
     if buf.len() < SEGMENT_PREFIX_LEN {
         return None;
@@ -1618,9 +1667,12 @@ pub async fn connect(peer: SocketAddr, cfg: KcpConfig) -> FluxResult<KcpStream> 
     hub.lock().routes.insert(conv, inbox.clone());
 
     let mut conn = Conn::new(cfg, conv, socket, Some(peer));
-    // One PING makes the conversation visible to a peer sitting in `accept`
-    // before any payload exists, and is what an Xray client does first anyway.
-    conn.send_ping(Instant::now());
+    // No opening PING: a real Xray client's first datagram is DATA, and an Xray
+    // *server* closes a session that opens with anything else — measured by
+    // capturing both sides and decoding them with this module's own parser. Our
+    // `accept()` learns the conversation from whatever arrives first, so nothing
+    // depends on the ping.
+    let _ = &mut conn;
     Ok(spawn_stream(conn, hub, key, inbox))
 }
 
