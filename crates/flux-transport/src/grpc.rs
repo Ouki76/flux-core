@@ -34,7 +34,12 @@ pub const MAX_GRPC_MESSAGE: usize = 16 * 1024 * 1024;
 /// Largest payload the proxy puts into one outbound gRPC message. Keeping this
 /// small bounds the per-write allocation and keeps a frame inside one HTTP/2
 /// flow-control window.
-const MAX_WRITE_CHUNK: usize = 16 * 1024;
+/// Largest payload placed in one gRPC message.
+///
+/// This was 16 KiB, so a 64 KiB write from the relay became four messages with four
+/// copies, four length prefixes and four flushes — the same defect that cost the
+/// WebSocket transport ~20 % until its cap was matched to the copy buffer.
+const MAX_WRITE_CHUNK: usize = 64 * 1024;
 
 /// Longest `:path` accepted on the server side. A gRPC method path is a few tens
 /// of bytes; anything larger is a probe or an attempt to grow our buffers.
