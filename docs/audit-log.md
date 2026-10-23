@@ -222,6 +222,46 @@ handshake against a real rustls fallback and fails without the fix with
 
 ---
 
+## Cycle 21 — 2026-10-23
+
+### Functional gap closed: mKCP is selectable from a config file
+
+`carrier: {type: "kcp", address: ..., header: "srtp"}` now exists, with `mtu`,
+`snd_wnd`, `rcv_wnd`, `interval_ms`, `resend` and `conv`, and `header` covering Xray's
+`none`/`srtp`/`utp`/`wechat-video`/`dtls`/`wireguard` masks. An unknown header is
+refused by name rather than silently substituted.
+
+The design point worth recording: mKCP travels over UDP but is a **stream** carrier.
+Sharing the `udp` arm of `parse_outbound_carrier` sent a KCP-carried VLESS node down
+the "UDP-native protocols" path, where it was refused with "carrier UDP currently
+supports shadowsocks, wireguard, hysteria2, tuic". It has to take the layered path
+with the KCP stream as the bottom layer, so everything above it (TLS, REALITY,
+WebSocket, the protocol) is untouched — which is the whole reason a carrier belongs at
+the bottom of the pipeline.
+
+Verified against a real Xray 26.3.27 server: a SOCKS5 client through a flux-core
+instance whose outbound is `carrier: kcp` + VLESS relays 8192 bytes through the Xray
+node byte-exact.
+
+### Test harness: a port race that had been reported as a flake four times
+
+`test_mux_interop` failed intermittently with "cannot hold the port the allocator just
+handed out". The allocator probes a port by binding and releasing; another thread in
+the same binary can take it in that window. Calling that a flake was the wrong
+response — the test's port hold now retries eight times and then fails with the same
+diagnosis, so a systematic problem still reports itself instead of being absorbed.
+Three consecutive runs of that suite are green.
+
+### State
+
+**1051 tests, 0 failed.** mKCP: interop proven in both directions against the real
+binary, and reachable from configuration. Still missing for full Xray parity: the
+`seed`/AES-GCM mask, PING/TERMINATE liveness, and Xray's `tti`/`uplinkCapacity`
+pacing (our congestion path is plain slow-start/AIMD; Xray's default is off, which
+ours matches).
+
+---
+
 ## Cycle 20 — 2026-10-23
 
 ### mKCP: interoperable with a real Xray node, both directions
