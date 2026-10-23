@@ -1635,3 +1635,53 @@ corruption. **Cycle 3 verdict (see `docs/mux-teardown-race.md`):**
 The test-infra half of this class was fixed separately: the port allocator now
 also *connects* to a candidate port, so a live listener (including one held with
 `SO_REUSEPORT`, which every flux listener sets) is skipped instead of handed out.
+
+---
+
+## Cycle 24 — 2026-10-24
+
+### The TLS and REALITY rows were never measuring TLS or REALITY
+
+`bench_tls` placed the `security` block **inside** the `carrier` object. The parser
+ignored it silently, so every row labelled TLS or REALITY was plain VLESS over TCP.
+The numbers this project has quoted — "REALITY 729 MB/s", "VLESS+TLS 660" — did not
+measure those layers at all. The deep key validation added in cycle 13 is what finally
+caught it: the harness now fails instead of measuring the wrong thing.
+
+Three fixes were needed: `security` moved to its sibling position, a self-signed
+certificate actually generated and passed to the inbound (a TLS inbound cannot start
+without one, and the old config comment claimed flux-core generated it in process), and
+an inbound `server_name` removed — that field is refused because the acceptor serves one
+certificate and never filtered by SNI.
+
+Real numbers on this host, 3 rounds x 128 MiB, byte-verified:
+
+| path | throughput | CPU | setup p50 |
+|---|---|---|---|
+| flux direct | 918 MB/s | 0.64 s/GB | 0.44 ms |
+| VLESS / TCP | 520 | 2.45 | 0.68 ms |
+| VLESS / TLS | 264 | 6.48 | 1.62 ms |
+| VLESS / REALITY | 239 | 7.47 | 2.11 ms |
+
+**REALITY costs 9 % over TLS; TLS costs 49 % over plain framing.** The record-layer
+work this project once did was optimising a layer that was never enabled in its own
+benchmark. The throughput is lost in TLS, which is where the next measurement points.
+
+`docs/reality-record-layer-report.md` now opens with the correction.
+
+### Buffer sizing: tried, no effect
+
+Raising the copier buffer from 64 KiB to 256 KiB moved Shadowsocks-2022 from 288 to
+282 MB/s — noise. Reverted rather than kept as a "probably helps".
+
+### The mux port race, finally fixed where it belongs
+
+The retry added in cycle 21 was at one call site; `start_flux` is used by every test in
+the binary and still panicked on the first `AddrInUse`. The retry is now in that shared
+helper — eight attempts, then the original diagnosis. Three consecutive suite runs are
+green where roughly one in three failed before.
+
+### State
+
+**1051 tests, 0 failed.** Performance is now within 22 % of sing-box on every matrix row
+and ahead on CPU on every row; the remaining gap is concentrated in TLS.
