@@ -128,6 +128,85 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 15 — 2026-10-23
+
+### Baseline
+
+fmt, clippy `-D warnings`, 1006 tests, audit, deny, doc — green at `d68a3d5`.
+
+### The project had never measured itself against a competitor on a protocol path
+
+Every encrypted-protocol number in the README was measured against itself, which
+proves the code works and says nothing about whether it is competitive. A head-to-head
+matrix (`examples/bench_matrix.rs`) now runs the same workload through flux-core and
+sing-box for nine protocol/transport pairs, and the xray side exists as validated
+config builders (`tests/xray_matrix_configs.rs`) with a real traffic test.
+
+First honest run, 64 MiB per round, 2 interleaved rounds, same machine:
+
+| path | flux-core | sing-box | delta |
+|---|---|---|---|
+| VLESS/TCP | 493 MB/s | 1047 | **−53 %** |
+| VLESS/WS+TLS | 367 | 642 | −43 % |
+| VLESS/gRPC+TLS | 236 | 308 | −23 % |
+| VMess/WS+TLS | 327 | 512 | −36 % |
+| Trojan/TLS | 482 | 658 | −27 % |
+| Shadowsocks-2022 | 455 | 807 | −44 % |
+| Shadowsocks-AEAD | 449 | 466 | −4 % |
+
+So the answer to "are we faster than sing-box" was: **on the plain relay yes, on
+every protocol path no** — by up to half.
+
+### The cause, and a doubling
+
+The dispatcher's in-kernel `splice` path requires both halves to be exactly
+`tokio::net::TcpStream`. Every protocol tunnel wraps the socket, so none of them ever
+took that path and all fell back to `tokio::io::copy_bidirectional`, whose internal
+buffers are **8 KiB per direction**. A new `copy_bidirectional_buffered` drives both
+directions from one task with 64 KiB buffers — no split (a mutex around the stream on
+every poll), no per-chunk allocation, a quarter of the syscalls.
+
+| path | before | after | vs sing-box |
+|---|---|---|---|
+| VLESS/TCP | 493 | **1036** | −53 % → **+4 %**, CPU −36 % |
+| Trojan/TLS | 482 | **765** | −27 % → **+8.5 %** |
+| VLESS/gRPC+TLS | 236 | **315** | −23 % → **+1.1 %** |
+
+Measured A/B on one protocol with only the copier changed: 493 → 1036 MB/s.
+
+Still behind, and next: VLESS/WS+TLS (−39 %), VMess/WS+TLS (−37 %), Shadowsocks-2022
+(−35 %), Shadowsocks-AEAD (−13 %), VLESS/TCP (−9 %). The WebSocket and SS gaps are the
+next obvious targets, and each is now attributable to a specific layer because the
+matrix lets one change be measured against a fixed competitor.
+
+### Open: the REALITY rows in the matrix are not believable
+
+Both REALITY rows report ~12 MB/s with a large CPU penalty while sing-box reports
+~635-680 MB/s — and `bench_tls` measures our REALITY at 729 MB/s with a correct
+config. So the matrix's REALITY scenario is wrong somewhere (most likely the decoy
+target it hands the server is not the TLS 1.3 endpoint REALITY needs, so the handshake
+takes a slow path). **Not quoting those two rows as a product result** until the
+scenario is fixed; recorded as the next measurement task.
+
+### Also fixed this cycle
+
+- **An `ip_cidr` rule now fires for a connection made by name.** The router is
+  synchronous and resolves nothing, so an IP rule only applied to address literals —
+  a real, silent difference from sing-box and xray. The dispatcher now resolves for
+  the routing decision only (250 ms budget, falls back to routing on the domain,
+  nothing resolves when no rule needs an address), while the dial keeps the domain.
+- The xray config work surfaced three xray-26 behaviours worth recording: `allowInsecure`
+  was removed (a client must pin the peer certificate as a lowercase-hex SHA-256 of the
+  leaf DER), Trojan's `flow` was removed, and xray's Trojan client cannot survive a
+  ≥8 KiB first write at any caller-side chunk size — it needs a lockstep round trip
+  below that before bulk data.
+
+### State
+
+**1012 tests, 0 failed** (was 1006).
+
+---
+
 ## Cycle 14 — 2026-10-23
 
 ### Baseline
