@@ -515,28 +515,35 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowsocksStream<S> {
             return Poll::Ready(Ok(0));
         }
 
-        let chunk_size = buf.len().min(MAX_PAYLOAD_LEN);
-        let plain_chunk = &buf[..chunk_size];
-        let len_bytes = ((chunk_size as u16) & 0x3FFF).to_be_bytes();
+        // Frame several chunks per call, up to the relay's copy buffer, and write
+        // them together: one chunk per call turned a 64 KiB write into four
+        // syscalls and four seals.
+        let cap = buf.len().min(64 * 1024);
+        let mut consumed = 0usize;
 
         let this = self.as_mut().get_mut();
-        // Frame and seal straight into the reusable write buffer: the length
-        // prefix and the payload share it, so there is no per-chunk allocation
-        // and the payload is never copied.
         this.write_buf.clear();
-        this.write_buf.extend_from_slice(&len_bytes);
-        this.enc
-            .encrypt_tail(&mut this.write_buf, 0)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        while consumed < cap {
+            let chunk_size = (cap - consumed).min(MAX_PAYLOAD_LEN);
+            let plain_chunk = &buf[consumed..consumed + chunk_size];
+            let len_bytes = ((chunk_size as u16) & 0x3FFF).to_be_bytes();
 
-        let payload_start = this.write_buf.len();
-        this.write_buf.extend_from_slice(plain_chunk);
-        this.enc
-            .encrypt_tail(&mut this.write_buf, payload_start)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+            let len_start = this.write_buf.len();
+            this.write_buf.extend_from_slice(&len_bytes);
+            this.enc
+                .encrypt_tail(&mut this.write_buf, len_start)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+
+            let payload_start = this.write_buf.len();
+            this.write_buf.extend_from_slice(plain_chunk);
+            this.enc
+                .encrypt_tail(&mut this.write_buf, payload_start)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            consumed += chunk_size;
+        }
 
         this.write_pos = 0;
-        this.writing_plain_size = chunk_size;
+        this.writing_plain_size = consumed;
 
         // Step 3: Write as much of the new frame to inner stream as possible
         while this.write_pos < this.write_buf.len() {

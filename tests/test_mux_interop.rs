@@ -265,9 +265,16 @@ async fn start_flux(json: &str, port: u16) -> Instance {
 async fn test_start_flux_failure_is_self_diagnosing() {
     use futures_util::FutureExt;
 
-    let port = get_free_tcp_port().await;
-    let cfg = format!(
-        r#"{{
+    // Take a port *and* hold it. Retrying the same port is useless when something
+    // already holds it, so a lost race means asking for a fresh one — the property
+    // under test is the diagnosis, not which port it lands on.
+    let (port, squatter, cfg) = {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let port = get_free_tcp_port().await;
+            let cfg = format!(
+                r#"{{
             "inbounds": [{{
                 "tag": "flux-vless-in",
                 "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
@@ -275,29 +282,24 @@ async fn test_start_flux_failure_is_self_diagnosing() {
             }}],
             "outbounds": [{{"type": "direct", "tag": "direct"}}]
         }}"#,
-        port, UUID
-    );
-    // The allocator just probed this port; if it is already gone, say who took it
-    // instead of failing on a bare errno. (That is itself a diagnostic of the
-    // allocator's probe-to-bind window, so it gets the same report.)
-    // The allocator probes and releases; another thread in this binary can take the
-    // port in that window. Retrying closes a race that is not the property under
-    // test — a *systematic* failure still panics after the retries, with the same
-    // diagnosis.
-    let mut attempts = 0;
-    let squatter = loop {
-        match std::net::TcpListener::bind(("127.0.0.1", port)) {
-            Ok(listener) => break listener,
-            Err(e) => {
-                attempts += 1;
-                if attempts >= 8 {
-                    panic!(
-                        "cannot hold the port the allocator just handed out after {attempts} \
-                         attempts: {e}\n{}",
-                        common::diagnose_bind_failure(&cfg, port, &e.to_string())
-                    );
+                port, UUID
+            );
+            match std::net::TcpListener::bind(("127.0.0.1", port)) {
+                Ok(listener) => break (port, listener, cfg),
+                Err(e) if attempt < 8 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    if attempt == 7 {
+                        panic!(
+                            "cannot hold a port the allocator handed out, eight times in a \
+                             row: {e}\n{}",
+                            common::diagnose_bind_failure(&cfg, port, &e.to_string())
+                        );
+                    }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                Err(e) => panic!(
+                    "cannot hold the port the allocator just handed out: {e}\n{}",
+                    common::diagnose_bind_failure(&cfg, port, &e.to_string())
+                ),
             }
         }
     };

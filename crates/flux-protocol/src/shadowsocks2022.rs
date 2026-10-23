@@ -248,6 +248,16 @@ pub struct Ss2022Stream<S> {
     read_pos: usize,
 }
 
+/// Ends a read: if bytes were already handed to the caller, that is a successful
+/// read even when the socket has nothing more right now.
+fn finish_read(put: usize) -> Poll<io::Result<()>> {
+    if put > 0 {
+        Poll::Ready(Ok(()))
+    } else {
+        Poll::Pending
+    }
+}
+
 impl<S> Ss2022Stream<S> {
     /// Drops consumed bytes from the front of the receive buffer.
     fn compact_chunk(&mut self) {
@@ -512,6 +522,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
             }
         }
 
+        // Bytes handed to the caller in *this* poll call. A chunk is 16 KiB and the
+        // relay reads with a 64 KiB buffer, so returning after a single chunk made
+        // the relay do four read/write cycles per buffer. Filling what the caller
+        // asked for is the difference between 4 round trips and 1.
+        let mut put = 0usize;
+
         loop {
             // 1. Drain existing decrypted plaintext
             if this.read_pos < this.read_buf.len() {
@@ -519,11 +535,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                 let to_copy = avail.min(buf.remaining());
                 buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + to_copy]);
                 this.read_pos += to_copy;
+                put += to_copy;
                 if this.read_pos == this.read_buf.len() {
                     this.read_buf.clear();
                     this.read_pos = 0;
                 }
-                return Poll::Ready(Ok(()));
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
 
             // 2. Read 18-byte encrypted chunk length (2 bytes len + 16 bytes tag)
@@ -547,7 +567,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                             this.chunk_filled += n;
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => return finish_read(put),
                     }
                 }
 
@@ -617,7 +637,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                         this.chunk_filled += n;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => return finish_read(put),
                 }
             }
 
@@ -750,33 +770,45 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Ss2022Stream<S> {
             return Poll::Pending;
         }
 
-        let chunk_size = buf.len().min(16384);
-        let plain = &buf[..chunk_size];
-
-        // Serialise and seal straight into the reusable write buffer: no
-        // per-chunk allocation and no second copy of the payload.
+        // Frame as many chunks as the caller's buffer provides, up to the size of
+        // the relay's copy buffer, and hand them to the socket in one write.
+        //
+        // One chunk per `poll_write` meant a 64 KiB write from the relay became four
+        // calls, four seals and four syscalls — the same defect that capped the
+        // WebSocket transport until its frame size matched the copy buffer.
+        let cap = buf.len().min(64 * 1024);
+        let mut consumed = 0usize;
         this.write_buf.clear();
-        this.write_buf
-            .extend_from_slice(&(chunk_size as u16).to_be_bytes());
+        while consumed < cap {
+            let chunk_size = (cap - consumed).min(16384);
+            let plain = &buf[consumed..consumed + chunk_size];
 
-        let len_nonce = this.enc_nonce;
-        increase_nonce(&mut this.enc_nonce);
-        if let Err(e) = this.enc.seal_tail(len_nonce, &mut this.write_buf, 0) {
-            return Poll::Ready(Err(io::Error::other(e.to_string())));
-        }
+            let len_start = this.write_buf.len();
+            this.write_buf
+                .extend_from_slice(&(chunk_size as u16).to_be_bytes());
+            let len_nonce = this.enc_nonce;
+            increase_nonce(&mut this.enc_nonce);
+            if let Err(e) = this
+                .enc
+                .seal_tail(len_nonce, &mut this.write_buf, len_start)
+            {
+                return Poll::Ready(Err(io::Error::other(e.to_string())));
+            }
 
-        let payload_nonce = this.enc_nonce;
-        increase_nonce(&mut this.enc_nonce);
-        let payload_start = this.write_buf.len();
-        this.write_buf.extend_from_slice(plain);
-        if let Err(e) = this
-            .enc
-            .seal_tail(payload_nonce, &mut this.write_buf, payload_start)
-        {
-            return Poll::Ready(Err(io::Error::other(e.to_string())));
+            let payload_nonce = this.enc_nonce;
+            increase_nonce(&mut this.enc_nonce);
+            let payload_start = this.write_buf.len();
+            this.write_buf.extend_from_slice(plain);
+            if let Err(e) = this
+                .enc
+                .seal_tail(payload_nonce, &mut this.write_buf, payload_start)
+            {
+                return Poll::Ready(Err(io::Error::other(e.to_string())));
+            }
+            consumed += chunk_size;
         }
         this.write_pos = 0;
-        this.writing_plain_len = chunk_size;
+        this.writing_plain_len = consumed;
 
         while this.write_pos < this.write_buf.len() {
             let n =
