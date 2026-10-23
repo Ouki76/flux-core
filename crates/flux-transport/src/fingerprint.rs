@@ -438,6 +438,95 @@ mod tests {
     }
 
     /// The exact bytes this profile puts on the wire as its first flight.
+    /// Pins what is actually emitted: the cipher order and the extension *set*.
+    ///
+    /// The extension *order* is deliberately shuffled per connection (that is the
+    /// point of the randomising profiles), so a single JA3 hash is not a stable
+    /// property of this client and pinning one would be a lie.
+    ///
+    /// **This is not a browser fingerprint, and the difference is worth stating.**
+    /// Chrome 120 emits 15 extensions with GREASE; we emit these 11, with rustls'
+    /// own ordering rolled by our shuffler:
+    /// `51-0-10-35-45-16-13-11-23-5-43`. The cipher table is Chrome's; the extension
+    /// set is rustls'. So the profiles are "closer than default", not
+    /// "browser-grade" — this test keeps the claim honest as much as it catches drift.
+    #[test]
+    fn emitted_client_hello_has_the_profile_ciphers_and_extension_set() {
+        // JA3 extension ids: 0 SNI, 5 status_request, 10 supported_groups,
+        // 11 ec_point_formats, 13 signature_algorithms, 16 ALPN, 23 session_ticket,
+        // 35 extended_master_secret, 43 supported_versions, 45 psk_key_exchange_modes,
+        // 51 key_share.
+        let want_exts = vec![0u16, 5, 10, 11, 13, 16, 23, 35, 43, 45, 51];
+        let want_ciphers: &[(&str, &[u16])] = &[
+            (
+                "chrome",
+                &[
+                    4865, 4866, 4867, 49195, 49199, 49196, 49200, 52393, 52392, 255,
+                ],
+            ),
+            (
+                "firefox",
+                &[
+                    4865, 4867, 4866, 49195, 49199, 52393, 52392, 49196, 49200, 255,
+                ],
+            ),
+            (
+                "safari",
+                &[4865, 4866, 4867, 49196, 49195, 49200, 49199, 255],
+            ),
+        ];
+
+        for (name, provider) in providers() {
+            let bytes = client_hello_bytes(provider, &[b"h2"], "example.com");
+            let hello = parse_client_hello(&bytes).expect("parse");
+
+            assert_eq!(
+                hello.cipher_suites,
+                *want_ciphers
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, c)| *c)
+                    .unwrap_or(&[]),
+                "{name}: cipher order is the fingerprint and must not drift"
+            );
+
+            let mut got_exts: Vec<u16> = hello.extensions.iter().map(|(ty, _)| *ty).collect();
+            got_exts.sort_unstable();
+            let mut want = want_exts.clone();
+            want.sort_unstable();
+            assert_eq!(got_exts, want, "{name}: extension set changed");
+        }
+    }
+
+    /// The profiles exist to make two connections look different from each other.
+    /// If the order were fixed, that purpose would be silently lost.
+    #[test]
+    fn the_extension_order_is_shuffled_between_connections() {
+        let provider = create_chrome_provider();
+        let order = |p: CryptoProvider| {
+            let bytes = client_hello_bytes(p, &[b"h2"], "example.com");
+            parse_client_hello(&bytes)
+                .expect("parse")
+                .extensions
+                .iter()
+                .map(|(ty, _)| *ty)
+                .collect::<Vec<_>>()
+        };
+        let first = order(create_chrome_provider());
+        let mut differs = false;
+        for _ in 0..8 {
+            if order(create_chrome_provider()) != first {
+                differs = true;
+                break;
+            }
+        }
+        let _ = provider;
+        assert!(
+            differs,
+            "extension order never changed across connections — the shuffle is not happening"
+        );
+    }
+
     fn client_hello_bytes(provider: CryptoProvider, alpn: &[&[u8]], name: &'static str) -> Vec<u8> {
         let cfg = build_client_config(provider, alpn);
         let name = ServerName::try_from(name).expect("valid server name");
