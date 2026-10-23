@@ -208,6 +208,58 @@ fn read_cpu_secs(pid: u32) -> Option<f64> {
     Some((utime + stime) as f64 / 100.0)
 }
 
+/// Kernel-visible state of a possibly-stuck process: overall state, what each
+/// thread is waiting in, and how much CPU it has burned.
+fn process_snapshot(pid: u32) -> Option<String> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let state = status
+        .lines()
+        .find(|l| l.starts_with("State:"))
+        .unwrap_or("State: ?")
+        .trim()
+        .to_string();
+    let threads: usize = status
+        .lines()
+        .find(|l| l.starts_with("Threads:"))
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let cpu = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            let fields: Vec<&str> = s.rsplit(')').next()?.split_whitespace().collect();
+            // utime/stime are fields 14/15 of the full line; after the comm split
+            // they are 11/12 of the remainder.
+            let utime: u64 = fields.get(11)?.parse().ok()?;
+            let stime: u64 = fields.get(12)?.parse().ok()?;
+            Some(utime + stime)
+        })
+        .unwrap_or(0);
+    let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan"))
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut waits: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/task")) {
+        for entry in rd.flatten().take(6) {
+            let tid = entry.file_name();
+            let s =
+                std::fs::read_to_string(format!("/proc/{pid}/task/{}/stat", tid.to_string_lossy()))
+                    .ok()
+                    .and_then(|line| line.rsplit(')').next().map(|r| r.trim().chars().next()))
+                    .flatten();
+            if let Some(s) = s {
+                waits.push(format!("{}({s})", tid.to_string_lossy()));
+            }
+        }
+    }
+    Some(format!(
+        "{state}; threads={threads}; cpu_ticks={cpu}; wchan={}; task states: {}",
+        if wchan.is_empty() { "-" } else { &wchan },
+        waits.join(" ")
+    ))
+}
+
 struct ProxyProc {
     child: Child,
     pid: u32,
@@ -332,6 +384,16 @@ impl Tunnel {
     }
 
     fn why(&self, ctx: &str) -> String {
+        // A hang is the one failure whose cause cannot be read from a log: the
+        // process is still alive, just not moving. Dump what the kernel knows about
+        // it (state, wait channel, per-thread state) so the next occurrence is
+        // attributable instead of being called a flake.
+        let mut stalls = String::new();
+        for (label, proc) in [("server", &self.server), ("client", &self.client)] {
+            if let Some(snap) = process_snapshot(proc.pid) {
+                stalls.push_str(&format!("\n  {label} pid={}: {snap}", proc.pid));
+            }
+        }
         let s = self.server.log_tail();
         let c = self.client.log_tail();
         let mut detail = String::new();
@@ -343,6 +405,9 @@ impl Tunnel {
                 detail.push_str("; ");
             }
             detail.push_str(&format!("client: {c}"));
+        }
+        if !stalls.is_empty() {
+            detail.push_str(&stalls);
         }
         if detail.is_empty() {
             format!("{ctx}: no diagnostic output")
