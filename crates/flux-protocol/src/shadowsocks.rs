@@ -424,7 +424,9 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                             let raw_len = u16::from_be_bytes([dec_len[0], dec_len[1]]);
                             self.payload_len = (raw_len & 0x3FFF) as usize;
                             let target_len = self.payload_len + TAG_LEN;
-                            self.payload_buf.resize(target_len, 0);
+                            if self.payload_buf.len() < target_len {
+                                self.payload_buf.resize(target_len, 0);
+                            }
                             self.len_pos = 0;
                             self.payload_pos = 0;
                         }

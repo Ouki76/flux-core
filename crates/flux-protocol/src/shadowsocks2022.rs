@@ -551,7 +551,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                 };
                 this.payload_len = plain_len;
                 let total_payload_enc = this.payload_len + 16;
-                this.payload_buf.resize(total_payload_enc, 0);
+                // `resize` zeroes the *whole* new length even when the buffer is
+                // already large enough, so this wrote 16 KiB of zeros per 16 KiB
+                // chunk. Only grow.
+                if this.payload_buf.len() < total_payload_enc {
+                    this.payload_buf.resize(total_payload_enc, 0);
+                }
                 this.payload_pos = 0;
                 this.len_pos = 0;
             }
