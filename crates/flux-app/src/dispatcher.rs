@@ -166,6 +166,55 @@ impl DefaultDispatcher {
         std::borrow::Cow::Borrowed(meta)
     }
 
+    /// Metadata to *route* with, which may differ from the metadata to *dial* with.
+    ///
+    /// A rule that decides on the destination's address (`ip_cidr`, `geoip`, or a
+    /// rule set containing CIDRs) can only fire for a domain if the name is
+    /// resolved first. Competitors resolve by default and let a rule opt out with
+    /// `no-resolve`; here the router is synchronous and has no resolver, so the
+    /// dispatcher asks whether any rule needs an address and resolves for the
+    /// routing decision only — the dial keeps the domain, so the outbound still
+    /// does its own resolution and SNI as before.
+    ///
+    /// A resolution failure is never fatal: routing falls back to the domain, which
+    /// is exactly the behaviour that existed before this was added.
+    async fn route_meta<'m>(
+        &self,
+        meta: &'m flux_types::SessionMeta,
+    ) -> std::borrow::Cow<'m, flux_types::SessionMeta> {
+        use flux_types::TargetAddress;
+        if !matches!(meta.destination, TargetAddress::Domain(..)) {
+            return std::borrow::Cow::Borrowed(meta);
+        }
+        if !self.router.needs_resolved_destination() {
+            return std::borrow::Cow::Borrowed(meta);
+        }
+        let Some(resolver) = &self.resolver else {
+            return std::borrow::Cow::Borrowed(meta);
+        };
+        match tokio::time::timeout(DNS_ROUTE_TIMEOUT, resolver.resolve(&meta.destination)).await {
+            Ok(Ok(addr)) => {
+                let mut resolved = meta.clone();
+                resolved.destination = TargetAddress::Ip(addr);
+                std::borrow::Cow::Owned(resolved)
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    "routing {} without an address: resolution failed ({e})",
+                    meta.destination
+                );
+                std::borrow::Cow::Borrowed(meta)
+            }
+            Err(_) => {
+                debug!(
+                    "routing {} without an address: resolution timed out after {:?}",
+                    meta.destination, DNS_ROUTE_TIMEOUT
+                );
+                std::borrow::Cow::Borrowed(meta)
+            }
+        }
+    }
+
     fn get_outbound(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
         self.outbounds.get(tag)
     }
@@ -198,7 +247,8 @@ impl DefaultDispatcher {
                 let mut pkt_meta = meta.clone();
                 pkt_meta.destination = destination.clone();
                 let effective_meta = self.resolve_effective_meta(&pkt_meta);
-                let tag: Arc<str> = self.router.route(&effective_meta).into();
+                let routing_meta = self.route_meta(&effective_meta).await;
+                let tag: Arc<str> = self.router.route(&routing_meta).into();
                 let dest = effective_meta.destination.clone();
                 if route_cache.len() >= MAX_ROUTE_CACHE_ENTRIES {
                     // Evict a single arbitrary entry instead of flushing the whole
@@ -343,11 +393,17 @@ impl DefaultDispatcher {
     }
 }
 
+/// Budget for the address lookup that routing may need. Short on purpose: a slow
+/// resolver must not add its latency to every connection, and routing without an
+/// address is always a valid fallback.
+const DNS_ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
 #[async_trait]
 impl Dispatcher for DefaultDispatcher {
     async fn dial_outbound(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
         let effective_meta = self.resolve_effective_meta(meta);
-        let outbound_tag = self.router.route(&effective_meta);
+        let routing_meta = self.route_meta(&effective_meta).await;
+        let outbound_tag = self.router.route(&routing_meta);
         debug!(
             "[{}] Routing stream {} -> {} (orig: {}) via [{}]",
             meta.inbound_tag,

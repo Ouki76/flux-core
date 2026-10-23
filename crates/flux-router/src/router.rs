@@ -262,6 +262,21 @@ impl Router {
         }
     }
 
+    /// True when some rule decides on the destination's **address**, so a domain
+    /// destination has to be resolved before routing for that rule to be able to
+    /// fire.
+    ///
+    /// Competitors resolve by default (unless a rule says `no-resolve`); this
+    /// router deliberately does not resolve on its own, because it is synchronous
+    /// and has no resolver. The dispatcher asks this question and resolves when the
+    /// answer is yes, which keeps the decision where the async I/O lives.
+    pub fn needs_resolved_destination(&self) -> bool {
+        self.ip_rules.iter().any(|&idx| {
+            let rule = &self.rules[idx];
+            !rule.ip_cidrs.is_empty() || !rule.geoip.is_empty() || !rule.rule_set.is_empty()
+        })
+    }
+
     pub fn default_outbound(&self) -> &str {
         &self.default_outbound
     }
