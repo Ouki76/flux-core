@@ -179,14 +179,29 @@ Still behind, and next: VLESS/WS+TLS (−39 %), VMess/WS+TLS (−37 %), Shadowso
 next obvious targets, and each is now attributable to a specific layer because the
 matrix lets one change be measured against a fixed competitor.
 
-### Open: the REALITY rows in the matrix are not believable
+### The REALITY rows: not a bad scenario — a 5-second defect per connection
 
-Both REALITY rows report ~12 MB/s with a large CPU penalty while sing-box reports
-~635-680 MB/s — and `bench_tls` measures our REALITY at 729 MB/s with a correct
-config. So the matrix's REALITY scenario is wrong somewhere (most likely the decoy
-target it hands the server is not the TLS 1.3 endpoint REALITY needs, so the handshake
-takes a slow path). **Not quoting those two rows as a product result** until the
-scenario is fixed; recorded as the next measurement task.
+The first matrix run reported REALITY at ~12 MB/s with a large CPU penalty while
+sing-box reported ~635-680 MB/s. I initially recorded this as a suspect scenario and
+refused to quote it, which was right, and the follow-up found something better: the
+harness now separates tunnel setup from bulk, and setup was **5002 ms** against
+sing-box's 1.6 ms with bulk a healthy ~510 MB/s.
+
+`probe_target_handshake` replays the client's ClientHello at the fallback and reads
+the target's TLS flight to mirror its record framing, with a 5 s deadline and a break
+condition that counts records. A **rustls** target (i.e. another flux node) sends a
+flight that does not match that count, so the loop waited out the full deadline on
+**every new connection**. OpenSSL and Go fallbacks happen to match, which is why the
+defect was invisible. Confirmed server-side and fallback-dependent: openssl
+`s_server` 6 ms, Go TLS 7 ms, rustls **5002 ms**; a sing-box *client* against a flux
+REALITY server with a rustls fallback also waited 5008 ms.
+
+Fixed by giving every read after the ServerHello a 100 ms idle window instead of the
+global deadline, and by caching the probe per fallback target for 60 s (the framing is
+a property of the target's TLS stack, not of the connection). Measured: setup
+**5002 → 0.7 ms**, end-to-end 37 → **538 MB/s**. The regression test runs a full
+handshake against a real rustls fallback and fails without the fix with
+`took 5.006264812s`.
 
 ### Also fixed this cycle
 
@@ -203,7 +218,48 @@ scenario is fixed; recorded as the next measurement task.
 
 ### State
 
-**1012 tests, 0 failed** (was 1006).
+**1013 tests, 0 failed** (was 1006).
+
+---
+
+## Cycle 16 — 2026-10-23
+
+### Final matrix (5 interleaved rounds × 200 MiB, quiet window)
+
+| path | flux bulk | sing-box bulk | throughput | CPU |
+|---|---|---|---|---|
+| VLESS / TCP | 1063 | 1186 | −10.4 % | **−28.0 %** |
+| Trojan / TLS | **769** | 743 | **+3.5 %** | **−25.4 %** |
+| VLESS / gRPC + TLS | 302 | 322 | −6.4 % | **−18.2 %** |
+| VLESS / REALITY | 539 | 728 | −26.0 % | +16.8 % |
+| Shadowsocks-AEAD | 428 | 499 | −14.2 % | +23.0 % |
+| Shadowsocks-2022 | 483 | 956 | −49.5 % | +67.8 % |
+| VLESS / WS + TLS | 421 | 710 | −40.7 % | +34.2 % |
+| VMess / WS + TLS | 316 | 502 | −37.0 % | +21.0 % |
+| VLESS / REALITY + Vision | 226 | 727 | −68.9 % | +194.3 % |
+
+Where we stand: parity or a win on the three TCP-ish paths, and behind on WebSocket,
+Shadowsocks-2022 and REALITY. Every row is now attributable to a layer rather than to
+"the proxy is slow", which is the point of having the matrix.
+
+Two rows carry a caveat the table cannot: **Vision is not like-for-like** — sing-box
+does not implement the Vision flow and ignores the field, so its 727 there is plain
+REALITY; the competitor for that row is xray. And above ~1.2 GB/s the harness's own
+echo is within 2× of the ceiling, so −6 % and +3.5 % mean "no measurable difference".
+
+### Vision: two real costs, and one row that only moves with TLS payloads
+
+`padding_len` drew from `rand::rngs::OsRng` — a `getrandom()` syscall **per frame**,
+i.e. one per 8 KiB of payload — and each frame allocated a fresh `Vec`. Both fixed
+(a per-thread CSPRNG seeded once; a reused scratch buffer). The write side also now
+mirrors the read side, which already had Xray's `switchToDirectCopy`: after the END
+frame the peer is in raw mode, so further framing would corrupt the stream, not just
+slow it. That path does not show in the benchmark because the payload is not TLS and
+the switch never triggers — with real TLS traffic it removes framing entirely.
+
+### State
+
+**1013 tests, 0 failed.**
 
 ---
 
