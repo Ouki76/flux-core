@@ -378,6 +378,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
             }
         }
 
+        // Fill what the caller asked for: the relay reads with a 64 KiB buffer and a
+        // chunk here is 16 KiB, so returning after one chunk made every buffer four
+        // separate read cycles.
+        let mut put = 0usize;
+
         loop {
             // Step 2: If we have decrypted chunk data, drain it into buf
             if self.chunk_pos < self.chunk_data.len() {
@@ -386,11 +391,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                 if to_write > 0 {
                     buf.put_slice(&self.chunk_data[self.chunk_pos..self.chunk_pos + to_write]);
                     self.chunk_pos += to_write;
+                    put += to_write;
                     if self.chunk_pos == self.chunk_data.len() {
                         self.chunk_data.clear();
                         self.chunk_pos = 0;
                     }
-                    return Poll::Ready(Ok(()));
+                    if buf.remaining() == 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    continue;
                 }
             }
 
@@ -433,7 +442,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                         continue;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        return if put > 0 {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        };
+                    }
                 }
             }
 
@@ -472,7 +487,13 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                         continue;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        return if put > 0 {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        };
+                    }
                 }
             }
         }
