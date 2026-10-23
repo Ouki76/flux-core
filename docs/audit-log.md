@@ -1768,3 +1768,40 @@ says the next attempt must attack latency per message, not bytes per message.
 
 **1051 tests, 0 failed.** Matrix standing: ahead of xray on 4 of 8 paths, ahead of both
 on CPU nearly everywhere, behind on gRPC (both) and Vision (not like-for-like).
+
+---
+
+## Cycle 27 — 2026-10-24
+
+### Shadowsocks-2022: from half the competitor to within 3 %
+
+The pattern behind several earlier null results finally named itself: our proxy is
+CPU-cheap and throughput-poor on every path that frames data, which means it is bound by
+the *number of read/write cycles*, not by bytes or compute. The relay writes and reads in
+64 KiB units; Shadowsocks was taking one 16 KiB chunk per call in both directions, so
+every buffer became four frames, four seals and four syscalls.
+
+| | at audit start | cycle 23 | now |
+|---|---|---|---|
+| Shadowsocks-2022 | −48 % | −23.5 % | **−2.7 %** |
+| CPU vs sing-box | +68 % | −5 % | **−28 %** |
+
+Both halves were fixed: writes frame up to 64 KiB into one buffer and hand it to the
+socket once; reads keep decrypting while the caller's buffer has room, and
+`finish_read` returns `Pending` only when nothing was delivered so bytes are never
+stranded mid-call.
+
+Shadowsocks-AEAD got the same write change but **no claim is made**: six solo rounds
+spread 182-253 MB/s and the interleaved comparison read −17 %. Noise, not evidence.
+
+### The port race, for the last time
+
+Eight retries on the *same* port cannot help when something holds it. The test now asks
+the allocator for a fresh port per attempt; four consecutive suite runs are green.
+
+### Next
+
+The same "cycles, not bytes" measurement applies to gRPC — the one path where both
+competitors beat us — and to VMess/WS. gRPC spends 14.5 s/GiB against sing-box's 33 and
+still loses on throughput, which is the signature of one round trip per message rather
+than one per buffer.
