@@ -106,6 +106,47 @@ fn client_connector_cache() -> &'static parking_lot::Mutex<HashMap<ConnectorKey,
     CACHE.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
 }
 
+/// Appends the certificates in `paths` to `store`, returning a configuration error
+/// that names the file when one is unreadable, malformed or empty.
+///
+/// Shared by the stream TLS client and the QUIC clients so a private CA behaves the
+/// same on both, and so neither can silently fall back to the public roots.
+pub fn add_ca_certs(store: &mut RootCertStore, paths: &[std::path::PathBuf]) -> FluxResult<()> {
+    for path in paths {
+        let pem = std::fs::read(path).map_err(|e| {
+            FluxError::Config(format!(
+                "cannot read tls ca_cert_path '{}': {e}",
+                path.display()
+            ))
+        })?;
+        let pems = pem::parse_many(&pem).map_err(|e| {
+            FluxError::Config(format!(
+                "tls ca_cert_path '{}' is not valid PEM: {e}",
+                path.display()
+            ))
+        })?;
+        let mut added = 0usize;
+        for p in pems {
+            store
+                .add(CertificateDer::from(p.into_contents()))
+                .map_err(|e| {
+                    FluxError::Config(format!(
+                        "tls ca_cert_path '{}' contains an unusable certificate: {e}",
+                        path.display()
+                    ))
+                })?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(FluxError::Config(format!(
+                "tls ca_cert_path '{}' contains no certificates",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct TlsTransport;
 
 impl TlsTransport {
@@ -157,37 +198,7 @@ impl TlsTransport {
 
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        for path in &cfg.ca_certs {
-            let pem = std::fs::read(path).map_err(|e| {
-                FluxError::Config(format!(
-                    "cannot read tls ca_cert_path '{}': {e}",
-                    path.display()
-                ))
-            })?;
-            let pems = pem::parse_many(&pem).map_err(|e| {
-                FluxError::Config(format!(
-                    "tls ca_cert_path '{}' is not valid PEM: {e}",
-                    path.display()
-                ))
-            })?;
-            let mut added = 0usize;
-            for p in pems {
-                let der = CertificateDer::from(p.into_contents());
-                root_store.add(der).map_err(|e| {
-                    FluxError::Config(format!(
-                        "tls ca_cert_path '{}' contains an unusable certificate: {e}",
-                        path.display()
-                    ))
-                })?;
-                added += 1;
-            }
-            if added == 0 {
-                return Err(FluxError::Config(format!(
-                    "tls ca_cert_path '{}' contains no certificates",
-                    path.display()
-                )));
-            }
-        }
+        add_ca_certs(&mut root_store, &cfg.ca_certs)?;
 
         let client_config = if cfg.insecure {
             ClientConfig::builder_with_provider(Arc::new(provider))

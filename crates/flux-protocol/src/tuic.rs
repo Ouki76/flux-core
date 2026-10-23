@@ -55,6 +55,9 @@ pub struct TuicV5Config {
     pub zero_rtt: bool,
     #[serde(default)]
     pub insecure: bool,
+    /// Extra trust anchors (PEM paths) pinned on top of the built-in roots.
+    #[serde(skip)]
+    pub ca_certs: Vec<std::path::PathBuf>,
     #[serde(default)]
     pub server_name: Option<String>,
     /// ALPN protocols for the QUIC TLS handshake (default: ["tuic", "tuic-v5", "h3"]).

@@ -22,6 +22,9 @@ pub struct Hysteria2Config {
     pub hop_interval_secs: u64,
     #[serde(default)]
     pub insecure: bool,
+    /// Extra trust anchors (PEM paths) pinned on top of the built-in roots.
+    #[serde(skip)]
+    pub ca_certs: Vec<std::path::PathBuf>,
     #[serde(default)]
     pub server_name: Option<String>,
     #[serde(default)]

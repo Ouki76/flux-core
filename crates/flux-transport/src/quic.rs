@@ -55,9 +55,14 @@ pub struct QuicTransport;
 
 impl QuicTransport {
     /// Builds the shared QUIC client configuration (TLS + transport params).
-    fn build_client_config(alpn: Vec<Vec<u8>>, insecure: bool) -> FluxResult<quinn::ClientConfig> {
+    fn build_client_config(
+        alpn: Vec<Vec<u8>>,
+        insecure: bool,
+        ca_certs: &[std::path::PathBuf],
+    ) -> FluxResult<quinn::ClientConfig> {
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        crate::tls::add_ca_certs(&mut root_store, ca_certs)?;
 
         let crypto = if insecure {
             ClientConfig::builder()
@@ -102,7 +107,17 @@ impl QuicTransport {
         alpn: Vec<Vec<u8>>,
         insecure: bool,
     ) -> FluxResult<quinn::Endpoint> {
-        let client_cfg = Self::build_client_config(alpn, insecure)?;
+        Self::create_client_endpoint_with_ca(is_ipv6, alpn, insecure, &[])
+    }
+
+    /// Same as [`Self::create_client_endpoint`], with extra trust anchors pinned.
+    pub fn create_client_endpoint_with_ca(
+        is_ipv6: bool,
+        alpn: Vec<Vec<u8>>,
+        insecure: bool,
+        ca_certs: &[std::path::PathBuf],
+    ) -> FluxResult<quinn::Endpoint> {
+        let client_cfg = Self::build_client_config(alpn, insecure, ca_certs)?;
         let bind_addr = if is_ipv6 {
             SocketAddr::from(([0; 16], 0))
         } else {
@@ -121,7 +136,7 @@ impl QuicTransport {
         insecure: bool,
         obfs_password: &str,
     ) -> FluxResult<quinn::Endpoint> {
-        let client_cfg = Self::build_client_config(alpn, insecure)?;
+        let client_cfg = Self::build_client_config(alpn, insecure, &[])?;
         let bind_addr = if is_ipv6 {
             SocketAddr::from(([0; 16], 0))
         } else {

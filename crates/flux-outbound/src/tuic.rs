@@ -97,10 +97,11 @@ impl TuicOutbound {
                 .clone()
                 .map(|v| v.into_iter().map(|s| s.into_bytes()).collect())
                 .unwrap_or_else(|| vec![b"tuic".to_vec(), b"tuic-v5".to_vec(), b"h3".to_vec()]);
-            let ep = QuicTransport::create_client_endpoint(
+            let ep = QuicTransport::create_client_endpoint_with_ca(
                 peer_addr.is_ipv6(),
                 alpn,
                 self.config.insecure,
+                &self.config.ca_certs,
             )?;
             *ep_guard = Some(ep.clone());
             ep
@@ -292,6 +293,7 @@ mod tests {
             congestion_control: "bbr".into(),
             zero_rtt: false,
             insecure: false,
+            ca_certs: vec![],
             server_name: None,
             alpn: None,
         };

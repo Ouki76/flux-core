@@ -123,10 +123,11 @@ impl Hysteria2Outbound {
                     obfs_pwd,
                 )?
             } else {
-                QuicTransport::create_client_endpoint(
+                QuicTransport::create_client_endpoint_with_ca(
                     peer_addr.is_ipv6(),
                     alpn,
                     self.config.insecure,
+                    &self.config.ca_certs,
                 )?
             };
             *ep_guard = Some(ep.clone());
@@ -306,6 +307,7 @@ mod tests {
             down_mbps: 100,
             hop_interval_secs: 30,
             insecure: false,
+            ca_certs: vec![],
             server_name: None,
             obfs: None,
             alpn: None,
