@@ -2015,3 +2015,39 @@ deferred rather than rushed.
 1052 tests, 0 failed. The "one framing unit per poll" defect has now been found and fixed
 in **six** places: WebSocket, Shadowsocks-2022, Shadowsocks-AEAD, REALITY, Vision (as
 endless padding) and VMess. It is the single most repeated bug in this codebase.
+
+---
+
+## Cycle 34 — 2026-10-24
+
+### GeoIP: the gap that made a whole rule type untested
+
+The matcher had no fixture, so a `geoip` rule could have matched nothing — or everything —
+and the suite would not have noticed. MaxMind's published test database (CC0, 18 KiB) is
+now in the repo and seven tests cover it, including the two cases that matter:
+
+- a `geoip` rule matches a GB address against the loaded database and rejects a US one;
+- **with no database loaded the rule matches nothing**, rather than falling through to
+  "match".
+
+`81.2.69.142 → GB`, `216.160.83.56 → US`, `89.160.20.128 → SE`, `2.125.160.216 → GB`.
+
+### Cycle 35 — fingerprints: what they are, and what they are not
+
+The profiles were called uTLS-style with nothing pinning their output. Measured:
+
+- cipher table: Chrome's, in Chrome's order;
+- extension set: rustls' — 11 extensions against Chrome 120's 15, **no GREASE**;
+- extension order: **shuffled per connection** on purpose, so one JA3 hash is not a stable
+  property of this client.
+
+Two tests now pin the cipher order and extension set per profile, and prove the order
+really does differ between connections. The doc comment puts Chrome's real JA3 next to
+ours. Verdict: **"closer than default", not "browser-grade"** — parity needs an
+arbitrary ClientHello, which rustls does not permit.
+
+### State
+
+**1061 tests, 0 failed.** Functional gaps closed this audit: mKCP (client, interop proven),
+IDNA, private-CA knob, UDP associations, nested-key typo detection, GeoIP fixture. Still
+open: XHTTP, mKCP server side, browser-grade ClientHello.
