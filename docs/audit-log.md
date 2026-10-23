@@ -222,6 +222,56 @@ handshake against a real rustls fallback and fails without the fix with
 
 ---
 
+## Cycle 22 — 2026-10-23
+
+### The matrix now has three columns
+
+xray is the closest competitor in the protocol space and had never been measured at
+all. Its column is wired from `tests/xray_matrix_configs.rs` — the builders proven by a
+test that runs the real binary — included by path so the benchmark cannot drift from a
+configuration somebody has actually verified.
+
+| path | flux | sing-box | xray |
+|---|---|---|---|
+| VLESS / TCP | 454 | 488 | **544** |
+| VLESS / WS + TLS | 199 | 272 | 90 |
+| VLESS / gRPC + TLS | 86 | 100 | **151** |
+| VLESS / REALITY | 156 | **279** | 215 |
+| REALITY + Vision | 91 | **273** | 217 |
+| VMess / WS | 133 | **174** | 146 |
+| Trojan / TLS | 220 | **269** | n/a (see below) |
+| Shadowsocks-2022 | 155 | **320** | 245 |
+| Shadowsocks-AEAD | 129 | **234** | no equivalent |
+
+**These absolutes are not comparable with the earlier desktop numbers** (VLESS/TCP was
+1063 there, 454 here for both stacks alike): different machine, different per-core
+performance. Only comparisons within a run mean anything, and the harness must be run
+on one machine for a published table.
+
+What the three columns actually say: xray is the fastest at raw stream throughput
+(gRPC, VLESS/TCP) and the slowest at WebSocket by a wide margin; sing-box leads every
+row that involves its TLS stack; we lead nothing on this machine, and lead WebSocket by
+2x over xray.
+
+### Turning on the column found three broken benchmark configs
+
+The harness's own configs carried fields that **this project's deep key validation
+refuses** — the same silently-ignored class found in the interop tests: `"host"`
+instead of `"headers"` in outbound WebSocket framing, and `"service_name"` on an
+*inbound* gRPC framing, which has no such option. They had been accepted and dropped,
+so those rows were not measuring what their configs said.
+
+### Open
+
+- **Trojan/xray fails its warm-up**: xray's Trojan client cannot survive a first write
+  of ≥8 KiB (documented by the audit that produced those configs) and the harness
+  pushes 4 MiB at once. Needs the same sub-8 KiB prime the interop test uses.
+- Our Shadowsocks rows are the largest gap (−48 % and −45 %). The cipher is not the
+  limit (this host's AES-128-GCM does 5.9 GB/s); it needs a profiler, which this
+  machine does not have (`perf` absent).
+
+---
+
 ## Cycle 21 — 2026-10-23
 
 ### Functional gap closed: mKCP is selectable from a config file
