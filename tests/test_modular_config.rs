@@ -380,3 +380,76 @@ async fn an_inbound_tls_server_name_is_refused() {
         .expect_err("an ignored server_name must be refused");
     assert!(err.contains("server_name"), "got: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// A key the schema does not know must be refused at any depth
+// ---------------------------------------------------------------------------
+
+/// `deny_unknown_fields` cannot be applied to serde's internally-tagged enums, so a
+/// typo *inside* a node used to be accepted and simply ignored — the configuration
+/// then did something other than what it said.
+#[test]
+fn an_unknown_key_inside_a_node_is_refused() {
+    let json = r#"{
+        "inbounds": [{
+            "tag": "in",
+            "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": 18099, "lissten": "x" },
+            "protocol": { "type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811" }
+        }],
+        "outbounds": [{ "type": "direct", "tag": "d" }]
+    }"#;
+    let err = flux_app::Config::from_json_str(json).expect_err("a typo must be refused");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("lissten"),
+        "the error must name the key: {msg}"
+    );
+    assert!(
+        msg.contains("config.inbounds[0].carrier"),
+        "the error must give the path: {msg}"
+    );
+    assert!(
+        msg.contains("listen_port"),
+        "the error must list what is accepted: {msg}"
+    );
+}
+
+#[test]
+fn an_unknown_key_deep_inside_a_protocol_block_is_refused() {
+    let json = r#"{
+        "outbounds": [{
+            "tag": "o",
+            "carrier": { "type": "tcp", "address": "127.0.0.1:443" },
+            "protocol": { "type": "trojan", "password": "pw", "pasword": "typo" }
+        }]
+    }"#;
+    let err = flux_app::Config::from_json_str(json).expect_err("a typo must be refused");
+    let msg = format!("{err}");
+    assert!(msg.contains("pasword"), "{msg}");
+    assert!(msg.contains("password"), "must list the real field: {msg}");
+}
+
+/// The YAML path runs the same check, because both are converted to the same value.
+#[test]
+fn an_unknown_key_is_refused_in_yaml_too() {
+    let yaml = r#"
+inbounds:
+  - tag: in
+    carrier: { type: tcp, listen: 127.0.0.1, listen_port: 18098, framin: ws }
+    protocol: { type: vless, uuid: "b831381d-6324-4d53-ad4f-8cda48b30811" }
+outbounds:
+  - { type: direct, tag: d }
+"#;
+    let err = flux_app::Config::from_yaml_str(yaml).expect_err("a typo must be refused");
+    assert!(format!("{err}").contains("framin"), "{err}");
+}
+
+/// And the alias a real config uses must not be mistaken for a typo.
+#[test]
+fn the_include_alias_is_not_a_typo() {
+    let json = r#"{ "$include": [], "outbounds": [{ "type": "direct", "tag": "d" }] }"#;
+    assert!(
+        flux_app::Config::from_json_str(json).is_ok(),
+        "$include is an accepted alias, not an unknown key"
+    );
+}

@@ -367,7 +367,9 @@ async fn start_h2_inbound() -> H2Endpoint {
         "inbounds": [{
             "tag": "h2-conformance-in",
             "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": port },
-            "framing": { "type": "h2", "path": "/" },
+            // Inbound h2 framing has no `path`: the client's `:path` is accepted as
+            // it arrives, so a `path` here was silently ignored (and now refused).
+            "framing": { "type": "h2" },
             "protocol": { "type": "vless", "uuid": UUID }
         }],
         "outbounds": [{ "type": "direct", "tag": "direct" }]
@@ -414,7 +416,9 @@ async fn h2_inbound_tunnel_roundtrip() {
         "outbounds": [{
             "tag": "h2-client",
             "carrier": { "type": "tcp", "address": format!("127.0.0.1:{}", server.port) },
-            "framing": { "type": "h2", "path": "/" },
+            // Inbound h2 framing has no `path`: the client's `:path` is accepted as
+            // it arrives, so a `path` here was silently ignored (and now refused).
+            "framing": { "type": "h2" },
             "protocol": { "type": "vless", "uuid": UUID }
         }]
     })

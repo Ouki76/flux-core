@@ -1654,7 +1654,7 @@ async fn test_interop_trojan_websocket_both_directions() {
             "outbounds": [{{
                 "tag": "sbox-trojan-ws-node",
                 "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
-                "framing": {{ "type": "websocket", "path": "/trojan-ws", "host": "127.0.0.1" }},
+                "framing": {{ "type": "websocket", "path": "/trojan-ws", "headers": {{ "Host": "127.0.0.1" }} }},
                 "protocol": {{ "type": "trojan", "password": "{}" }}
             }}]
         }}"#,
@@ -1778,7 +1778,7 @@ async fn test_interop_vless_websocket_both_directions() {
             "outbounds": [{{
                 "tag": "sbox-vless-ws-node",
                 "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
-                "framing": {{ "type": "websocket", "path": "/vless-ws", "host": "127.0.0.1" }},
+                "framing": {{ "type": "websocket", "path": "/vless-ws", "headers": {{ "Host": "127.0.0.1" }} }},
                 "protocol": {{ "type": "vless", "uuid": "{}" }}
             }}]
         }}"#,
@@ -2205,7 +2205,7 @@ async fn test_interop_vless_grpc_both_directions() {
                     "certificate_path": "{}",
                     "key_path": "{}"
                 }},
-                "framing": {{ "type": "grpc", "service_name": "vless-grpc-tunnel" }},
+                "framing": {{ "type": "grpc" }},
                 "protocol": {{ "type": "vless", "uuid": "{}" }}
             }}],
             "outbounds": [{{"type": "direct", "tag": "direct"}}]
@@ -2337,7 +2337,7 @@ async fn test_interop_trojan_grpc_both_directions() {
             "inbounds": [{{
                 "tag": "flux-trojan-grpc-in",
                 "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {} }},
-                "framing": {{ "type": "grpc", "service_name": "trojan-grpc-tunnel" }},
+                "framing": {{ "type": "grpc" }},
                 "protocol": {{ "type": "trojan", "password": "{}" }}
             }}],
             "outbounds": [{{"type": "direct", "tag": "direct"}}]
@@ -2478,7 +2478,7 @@ async fn test_interop_vless_h2_both_directions() {
                     "certificate_path": "{}",
                     "key_path": "{}"
                 }},
-                "framing": {{ "type": "h2", "path": "/vless-h2" }},
+                "framing": {{ "type": "h2" }},
                 "protocol": {{ "type": "vless", "uuid": "{}" }}
             }}],
             "outbounds": [{{"type": "direct", "tag": "direct"}}]
@@ -2627,7 +2627,7 @@ async fn test_interop_trojan_h2_both_directions() {
                     "certificate_path": "{}",
                     "key_path": "{}"
                 }},
-                "framing": {{ "type": "h2", "path": "/trojan-h2" }},
+                "framing": {{ "type": "h2" }},
                 "protocol": {{ "type": "trojan", "password": "{}" }}
             }}],
             "outbounds": [{{"type": "direct", "tag": "direct"}}]
@@ -3235,7 +3235,7 @@ async fn test_interop_vmess_websocket_both_directions() {
             "outbounds": [{{
                 "tag": "sbox-vmess-ws-node",
                 "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
-                "framing": {{ "type": "websocket", "path": "/vmess-ws", "host": "127.0.0.1" }},
+                "framing": {{ "type": "websocket", "path": "/vmess-ws", "headers": {{ "Host": "127.0.0.1" }} }},
                 "protocol": {{ "type": "vmess", "uuid": "{}" }}
             }}]
         }}"#,
@@ -4214,8 +4214,7 @@ async fn test_interop_hysteria2_salamander_obfs_flux_to_singbox() {
                 "security": {{ "type": "tls", "sni": "localhost", "insecure": true }},
                 "protocol": {{
                     "type": "hysteria2", "password": "{password}",
-                    "obfs": "salamander", "obfs_password": "{obfs_password}",
-                    "alpn": ["h3"]
+                    "obfs": "salamander", "obfs_password": "{obfs_password}"
                 }}
             }}]
         }}"#

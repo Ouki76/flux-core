@@ -1255,7 +1255,7 @@ async fn test_mux_over_websocket_transport() {
             "outbounds": [{{
                 "tag": "node",
                 "carrier": {{ "type": "tcp", "address": "127.0.0.1:{}" }},
-                "framing": {{ "type": "websocket", "path": "/mux-ws", "host": "127.0.0.1" }},
+                "framing": {{ "type": "websocket", "path": "/mux-ws", "headers": {{ "Host": "127.0.0.1" }} }},
                 "protocol": {{ "type": "vless", "uuid": "{}" }},
                 "multiplex": {{ "enabled": true }}
             }}]

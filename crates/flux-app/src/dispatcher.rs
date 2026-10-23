@@ -605,9 +605,9 @@ impl Dispatcher for DefaultDispatcher {
         // so `flux_active_connections` never counted it, `DELETE /connections`
         // could not close it, and its traffic was only visible in the global total.
         let mut conn_reg = self.meter.as_ref().map(|m| m.register_connection(&meta));
-        let mut cancel_conn = conn_reg.as_mut().map(|(_, _, rx)| {
-            std::mem::replace(rx, tokio::sync::broadcast::channel(1).1)
-        });
+        let mut cancel_conn = conn_reg
+            .as_mut()
+            .map(|(_, _, rx)| std::mem::replace(rx, tokio::sync::broadcast::channel(1).1));
         let conn_download = conn_reg.as_ref().map(|(_, c, _)| c.download.clone());
         // Endpoints are only accessed from this task; a plain HashMap avoids DashMap sharding overhead.
         let mut endpoints: std::collections::HashMap<Arc<str>, EndpointSlot> =

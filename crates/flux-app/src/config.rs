@@ -1206,6 +1206,61 @@ pub fn strip_comments(input: &str) -> String {
     out
 }
 
+/// Rejects a key the schema does not know, at any depth.
+///
+/// `deny_unknown_fields` cannot be applied to serde's internally-tagged enums —
+/// which is what every `carrier`/`protocol`/`security`/`framing` block is — so a
+/// typo *inside* a node used to be accepted silently: `lissten_port` or `securty`
+/// simply vanished and the configuration did something other than it said.
+///
+/// Rather than hand-maintain a schema that would drift from the structs, the parsed
+/// configuration is serialised back and the two key sets are compared. Serde emits
+/// exactly the keys it accepts, so the check cannot fall out of date, and it works at
+/// any depth for free.
+fn reject_unknown_keys(
+    raw: &serde_json::Value,
+    typed: &serde_json::Value,
+    path: &str,
+) -> FluxResult<()> {
+    match (raw, typed) {
+        (serde_json::Value::Object(raw_map), serde_json::Value::Object(typed_map)) => {
+            for key in raw_map.keys() {
+                // `$include` is accepted as an alias for `include`.
+                let canonical: &str = if key == "$include" { "include" } else { key };
+                if !typed_map.contains_key(canonical) && !ALWAYS_ACCEPTED_KEYS.contains(&canonical)
+                {
+                    let mut known: Vec<&str> = typed_map.keys().map(|s| s.as_str()).collect();
+                    known.sort_unstable();
+                    return Err(FluxError::Config(format!(
+                        "unknown field `{key}` in {path}{}; expected one of: {}",
+                        "",
+                        known.join(", ")
+                    )));
+                }
+            }
+            for (key, raw_child) in raw_map {
+                let canonical: &str = if key == "$include" { "include" } else { key };
+                if let Some(typed_child) = typed_map.get(canonical) {
+                    reject_unknown_keys(raw_child, typed_child, &format!("{path}.{key}"))?;
+                }
+            }
+        }
+        (serde_json::Value::Array(raw_items), serde_json::Value::Array(typed_items)) => {
+            for (i, (raw_child, typed_child)) in
+                raw_items.iter().zip(typed_items.iter()).enumerate()
+            {
+                reject_unknown_keys(raw_child, typed_child, &format!("{path}[{i}]"))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Keys that are valid configuration but deliberately absent from the serialised
+/// form (`#[serde(skip)]`), so the comparison above must not flag them.
+const ALWAYS_ACCEPTED_KEYS: &[&str] = &[];
+
 impl Config {
     /// Parse configuration from a JSON string (with optional comments and env vars).
     pub fn from_json_str(raw: &str) -> FluxResult<Self> {
@@ -1213,15 +1268,32 @@ impl Config {
         // line containing `${SOME_UNSET_VAR}` abort the whole configuration.
         let stripped = strip_comments(raw);
         let expanded = try_expand_env_vars(&stripped).map_err(FluxError::Config)?;
-        serde_json::from_str(&expanded)
-            .map_err(|e| FluxError::Config(format!("failed to parse json config: {}", e)))
+        let cfg: Self = serde_json::from_str(&expanded)
+            .map_err(|e| FluxError::Config(format!("failed to parse json config: {}", e)))?;
+        // Catch keys the schema does not know, at any depth (see `reject_unknown_keys`).
+        if let (Ok(raw), Ok(typed)) = (
+            serde_json::from_str::<serde_json::Value>(&expanded),
+            serde_json::to_value(&cfg),
+        ) {
+            reject_unknown_keys(&raw, &typed, "config")?;
+        }
+        Ok(cfg)
     }
 
     /// Parse configuration from a YAML string (with env vars).
     pub fn from_yaml_str(raw: &str) -> FluxResult<Self> {
         let expanded = expand_env_vars_skipping_comments(raw).map_err(FluxError::Config)?;
-        serde_yaml_ng::from_str(&expanded)
-            .map_err(|e| FluxError::Config(format!("failed to parse yaml config: {}", e)))
+        let cfg: Self = serde_yaml_ng::from_str(&expanded)
+            .map_err(|e| FluxError::Config(format!("failed to parse yaml config: {}", e)))?;
+        // Same deep key check as the JSON path: YAML is converted to JSON so one
+        // implementation covers both.
+        if let (Ok(raw_v), Ok(typed)) = (
+            serde_yaml_ng::from_str::<serde_json::Value>(&expanded),
+            serde_json::to_value(&cfg),
+        ) {
+            reject_unknown_keys(&raw_v, &typed, "config")?;
+        }
+        Ok(cfg)
     }
 
     /// Auto-detect format from file extension or content and parse.
