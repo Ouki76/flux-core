@@ -383,6 +383,11 @@ impl AsyncRead for GrpcStream {
             return Poll::Ready(Ok(()));
         }
 
+        // Deliver as much as the caller asked for, not one message per poll. The
+        // relay reads with a 64 KiB buffer and a message is 64 KiB, so returning
+        // after a single one made every buffer a separate read/parse cycle.
+        let mut put = 0usize;
+
         loop {
             // Drain payload left over from a message larger than `buf`.
             if this.unread_pos < this.unread_payload.len() {
@@ -390,11 +395,15 @@ impl AsyncRead for GrpcStream {
                 let take = available.min(buf.remaining());
                 buf.put_slice(&this.unread_payload[this.unread_pos..this.unread_pos + take]);
                 this.unread_pos += take;
+                put += take;
                 if this.unread_pos == this.unread_payload.len() {
                     this.unread_payload = Bytes::new();
                     this.unread_pos = 0;
                 }
-                return Poll::Ready(Ok(()));
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
 
             if this.read_buf.len() >= GRPC_HEADER_LEN {
@@ -402,11 +411,15 @@ impl AsyncRead for GrpcStream {
                     Ok(FrameStep::Payload(payload)) => {
                         let take = payload.len().min(buf.remaining());
                         buf.put_slice(&payload[..take]);
+                        put += take;
                         if take < payload.len() {
                             this.unread_payload = payload;
                             this.unread_pos = take;
                         }
-                        return Poll::Ready(Ok(()));
+                        if buf.remaining() == 0 {
+                            return Poll::Ready(Ok(()));
+                        }
+                        continue;
                     }
                     Ok(FrameStep::Empty) => continue,
                     Ok(FrameStep::Incomplete) => {}
@@ -417,7 +430,15 @@ impl AsyncRead for GrpcStream {
             let more = match this.poll_next_chunk(cx) {
                 Poll::Ready(Ok(more)) => more,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                // Nothing more right now: if bytes were delivered, that is a
+                // successful read.
+                Poll::Pending => {
+                    return if put > 0 {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    };
+                }
             };
             match more {
                 Some(_) => continue,
