@@ -1685,3 +1685,43 @@ green where roughly one in three failed before.
 
 **1051 tests, 0 failed.** Performance is now within 22 % of sing-box on every matrix row
 and ahead on CPU on every row; the remaining gap is concentrated in TLS.
+
+---
+
+## Cycle 25 — 2026-10-24
+
+### Three-column comparison, with CPU for both competitors
+
+| path | flux | sing-box | xray | vs sbox | vs xray | CPU vs sbox / xray |
+|---|---|---|---|---|---|---|
+| VLESS / TCP | 667 | 631 | 568 | **+5.7 %** | **+17.4 %** | −40 / −55 % |
+| VLESS / WS + TLS | 259 | 295 | 104 | −12.2 % | **+148.8 %** | −40 / −70 % |
+| VLESS / gRPC | 93 | 117 | **184** | −20.3 % | −49.4 % | −50 / −28 % |
+| VLESS / REALITY | 244 | 300 | 221 | −18.8 % | **+10.5 %** | −30 / −41 % |
+| REALITY + Vision | 128 | 310 | 253 | −58.8 % | −49.6 % | +55 / +38 % |
+| VMess / WS | 178 | 197 | 149 | −9.6 % | **+19.4 %** | −36 / −49 % |
+| Shadowsocks-2022 | 259 | 338 | 285 | −23.5 % | −9.4 % | −5 / −53 % |
+| Shadowsocks-AEAD | 272 | 263 | — | +3.5 % | — | −24 % |
+
+Ahead of xray on four of eight paths and ahead on CPU almost everywhere. The real
+deficits are gRPC (−49 % vs xray) and Vision (−59 % vs sing-box, though sing-box does not
+implement the Vision flow so that comparison is not like-for-like), and
+Shadowsocks-2022 remains the largest gap against sing-box.
+
+### Open with evidence: an intermittent hang in the TLS-carrying paths
+
+Two occurrences, both in three-stack runs, both at a round boundary with a fresh tunnel:
+VMess/WS timed out at round 2, Trojan/TLS at round 3 after measuring 355 MB/s at round 1.
+
+Not reproducible on demand: six solo rounds of VMess/WS passed, four three-stack rounds
+passed. It appeared after the copier change in cycle 23, which makes that the first thing
+to bisect — the yield-after-64-passes path is the new code in the picture.
+
+Recorded as a **rate to measure**, not a fix to claim. Next cycle: measure the hang rate
+for the TLS paths (N tunnels, count timeouts), then bisect the copier yield.
+
+### Also
+
+`bench_tls`'s correction from cycle 24 changed what the harness measures; its REALITY
+cost is 9 % over TLS and TLS is 49 % over plain framing, so the TLS layer — not the
+record layer — is where the throughput goes on every encrypted path.
