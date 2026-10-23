@@ -238,6 +238,7 @@ impl DefaultDispatcher {
         packet_tx: &mpsc::Sender<UdpPacket>,
         dead_ep_tx: &mpsc::UnboundedSender<EndpointKey>,
         per_destination_tags: &mut std::collections::HashSet<Arc<str>>,
+        conn_download: Option<Arc<std::sync::atomic::AtomicU64>>,
     ) -> Option<Arc<dyn PacketEndpoint>> {
         const MAX_ROUTE_CACHE_ENTRIES: usize = 4096;
 
@@ -304,6 +305,7 @@ impl DefaultDispatcher {
         let ep_recv = ep.clone();
         let reply_tx = packet_tx.clone();
         let meter_recv = self.meter.clone();
+        let conn_recv = conn_download.clone();
         let token = cancel_token.clone();
         let client_addr = flux_types::TargetAddress::Ip(meta.source);
         let dead_tx = dead_ep_tx.clone();
@@ -331,6 +333,9 @@ impl DefaultDispatcher {
                             reply.destination = client_addr.clone();
                             if reply_tx.send(reply).await.is_err() {
                                 break;
+                            }
+                            if let Some(c) = &conn_recv {
+                                c.fetch_add(r_len, std::sync::atomic::Ordering::Relaxed);
                             }
                             if let Some(m) = &meter_recv {
                                 m.record_traffic(0, r_len);
@@ -594,6 +599,16 @@ impl Dispatcher for DefaultDispatcher {
         packet_tx: mpsc::Sender<UdpPacket>,
     ) {
         let cancel_token = tokio_util::sync::CancellationToken::new();
+        // A UDP association is a connection as far as an operator is concerned: it
+        // has a source, a destination, a lifetime and byte counters, and the API's
+        // "close connection" must be able to stop it. It used to register nothing,
+        // so `flux_active_connections` never counted it, `DELETE /connections`
+        // could not close it, and its traffic was only visible in the global total.
+        let mut conn_reg = self.meter.as_ref().map(|m| m.register_connection(&meta));
+        let mut cancel_conn = conn_reg.as_mut().map(|(_, _, rx)| {
+            std::mem::replace(rx, tokio::sync::broadcast::channel(1).1)
+        });
+        let conn_download = conn_reg.as_ref().map(|(_, c, _)| c.download.clone());
         // Endpoints are only accessed from this task; a plain HashMap avoids DashMap sharding overhead.
         let mut endpoints: std::collections::HashMap<Arc<str>, EndpointSlot> =
             std::collections::HashMap::new();
@@ -613,7 +628,26 @@ impl Dispatcher for DefaultDispatcher {
         let mut per_destination_tags: std::collections::HashSet<Arc<str>> =
             std::collections::HashSet::new();
 
-        while let Some(packet) = packet_rx.recv().await {
+        loop {
+            let packet = tokio::select! {
+                biased;
+                // The API asked for this association to be closed.
+                _ = async {
+                    match cancel_conn.as_mut() {
+                        Some(rx) => {
+                            let _ = rx.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    debug!("UDP association cancelled via API");
+                    break;
+                }
+                packet = packet_rx.recv() => match packet {
+                    Some(p) => p,
+                    None => break,
+                },
+            };
             while let Ok(key) = dead_ep_rx.try_recv() {
                 debug!(
                     "UDP endpoint [{}] closed; it will be re-dialled on demand",
@@ -652,6 +686,7 @@ impl Dispatcher for DefaultDispatcher {
                             &packet_tx,
                             &dead_ep_tx,
                             &mut per_destination_tags,
+                            conn_download.clone(),
                         )
                         .await;
                     match endpoint {
@@ -676,12 +711,23 @@ impl Dispatcher for DefaultDispatcher {
                 // route-cache lookup per datagram.
                 debug!("failed to forward UDP packet: {}; dropping endpoint", e);
                 drop_failed_endpoint(&mut endpoints, &endpoint);
-            } else if let Some(m) = &meter {
-                m.record_traffic(bytes_len, 0);
+            } else {
+                if let Some((_, conn, _)) = conn_reg.as_ref() {
+                    conn.upload
+                        .fetch_add(bytes_len, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(m) = &meter {
+                    m.record_traffic(bytes_len, 0);
+                }
             }
         }
 
         cancel_token.cancel();
+        if let Some((id, _, _)) = conn_reg.take()
+            && let Some(m) = &self.meter
+        {
+            m.remove_connection(&id);
+        }
     }
 }
 
@@ -1875,5 +1921,180 @@ mod dispatcher_audit_tests {
             .await
             .expect("dispatch_packet must terminate")
             .expect("no panic");
+    }
+}
+
+#[cfg(test)]
+mod udp_association_tests {
+    use super::*;
+    use crate::api::TrafficMeter;
+    use flux_types::{NetworkType, Outbound, SessionMeta, TargetAddress, UdpPacket};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    /// A UDP endpoint that echoes back what it receives.
+    struct EchoPacketEndpoint;
+
+    #[async_trait::async_trait]
+    impl flux_types::PacketEndpoint for EchoPacketEndpoint {
+        async fn send_packet(&self, _packet: UdpPacket) -> FluxResult<()> {
+            Ok(())
+        }
+        async fn recv_packet(&self) -> FluxResult<UdpPacket> {
+            std::future::pending().await
+        }
+    }
+
+    struct UdpOutbound {
+        tag: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Outbound for UdpOutbound {
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+        fn protocol(&self) -> &'static str {
+            "test"
+        }
+        async fn dial_stream(&self, _meta: &SessionMeta) -> FluxResult<BoxedStream> {
+            Err(flux_types::FluxError::Config("stream unsupported".into()))
+        }
+        async fn dial_packet(
+            &self,
+            _meta: &SessionMeta,
+        ) -> FluxResult<Box<dyn flux_types::PacketEndpoint>> {
+            Ok(Box::new(EchoPacketEndpoint))
+        }
+    }
+
+    impl OutboundLookup for UdpRegistry {
+        fn get(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
+            (tag == "direct").then(|| {
+                Arc::new(UdpOutbound {
+                    tag: "direct".into(),
+                }) as Arc<dyn Outbound>
+            })
+        }
+    }
+
+    struct UdpRegistry;
+
+    fn build(meter: Arc<TrafficMeter>) -> Arc<DefaultDispatcher> {
+        Arc::new(
+            DefaultDispatcher::new(
+                Arc::new(Router::new(vec![], "direct")),
+                Arc::new(UdpRegistry),
+            )
+            .with_meter(meter),
+        )
+    }
+
+    fn meta() -> SessionMeta {
+        SessionMeta::new(
+            SocketAddr::from(([127, 0, 0, 1], 40001)),
+            "example.com:53".parse::<TargetAddress>().unwrap(),
+            "mixed-in",
+            NetworkType::Udp,
+        )
+    }
+
+    /// A UDP association must appear in the connection table while it lives, so an
+    /// operator can see it and the API can close it.
+    #[tokio::test]
+    async fn a_udp_association_is_registered_while_it_lives() {
+        let meter = Arc::new(TrafficMeter::new());
+        let disp = build((*meter).clone());
+        let (tx, rx) = mpsc::channel::<UdpPacket>(8);
+        let (reply_tx, _reply_rx) = mpsc::channel::<UdpPacket>(8);
+
+        let task = {
+            let disp = disp.clone();
+            tokio::spawn(async move { disp.dispatch_packet(meta(), rx, reply_tx).await })
+        };
+        // Drive one datagram so the association is established.
+        tx.send(UdpPacket::new(
+            bytes::Bytes::from_static(b"hello"),
+            "127.0.0.1:40001".parse().unwrap(),
+            "example.com:53".parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while meter.connections.is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let entry = meter
+            .connections
+            .iter()
+            .next()
+            .expect("a UDP association must be in the connection table")
+            .clone();
+        assert_eq!(entry.meta.network, NetworkType::Udp);
+        drop(entry);
+
+        // Closing the channel ends the association and releases the entry.
+        drop(tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !meter.connections.is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            meter.connections.is_empty(),
+            "the association must be unregistered when it ends"
+        );
+        assert!(
+            meter
+                .upload_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= 5,
+            "the association's traffic must reach the global counter"
+        );
+    }
+
+    /// `DELETE /api/v1/connections/<id>` must actually stop a UDP association —
+    /// before this it was registered nowhere and could not be closed at all.
+    #[tokio::test]
+    async fn the_api_can_close_a_udp_association() {
+        let meter = Arc::new(TrafficMeter::new());
+        let disp = build((*meter).clone());
+        let (tx, rx) = mpsc::channel::<UdpPacket>(8);
+        let (reply_tx, _reply_rx) = mpsc::channel::<UdpPacket>(8);
+
+        let task = {
+            let disp = disp.clone();
+            tokio::spawn(async move { disp.dispatch_packet(meta(), rx, reply_tx).await })
+        };
+        tx.send(UdpPacket::new(
+            bytes::Bytes::from_static(b"x"),
+            "127.0.0.1:40001".parse().unwrap(),
+            "example.com:53".parse().unwrap(),
+        ))
+        .await
+        .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while meter.connections.is_empty() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let id = meter
+            .connections
+            .iter()
+            .next()
+            .expect("registered")
+            .id
+            .clone();
+        meter.close_connection(&id);
+
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        assert!(
+            finished.is_ok(),
+            "closing the association through the API must end the relay task"
+        );
+        // The receiver is still open on our side, so the task can only have ended
+        // because of the cancellation.
+        let _ = tx;
     }
 }
