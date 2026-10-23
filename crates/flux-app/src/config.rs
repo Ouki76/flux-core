@@ -390,6 +390,20 @@ pub enum InboundCarrierConfig {
         #[serde(default)]
         address: Option<String>,
     },
+    /// Accepted so the error can be precise: the *client* side of mKCP works and is
+    /// interoperable with Xray, but serving mKCP needs every inbound to accept an
+    /// already-established stream instead of binding a TCP listener itself. Until
+    /// that exists, saying so beats the untagged-enum message a user would otherwise
+    /// get.
+    #[serde(rename = "kcp", alias = "mkcp")]
+    Kcp {
+        #[serde(default)]
+        listen: Option<String>,
+        #[serde(default)]
+        listen_port: Option<u16>,
+        #[serde(default)]
+        address: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

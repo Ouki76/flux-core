@@ -295,3 +295,31 @@ fn get_free_tcp_port_blocking() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     l.local_addr().unwrap().port()
 }
+
+/// An inbound `carrier: kcp` must fail with a sentence, not with serde's
+/// untagged-enum message. The client side works; the server side needs every inbound
+/// to accept an already-established stream, which is a cross-cutting change.
+#[tokio::test]
+async fn a_kcp_inbound_says_what_is_missing() {
+    let port = get_free_tcp_port().await;
+    let cfg = format!(
+        r#"{{
+  "inbounds": [{{
+    "tag": "kcp-in",
+    "carrier": {{"type": "kcp", "listen": "127.0.0.1", "listen_port": {port}}},
+    "protocol": {{"type": "vless", "uuid": "{UUID}"}}
+  }}],
+  "outbounds": [{{"type": "direct", "tag": "d"}}]
+}}"#
+    );
+    let parsed = flux_app::Config::from_json_str(&cfg).expect("the carrier must parse");
+    let err = match flux_app::Instance::new(parsed) {
+        Ok(_) => panic!("a kcp inbound must be refused"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(err.contains("inbound carrier 'kcp'"), "{err}");
+    assert!(
+        err.contains("client side works"),
+        "the error must say what does work: {err}"
+    );
+}

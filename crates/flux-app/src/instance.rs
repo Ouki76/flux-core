@@ -1453,6 +1453,13 @@ fn build_layered_outbound(
 
 fn parse_inbound_carrier(carrier: &InboundCarrierConfig) -> FluxResult<(SocketAddr, bool)> {
     match carrier {
+        InboundCarrierConfig::Kcp { .. } => Err(FluxError::Config(
+            "inbound carrier 'kcp' is not implemented yet: the client side works and \
+             interoperates with Xray, but serving mKCP needs every inbound to accept an \
+             already-established stream rather than binding its own TCP listener. Use a \
+             tcp carrier on the server for now."
+                .into(),
+        )),
         InboundCarrierConfig::Tcp {
             listen,
             listen_port,

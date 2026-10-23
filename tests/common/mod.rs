@@ -1,3 +1,9 @@
+//! Shared helpers for the integration tests.
+//!
+//! Each test binary includes this module wholesale and uses a subset of it, so
+//! "never used" here means "not used by *this* binary".
+#![allow(dead_code)]
+
 use std::fmt::Write as _;
 use std::net::SocketAddr;
 use std::sync::Mutex;
@@ -98,16 +104,13 @@ pub async fn port_is_free(port: u16) -> bool {
 /// intended bind because every flux listener sets `SO_REUSEPORT`; the reservation is
 /// simply dropped when it is bound over.
 fn hold_port(port: u16) {
-    use std::os::fd::AsRawFd;
-    let sock = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
-        Ok(_) => (),
-        Err(_) => return,
-    };
-    let _ = sock;
-    // Bind the real port with SO_REUSEPORT through the same helper the allocator
+    // Bind the real port with `SO_REUSEPORT` through the same helper the allocator
     // uses for probing.
     if let Some(listener) = bind_reuseport(port) {
-        HOLDERS.lock().unwrap_or_else(|e| e.into_inner()).push(listener);
+        HOLDERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(listener);
     }
 }
 
