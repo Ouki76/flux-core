@@ -508,9 +508,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
             // 2. Read 18-byte encrypted chunk length (2 bytes len + 16 bytes tag)
             if this.payload_len == 0 {
                 while this.len_pos < 18 {
-                    let mut tmp = [0u8; 18];
-                    let needed = 18 - this.len_pos;
-                    let mut tmp_buf = ReadBuf::new(&mut tmp[..needed]);
+                    let pos_now = this.len_pos;
+                    let mut tmp_buf = ReadBuf::new(&mut this.len_buf[pos_now..18]);
                     match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
                         Poll::Ready(Ok(())) => {
                             let n = tmp_buf.filled().len();
@@ -523,8 +522,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                                     "unexpected EOF reading 2022 chunk len",
                                 )));
                             }
-                            let pos = this.len_pos;
-                            this.len_buf[pos..pos + n].copy_from_slice(&tmp[..n]);
                             this.len_pos += n;
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -562,10 +559,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
             // 3. Read encrypted payload chunk
             let total_payload_enc = this.payload_len + 16;
             while this.payload_pos < total_payload_enc {
-                let needed = total_payload_enc - this.payload_pos;
-                let mut tmp = [0u8; 8192];
-                let to_read = needed.min(tmp.len());
-                let mut tmp_buf = ReadBuf::new(&mut tmp[..to_read]);
+                // Read straight into the destination: one syscall for the whole
+                // chunk and no second copy of the payload.
+                let pos_now = this.payload_pos;
+                let mut tmp_buf = ReadBuf::new(&mut this.payload_buf[pos_now..total_payload_enc]);
                 match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
                     Poll::Ready(Ok(())) => {
                         let n = tmp_buf.filled().len();
@@ -575,8 +572,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
                                 "unexpected EOF reading 2022 payload chunk",
                             )));
                         }
-                        let pos = this.payload_pos;
-                        this.payload_buf[pos..pos + n].copy_from_slice(&tmp[..n]);
                         this.payload_pos += n;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),

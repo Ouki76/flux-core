@@ -439,10 +439,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
             if self.payload_len > 0 {
                 let ppos = self.payload_pos;
                 let target_len = self.payload_len + TAG_LEN;
-                let mut tmp = [0u8; 16 * 1024];
-                let to_read = (target_len - ppos).min(tmp.len());
-                let mut ptmp_buf = ReadBuf::new(&mut tmp[..to_read]);
-                match Pin::new(&mut self.inner).poll_read(cx, &mut ptmp_buf) {
+                // Read straight into the destination: the stack copy here cost a
+                // second copy of every payload byte and capped a read at 16 KiB on
+                // top of a 16 KiB chunk.
+                let this = self.as_mut().get_mut();
+                let mut ptmp_buf = ReadBuf::new(&mut this.payload_buf[ppos..target_len]);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut ptmp_buf) {
                     Poll::Ready(Ok(())) => {
                         let n = ptmp_buf.filled().len();
                         if n == 0 {
@@ -451,7 +453,6 @@ impl<S: AsyncRead + Unpin> AsyncRead for ShadowsocksStream<S> {
                                 "EOF in Shadowsocks chunk",
                             )));
                         }
-                        self.payload_buf[ppos..ppos + n].copy_from_slice(&tmp[..n]);
                         self.payload_pos += n;
                         if self.payload_pos == target_len {
                             let this = self.as_mut().get_mut();
