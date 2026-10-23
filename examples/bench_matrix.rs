@@ -850,7 +850,12 @@ impl Scenario {
         })
     }
 
-    fn xray_params<'a>(&self, s: &'a Setup, socks: u16, port: u16) -> xray_matrix_configs::Params<'a> {
+    fn xray_params<'a>(
+        &self,
+        s: &'a Setup,
+        socks: u16,
+        port: u16,
+    ) -> xray_matrix_configs::Params<'a> {
         xray_matrix_configs::Params {
             server_port: port,
             socks_port: socks,
@@ -1306,10 +1311,12 @@ async fn run_scenario(
                 Stack::Xray,
                 Outcome::Skipped("no xray equivalent for this transport".into()),
             )),
-            (Some(bin), Some(_)) => match prepare_tunnel(Stack::Xray, scenario, setup, bin, "xray").await {
-                Ok(t) => xray = Some(t),
-                Err(e) => results.push((Stack::Xray, Outcome::Skipped(e))),
-            },
+            (Some(bin), Some(_)) => {
+                match prepare_tunnel(Stack::Xray, scenario, setup, bin, "xray").await {
+                    Ok(t) => xray = Some(t),
+                    Err(e) => results.push((Stack::Xray, Outcome::Skipped(e))),
+                }
+            }
         }
     }
 
@@ -1397,7 +1404,7 @@ async fn run_scenario(
             results.push((stack, Outcome::Skipped(e)));
         }
     }
-        results
+    results
 }
 
 fn print_progress(round: usize, stack: Stack, sample: &Sample) {
