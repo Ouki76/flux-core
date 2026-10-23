@@ -906,6 +906,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
             this.header_verified = true;
         }
 
+        // Fill the caller's buffer: the relay reads with 64 KiB and a VMess chunk is
+        // 16 KiB, so returning after one chunk made every buffer four read cycles.
+        let mut put = 0usize;
+
         loop {
             // 1. Drain existing decrypted plaintext
             if this.read_pos < this.read_buf.len() {
@@ -913,11 +917,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
                 let to_copy = avail.min(buf.remaining());
                 buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + to_copy]);
                 this.read_pos += to_copy;
+                put += to_copy;
                 if this.read_pos == this.read_buf.len() {
                     this.read_buf.clear();
                     this.read_pos = 0;
                 }
-                return Poll::Ready(Ok(()));
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
 
             // 2. Read 2-byte chunk length
@@ -943,7 +951,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
                             this.len_pos += n;
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Pending,
+                        Poll::Pending => {
+                            // Bytes were already handed to the caller: that is a
+                            // successful read even if nothing more is available now.
+                            return if put > 0 {
+                                Poll::Ready(Ok(()))
+                            } else {
+                                Poll::Pending
+                            };
+                        }
                     }
                 }
 
@@ -989,7 +1005,15 @@ impl<S: AsyncRead + Unpin> AsyncRead for VmessStream<S> {
                         this.payload_pos += n;
                     }
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        // Bytes were already handed to the caller: that is a
+                        // successful read even if nothing more is available now.
+                        return if put > 0 {
+                            Poll::Ready(Ok(()))
+                        } else {
+                            Poll::Pending
+                        };
+                    }
                 }
             }
 
@@ -1044,20 +1068,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
             return Poll::Ready(Ok(0));
         }
 
-        let chunk_size = buf.len().min(16384);
-        let plain = &buf[..chunk_size];
-
-        let total_chunk_len = (chunk_size + 16) as u16;
-        let mut len_bytes = total_chunk_len.to_be_bytes();
-        if let Some(masker) = &mut this.write_masker {
-            let mut mask = [0u8; 2];
-            masker.read(&mut mask);
-            len_bytes[0] ^= mask[0];
-            len_bytes[1] ^= mask[1];
-        }
-
-        let nonce = Self::make_chunk_nonce(&this.enc_iv, this.write_count);
-        this.write_count = this.write_count.wrapping_add(1);
+        // Frame several chunks per call, up to the relay's copy buffer. One 16 KiB
+        // chunk per `poll_write` turned a 64 KiB write into four frames, four seals
+        // and four syscalls — the defect fixed in the WebSocket, Shadowsocks and
+        // REALITY transports, which had all been capped at one framing unit per call.
+        let cap = buf.len().min(64 * 1024);
+        let mut consumed = 0usize;
 
         this.write_buf.clear();
 
@@ -1091,19 +1107,37 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
             this.header_written = true;
         }
 
-        this.write_buf.extend_from_slice(&len_bytes);
-        // Seal the payload straight into the write buffer: no per-chunk
-        // allocation and no second copy.
-        let payload_start = this.write_buf.len();
-        this.write_buf.extend_from_slice(plain);
-        if let Err(e) = this
-            .enc_cipher
-            .seal_tail(nonce, b"", &mut this.write_buf, payload_start)
-        {
-            return Poll::Ready(Err(io::Error::other(e.to_string())));
+        while consumed < cap {
+            let chunk_size = (cap - consumed).min(16384);
+            let plain = &buf[consumed..consumed + chunk_size];
+
+            let total_chunk_len = (chunk_size + 16) as u16;
+            let mut len_bytes = total_chunk_len.to_be_bytes();
+            if let Some(masker) = &mut this.write_masker {
+                let mut mask = [0u8; 2];
+                masker.read(&mut mask);
+                len_bytes[0] ^= mask[0];
+                len_bytes[1] ^= mask[1];
+            }
+
+            let nonce = Self::make_chunk_nonce(&this.enc_iv, this.write_count);
+            this.write_count = this.write_count.wrapping_add(1);
+
+            this.write_buf.extend_from_slice(&len_bytes);
+            // Seal the payload straight into the write buffer: no per-chunk
+            // allocation and no second copy.
+            let payload_start = this.write_buf.len();
+            this.write_buf.extend_from_slice(plain);
+            if let Err(e) =
+                this.enc_cipher
+                    .seal_tail(nonce, b"", &mut this.write_buf, payload_start)
+            {
+                return Poll::Ready(Err(io::Error::other(e.to_string())));
+            }
+            consumed += chunk_size;
         }
         this.write_pos = 0;
-        this.writing_plain_len = chunk_size;
+        this.writing_plain_len = consumed;
 
         while this.write_pos < this.write_buf.len() {
             let n =

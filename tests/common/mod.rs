@@ -95,73 +95,6 @@ pub async fn port_is_free(port: u16) -> bool {
 /// failure can be attributed: [`diagnose_bind_failure`] reports whether the
 /// failing port came from this allocator, when, and to which test thread.
 #[allow(dead_code)]
-/// Keeps a `SO_REUSEPORT` listener on the port we just handed out.
-///
-/// The allocator probes a port by binding and releasing it, which leaves a window in
-/// which a sibling test thread — or its own probe — can hand the same port to someone
-/// else. Retrying at the call site cannot fix that: the port is already taken.
-/// Holding the socket closes the window at the root, and it does not block the
-/// intended bind because every flux listener sets `SO_REUSEPORT`; the reservation is
-/// simply dropped when it is bound over.
-fn hold_port(port: u16) {
-    // Bind the real port with `SO_REUSEPORT` through the same helper the allocator
-    // uses for probing.
-    if let Some(listener) = bind_reuseport(port) {
-        HOLDERS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(listener);
-    }
-}
-
-/// `SO_REUSEPORT` listener on `port`, or `None` when it cannot be bound.
-fn bind_reuseport(port: u16) -> Option<std::net::TcpListener> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        if fd < 0 {
-            return None;
-        }
-        let one: libc::c_int = 1;
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEADDR,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_REUSEPORT,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
-        let addr = libc::sockaddr_in {
-            sin_family: libc::AF_INET as libc::sa_family_t,
-            sin_port: port.to_be(),
-            sin_addr: libc::in_addr {
-                s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-            },
-            sin_zero: [0; 8],
-        };
-        if libc::bind(
-            fd,
-            &addr as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ) != 0
-        {
-            libc::close(fd);
-            return None;
-        }
-        let listener = std::net::TcpListener::from_raw_fd(fd);
-        let _ = listener.as_raw_fd();
-        Some(listener)
-    }
-}
-
-static HOLDERS: std::sync::Mutex<Vec<std::net::TcpListener>> = std::sync::Mutex::new(Vec::new());
-
 pub async fn get_free_tcp_port() -> u16 {
     warn_once_if_ephemeral_range_overlaps();
     let base = port_block_base();
@@ -176,7 +109,6 @@ pub async fn get_free_tcp_port() -> u16 {
         last = port;
         if port_is_free(port).await {
             record_allocation(port);
-            hold_port(port);
             return port;
         }
         if trace_enabled() {
