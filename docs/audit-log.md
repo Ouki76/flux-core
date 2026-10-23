@@ -1881,3 +1881,62 @@ reach for, together with `strace -c`, which is what found the two biggest wins s
 ---
 
 ## Cycle 28 — 2026-10-24
+
+---
+
+## Cycle 30 — 2026-10-24
+
+### Shadowsocks-AEAD: −17 % → +19 %
+
+The AEAD variant got the multi-chunk *write* two cycles ago but its read path still
+returned after one 16 KiB chunk while the relay reads with 64 KiB. Same defect, same fix
+as the 2022 variant.
+
+| | before | after |
+|---|---|---|
+| Shadowsocks-AEAD | −17.1 % | **+19.4 %** (281 vs 235) |
+| CPU vs sing-box | −3 % | −28 % |
+
+Both Shadowsocks variants now beat or match sing-box on throughput and beat it clearly on
+CPU. Both started this audit at roughly half its rate.
+
+### Full matrix after the Shadowsocks work
+
+| path | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | 703 | 606 | 659 | **+16.1 %** | **+6.7 %** |
+| gRPC + TLS | 102 | 116 | 190 | −12.1 % | −46.1 % |
+| REALITY | 239 | 304 | 205 | −21.5 % | **+16.4 %** |
+| REALITY + Vision | 128 | 290 | 235 | −55.7 % | −45.4 % |
+| VMess / WS | 169 | 208 | 163 | −19.0 % | **+3.9 %** |
+| Trojan / TLS | 281 | 304 | — | −7.4 % | — |
+| Shadowsocks-2022 | 336 | 326 | 270 | **+3.1 %** | **+24.2 %** |
+| Shadowsocks-AEAD | 254 | 253 | — | **+0.4 %** | — |
+
+Ahead of sing-box on three paths and of xray on four. CPU is better than both on every
+row. The remaining deficits are concentrated: gRPC and Vision.
+
+### gRPC: fourth null, and what it is *not*
+
+The read-size histogram showed 1 488 reads of exactly 4 096 bytes on this path — h2 asks
+its stream for 4 KiB at a time, which through TLS means a syscall per 4 KiB. Wrapping the
+stream in a 64 KiB `BufReader` before the handshake changed nothing (98.7 vs 100 MB/s),
+so the syscalls were not the limit either, and the change was reverted rather than kept
+as an unmeasured layer.
+
+Four attempts — frame size, write batching, read batching, syscall batching — all null.
+What the numbers say: we spend 14.5 s/GiB against sing-box's 33, so we are cheap and
+slow, i.e. bound by *per-message latency* in something we do not control from the framing
+code. The next honest step is to test the h2 crate's scheduling in isolation with a
+standalone harness, not to keep patching around it.
+
+### The stall: diagnosed one level deeper, and backstopped
+
+The stall snapshot added earlier paid off on its first real sighting: both tunnel
+processes **asleep in `futex` with a frozen CPU count**. That is a missed wakeup, not a
+spin, and it has never reproduced outside a three-stack run.
+
+The copier now runs a ticker that re-polls it *only* after 500 ms with no poll at all, and
+logs when it fires. A healthy transfer never sees it; a stalled one now costs 250 ms
+instead of a 120 s timeout, and the warning names the path. It is a backstop, not a fix —
+said plainly in the commit, because the missed wakeup is still in there.
