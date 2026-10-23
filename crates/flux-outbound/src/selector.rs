@@ -4,6 +4,7 @@ use flux_types::{
 };
 use parking_lot::RwLock;
 use std::sync::Arc;
+use tracing::warn;
 
 pub struct SelectorOutbound {
     tag: String,
@@ -38,12 +39,31 @@ impl SelectorOutbound {
 
     fn get_active(&self) -> FluxResult<Arc<dyn Outbound>> {
         let current_tag = self.current();
-        self.lookup.get(&current_tag).ok_or_else(|| {
-            FluxError::OutboundNotFound(format!(
-                "selector '{}': selected outbound '{}' not found in registry",
-                self.tag, current_tag
-            ))
-        })
+        if let Some(outbound) = self.lookup.get(&current_tag) {
+            return Ok(outbound);
+        }
+
+        // The recorded selection can go stale — a reload rebuilds the registry,
+        // so the member the user picked may no longer exist while other members
+        // are alive. Failing every session forever is not an option when the
+        // group still has a usable candidate, so fall through to the first
+        // resolvable member. The recorded tag is deliberately *not* rewritten:
+        // it is the user's choice, and it may resolve again after the next
+        // reload.
+        for candidate in &self.outbounds {
+            if let Some(outbound) = self.lookup.get(candidate) {
+                warn!(
+                    "[{}] selected outbound '{}' is no longer in the registry; dialing '{}' instead",
+                    self.tag, current_tag, candidate
+                );
+                return Ok(outbound);
+            }
+        }
+
+        Err(FluxError::OutboundNotFound(format!(
+            "selector '{}': selected outbound '{}' not found in registry, and no candidate resolves",
+            self.tag, current_tag
+        )))
     }
 }
 
@@ -110,6 +130,9 @@ pub(crate) mod test_support {
     //! Minimal fakes shared by the group-outbound unit tests.
 
     use super::*;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::AsyncWriteExt;
 
     /// An outbound that records nothing and never dials: the group tests only
     /// exercise selection logic.
@@ -157,6 +180,123 @@ pub(crate) mod test_support {
         }
     }
 
+    /// A UDP association that exists only to prove a packet dial succeeded.
+    pub struct FakePacket;
+
+    #[async_trait]
+    impl PacketEndpoint for FakePacket {
+        async fn send_packet(&self, _packet: flux_types::UdpPacket) -> FluxResult<()> {
+            Ok(())
+        }
+        async fn recv_packet(&self) -> FluxResult<flux_types::UdpPacket> {
+            Err(FluxError::Protocol {
+                protocol: "fake",
+                message: "no packets".into(),
+            })
+        }
+    }
+
+    /// A member whose health and dial outcomes the test controls at runtime, and
+    /// which counts every dial attempt it receives.
+    ///
+    /// A healthy member connects to `responder`, a local server that answers
+    /// with an HTTP status line, so a probe through it can genuinely succeed —
+    /// the probe loop tests need real measurements, not stubs.
+    pub struct ScriptedOutbound {
+        pub tag: String,
+        healthy: AtomicBool,
+        pub stream_dials: AtomicUsize,
+        pub packet_dials: AtomicUsize,
+        responder: Option<SocketAddr>,
+    }
+
+    impl ScriptedOutbound {
+        pub fn new(tag: &str, healthy: bool) -> Self {
+            Self {
+                tag: tag.to_string(),
+                healthy: AtomicBool::new(healthy),
+                stream_dials: AtomicUsize::new(0),
+                packet_dials: AtomicUsize::new(0),
+                responder: None,
+            }
+        }
+
+        pub fn with_responder(mut self, addr: SocketAddr) -> Self {
+            self.responder = Some(addr);
+            self
+        }
+
+        pub fn set_healthy(&self, healthy: bool) {
+            self.healthy.store(healthy, Ordering::SeqCst);
+        }
+
+        pub fn stream_dials(&self) -> usize {
+            self.stream_dials.load(Ordering::SeqCst)
+        }
+
+        pub fn packet_dials(&self) -> usize {
+            self.packet_dials.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Outbound for ScriptedOutbound {
+        fn tag(&self) -> &str {
+            &self.tag
+        }
+        fn protocol(&self) -> &'static str {
+            "scripted"
+        }
+        async fn dial_stream(&self, _meta: &SessionMeta) -> FluxResult<BoxedStream> {
+            self.stream_dials.fetch_add(1, Ordering::SeqCst);
+            if !self.healthy.load(Ordering::SeqCst) {
+                return Err(FluxError::Protocol {
+                    protocol: "scripted",
+                    message: format!("member '{}' is down", self.tag),
+                });
+            }
+            match self.responder {
+                Some(addr) => {
+                    let sock = tokio::net::TcpStream::connect(addr)
+                        .await
+                        .map_err(FluxError::Io)?;
+                    Ok(Box::new(sock) as BoxedStream)
+                }
+                None => {
+                    let (client, _server) = tokio::io::duplex(64);
+                    Ok(Box::new(client) as BoxedStream)
+                }
+            }
+        }
+        async fn dial_packet(&self, _meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+            self.packet_dials.fetch_add(1, Ordering::SeqCst);
+            if self.healthy.load(Ordering::SeqCst) {
+                Ok(Box::new(FakePacket))
+            } else {
+                Err(FluxError::Protocol {
+                    protocol: "scripted",
+                    message: format!("member '{}' is down", self.tag),
+                })
+            }
+        }
+    }
+
+    /// Spawns a local HTTP/1.1 responder and returns its address. Every probe
+    /// connection is answered with a 204 status line, so a member pointed at it
+    /// measures a real (small) RTT.
+    pub async fn http_responder() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = sock.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await;
+                });
+            }
+        });
+        addr
+    }
+
     pub struct FakeRegistry(pub Vec<Arc<dyn Outbound>>);
 
     impl FakeRegistry {
@@ -169,11 +309,44 @@ pub(crate) mod test_support {
                     .collect(),
             ))
         }
+
+        pub fn over(members: Vec<Arc<dyn Outbound>>) -> Arc<Self> {
+            Arc::new(Self(members))
+        }
     }
 
     impl OutboundLookup for FakeRegistry {
         fn get(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
             self.0.iter().find(|o| o.tag() == tag).cloned()
+        }
+    }
+
+    /// A registry that can change under a live group, like the real one during a
+    /// reload: members can disappear (or come back) between two dials.
+    #[derive(Default)]
+    pub struct LiveRegistry(pub dashmap::DashMap<String, Arc<dyn Outbound>>);
+
+    impl LiveRegistry {
+        pub fn over(members: Vec<Arc<dyn Outbound>>) -> Arc<Self> {
+            let reg = Arc::new(Self::default());
+            for member in members {
+                reg.insert(member);
+            }
+            reg
+        }
+
+        pub fn insert(&self, member: Arc<dyn Outbound>) {
+            self.0.insert(member.tag().to_string(), member);
+        }
+
+        pub fn remove(&self, tag: &str) {
+            self.0.remove(tag);
+        }
+    }
+
+    impl OutboundLookup for LiveRegistry {
+        fn get(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
+            self.0.get(tag).map(|entry| entry.value().clone())
         }
     }
 
@@ -239,5 +412,88 @@ mod tests {
             vec!["a".to_string(), "b".to_string()]
         );
         assert_eq!(s.current_selected(), Some("a".to_string()));
+    }
+
+    /// A selection can go stale under the group: a reload can rebuild the
+    /// registry, so the tag the group remembers is no longer resolvable while
+    /// another candidate is alive. The group must dial the live member instead
+    /// of failing every session for the rest of the process's life.
+    #[tokio::test]
+    async fn dials_a_live_candidate_when_the_selection_is_gone() {
+        let live: Arc<dyn Outbound> = Arc::new(ScriptedOutbound::new("b", true));
+        let reg = FakeRegistry::over(vec![live]);
+        let s = SelectorOutbound::new(
+            "sel",
+            vec!["a".into(), "b".into()],
+            None, // defaults to "a", which the registry does not have
+            reg,
+        );
+        assert_eq!(s.current(), "a");
+        let stream = s.dial_stream(&meta()).await;
+        assert!(
+            stream.is_ok(),
+            "the selector must fall through to a live member, got {:?}",
+            stream.err().map(|e| e.to_string())
+        );
+    }
+
+    /// With every candidate missing the group must report the failure rather
+    /// than panicking or dialing a made-up tag.
+    #[tokio::test]
+    async fn reports_an_error_when_no_candidate_resolves() {
+        let s = SelectorOutbound::new(
+            "sel",
+            vec!["a".into(), "b".into()],
+            None,
+            FakeRegistry::over(vec![]),
+        );
+        let err = match s.dial_stream(&meta()).await {
+            Err(e) => e,
+            Ok(_) => panic!("no candidate exists, so the dial must fail"),
+        };
+        assert!(matches!(err, FluxError::OutboundNotFound(_)), "{err:?}");
+        assert!(s.dial_packet(&meta()).await.is_err());
+    }
+
+    /// Many tasks switching the selection and dialing at once: no panic, no
+    /// deadlock, and whatever is observed must be one of the members.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_select_and_dial_stay_within_the_members() {
+        let a: Arc<dyn Outbound> = Arc::new(ScriptedOutbound::new("a", true));
+        let b: Arc<dyn Outbound> = Arc::new(ScriptedOutbound::new("b", true));
+        let s = Arc::new(SelectorOutbound::new(
+            "sel",
+            vec!["a".into(), "b".into()],
+            None,
+            FakeRegistry::over(vec![a, b]),
+        ));
+
+        let mut tasks = Vec::new();
+        for worker in 0..16 {
+            let s = s.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..64 {
+                    let target = if (worker + i) % 2 == 0 { "a" } else { "b" };
+                    s.select(target).expect("selecting a member must succeed");
+                    let current = s.current();
+                    assert!(
+                        current == "a" || current == "b",
+                        "selection left the member list: {current}"
+                    );
+                    assert!(
+                        s.dial_stream(&meta()).await.is_ok(),
+                        "both members are healthy"
+                    );
+                    assert!(
+                        s.dial_packet(&meta()).await.is_ok(),
+                        "both members are healthy for UDP"
+                    );
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("no task may panic");
+        }
+        assert!(matches!(s.current().as_str(), "a" | "b"));
     }
 }

@@ -177,6 +177,7 @@ impl Outbound for LoadBalanceOutbound {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selector::test_support::ScriptedOutbound;
 
     fn lb(strategy: BalanceStrategy, tags: &[&str]) -> LoadBalanceOutbound {
         LoadBalanceOutbound::new(
@@ -244,5 +245,172 @@ mod tests {
     fn plain_members_do_not_require_per_destination() {
         let r = lb(BalanceStrategy::RoundRobin, &["a", "b"]);
         assert!(!r.udp_endpoint_per_destination());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dial behaviour
+    // -----------------------------------------------------------------------
+
+    /// A group with no members must say so with the variant that means "no such
+    /// outbound", not with a generic network error: the caller can tell a
+    /// misconfiguration from every member being down.
+    #[tokio::test]
+    async fn an_empty_group_reports_outbound_not_found() {
+        let reg = crate::selector::test_support::FakeRegistry::over(vec![]);
+        let r = LoadBalanceOutbound::new("lb", vec![], None, reg);
+        let err = match r.dial_stream(&crate::selector::test_support::meta()).await {
+            Err(e) => e,
+            Ok(_) => panic!("an empty group cannot dial"),
+        };
+        assert!(matches!(err, FluxError::OutboundNotFound(_)), "{err:?}");
+        let err = match r.dial_packet(&crate::selector::test_support::meta()).await {
+            Err(e) => e,
+            Ok(_) => panic!("an empty group cannot dial"),
+        };
+        assert!(matches!(err, FluxError::OutboundNotFound(_)), "{err:?}");
+    }
+
+    /// Round-robin must actually spread sessions over the members at dial time,
+    /// not just in the index helper.
+    #[tokio::test]
+    async fn round_robin_spreads_dials_across_members() {
+        let a = Arc::new(ScriptedOutbound::new("a", true));
+        let b = Arc::new(ScriptedOutbound::new("b", true));
+        let reg = crate::selector::test_support::LiveRegistry::over(vec![a.clone(), b.clone()]);
+        let r = LoadBalanceOutbound::new(
+            "lb",
+            vec!["a".to_string(), "b".to_string()],
+            Some(BalanceStrategy::RoundRobin),
+            reg,
+        );
+
+        for _ in 0..6 {
+            assert!(
+                r.dial_stream(&crate::selector::test_support::meta())
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(a.stream_dials(), 3);
+        assert_eq!(b.stream_dials(), 3);
+    }
+
+    /// A member that is not in the registry is skipped, and the session is
+    /// carried by a member that does exist.
+    #[tokio::test]
+    async fn a_missing_member_is_skipped() {
+        let b = Arc::new(ScriptedOutbound::new("b", true));
+        let reg = crate::selector::test_support::LiveRegistry::over(vec![b.clone()]);
+        let r = LoadBalanceOutbound::new(
+            "lb",
+            vec!["a".to_string(), "b".to_string()],
+            Some(BalanceStrategy::RoundRobin),
+            reg,
+        );
+        for _ in 0..4 {
+            assert!(
+                r.dial_stream(&crate::selector::test_support::meta())
+                    .await
+                    .is_ok()
+            );
+        }
+        assert_eq!(b.stream_dials(), 4);
+    }
+
+    /// Every member down: each is dialed exactly once and the error names the
+    /// group. The rotation must not lose track of a member (that is how a group
+    /// ends up with a member that is never dialed again).
+    #[tokio::test]
+    async fn all_members_down_tries_each_once() {
+        let a = Arc::new(ScriptedOutbound::new("a", false));
+        let b = Arc::new(ScriptedOutbound::new("b", false));
+        let reg = crate::selector::test_support::LiveRegistry::over(vec![a.clone(), b.clone()]);
+        let r = LoadBalanceOutbound::new(
+            "lb",
+            vec!["a".to_string(), "b".to_string()],
+            Some(BalanceStrategy::RoundRobin),
+            reg,
+        );
+
+        let err = match r.dial_stream(&crate::selector::test_support::meta()).await {
+            Err(e) => e,
+            Ok(_) => panic!("both members are down"),
+        };
+        assert!(matches!(err, FluxError::Network(_)), "{err:?}");
+        assert_eq!(a.stream_dials(), 1);
+        assert_eq!(b.stream_dials(), 1);
+
+        // A member that comes back is used again on the very next dial.
+        b.set_healthy(true);
+        assert!(
+            r.dial_stream(&crate::selector::test_support::meta())
+                .await
+                .is_ok()
+        );
+    }
+
+    /// The rotation counter is a `usize` shared by every dialer. At the end of
+    /// its range it must wrap, not panic in a debug build, and the index must
+    /// stay inside the list.
+    #[tokio::test]
+    async fn the_rotation_counter_wraps_without_panicking() {
+        let r = lb(BalanceStrategy::RoundRobin, &["a", "b", "c"]);
+        r.counter.store(usize::MAX - 1, Ordering::SeqCst);
+        for _ in 0..8 {
+            let idx = r.select_index(&crate::selector::test_support::meta());
+            assert!(
+                idx < r.outbounds.len(),
+                "index {idx} outside the member list"
+            );
+        }
+    }
+
+    /// Many tasks dialing at once: no panic, and every dial is carried by a
+    /// configured member.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_dials_stay_within_the_members() {
+        let a = Arc::new(ScriptedOutbound::new("a", true));
+        let b = Arc::new(ScriptedOutbound::new("b", true));
+        let c = Arc::new(ScriptedOutbound::new("c", true));
+        let reg = crate::selector::test_support::LiveRegistry::over(vec![
+            a.clone(),
+            b.clone(),
+            c.clone(),
+        ]);
+        let r = Arc::new(LoadBalanceOutbound::new(
+            "lb",
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            Some(BalanceStrategy::RoundRobin),
+            reg,
+        ));
+
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let r = r.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..40 {
+                    assert!(
+                        r.dial_stream(&crate::selector::test_support::meta())
+                            .await
+                            .is_ok()
+                    );
+                    let selected = r.current_selected().expect("groups report a selection");
+                    assert!(
+                        ["a", "b", "c"].contains(&selected.as_str()),
+                        "selection left the member list: {selected}"
+                    );
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("no task may panic");
+        }
+        let total = a.stream_dials() + b.stream_dials() + c.stream_dials();
+        assert_eq!(
+            total,
+            12 * 40,
+            "every session was carried by exactly one member"
+        );
+        assert!(a.stream_dials() > 0 && b.stream_dials() > 0 && c.stream_dials() > 0);
     }
 }

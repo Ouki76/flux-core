@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, OutboundLookup, PacketEndpoint, SessionMeta,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -15,7 +15,10 @@ pub struct FallbackOutbound {
     url: Option<String>,
     interval: Duration,
     lookup: Arc<dyn OutboundLookup>,
-    cancel_token: tokio_util::sync::CancellationToken,
+    /// The token of the running probe loop, if any. `None` before the first
+    /// `start_probing()`; holds a cancelled token after `stop()` so a later
+    /// start can install a fresh one.
+    probe_loop: Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 impl FallbackOutbound {
@@ -37,7 +40,7 @@ impl FallbackOutbound {
             url,
             interval: interval.unwrap_or(Duration::from_secs(300)),
             lookup,
-            cancel_token: tokio_util::sync::CancellationToken::new(),
+            probe_loop: Mutex::new(None),
         }
     }
 
@@ -45,14 +48,29 @@ impl FallbackOutbound {
         self.current_active.read().clone()
     }
 
+    /// Arms the probe loop.
+    ///
+    /// Idempotent while the loop runs: a second call must not add a second
+    /// loop, which would double every member's probe rate. Re-armable after
+    /// `stop()`: an `Instance` can be stopped and started again, and a group
+    /// whose token stays cancelled would never probe again.
     pub fn start_probing(self: &Arc<Self>) {
         if self.url.is_none() {
             return;
         }
 
+        let token = {
+            let mut slot = self.probe_loop.lock();
+            if slot.as_ref().is_some_and(|t| !t.is_cancelled()) {
+                return;
+            }
+            let token = tokio_util::sync::CancellationToken::new();
+            *slot = Some(token.clone());
+            token
+        };
+
         let weak = Arc::downgrade(self);
         let interval = self.interval;
-        let token = self.cancel_token.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = token.cancelled() => return,
@@ -74,6 +92,40 @@ impl FallbackOutbound {
                 }
             }
         });
+    }
+
+    /// The members in the order they must be tried: the primary first (the
+    /// documented "first healthy candidate wins"), then the currently selected
+    /// member, then the rest in configuration order — each member exactly once.
+    ///
+    /// Trying the primary first is what makes the group fail *back*, and the
+    /// dedup is what keeps a failover cheap: without it the primary was dialed
+    /// twice per session once the group had moved to a backup.
+    fn dial_order<'a>(&'a self, active: &'a str) -> Vec<&'a str> {
+        let mut order: Vec<&str> = Vec::with_capacity(self.outbounds.len() + 2);
+        if let Some(primary) = self.outbounds.first() {
+            order.push(primary.as_str());
+        }
+        if !order.contains(&active) {
+            order.push(active);
+        }
+        // A linear `contains` check is smaller and faster than a `HashSet` for
+        // the handful of members a group has, and it allocates nothing per
+        // member on a path that runs once per session.
+        for candidate in &self.outbounds {
+            if !order.contains(&candidate.as_str()) {
+                order.push(candidate.as_str());
+            }
+        }
+        order
+    }
+
+    /// Cancels the probe loop. Idempotent, and does not prevent a later
+    /// `start_probing()` from arming a new one.
+    pub fn stop_probing(&self) {
+        if let Some(token) = self.probe_loop.lock().as_ref() {
+            token.cancel();
+        }
     }
 
     pub async fn probe_candidates(&self) {
@@ -129,47 +181,27 @@ impl Outbound for FallbackOutbound {
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream> {
         let active = self.current();
 
-        // 1. If currently active is not the primary candidate, first attempt the primary candidate
-        if let Some(primary) = self.outbounds.first()
-            && primary != &active
-            && let Some(outbound) = self.lookup.get(primary)
-            && let Ok(stream) = outbound.dial_stream(meta).await
-        {
-            debug!(
-                "[{}] Primary fallback node '{}' recovered, switching back",
-                self.tag, primary
-            );
-            *self.current_active.write() = primary.clone();
-            return Ok(stream);
-        }
-
-        // 2. Try the currently active candidate
-        if let Some(outbound) = self.lookup.get(&active) {
+        for candidate_tag in self.dial_order(&active) {
+            let Some(outbound) = self.lookup.get(candidate_tag) else {
+                continue;
+            };
             match outbound.dial_stream(meta).await {
-                Ok(stream) => return Ok(stream),
+                Ok(stream) => {
+                    if candidate_tag != active {
+                        debug!(
+                            "[{}] Switched active fallback to '{}'",
+                            self.tag, candidate_tag
+                        );
+                        *self.current_active.write() = candidate_tag.to_string();
+                    }
+                    return Ok(stream);
+                }
                 Err(e) => {
                     warn!(
-                        "[{}] Primary fallback node '{}' failed dial: {}. Falling back to next candidates...",
-                        self.tag, active, e
+                        "[{}] Fallback candidate '{}' failed dial: {}. Trying next...",
+                        self.tag, candidate_tag, e
                     );
                 }
-            }
-        }
-
-        // 3. Try remaining candidates in priority order
-        for candidate_tag in &self.outbounds {
-            if candidate_tag == &active {
-                continue;
-            }
-            if let Some(outbound) = self.lookup.get(candidate_tag)
-                && let Ok(stream) = outbound.dial_stream(meta).await
-            {
-                debug!(
-                    "[{}] Switched active fallback to '{}'",
-                    self.tag, candidate_tag
-                );
-                *self.current_active.write() = candidate_tag.clone();
-                return Ok(stream);
             }
         }
 
@@ -180,28 +212,32 @@ impl Outbound for FallbackOutbound {
     }
 
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+        // Same priority order and the same recovery as `dial_stream`: whether a
+        // group is currently on its primary must not depend on which protocol
+        // was dialed last.
         let active = self.current();
-        if let Some(outbound) = self.lookup.get(&active) {
+
+        for candidate_tag in self.dial_order(&active) {
+            let Some(outbound) = self.lookup.get(candidate_tag) else {
+                continue;
+            };
             match outbound.dial_packet(meta).await {
-                Ok(ep) => return Ok(ep),
+                Ok(endpoint) => {
+                    if candidate_tag != active {
+                        debug!(
+                            "[{}] Switched active fallback UDP to '{}'",
+                            self.tag, candidate_tag
+                        );
+                        *self.current_active.write() = candidate_tag.to_string();
+                    }
+                    return Ok(endpoint);
+                }
                 Err(e) => {
                     warn!(
-                        "[{}] Primary fallback UDP node '{}' failed: {}. Falling back...",
-                        self.tag, active, e
+                        "[{}] Fallback UDP candidate '{}' failed: {}. Trying next...",
+                        self.tag, candidate_tag, e
                     );
                 }
-            }
-        }
-
-        for candidate_tag in &self.outbounds {
-            if candidate_tag == &active {
-                continue;
-            }
-            if let Some(outbound) = self.lookup.get(candidate_tag)
-                && let Ok(ep) = outbound.dial_packet(meta).await
-            {
-                *self.current_active.write() = candidate_tag.clone();
-                return Ok(ep);
             }
         }
 
@@ -239,13 +275,14 @@ impl Outbound for FallbackOutbound {
     }
 
     fn stop(&self) {
-        self.cancel_token.cancel();
+        self.stop_probing();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selector::test_support::{LiveRegistry, ScriptedOutbound, http_responder, meta};
 
     fn fallback(tags: &[&str]) -> FallbackOutbound {
         FallbackOutbound::new(
@@ -282,20 +319,279 @@ mod tests {
         );
     }
 
-    /// `stop()` must cancel the probe loop so a reload does not leak it.
-    #[test]
-    fn stop_cancels_probing() {
-        let f = std::sync::Arc::new(fallback(&["a"]));
-        assert!(!f.cancel_token.is_cancelled());
-        f.stop();
-        assert!(f.cancel_token.is_cancelled());
-    }
-
     /// A per-destination member must make the whole group per-destination.
     #[test]
     fn delegates_per_destination_flag() {
         let reg = crate::selector::test_support::FakeRegistry::of(&[("vm", true), ("a", false)]);
         let f = FallbackOutbound::new("fb", vec!["vm".into(), "a".into()], None, None, reg);
         assert!(f.udp_endpoint_per_destination());
+    }
+
+    // -----------------------------------------------------------------------
+    // Failover
+    // -----------------------------------------------------------------------
+
+    /// Two scripted members plus the registry that holds them, so a test can
+    /// read the per-member dial counters and flip health at runtime.
+    fn scripted(
+        tags: &[&str],
+    ) -> (
+        Arc<ScriptedOutbound>,
+        Arc<ScriptedOutbound>,
+        Arc<LiveRegistry>,
+    ) {
+        let a = Arc::new(ScriptedOutbound::new(tags[0], true));
+        let b = Arc::new(ScriptedOutbound::new(tags[1], true));
+        let reg = LiveRegistry::over(vec![a.clone(), b.clone()]);
+        (a, b, reg)
+    }
+
+    fn group(reg: Arc<LiveRegistry>, tags: &[&str]) -> FallbackOutbound {
+        FallbackOutbound::new(
+            "fb",
+            tags.iter().map(|s| s.to_string()).collect(),
+            None,
+            None,
+            reg,
+        )
+    }
+
+    /// TCP fails over to a live member, and — the documented "first healthy
+    /// candidate wins" — returns to the primary once it answers again.
+    #[tokio::test]
+    async fn tcp_fails_over_and_recovers() {
+        let (a, b, reg) = scripted(&["a", "b"]);
+        a.set_healthy(false);
+        let f = group(reg, &["a", "b"]);
+
+        assert!(f.dial_stream(&meta()).await.is_ok(), "b must serve");
+        assert_eq!(f.current(), "b", "the group is now on the backup");
+
+        a.set_healthy(true);
+        assert!(f.dial_stream(&meta()).await.is_ok());
+        assert_eq!(f.current(), "a", "the recovered primary must win again");
+        assert_eq!(b.stream_dials(), 1, "b is only dialed while a is down");
+    }
+
+    /// UDP must follow the same policy as TCP: the group is one group, and an
+    /// operator's failover must not depend on which protocol happened to be
+    /// dialed first. A group that never returns to its primary for datagrams is
+    /// stuck on the backup for the life of the process.
+    #[tokio::test]
+    async fn udp_fails_over_and_recovers() {
+        let (a, _b, reg) = scripted(&["a", "b"]);
+        a.set_healthy(false);
+        let f = group(reg, &["a", "b"]);
+
+        assert!(f.dial_packet(&meta()).await.is_ok(), "b must serve");
+        assert_eq!(f.current(), "b");
+
+        a.set_healthy(true);
+        assert!(f.dial_packet(&meta()).await.is_ok());
+        assert_eq!(
+            f.current(),
+            "a",
+            "UDP must recover to the primary exactly like TCP does"
+        );
+    }
+
+    /// One failed dial must not cost a second attempt at the same member: the
+    /// candidates are tried in priority order, once each. Before this was fixed
+    /// the primary was dialed twice (recovery step, then the remaining-candidates
+    /// loop), which doubled the failover time of a 2-member group.
+    #[tokio::test]
+    async fn a_failing_dial_never_retries_a_member() {
+        let (a, b, reg) = scripted(&["a", "b"]);
+        let f = group(reg, &["a", "b"]);
+
+        // Get the group onto the backup first, then take both members down.
+        a.set_healthy(false);
+        assert!(f.dial_stream(&meta()).await.is_ok());
+        assert_eq!(f.current(), "b");
+
+        b.set_healthy(false);
+        let a_before = a.stream_dials();
+        let b_before = b.stream_dials();
+
+        let outcome = f.dial_stream(&meta()).await;
+        let err = match outcome {
+            Err(e) => e,
+            Ok(_) => panic!("both members are down, the dial must fail"),
+        };
+        assert!(
+            matches!(err, FluxError::Network(_)),
+            "the group must report a network failure, got {err:?}"
+        );
+        assert_eq!(
+            a.stream_dials() - a_before,
+            1,
+            "the primary must be dialed once, not once per failover step"
+        );
+        assert_eq!(
+            b.stream_dials() - b_before,
+            1,
+            "the backup must be dialed once"
+        );
+    }
+
+    /// Both protocols must try every member exactly once when all of them fail
+    /// for UDP too.
+    #[tokio::test]
+    async fn a_failing_udp_dial_never_retries_a_member() {
+        let (a, b, reg) = scripted(&["a", "b"]);
+        a.set_healthy(false);
+        b.set_healthy(false);
+        let f = group(reg, &["a", "b"]);
+
+        assert!(f.dial_packet(&meta()).await.is_err());
+        assert_eq!(a.packet_dials(), 1);
+        assert_eq!(b.packet_dials(), 1);
+    }
+
+    /// An empty candidate list cannot be produced by the config validator, but
+    /// the group must still dial something rather than fail for ever: it falls
+    /// back to `direct`.
+    #[tokio::test]
+    async fn an_empty_group_still_dials_direct() {
+        let direct: Arc<dyn Outbound> = Arc::new(ScriptedOutbound::new("direct", true));
+        let reg = LiveRegistry::over(vec![direct]);
+        let f = FallbackOutbound::new("fb", vec![], None, None, reg);
+        assert_eq!(f.current(), "direct");
+        assert!(f.dial_stream(&meta()).await.is_ok());
+        assert!(f.dial_packet(&meta()).await.is_ok());
+    }
+
+    /// A member removed from the registry must not stop the group from dialing
+    /// the members it still has.
+    #[tokio::test]
+    async fn dials_a_live_member_when_the_active_one_vanishes() {
+        let (a, _b, reg) = scripted(&["a", "b"]);
+        let f = group(reg.clone(), &["a", "b"]);
+        // Fail over to b first so that `active` is a real member that then goes
+        // away, which is what a reload does to a group.
+        a.set_healthy(false);
+        assert!(f.dial_stream(&meta()).await.is_ok());
+        // The backup vanishes (a reload) while the primary recovers.
+        a.set_healthy(true);
+        reg.remove("b");
+        assert!(
+            f.dial_stream(&meta()).await.is_ok(),
+            "the other candidate still exists"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The probe loop
+    // -----------------------------------------------------------------------
+
+    /// One group owns one probe loop. A repeated `start_probing()` must not
+    /// double the rate, `stop()` must end it, and a stopped group must be able
+    /// to resume — an `Instance` can be stopped and started again.
+    #[tokio::test]
+    async fn the_probe_loop_is_single_and_resumable() {
+        let responder = http_responder().await;
+        let a = Arc::new(ScriptedOutbound::new("a", true).with_responder(responder));
+        let reg = LiveRegistry::over(vec![a.clone()]);
+        let f = Arc::new(FallbackOutbound::new(
+            "fb",
+            vec!["a".to_string()],
+            Some("http://127.0.0.1:1/generate_204".to_string()),
+            Some(Duration::from_millis(40)),
+            reg,
+        ));
+
+        f.start_probing();
+        f.start_probing();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let while_running = a.stream_dials();
+        assert!(
+            while_running >= 4,
+            "the probe loop never ran: {while_running} probes in 400 ms"
+        );
+        assert!(
+            while_running < 16,
+            "a second start_probing() doubled the probe rate: {while_running} probes in 400 ms at a 40 ms interval"
+        );
+
+        f.stop();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let stopped = a.stream_dials();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(a.stream_dials(), stopped, "stop() must end the probe loop");
+
+        f.start_probing();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            a.stream_dials() > stopped,
+            "a stopped group must resume probing when it is started again"
+        );
+    }
+
+    /// Probing stops at the first healthy candidate in priority order, even when
+    /// earlier candidates are dead — and a dead candidate is retried on the next
+    /// round, so it can never be permanently written off.
+    #[tokio::test]
+    async fn probing_skips_dead_members_and_retries_them() {
+        let responder = http_responder().await;
+        let a = Arc::new(ScriptedOutbound::new("a", false).with_responder(responder));
+        let b = Arc::new(ScriptedOutbound::new("b", true).with_responder(responder));
+        let reg = LiveRegistry::over(vec![a.clone(), b.clone()]);
+        let f = FallbackOutbound::new(
+            "fb",
+            vec!["a".to_string(), "b".to_string()],
+            Some("http://127.0.0.1:1/generate_204".to_string()),
+            None,
+            reg,
+        );
+
+        f.probe_candidates().await;
+        assert_eq!(f.current(), "b", "the first healthy candidate wins");
+        assert_eq!(a.stream_dials(), 1, "the dead primary must be tried");
+
+        a.set_healthy(true);
+        f.probe_candidates().await;
+        assert_eq!(f.current(), "a", "a recovered primary must be retried");
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrency
+    // -----------------------------------------------------------------------
+
+    /// Many tasks dialing while the active member flips: no panic, no deadlock,
+    /// and the selection is always one of the configured members.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_dialing_keeps_a_member_selected() {
+        let (a, b, reg) = scripted(&["a", "b"]);
+        let f = Arc::new(group(reg, &["a", "b"]));
+
+        let mut tasks = Vec::new();
+        for worker in 0..12 {
+            let f = f.clone();
+            let a = a.clone();
+            let b = b.clone();
+            tasks.push(tokio::spawn(async move {
+                for i in 0..32 {
+                    // Flap the members while other tasks are dialing.
+                    if (worker + i) % 7 == 0 {
+                        a.set_healthy((worker + i) % 14 == 0);
+                        b.set_healthy((worker + i) % 3 != 0);
+                    }
+                    let _ = f.dial_stream(&meta()).await;
+                    let _ = f.dial_packet(&meta()).await;
+                    let current = f.current();
+                    assert!(
+                        current == "a" || current == "b",
+                        "selection left the member list: {current}"
+                    );
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("no task may panic");
+        }
+        a.set_healthy(true);
+        b.set_healthy(true);
+        assert!(f.dial_stream(&meta()).await.is_ok());
+        assert!(matches!(f.current().as_str(), "a" | "b"));
     }
 }

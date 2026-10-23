@@ -4,7 +4,7 @@ use flux_types::{
     BoxedStream, FluxError, FluxResult, Outbound, OutboundLookup, PacketEndpoint, SessionMeta,
     TargetAddress,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -23,7 +23,10 @@ pub struct UrlTestOutbound {
     current_best: Arc<RwLock<Option<String>>>,
     latencies: Arc<DashMap<String, Duration>>,
     lookup: Arc<dyn OutboundLookup>,
-    cancel_token: tokio_util::sync::CancellationToken,
+    /// The token of the running probe loop, if any. `None` before the first
+    /// `start_probing()`; holds a cancelled token after `stop()` so that a
+    /// later start can install a fresh one.
+    probe_loop: Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 impl UrlTestOutbound {
@@ -55,15 +58,30 @@ impl UrlTestOutbound {
             current_best: Arc::new(RwLock::new(initial_best)),
             latencies: Arc::new(DashMap::new()),
             lookup,
-            cancel_token: tokio_util::sync::CancellationToken::new(),
+            probe_loop: Mutex::new(None),
         }
     }
 
     /// Spawns the background health check probe loop.
+    ///
+    /// Idempotent while the loop runs: a second call must not add a second loop,
+    /// which would double every member's probe rate. Re-armable after `stop()`:
+    /// an `Instance` can be stopped and started again, and a group that came
+    /// back from a stop with a permanently cancelled token would never probe
+    /// again for the rest of the process's life.
     pub fn start_probing(self: &Arc<Self>) {
+        let token = {
+            let mut slot = self.probe_loop.lock();
+            if slot.as_ref().is_some_and(|t| !t.is_cancelled()) {
+                return;
+            }
+            let token = tokio_util::sync::CancellationToken::new();
+            *slot = Some(token.clone());
+            token
+        };
+
         let weak = Arc::downgrade(self);
         let interval = self.interval;
-        let token = self.cancel_token.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = token.cancelled() => return,
@@ -183,12 +201,36 @@ impl UrlTestOutbound {
                 ))
             })?;
 
-        self.lookup.get(&best).ok_or_else(|| {
-            FluxError::OutboundNotFound(format!(
-                "urltest '{}': active outbound '{}' not found in registry",
-                self.tag, best
-            ))
-        })
+        if let Some(outbound) = self.lookup.get(&best) {
+            return Ok(outbound);
+        }
+
+        // The remembered best can go stale (a reload rebuilt the registry). Dial
+        // a candidate that still exists instead of failing every session: the
+        // latency table is advisory, the member list is the contract. The
+        // remembered tag is left alone — the next probe round replaces it.
+        for candidate in &self.outbounds {
+            if let Some(outbound) = self.lookup.get(candidate) {
+                debug!(
+                    "[{}] best outbound '{}' is no longer in the registry; dialing '{}' instead",
+                    self.tag, best, candidate
+                );
+                return Ok(outbound);
+            }
+        }
+
+        Err(FluxError::OutboundNotFound(format!(
+            "urltest '{}': active outbound '{}' not found in registry, and no candidate resolves",
+            self.tag, best
+        )))
+    }
+
+    /// Cancels the probe loop. Idempotent, and does not prevent a later
+    /// `start_probing()` from arming a new one.
+    pub fn stop_probing(&self) {
+        if let Some(token) = self.probe_loop.lock().as_ref() {
+            token.cancel();
+        }
     }
 }
 
@@ -238,13 +280,16 @@ impl Outbound for UrlTestOutbound {
     }
 
     fn stop(&self) {
-        self.cancel_token.cancel();
+        self.stop_probing();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selector::test_support::{
+        FakeRegistry, LiveRegistry, ScriptedOutbound, http_responder, meta,
+    };
 
     fn urltest(tolerance_ms: u64) -> UrlTestOutbound {
         UrlTestOutbound::new(
@@ -327,5 +372,241 @@ mod tests {
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
         assert_eq!(t.url(), "http://cp.cloudflare.com/generate_204");
+    }
+
+    // -----------------------------------------------------------------------
+    // Failover, staleness and the probe loop
+    // -----------------------------------------------------------------------
+
+    /// The remembered best tag can go stale under a live group: a reload
+    /// rebuilds the registry, so the member it names is gone while another
+    /// candidate is alive. Failing every session for ever is not acceptable.
+    #[tokio::test]
+    async fn dials_a_live_candidate_when_the_best_is_gone() {
+        let live: Arc<dyn Outbound> = Arc::new(ScriptedOutbound::new("b", true));
+        let t = UrlTestOutbound::new(
+            "ut",
+            vec!["a".to_string(), "b".to_string()],
+            None,
+            None,
+            None,
+            FakeRegistry::over(vec![live]),
+        );
+        assert_eq!(t.current_best_tag(), Some("a".to_string()));
+        assert!(
+            t.dial_stream(&meta()).await.is_ok(),
+            "the group must dial the member that still exists"
+        );
+        assert!(t.dial_packet(&meta()).await.is_ok());
+    }
+
+    /// Selection follows the measurements in both directions: a member that
+    /// starts failing is dropped, and a member that recovers is selectable
+    /// again. A failed probe is never a permanent death sentence.
+    #[tokio::test]
+    async fn a_recovered_member_is_selected_again() {
+        let responder = http_responder().await;
+        let a = Arc::new(ScriptedOutbound::new("a", false).with_responder(responder));
+        let b = Arc::new(ScriptedOutbound::new("b", true).with_responder(responder));
+        let reg = LiveRegistry::over(vec![a.clone(), b.clone()]);
+        let t = UrlTestOutbound::new(
+            "ut",
+            vec!["a".to_string(), "b".to_string()],
+            None,
+            None,
+            None,
+            reg,
+        );
+
+        t.probe_all().await;
+        assert!(
+            t.latencies.get("a").is_none(),
+            "a failed probe must not leave a measurement behind"
+        );
+        assert_eq!(t.current_best_tag(), Some("b".to_string()));
+
+        a.set_healthy(true);
+        b.set_healthy(false);
+        t.probe_all().await;
+        assert_eq!(
+            t.current_best_tag(),
+            Some("a".to_string()),
+            "the recovered member must be selectable again"
+        );
+        assert!(t.dial_stream(&meta()).await.is_ok());
+    }
+
+    /// A member that disappears from the registry must not be resurrected by a
+    /// probe result that arrived for it: its measurement is dropped, and the
+    /// group keeps dialing the members it still has.
+    #[tokio::test]
+    async fn a_vanished_member_is_not_resurrected() {
+        let responder = http_responder().await;
+        let a = Arc::new(ScriptedOutbound::new("a", true).with_responder(responder));
+        let b = Arc::new(ScriptedOutbound::new("b", true).with_responder(responder));
+        let reg = LiveRegistry::over(vec![a.clone(), b.clone()]);
+        let t = UrlTestOutbound::new(
+            "ut",
+            vec!["a".to_string(), "b".to_string()],
+            None,
+            None,
+            Some(Duration::ZERO),
+            reg.clone(),
+        );
+
+        t.probe_all().await;
+        assert!(t.latencies.contains_key("a") && t.latencies.contains_key("b"));
+
+        reg.remove("a");
+        t.probe_all().await;
+        assert!(
+            !t.latencies.contains_key("a"),
+            "a member that no longer exists must not keep a latency"
+        );
+        assert_eq!(t.current_best_tag(), Some("b".to_string()));
+        assert!(t.dial_stream(&meta()).await.is_ok());
+    }
+
+    /// One group owns one probe loop: a repeated `start_probing()` must not
+    /// double the probe rate (twice the connections, twice the load on the
+    /// members), and a group that was stopped must be able to resume — an
+    /// `Instance` can be stopped and started again.
+    #[tokio::test]
+    async fn the_probe_loop_is_single_and_resumable() {
+        let responder = http_responder().await;
+        let a = Arc::new(ScriptedOutbound::new("a", true).with_responder(responder));
+        let group = Arc::new(UrlTestOutbound::new(
+            "ut",
+            vec!["a".to_string()],
+            None,
+            Some(Duration::from_millis(40)),
+            None,
+            FakeRegistry::over(vec![a.clone()]),
+        ));
+
+        group.start_probing();
+        group.start_probing();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let while_running = a.stream_dials();
+        assert!(
+            while_running >= 4,
+            "the probe loop never ran: {while_running} probes in 400 ms"
+        );
+        assert!(
+            while_running < 16,
+            "a second start_probing() doubled the probe rate: {while_running} probes in 400 ms at a 40 ms interval"
+        );
+        assert!(
+            group.current_best_tag().is_some(),
+            "a healthy member must have been measured"
+        );
+
+        group.stop();
+        tokio::time::sleep(Duration::from_millis(150)).await; // let an in-flight round end
+        let stopped = a.stream_dials();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(a.stream_dials(), stopped, "stop() must end the probe loop");
+
+        group.start_probing();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            a.stream_dials() > stopped,
+            "a stopped group must resume probing when it is started again"
+        );
+    }
+
+    /// When every member is down the group keeps its last selection instead of
+    /// dropping to "no member at all": the next dial still names a member (and
+    /// fails on its own error), and a probe round that finds a healthy member
+    /// recovers the group.
+    #[tokio::test]
+    async fn an_all_unhealthy_group_keeps_a_member_to_dial() {
+        let responder = http_responder().await;
+        let a = Arc::new(ScriptedOutbound::new("a", true).with_responder(responder));
+        let b = Arc::new(ScriptedOutbound::new("b", true).with_responder(responder));
+        let t = UrlTestOutbound::new(
+            "ut",
+            vec!["a".to_string(), "b".to_string()],
+            None,
+            None,
+            Some(Duration::ZERO),
+            LiveRegistry::over(vec![a.clone(), b.clone()]),
+        );
+
+        t.probe_all().await;
+        assert!(t.current_best_tag().is_some());
+
+        a.set_healthy(false);
+        b.set_healthy(false);
+        t.probe_all().await;
+        assert!(
+            t.current_best_tag().is_some(),
+            "an unhealthy group must still name a member to dial"
+        );
+        assert!(t.latencies.is_empty(), "no measurement survived");
+        assert!(t.dial_stream(&meta()).await.is_err());
+
+        b.set_healthy(true);
+        t.probe_all().await;
+        assert_eq!(t.current_best_tag(), Some("b".to_string()));
+        assert!(t.dial_stream(&meta()).await.is_ok());
+    }
+
+    /// An empty group must probe and dial without panicking.
+    #[tokio::test]
+    async fn an_empty_group_is_not_a_panic() {
+        let t = UrlTestOutbound::new(
+            "ut",
+            vec![],
+            None,
+            None,
+            None,
+            crate::selector::test_support::FakeRegistry::over(vec![]),
+        );
+        t.probe_all().await;
+        assert_eq!(t.current_best_tag(), None);
+        assert!(t.dial_stream(&meta()).await.is_err());
+        assert!(t.dial_packet(&meta()).await.is_err());
+    }
+
+    /// Probing and dialing from many tasks at once: no panic, no deadlock, and
+    /// the selection is always one of the configured members.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_probing_and_dialing_stay_consistent() {
+        let responder = http_responder().await;
+        let a = Arc::new(ScriptedOutbound::new("a", true).with_responder(responder));
+        let b = Arc::new(ScriptedOutbound::new("b", true).with_responder(responder));
+        let t = Arc::new(UrlTestOutbound::new(
+            "ut",
+            vec!["a".to_string(), "b".to_string()],
+            None,
+            None,
+            Some(Duration::ZERO),
+            LiveRegistry::over(vec![a, b]),
+        ));
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let t = t.clone();
+            tasks.push(tokio::spawn(async move {
+                for _ in 0..24 {
+                    t.probe_all().await;
+                    let best = t.current_best_tag();
+                    assert!(
+                        matches!(best.as_deref(), Some("a") | Some("b")),
+                        "selection left the member list: {best:?}"
+                    );
+                    assert!(t.dial_stream(&meta()).await.is_ok());
+                    assert!(t.dial_packet(&meta()).await.is_ok());
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("no task may panic");
+        }
+        assert!(matches!(
+            t.current_best_tag().as_deref(),
+            Some("a") | Some("b")
+        ));
     }
 }
