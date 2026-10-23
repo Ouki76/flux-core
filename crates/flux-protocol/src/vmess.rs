@@ -1423,3 +1423,79 @@ mod replay_tests {
         assert!(VmessProtocol::verify_auth_id(&auth_id, &[known]).is_none());
     }
 }
+
+#[cfg(test)]
+mod framing_guard_tests {
+    //! VMess had the same one-chunk-per-call defect as the Shadowsocks and WebSocket
+    //! transports: a 64 KiB write from the relay became four frames, four seals and
+    //! four syscalls. This fails if that comes back.
+
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    #[derive(Default)]
+    struct Counting {
+        writes: Vec<usize>,
+    }
+
+    impl AsyncWrite for Counting {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.push(buf.len());
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for Counting {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_64_kib_write_is_one_frame_flight() {
+        let mut stream = VmessStream::new_client(
+            Counting::default(),
+            [7u8; 16],
+            [9u8; 16],
+            0x01, // security: aes-128-gcm
+            0,
+            0,
+        );
+
+        // The client writes its request header on the first call; the property under
+        // test is what a payload write does after it.
+        tokio::io::AsyncWriteExt::write_all(&mut stream, b"hdr")
+            .await
+            .expect("header");
+        let after_header = stream.inner.writes.len();
+
+        let payload = vec![0x33u8; 64 * 1024];
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &payload)
+            .await
+            .expect("payload");
+
+        let calls = stream.inner.writes[after_header..].to_vec();
+        assert_eq!(
+            calls.len(),
+            1,
+            "64 KiB must reach the transport as one write, not {} (sizes: {calls:?})",
+            calls.len()
+        );
+    }
+}
