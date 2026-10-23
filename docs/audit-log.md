@@ -2084,3 +2084,38 @@ An attempt to rewrite those call sites into a builder closure (so a permanent ho
 be escaped with a fresh port) broke the file's structure under regex rewriting and was
 reverted. The builder is still the right answer for a *permanent* holder; it is not what
 this failure was.
+
+---
+
+## Cycle 37 — 2026-10-24
+
+### Vision is a real deficit, and my earlier claim about it was wrong
+
+I had written that sing-box does not implement the Vision flow and that the comparison was
+therefore not like-for-like. **That was wrong** — sing-box supports `xtls-rprx-vision`, and
+the harness configures it. The row is a genuine comparison, and the deficit is genuine.
+
+Five interleaved rounds, xray excluded:
+
+| path | flux | sing-box | delta |
+|---|---|---|---|
+| VLESS / REALITY | 259 | 312 | −17.0 % |
+| VLESS / REALITY + Vision | 221 | 298 | −26.0 % |
+
+Vision costs us 15 % over REALITY alone; it costs sing-box 4.5 %. So there is real overhead
+in our Vision path beyond the transport.
+
+The cause is visible in the read loop: serving buffered output did
+`this.out.drain(..n).collect()` — a heap allocation and two copies **per read** — and
+returned after one piece instead of filling the caller's buffer.
+
+**Removing it did not survive its own test.** With the copies gone the throughput moved
+within noise (244 vs 221 at five rounds, the gap still −21.6 %), and
+`truncated_frame_is_an_error_not_clean_eof` started failing: returning `Ready` with bytes
+already delivered changed when the truncation error surfaces, and tokio's `read_to_end`
+asserted on it. A change that trades a correctness property for a noise-level gain is not
+a change worth making, so it is reverted in full.
+
+Recorded as an open item with the specific lead: the allocation-per-read is real waste, but
+it needs to be removed *without* touching when EOF and truncation errors are reported —
+that is, the refill loop has to keep the state machine's error paths exactly where they are.
