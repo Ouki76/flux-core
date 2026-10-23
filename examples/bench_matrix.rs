@@ -17,13 +17,22 @@
 //! Each round moves one pipelined request/response stream of `--mb` MiB through
 //! a freshly dialled tunnel connection and records
 //!
-//!   * MB/s (MiB/s, 1 MiB = 1048576 B) of payload, and
+//!   * MB/s (MiB/s, 1 MiB = 1048576 B) of payload — both end-to-end and with the
+//!     connection-setup phase excluded ("bulk"), because a protocol whose
+//!     handshake costs seconds would otherwise be misread as slow crypto, and
 //!   * CPU-seconds burned by the **two tunnel processes** per GiB of payload,
-//!     from `/proc/<pid>/schedstat` (nanosecond resolution) with
-//!     `/proc/<pid>/stat` ticks (10 ms) as the fallback.
+//!     summed over every thread's `/proc/<pid>/task/*/schedstat` (nanosecond
+//!     resolution; the per-process `/proc/<pid>/stat` ticks are only a fallback,
+//!     since a proxy does its work on worker threads and the thread-group leader
+//!     alone reports ~0).
 //!
 //! The harness process owns the client endpoint *and* the echo server, so its
 //! own CPU is never charged to either stack.
+//!
+//! One subtlety is load-bearing: the transfer task must keep the socket's write
+//! half **open** until the echo has come back in full. Dropping it sends a FIN,
+//! and a proxy that tears the whole connection down when one direction hits EOF
+//! (sing-box does) then truncates the download at a random offset.
 //!
 //! Rounds alternate which stack goes first (odd rounds flux, even rounds
 //! sing-box) so a thermal/scheduler drift inside a scenario cannot

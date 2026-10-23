@@ -17,8 +17,13 @@ harness ──SOCKS5──> client proxy ══tunnel══> server proxy ──
                                                    (and back)
 ```
 
-Measured at `7e938a6`, 16-core desktop, `flux-core 1.3.4` vs `sing-box 1.11.4`
-(xray 26.3.27 is installed but is not part of this matrix).
+Measured on a 16-core desktop from the tree at `90d4933` — `fix(reality): a
+rustls fallback cost 5 seconds on every connection`, the fix this matrix forced —
+`flux-core 1.3.4` vs `sing-box 1.11.4`. xray 26.3.27 is installed but is not part
+of this matrix. The REALITY rows were re-measured after that fix landed and are
+confirmed on the committed tree; the Vision row was measured just before
+`crates/flux-protocol/src/vision.rs` started changing, so treat it as a lower
+bound and re-run before quoting it.
 
 ## The table as printed
 
@@ -27,8 +32,8 @@ $ cargo run --release --example bench_matrix -- --rounds 5 --mb 200
 
 flux-core  : flux-core 1.3.4  (./target/release/flux-core)
 sing-box   : sing-box version 1.11.4  (/home/ouki/.local/bin/sing-box)
-echo server: 127.0.0.1:43051 (in this process; not charged to either stack)
-TLS decoy  : 127.0.0.1:34269 (REALITY certificate source)
+echo server: 127.0.0.1:37811 (in this process; not charged to either stack)
+TLS decoy  : 127.0.0.1:43311 (REALITY certificate source)
 workload   : 200 MiB payload per round, 5 round(s), fresh tunnel connection per round
 
 ========================================================================================================================================
@@ -37,171 +42,179 @@ MB/s = MiB/s of payload for a FRESH tunnel connection (setup included); bulk exc
 ========================================================================================================================================
 Protocol / transport                 Stack       MB/s e2e       min       max MB/s bulk  setup ms CPU s/GiB   n  status
 ----------------------------------------------------------------------------------------------------------------------------------------
-VLESS / TCP                          flux-core     1068.4    1011.8    1137.9    1070.1       0.3     1.199   5  ok
-                                     sing-box      1181.0    1118.6    1223.8    1183.7       0.4     1.733   5  ok
-VLESS / WS + TLS                     flux-core      420.1     406.0     433.7     420.7       0.7     4.731   5  ok
-                                     sing-box       688.4     675.5     731.0     691.1       1.1     3.370   5  ok
-VLESS / gRPC + TLS                   flux-core      305.9     297.2     323.4     306.1       0.7     8.091   5  ok
-                                     sing-box       324.5     321.2     332.7     324.6       0.3    10.119   5  ok
-VLESS / REALITY                      flux-core       37.3      36.9      37.4     561.3    5002.0     3.365   5  ok
-                                     sing-box       793.8     604.5     814.6     797.8       1.4     2.905   5  ok
-VLESS / REALITY + Vision             flux-core       34.3      34.0      34.5     242.8    5002.6     8.488   5  ok
-                                     sing-box       750.5     703.8     777.8     755.7       1.7     2.852   5  ok
-VMess / WS + TLS                     flux-core      338.4     324.7     346.9     338.8       0.6     5.770   5  ok
-                                     sing-box       523.9     454.4     576.5     525.5       1.2     5.158   5  ok
-Trojan / TLS                         flux-core      785.4     750.4     809.8     787.4       0.6     2.159   5  ok
-                                     sing-box       734.2     698.7     748.5     737.2       1.2     3.089   5  ok
-Shadowsocks-2022 / blake3-aes-128-gcm flux-core      487.7     448.1     514.4     488.1       0.3     3.954   5  ok
-                                     sing-box       899.0     831.8     913.3     900.5       0.4     2.600   5  ok
-Shadowsocks-AEAD / aes-256-gcm       flux-core      433.4     396.8     452.9     433.7       0.3     4.457   5  ok
-                                     sing-box       503.8     492.5     519.4     504.4       0.5     3.660   5  ok
+VLESS / TCP                          flux-core     1060.9    1038.0    1097.6    1062.7       0.3     1.197   5  ok
+                                     sing-box      1183.2    1109.5    1239.2    1186.4       0.5     1.664   5  ok
+VLESS / WS + TLS                     flux-core      420.5     399.4     435.1     421.2       0.6     4.672   5  ok
+                                     sing-box       707.4     701.4     719.2     710.2       1.1     3.482   5  ok
+VLESS / gRPC + TLS                   flux-core      301.3     291.6     303.4     301.6       0.6     8.252   5  ok
+                                     sing-box       322.1     317.0     326.6     322.3       0.3    10.089   5  ok
+VLESS / REALITY                      flux-core      538.0     504.5     547.4     539.0       0.7     3.593   5  ok
+                                     sing-box       724.5     696.7     748.3     728.1       1.6     3.078   5  ok
+VLESS / REALITY + Vision             flux-core      225.6     222.9     236.5     225.8       0.7     8.967   5  ok
+                                     sing-box       722.4     708.0     751.4     726.9       1.6     3.046   5  ok
+VMess / WS + TLS                     flux-core      315.9     308.8     329.7     316.3       0.7     6.245   5  ok
+                                     sing-box       500.5     461.1     506.7     501.8       1.1     5.161   5  ok
+Trojan / TLS                         flux-core      767.5     721.7     797.1     769.1       0.6     2.231   5  ok
+                                     sing-box       740.7     690.8     746.8     743.3       1.2     2.990   5  ok
+Shadowsocks-2022 / blake3-aes-128-gcm flux-core      482.6     471.5     511.3     482.9       0.3     4.023   5  ok
+                                     sing-box       953.9     915.5     974.0     955.7       0.4     2.397   5  ok
+Shadowsocks-AEAD / aes-256-gcm       flux-core      427.8     416.6     464.8     428.2       0.3     4.611   5  ok
+                                     sing-box       498.6     446.8     516.5     499.1       0.5     3.751   5  ok
 ----------------------------------------------------------------------------------------------------------------------------------------
 
 PAIRWISE SUMMARY (medians; flux-core relative to sing-box)
 --------------------------------------------------------------------------------------------------------
 Protocol / transport                    flux bulk  sbox bulk  throughput  CPU ratio  setup flux/sbox
 --------------------------------------------------------------------------------------------------------
-VLESS / TCP                                1070.1     1183.7       -9.6%     -30.8%     0.3 / 0.4 ms
-VLESS / WS + TLS                            420.7      691.1      -39.1%     +40.4%     0.7 / 1.1 ms
-VLESS / gRPC + TLS                          306.1      324.6       -5.7%     -20.0%     0.7 / 0.3 ms
-VLESS / REALITY                             561.3      797.8      -29.6%     +15.8%  5002.0 / 1.4 ms
-VLESS / REALITY + Vision                    242.8      755.7      -67.9%    +197.7%  5002.6 / 1.7 ms
-VMess / WS + TLS                            338.8      525.5      -35.5%     +11.9%     0.6 / 1.2 ms
-Trojan / TLS                                787.4      737.2       +6.8%     -30.1%     0.6 / 1.2 ms
-Shadowsocks-2022 / blake3-aes-128-gcm       488.1      900.5      -45.8%     +52.1%     0.3 / 0.4 ms
-Shadowsocks-AEAD / aes-256-gcm              433.7      504.4      -14.0%     +21.8%     0.3 / 0.5 ms
+VLESS / TCP                                1062.7     1186.4      -10.4%     -28.0%     0.3 / 0.5 ms
+VLESS / WS + TLS                            421.2      710.2      -40.7%     +34.2%     0.6 / 1.1 ms
+VLESS / gRPC + TLS                          301.6      322.3       -6.4%     -18.2%     0.6 / 0.3 ms
+VLESS / REALITY                             539.0      728.1      -26.0%     +16.8%     0.7 / 1.6 ms
+VLESS / REALITY + Vision                    225.8      726.9      -68.9%    +194.3%     0.7 / 1.6 ms
+VMess / WS + TLS                            316.3      501.8      -37.0%     +21.0%     0.7 / 1.1 ms
+Trojan / TLS                                769.1      743.3       +3.5%     -25.4%     0.6 / 1.2 ms
+Shadowsocks-2022 / blake3-aes-128-gcm       482.9      955.7      -49.5%     +67.8%     0.3 / 0.4 ms
+Shadowsocks-AEAD / aes-256-gcm              428.2      499.1      -14.2%     +23.0%     0.3 / 0.5 ms
 --------------------------------------------------------------------------------------------------------
 ```
 
 `MB/s` is MiB/s of payload counted once (200 MiB in, 200 MiB back out). `CPU s/GiB`
-is the CPU burned by the **two tunnel processes** ("MB/s bulk" excludes the
-connection-setup phase, "setup ms" is that phase on its own). Per-round samples
-are printed above the table.
+is the CPU burned by the **two tunnel processes** — "MB/s bulk" excludes the
+connection-setup phase and "setup ms" is that phase on its own. Per-round samples
+are printed above the table, and every cell is a median of 5 interleaved rounds.
 
 ## Which pairs work
 
-All nine run. Every pair below was driven through both stacks, with a real
-handshake, a 200 MiB echo and a byte-exact byte count:
+All nine run, each driven through both stacks with a real handshake and a
+byte-exact 200 MiB echo:
 
-| pair | works | note |
-|---|---|---|
-| VLESS over TCP (plain) | yes | the baseline; closest to parity (−9.6 %), CPU −31 % |
-| VLESS over WebSocket + TLS | yes | −39 %; the largest transport-shaped gap |
-| VLESS over gRPC + TLS | yes | −5.7 % on throughput and −20 % CPU: gRPC is bounded by HTTP/2 flow control for **both** stacks, which flattens the difference |
-| VLESS + REALITY, Vision off | yes | bulk −29.6 %; plus a **5 s per-connection setup defect** (below) |
-| VLESS + REALITY, Vision on | yes | bulk −68 %, CPU +198 %: Vision costs flux 2.3× of its own REALITY bulk rate (561 → 243 MB/s) and sing-box 5 % (798 → 756) |
-| VMess over WebSocket + TLS | yes | −35.5 %, CPU +12 % |
-| Trojan + TLS | yes | **+6.8 %** — our only throughput win, and CPU −30 % |
-| Shadowsocks-2022 (blake3-aes-128-gcm) | yes | −45.8 %, CPU +52 % |
-| Shadowsocks AEAD (aes-256-gcm) | yes | −14.0 %, CPU +22 % |
+| pair | works | throughput vs sing-box | CPU vs sing-box |
+|---|---|---|---|
+| VLESS over TCP (plain) | yes | −10.4 % | **−28.0 %** |
+| VLESS over WebSocket + TLS | yes | −40.7 % | +34.2 % |
+| VLESS over gRPC + TLS | yes | −6.4 % | **−18.2 %** |
+| VLESS + REALITY, Vision off | yes | −26.0 % | +16.8 % |
+| VLESS + REALITY, Vision on | yes | **−68.9 %** | **+194.3 %** |
+| VMess over WebSocket + TLS | yes | −37.0 % | +21.0 % |
+| Trojan + TLS | yes | **+3.5 %** | **−25.4 %** |
+| Shadowsocks-2022 (blake3-aes-128-gcm) | yes | **−49.5 %** | +67.8 % |
+| Shadowsocks AEAD (aes-256-gcm) | yes | −14.2 % | +23.0 % |
 
-Nothing was silently dropped, and no pair needed a "n/a" row in this run. The
-`n/a` paths exist, are exercised by the harness's own tests, and print as
-`n/a (reason)` with the full reason repeated below the table:
+Nothing was silently dropped and no pair needed an `n/a` row in this run. The
+`n/a` paths exist, are exercised, and print as `n/a (reason)` with the full reason
+repeated under the table:
 
 ```
 Trojan / TLS          sing-box    -   -   -   -   -   -   0  n/a (not installed (no sing-box binary found))
 Trojan / TLS          flux-core   -   -   -   -   -   -   0  n/a (round 1: timeout: no completion within 1s (4000 MiB at…)
 ```
 
-(the first is `--singbox /nonexistent/sing-box`; the second is `--mb 4000
---timeout 1`, which returns in 2.1 s instead of hanging — a timeout is recorded
-as a result, not waited out.)
+The first is `--singbox /nonexistent/sing-box`; the second is `--mb 4000
+--timeout 1`, which returns in 2.1 s with the timeout recorded instead of hanging.
 
-Two configuration requirements are worth recording because a wrong one looks
-like a protocol failure:
+Two configuration requirements are worth recording, because getting either wrong
+looks like a protocol failure:
 
 * **REALITY needs a genuine TLS 1.3 `fallback`/`handshake` target.** Pointed at a
-  plain TCP echo server, the flux REALITY handshake fails with
-  `TLS / Crypto error: expected TLS ServerHello`, and sing-box fails with
-  `REALITY: processed invalid connection`. Both need a real TLS 1.3 server to play
-  the certificate chain from; the harness runs one (rustls) for all REALITY
-  scenarios and does not charge it to either stack.
+  plain TCP echo server, the flux handshake fails with
+  `TLS / Crypto error: expected TLS ServerHello` and sing-box fails with
+  `REALITY: processed invalid connection`. Both fetch the certificate chain to
+  mimic from that target, so the harness runs a real TLS 1.3 server (rustls) for
+  every REALITY scenario and does not charge its CPU to either stack.
 * **The harness must not half-close the tunnel when its upload finishes.** The
-  first version of the transfer task dropped the write half when the last chunk
-  was written; sing-box tears the whole connection down on EOF in one direction,
-  so the download was truncated at a variable offset (0 B … 3.7 MB of a 4 MB
-  transfer) and sing-box looked broken at random. The writer now holds the socket
-  open until the echo has come back in full. `bench_native`'s copy of the
-  transfer is harmless only because it compares SOCKS→direct.
+  first version of the transfer task dropped the write half once the last chunk
+  was written; sing-box tears the whole connection down when one direction hits
+  EOF, so the download was truncated at a variable offset (0 B … 3.7 MB of a 4 MB
+  transfer) and sing-box looked randomly broken. The writer now holds the socket
+  open until the echo has come back in full. `bench_native`'s copy of the transfer
+  escapes this only because it compares SOCKS → direct.
 
-## The REALITY setup defect (the one result that is not about throughput)
+## The defect the matrix found
 
-`setup ms` is in the table because without it this row is unreadable: flux's
-REALITY inbound takes **5.0 s to accept each new connection**, and a fixed 5 s
-dominates any "MB/s" computed over a fresh connection.
+The `setup ms` column exists because the first REALITY run reported **37 MB/s**
+with a 5 000 ms setup, which is not a throughput number. It was not slow crypto
+and it was not a broken scenario: flux's REALITY *inbound* took **5.0 s to accept
+each new connection**, and a fixed 5 s dominates anything computed over a fresh
+connection.
 
-It is server-side, and it depends on the `fallback` target. Same flux-core binary,
-same keypair, same client; only the fallback changed:
+It was server-side, and it depended on the `fallback` target. Same flux-core
+binary, same keypair, same client; only the fallback changed:
 
 | fallback for flux's REALITY inbound | SOCKS connect → tunnel ready |
 |---|---|
-| openssl `s_server -tls1_3` | **6 ms** |
-| sing-box TLS inbound (Go `crypto/tls`) | **7 ms** |
+| openssl `s_server -tls1_3` | 6 ms |
+| sing-box TLS inbound (Go `crypto/tls`) | 7 ms |
 | flux-core's own TLS inbound (rustls) | **5002 ms** |
 
-A **sing-box** client → flux REALITY server with a rustls fallback also waits
-5008 ms, so the cost is in the flux server, not the flux client and not the
-harness; sing-box's REALITY inbound with the *same* rustls decoy accepts in
-1.4 ms. The code path is `probe_target_handshake` in
-`crates/flux-transport/src/reality.rs` (~L1788–1800): it replays the client's
-ClientHello at the fallback and reads **up to 7 handshake records against a
-`now + 5 s` deadline**, `break`ing on timeout rather than treating "the target's
-flight is complete" as success. Against a rustls fallback it burns the whole
-deadline on every connection; OpenSSL and Go fallbacks end the loop early.
+A **sing-box** client → flux REALITY server with a rustls fallback also waited
+5008 ms, so the cost was in the flux server, not the client and not the harness;
+sing-box's REALITY inbound with the *same* rustls decoy accepted in 1.4 ms. The
+code was `probe_target_handshake` in `crates/flux-transport/src/reality.rs`: it
+replays the client's ClientHello at the fallback and read **up to 7 handshake
+records against a `now + 5 s` deadline**, `break`ing on timeout instead of treating
+"the target's flight is complete" as success. Against a rustls fallback it burned
+the whole deadline on every connection, which is why the defect was invisible in
+mixed-stack tests — OpenSSL and Go fallbacks happen to end the loop early.
 
-Consequence: any REALITY deployment whose `fallback` is a rustls server (flux's
-own TLS inbound is one, and it is a very common server stack) pays 5 s per
-connection opening. Bulk throughput is unaffected — 561 MB/s once the connection
-is up — so a long-lived tunnel hides it and a browser does not.
+Fixed in the same cycle (bounded sequel-idle instead of a 5 s deadline, plus a
+60 s mimicry cache keyed by target), and re-measured with the same harness:
+
+| VLESS / REALITY, flux-core | before | after |
+|---|---|---|
+| setup per connection | 5002.0 ms | **0.7 ms** |
+| MB/s end-to-end | 37.3 | **538.0** |
+| MB/s bulk | 561.3 | 539.0 |
+| CPU s/GiB (bulk unaffected) | 3.365 | 3.593 |
+
+That is the whole point of the matrix: a real, user-visible defect that no
+self-comparison could ever have surfaced, found and closed by a 5-line table.
 
 ## What the numbers do and do not prove
 
 **They do prove**, on one machine with one harness:
 
 * each stack's own client+server pair, doing the same work on the same wire
-  formats, with a fixed payload, a fixed number of interleaved rounds and the CPU
+  formats, with a fixed payload, a fixed number of interleaved rounds, and the CPU
   of both tunnel processes charged to it;
-* that the gaps are *layer-specific*, not a single global constant: Trojan (−30 %
-  CPU, +6.8 % throughput), TCP (−31 % CPU, −9.6 %), gRPC (−20 % CPU, −5.7 %) are
-  at or near parity while WebSocket (−39 %), Shadowsocks-2022 (−46 %) and Vision
-  (−68 % / +198 % CPU) are not. That is the shape of a few specific hot paths, not
-  of a slow runtime.
+* that the remaining gaps are *layer-specific* rather than one global constant:
+  Trojan (+3.5 % throughput, −25 % CPU), VLESS/TCP (−10 %, −28 %) and gRPC (−6 %,
+  −18 %) are at or near parity, while WebSocket (−41 %), Shadowsocks-2022 (−50 %)
+  and Vision (−69 %, +194 % CPU) are not. That is the shape of a few specific hot
+  paths, not of a slow runtime — and it tells you exactly where to look next.
 
 **They do not prove**, and should not be quoted as if they did:
 
 * **anything about a real network.** This is loopback: no MTU, no packet loss, no
   RTT, no congestion control, no middlebox. A relay that wins here on syscalls per
-  byte can lose on a 200 ms path, and vice versa. REALITY/WS/gRPC framing costs are
-  amplified or hidden differently once packets are actually routed.
+  byte can lose on a 200 ms path, and framing costs are amplified or hidden
+  differently once packets are actually routed.
 * **anything about multiplexed or multi-stream use.** One stream, one connection
   at a time. `bench_native --streams 8` and `bench_udp` cover other shapes.
-* **anything about a shaped or contended machine.** Rounds are interleaved
-  (odd rounds flux first, even rounds sing-box first) and reported as
-  min/median/max precisely because a single-shot loopback number is not
-  reproducible; here the round-to-round spread is a few percent for most rows and
-  up to ~13 % for the REALITY rows, and the runs were taken at load average < 1,
-  which is the best case. The absolute MB/s will be lower on a busy box; the
-  ratio is more stable than either absolute number.
+* **anything about a contended machine.** Rounds are interleaved (odd rounds
+  flux first, even rounds sing-box first) and reported as min/median/max precisely
+  because a single-shot loopback number is not reproducible. This run was taken in
+  a quiet window (load average ≤ 3 on 16 cores; round-to-round spread mostly a few
+  percent, up to ~13 % on the REALITY rows). Absolute MB/s will be lower on a busy
+  box; the ratio is more stable than either absolute number.
 * **that the harness is not the ceiling.** The client endpoint and the echo server
   live in the benchmarking process and are not charged to either stack, but they
-  do consume CPU. On the same machine at the same time, `bench_native --rounds 2
-  --mb 300` puts a direct loopback echo at 2149 MB/s and a SOCKS→direct relay at
+  do consume CPU. On this machine at the same time, `bench_native --rounds 2 --mb
+  300` put a direct loopback echo at 2149 MB/s and a SOCKS → direct relay at
   1716 MB/s, so at the ~1.1–1.2 GB/s both stacks reach on plain VLESS/TCP the
-  harness is within a factor of two of being the co-limit. That is exactly why the
-  near-parity rows (−5.7 %, −9.6 %, +6.8 %) should be read as "no measurable
-  difference", not as "flux-core is 1.07× sing-box".
-* **that sing-box and flux-core were configured equally well.** Both were given
-  their natural, tested configuration for each protocol (lifted from
+  harness is within a factor of two of being the co-limit. That is why the
+  near-parity rows (−6.4 %, −10.4 %, +3.5 %) should be read as "no measurable
+  difference", not as "flux-core is 1.03× sing-box".
+* **that sing-box and flux-core were configured equally well.** Both got their
+  natural, tested configuration for each protocol (lifted from
   `tests/test_singbox_interop.rs`, which is proven against a real binary), but
-  neither was tuned: no buffer-size, mux, or CPU-affinity tuning on either side.
-  sing-box's defaults may simply be better than our defaults; the matrix says who
+  neither was tuned: no buffer-size, mux or CPU-affinity tuning on either side.
+  sing-box's defaults may simply be better than our defaults. The matrix says who
   is faster out of the box, not who can be made faster.
-* **the number in isolation.** VLESS/TCP at 1068 MB/s is not "the speed of
+* **the number in isolation.** VLESS/TCP at 1061 MB/s is not "the speed of
   flux-core"; it is the speed of this pair of processes, on this machine, with a
-  128 KiB write chunk, at this commit. The commit matters: the matrix was first
-  run against a tree without `copy_bidirectional_buffered`, where flux's
-  protocol tunnels were at roughly half of these numbers (VLESS/TCP 493 vs 1047).
+  128 KiB write chunk, at this commit. The commit matters: the matrix was first run
+  on a tree without `copy_bidirectional_buffered`, where flux's protocol tunnels
+  ran at roughly half of these numbers (VLESS/TCP 493 vs 1047).
 
 ## Reproducing
 
@@ -212,11 +225,11 @@ cargo build --release -p flux-core --bin flux-core --example bench_matrix
 # 2. the run behind the table above
 ./target/release/examples/bench_matrix --rounds 5 --mb 200
 
-# a single pair, or the flux column only
+# one pair, or the flux column only
 ./target/release/examples/bench_matrix --only reality --rounds 3 --mb 200
 ./target/release/examples/bench_matrix --only "shadowsocks-2022" --no-singbox
 
-# tuning knobs
+# knobs
 #   --rounds N      interleaved rounds per pair        (default 3)
 #   --mb N          MiB of payload per round           (default 200)
 #   --only SUBSTR   filter on protocol name            (case-insensitive)
@@ -231,6 +244,6 @@ under `/tmp/bench_matrix_<pid>/` — the first thing to reach for when a pair fa
 `BENCH_MATRIX_TRACE=1` timestamps each transfer phase, which is how the 5 s REALITY
 setup was separated from the bulk rate.
 
-Gates for this work: `cargo build --release -p flux-core --bin flux-core
---example bench_matrix --example bench_native`, `cargo clippy --workspace
---all-targets -- -D warnings`, `cargo fmt --all -- --check` — all green.
+Gates for this work, all green: `cargo build --release -p flux-core --bin
+flux-core --example bench_matrix --example bench_native`, `cargo clippy
+--workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`.

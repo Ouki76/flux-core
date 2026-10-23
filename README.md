@@ -136,16 +136,28 @@ side-by-side comparisons (sing-box, direct echo, multi-stream aggregates) were
 removed rather than left to rot — the harness still prints them when `sing-box`
 is installed on the machine.
 
-Single stream:
+Single stream, measured against **sing-box** on the same machine, same workload,
+interleaved rounds — the only comparison that says anything about competitiveness
+(full table and methodology in [docs/bench-matrix-report.md](docs/bench-matrix-report.md)):
 
-| Path | Throughput |
-|---|---|
-| TCP relay (SOCKS5 → direct) | **2622 MB/s** |
-| VLESS + REALITY | 729 MB/s |
-| VLESS + TLS | 660 MB/s |
-| VMess (AES-128-GCM) | 3676 MB/s |
-| Shadowsocks-2022 (blake3-aes-128-gcm) | 3792 MB/s |
-| Shadowsocks-AEAD (aes-256-gcm) | 3323 MB/s |
+| Path | This proxy | sing-box | Verdict |
+|---|---|---|---|
+| VLESS / TCP | 1063 MB/s | 1186 | −10 %, **−28 % CPU** |
+| Trojan / TLS | **769** | 743 | **+3.5 %**, −25 % CPU |
+| VLESS / gRPC + TLS | 302 | 322 | −6 %, −18 % CPU |
+| VLESS / REALITY | 539 | 728 | −26 % |
+| Shadowsocks-AEAD (aes-256-gcm) | 428 | 499 | −14 % |
+| Shadowsocks-2022 | 483 | 956 | −50 % |
+| VLESS / WS + TLS | 421 | 710 | −41 % |
+| VMess / WS + TLS | 316 | 502 | −37 % |
+
+Reproduce: `cargo run --release --example bench_matrix -- --rounds 5 --mb 200`.
+
+Plain relay, the datapath under every protocol: **2622 MB/s** (sing-box: 2300,
++14 % throughput, −39 % CPU, 7 vs 26 MiB RSS). The earlier per-protocol numbers
+that this table replaces (VLESS 729, VMess 3676, SS-2022 3792) were measured with
+different payloads and against nothing, so they could not be compared with any
+competitor.
 
 Userspace datapaths (the two that run their own TCP/IP stack):
 
