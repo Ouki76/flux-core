@@ -1985,3 +1985,33 @@ competitor, ask which is true — are we doing more work, or the same work with 
 trips?** More CPU means wasted work (Vision's endless padding); less CPU with less
 throughput means round trips per buffer (everything else). The matrix's CPU column, not
 its throughput column, is what separates the two cases.
+
+---
+
+## Cycle 33 — 2026-10-24
+
+### VMess: the same framing defect, and a revert
+
+`poll_write` framed one 16 KiB chunk per call and `poll_read` returned after one chunk, so
+a 64 KiB write became four frames, four seals and four syscalls. Fixed the same way as the
+other transports: `strace` now shows 875 writes of 65 536 bytes and no 16 KiB writes.
+Throughput 169 → 174 MB/s — this path is dominated by WebSocket-over-TLS, so the number is
+small; the framing was the point.
+
+### The port holder was a worse bug than the race
+
+The `SO_REUSEPORT` holder added in cycle 28 is sound in principle — verified by hand that
+flux binds over a REUSEPORT holder — but it correlated with a hard `AddrInUse` failure on
+flux's *own* bind in the mux suite, eight attempts in a row. A test helper that can block
+the very bind it protects is worse than the race it closes, so it is reverted. The race is
+a test-infrastructure annoyance that costs a re-run; the holder cost a whole suite.
+
+The right fix remains the builder refactor: make `start_flux` take a closure that builds
+the config from a port, so a lost race can be retried with a fresh port. Twelve call sites,
+deferred rather than rushed.
+
+### State
+
+1052 tests, 0 failed. The "one framing unit per poll" defect has now been found and fixed
+in **six** places: WebSocket, Shadowsocks-2022, Shadowsocks-AEAD, REALITY, Vision (as
+endless padding) and VMess. It is the single most repeated bug in this codebase.
