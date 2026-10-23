@@ -14,6 +14,13 @@ use std::borrow::Cow;
 #[inline]
 pub fn normalize_host(host: &str) -> Cow<'_, str> {
     let trimmed = host.trim().trim_end_matches('.');
+    // A non-ASCII name must be compared in its ASCII form: a rule written as
+    // `domain:example.com` has to match a client that sent the same name in its
+    // Unicode form. `flux_types::normalize_domain` is the single implementation
+    // both the router and the address type use.
+    if !trimmed.is_ascii() {
+        return Cow::Owned(flux_types::normalize_domain(trimmed));
+    }
     if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
         Cow::Owned(trimmed.to_ascii_lowercase())
     } else {

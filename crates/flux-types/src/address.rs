@@ -11,6 +11,24 @@ pub enum TargetAddress {
     Domain(String, u16),
 }
 
+/// Converts a hostname to its ASCII (punycode) form and lowercases it.
+///
+/// Returns the input unchanged when it is already ASCII and cannot be mistaken for
+/// anything else, so the common path allocates nothing beyond the `String` the
+/// caller already had. A name that IDNA rejects (an empty or over-long label, a
+/// disallowed character) is returned trimmed and lowercased rather than dropped:
+/// a connection to a nonsense name should fail in DNS, not vanish here.
+pub fn normalize_domain(host: &str) -> String {
+    let trimmed = host.trim().trim_end_matches('.');
+    if trimmed.is_ascii() {
+        return trimmed.to_ascii_lowercase();
+    }
+    match idna::domain_to_ascii(trimmed) {
+        Ok(ascii) => ascii,
+        Err(_) => trimmed.to_lowercase(),
+    }
+}
+
 impl TargetAddress {
     pub fn ip(ip: IpAddr, port: u16) -> Self {
         Self::Ip(SocketAddr::new(ip, port))
@@ -20,8 +38,15 @@ impl TargetAddress {
         Self::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port))
     }
 
+    /// Builds a domain destination, normalising the name on the way in.
+    ///
+    /// Everything downstream — rule matching, the Fake-IP map, the DNS cache —
+    /// compares names as ASCII, and a client is free to send the Unicode form in a
+    /// SOCKS5 or HTTP CONNECT request. Converting once here means a Cyrillic or
+    /// Chinese name is routed by the same rule as its `xn--` form instead of
+    /// silently taking `final`.
     pub fn domain(domain: impl Into<String>, port: u16) -> Self {
-        Self::Domain(domain.into(), port)
+        Self::Domain(normalize_domain(&domain.into()), port)
     }
 
     pub fn port(&self) -> u16 {
@@ -261,5 +286,38 @@ mod address_literal_tests {
             }
             other => panic!("parsed as {other:?}, expected a Domain"),
         }
+    }
+}
+
+#[cfg(test)]
+mod idna_tests {
+    use super::*;
+
+    /// A Unicode name must be converted to the form every comparison uses, or a
+    /// rule written for the ASCII name silently never matches.
+    #[test]
+    fn a_unicode_domain_becomes_its_ascii_form() {
+        assert_eq!(normalize_domain("пример.рф"), "xn--e1afmkfd.xn--p1ai");
+        assert_eq!(normalize_domain("例え.テスト"), "xn--r8jz45g.xn--zckzah");
+        assert_eq!(TargetAddress::domain("пример.рф", 443).host(), "xn--e1afmkfd.xn--p1ai");
+    }
+
+    /// The common path must not change what it did before.
+    #[test]
+    fn ascii_names_are_trimmed_and_lowercased() {
+        assert_eq!(normalize_domain("Example.COM."), "example.com");
+        assert_eq!(normalize_domain(" example.com "), "example.com");
+        assert_eq!(normalize_domain("127.0.0.1"), "127.0.0.1");
+    }
+
+    /// A name IDNA rejects is passed through rather than dropped: the connection
+    /// should fail in DNS, not vanish in the router.
+    #[test]
+    fn a_name_idna_rejects_survives_the_conversion() {
+        let weird = "exa\u{0000}mple.com";
+        assert!(normalize_domain(weird).contains("mple.com"));
+        // Over-long label (64 chars) is invalid; the input is still returned.
+        let long = format!("{}.com", "a".repeat(70));
+        assert!(normalize_domain(&long).ends_with(".com"));
     }
 }

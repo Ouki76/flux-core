@@ -173,6 +173,21 @@ fn reexec_in_userns(test_name: &str) -> Result<(), ReexecError> {
         .arg(&exe)
         .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
         .env(NS_CHILD_ENV, "1")
+        // Inside a user namespace `/run` is still the host's, so the real
+        // `xtables.lock` is unreadable and every iptables call dies with
+        // "can't open lock file /run/xtables.lock: Permission denied". Point the
+        // lock at a private file instead: the namespace has its own iptables
+        // state anyway, so the lock only needs to be private to this child.
+        .env(
+            "XTABLES_LOCKFILE",
+            // Unique per test: the tests run in parallel, and a shared lock file
+            // makes them fail with "Resource temporarily unavailable".
+            std::env::temp_dir().join(format!(
+                "flux-xtables-{}-{}.lock",
+                std::process::id(),
+                test_name
+            )),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err))

@@ -46,10 +46,25 @@
 //! v26 — uses a *different* segment layout (`conv u16`, commands 0..3, big
 //! endian, 18-byte DATA overhead, `transport/internet/kcp/segment.go`), so the
 //! two are not interchangeable; see the module's report for the exact
-//! differences. The obfuscation layer, on the other hand, is
-//! byte-exact with Xray (`transport/internet/headers/*` and
-//! `crypt.go` / `finalmask/mkcp/original`), so swapping the segment codec is
-//! the only change needed to talk to a real Xray node.
+//! differences. The obfuscation layer, on the other hand, is byte-exact with
+//! Xray (`transport/internet/headers/*` and `crypt.go` /
+//! `finalmask/mkcp/original`), so swapping the segment codec is the only change
+//! needed for the framing to match.
+//!
+//! Three further gaps, all deliberate and all visible to a real Xray peer:
+//!
+//! * Command set. ikcp has PUSH/ACK/WASK/WINS only; Xray adds `PING` and
+//!   `TERMINATE`. A stream here has no close, so a peer that stops without
+//!   closing looks like silence, which is why liveness falls back to probing
+//!   (see [`PEER_SILENCE_LIMIT`]).
+//! * Payload encryption. Xray's `seed` option replaces the "original" mask with
+//!   an AES-GCM AEAD keyed from the seed (`NewAEADAESGCMBasedOnSeed`, now
+//!   `finalmask/mkcp/aes128gcm`). [`KcpObfs`] has no such mode, and a peer
+//!   configured with `seed` cannot be read by this module.
+//! * Congestion control shape. `no_congestion` mirrors Xray's `congestion:
+//!   false` (a fixed window), but the adaptive path here is a plain
+//!   slow-start/AIMD on the window rather than Xray's
+//!   `tti`/`uplinkCapacity`/`cwndMultiplier` pacing.
 //!
 //! # Behaviour
 //!
@@ -62,6 +77,13 @@
 //! * Datagrams that fail deobfuscation, carry a foreign conversation id, claim a
 //!   length beyond the MTU or are truncated are dropped silently — a hostile
 //!   peer can only cost CPU, never a panic.
+//! * RTT is measured from the local send time of the acknowledged segment rather
+//!   than from the millisecond `ts` echo, so the estimate has microsecond
+//!   resolution; Karn's rule still applies, and no retransmitted segment
+//!   contributes a sample.
+//! * An idle conversation exchanges a window probe every ten seconds and is
+//!   declared lost after a minute of complete silence, because mKCP has no FIN
+//!   to tell one end that the other has gone.
 //!
 //! Note on fragmentation bookkeeping: `frg` follows the historic KCP convention
 //! of counting *down* from 255, so a 40 KiB write over a 1310-byte MSS leaves as
@@ -86,16 +108,29 @@ use tokio::sync::Notify;
 // Wire constants
 // ---------------------------------------------------------------------------
 
-/// Size of the segment header, in bytes.
-pub const SEGMENT_HEADER_LEN: usize = 24;
-/// `cmd` of a data segment.
-pub const CMD_PUSH: u8 = 81;
-/// `cmd` of an acknowledgement segment.
-pub const CMD_ACK: u8 = 82;
-/// `cmd` of a window probe ("what is your window?").
-pub const CMD_WASK: u8 = 83;
-/// `cmd` of a window update, sent in reply to [`CMD_WASK`].
-pub const CMD_WINS: u8 = 84;
+/// Bytes of every segment prefix: `conv u16 ‖ cmd u8 ‖ option u8`.
+pub const SEGMENT_PREFIX_LEN: usize = 4;
+/// Total header of a DATA segment (prefix included): the payload follows.
+pub const DATA_OVERHEAD: usize = 18;
+/// Header of an ACK segment, before the `u32` number list.
+pub const ACK_OVERHEAD: usize = 17;
+/// Size of a PING or TERMINATE segment, which carries no payload.
+pub const CMD_ONLY_LEN: usize = 16;
+
+/// Acknowledgement of data received from the peer.
+pub const CMD_ACK: u8 = 0;
+/// Stream data.
+pub const CMD_DATA: u8 = 1;
+/// The peer is closing the conversation.
+pub const CMD_TERMINATE: u8 = 2;
+/// Liveness probe, also a vehicle for a cumulative acknowledgement.
+pub const CMD_PING: u8 = 3;
+
+/// `option` value meaning "this side is closing" (`SegmentOptionClose`).
+pub const OPTION_CLOSE: u8 = 1;
+
+/// An ACK segment carries at most this many segment numbers.
+pub const MAX_ACK_NUMBERS: usize = 128;
 
 /// A single write is fragmented into at most this many segments, which is what
 /// keeps `frg = 255 - index` representable.
@@ -115,9 +150,19 @@ const FAST_RETRANSMIT_LIMIT: u32 = 5;
 /// No datagram at all for this long, with unacknowledged data outstanding, means
 /// the peer is gone.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// Send a window probe after this long without sending anything, which doubles
-/// as a keepalive for an otherwise idle stream.
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
+/// How often to send a PING when the conversation is otherwise quiet. Xray
+/// pings on a three-second timer, and the same value keeps our own liveness
+/// detection (`PEER_SILENCE_LIMIT`) honest in both directions.
+const PING_IDLE: Duration = Duration::from_secs(3);
+/// Nothing at all from the peer for this long, while we keep probing, means the
+/// conversation is gone.
+///
+/// mKCP has no FIN — a stream that is simply abandoned leaves the other end
+/// reading into silence — so liveness has to be inferred. Both ends probe every
+/// [`KEEPALIVE_IDLE`] when idle and answer probes with a window update, so a
+/// live peer is never quiet for a tenth of this, and six lost probes in a row
+/// are needed to trip it.
+const PEER_SILENCE_LIMIT: Duration = Duration::from_secs(60);
 /// How long [`accept`] waits for the first datagram of a conversation.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Depth of the per-conversation datagram queue between the socket driver and
@@ -326,59 +371,215 @@ mod envelope {
 // Segment codec
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+/// One wire segment.
+///
+/// Xray has four commands and three bodies, all big-endian behind a four-byte
+/// prefix (`conv u16 ‖ cmd u8 ‖ option u8`). Three things are easy to get wrong
+/// and are deliberate here: the conversation id is 16 bits, there is **no
+/// fragment index** — the fourth byte is an option flag, and reassembly is by
+/// `sn` — and DATA carries no receive window, which only ACK does.
+#[derive(Debug, Default)]
 struct Segment {
     cmd: u8,
-    frg: u8,
-    wnd: u16,
+    option: u8,
+    /// DATA: sender clock, ms. ACK: the newest timestamp it acknowledges.
     ts: u32,
+    /// DATA: segment number.
     sn: u32,
-    una: u32,
+    /// DATA/PING/TERMINATE: next number the sender expects from us (a
+    /// cumulative acknowledgement, Xray's `SendingNext`).
+    sending_next: u32,
+    /// ACK: first number the sender of the ACK has not received (Xray's
+    /// `ReceivingNext`).
+    receiving_next: u32,
+    /// ACK: absolute right edge of the sender's receive window (Xray's
+    /// `ReceivingWindow`, which is `next + window size`, not a free count).
+    window_edge: u32,
+    /// ACK: the segment numbers being acknowledged.
+    numbers: Vec<u32>,
+    /// PING/TERMINATE: the peer's retransmission timeout, ms.
+    peer_rto: u32,
+    /// DATA payload.
     data: Vec<u8>,
 }
 
-fn encode_segment(conv: u32, seg: &Segment, out: &mut Vec<u8>) {
-    out.extend_from_slice(&conv.to_le_bytes());
-    out.push(seg.cmd);
-    out.push(seg.frg);
-    out.extend_from_slice(&seg.wnd.to_le_bytes());
-    out.extend_from_slice(&seg.ts.to_le_bytes());
-    out.extend_from_slice(&seg.sn.to_le_bytes());
-    out.extend_from_slice(&seg.una.to_le_bytes());
-    out.extend_from_slice(&(seg.data.len() as u32).to_le_bytes());
-    out.extend_from_slice(&seg.data);
+impl Segment {
+    fn data(sn: u32, sending_next: u32, ts: u32, data: Vec<u8>) -> Self {
+        Self {
+            cmd: CMD_DATA,
+            ts,
+            sn,
+            sending_next,
+            data,
+            ..Self::default()
+        }
+    }
+
+    fn ack(receiving_next: u32, window_edge: u32, ts: u32, numbers: Vec<u32>) -> Self {
+        Self {
+            cmd: CMD_ACK,
+            ts,
+            receiving_next,
+            window_edge,
+            numbers,
+            ..Self::default()
+        }
+    }
+
+    fn command(cmd: u8, sending_next: u32, receiving_next: u32, peer_rto: u32) -> Self {
+        Self {
+            cmd,
+            sending_next,
+            receiving_next,
+            peer_rto,
+            ..Self::default()
+        }
+    }
+
+    fn wire_len(&self) -> usize {
+        match self.cmd {
+            CMD_DATA => DATA_OVERHEAD + self.data.len(),
+            CMD_ACK => ACK_OVERHEAD + self.numbers.len() * 4,
+            _ => CMD_ONLY_LEN,
+        }
+    }
 }
 
-/// Parses one segment out of a deobfuscated datagram.
+fn encode_segment(conv: u16, seg: &Segment, out: &mut Vec<u8>) {
+    out.extend_from_slice(&conv.to_be_bytes());
+    out.push(seg.cmd);
+    out.push(seg.option);
+    match seg.cmd {
+        CMD_DATA => {
+            out.extend_from_slice(&seg.ts.to_be_bytes());
+            out.extend_from_slice(&seg.sn.to_be_bytes());
+            out.extend_from_slice(&seg.sending_next.to_be_bytes());
+            out.extend_from_slice(&(seg.data.len() as u16).to_be_bytes());
+            out.extend_from_slice(&seg.data);
+        }
+        CMD_ACK => {
+            out.extend_from_slice(&seg.window_edge.to_be_bytes());
+            out.extend_from_slice(&seg.receiving_next.to_be_bytes());
+            out.extend_from_slice(&seg.ts.to_be_bytes());
+            out.push(seg.numbers.len() as u8);
+            for number in &seg.numbers {
+                out.extend_from_slice(&number.to_be_bytes());
+            }
+        }
+        _ => {
+            out.extend_from_slice(&seg.sending_next.to_be_bytes());
+            out.extend_from_slice(&seg.receiving_next.to_be_bytes());
+            out.extend_from_slice(&seg.peer_rto.to_be_bytes());
+        }
+    }
+}
+
+/// Parses one segment, returning it with the number of bytes it consumed.
 ///
-/// Returns `None` for anything that is not a well-formed segment for `conv`:
-/// short buffers, a foreign conversation id, an unknown command, or a `len` that
-/// does not describe the datagram exactly (which covers both truncation and a
-/// length field larger than what arrived).
-fn decode_segment(conv: u32, buf: &[u8]) -> Option<Segment> {
-    if buf.len() < SEGMENT_HEADER_LEN {
+/// `None` means these bytes are not a well-formed segment for `conv`: too short,
+/// a foreign conversation id, an unknown command, or a length field that runs
+/// past the datagram (which covers truncation and an inflated `len` alike).
+fn decode_segment(conv: u16, buf: &[u8]) -> Option<(Segment, usize)> {
+    if buf.len() < SEGMENT_PREFIX_LEN {
         return None;
     }
-    if u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) != conv {
+    if u16::from_be_bytes([buf[0], buf[1]]) != conv {
         return None;
     }
-    let cmd = buf[4];
-    if !matches!(cmd, CMD_PUSH | CMD_ACK | CMD_WASK | CMD_WINS) {
-        return None;
+    let cmd = buf[2];
+    let option = buf[3];
+    let body = &buf[SEGMENT_PREFIX_LEN..];
+    let segment = match cmd {
+        CMD_DATA => {
+            if body.len() < 14 {
+                return None;
+            }
+            let ts = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            let sn = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+            let sending_next = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+            let len = u16::from_be_bytes([body[12], body[13]]) as usize;
+            // A zero-length DATA is unparseable on the Xray side too, so it is
+            // never produced and never accepted.
+            if len == 0 || body.len() < 14 + len {
+                return None;
+            }
+            Segment {
+                cmd,
+                option,
+                ts,
+                sn,
+                sending_next,
+                data: body[14..14 + len].to_vec(),
+                ..Segment::default()
+            }
+        }
+        CMD_ACK => {
+            if body.len() < 13 {
+                return None;
+            }
+            let window_edge = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+            let receiving_next = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+            let ts = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+            let count = body[12] as usize;
+            if body.len() < 13 + count * 4 {
+                return None;
+            }
+            let mut numbers = Vec::with_capacity(count);
+            for index in 0..count {
+                let at = 13 + index * 4;
+                numbers.push(u32::from_be_bytes([
+                    body[at],
+                    body[at + 1],
+                    body[at + 2],
+                    body[at + 3],
+                ]));
+            }
+            Segment {
+                cmd,
+                option,
+                ts,
+                receiving_next,
+                window_edge,
+                numbers,
+                ..Segment::default()
+            }
+        }
+        CMD_TERMINATE | CMD_PING => {
+            if body.len() < 12 {
+                return None;
+            }
+            Segment {
+                cmd,
+                option,
+                sending_next: u32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+                receiving_next: u32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+                peer_rto: u32::from_be_bytes([body[8], body[9], body[10], body[11]]),
+                ..Segment::default()
+            }
+        }
+        _ => return None,
+    };
+    let used = segment.wire_len();
+    Some((segment, used))
+}
+
+/// Parses every segment in a deobfuscated datagram, stopping at the first one
+/// that does not make sense — the same tolerance Xray's `KCPPacketReader` has
+/// for coalesced or damaged datagrams.
+fn decode_datagram(conv: u16, buf: &[u8]) -> Vec<Segment> {
+    let mut segments = Vec::new();
+    let mut rest = buf;
+    while !rest.is_empty() {
+        let Some((segment, used)) = decode_segment(conv, rest) else {
+            break;
+        };
+        if used == 0 || used > rest.len() {
+            break;
+        }
+        segments.push(segment);
+        rest = &rest[used..];
     }
-    let len = u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]) as usize;
-    if buf.len() - SEGMENT_HEADER_LEN != len {
-        return None;
-    }
-    Some(Segment {
-        cmd,
-        frg: buf[5],
-        wnd: u16::from_le_bytes([buf[6], buf[7]]),
-        ts: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-        sn: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-        una: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
-        data: buf[SEGMENT_HEADER_LEN..].to_vec(),
-    })
+    segments
 }
 
 /// Strips the obfuscation layer. `None` means the datagram must be dropped.
@@ -396,7 +597,9 @@ fn unwrap_datagram(obfs: KcpObfs, datagram: &[u8]) -> Option<Vec<u8>> {
 /// Tuning for one mKCP conversation, plus its camouflage mode.
 #[derive(Clone, Copy, Debug)]
 pub struct KcpConfig {
-    /// Conversation id. `0` asks [`connect`] / [`accept`] to pick one.
+    /// Conversation id, 16 bits on the wire. `0` asks [`connect`] / [`accept`]
+    /// to pick one at random; anything above `0xFFFF` is refused, because a peer
+    /// could never match it.
     pub conv: u32,
     /// Largest datagram, in bytes. Xray's default is 1350; the KCP payload is
     /// this minus the header and obfuscation overhead.
@@ -438,7 +641,7 @@ impl KcpConfig {
     /// Largest segment payload for these settings.
     pub fn mss(&self) -> usize {
         self.mtu
-            .saturating_sub(SEGMENT_HEADER_LEN + self.obfs.header_len() + envelope::OVERHEAD)
+            .saturating_sub(DATA_OVERHEAD + self.obfs.header_len() + envelope::OVERHEAD)
     }
 
     /// Bytes the obfuscation layer adds to every datagram.
@@ -446,8 +649,32 @@ impl KcpConfig {
         self.obfs.header_len() + envelope::OVERHEAD
     }
 
+    /// The conversation id as it appears on the wire, generating one when the
+    /// configuration asked for `0`.
+    fn conversation(&self) -> FluxResult<u16> {
+        if self.conv > u32::from(u16::MAX) {
+            return Err(FluxError::Config(format!(
+                "mKCP conv {} does not fit in the 16 bits Xray puts on the wire (max 65535)",
+                self.conv
+            )));
+        }
+        let conv = if self.conv == 0 {
+            // Zero would be a valid id, but it is also what an uninitialised
+            // config carries, so generate a non-zero one to keep the two apart.
+            loop {
+                let candidate: u16 = rand::random();
+                if candidate != 0 {
+                    break candidate;
+                }
+            }
+        } else {
+            self.conv as u16
+        };
+        Ok(conv)
+    }
+
     fn validate(&self) -> FluxResult<()> {
-        let overhead = SEGMENT_HEADER_LEN + self.obfs_overhead();
+        let overhead = DATA_OVERHEAD + self.obfs_overhead();
         if self.mtu <= overhead + 16 {
             return Err(FluxError::Config(format!(
                 "mKCP mtu {} is too small: {} bytes of header/obfuscation overhead ({}) leave no room for data",
@@ -509,29 +736,25 @@ pub struct KcpStats {
 /// A queued payload, already cut to fit one segment.
 struct QueuedSeg {
     data: Bytes,
-    frg: u8,
 }
 
-/// Splits one write into at most [`MAX_FRAGMENTS`] segments, each at most `mss`
-/// bytes. `frg` counts down from 255 so the last fragment of a write is the one
-/// with the smallest index — the KCP convention that lets a receiver recognise
-/// the tail of a message.
-fn fragment(data: &[u8], mss: usize) -> Vec<QueuedSeg> {
+/// Splits one write into segment-sized chunks.
+///
+/// Xray has no fragment index: a write is just a run of consecutive `sn`s, and
+/// the peer concatenates them in order. Splitting is therefore the whole of
+/// "fragmentation" on the wire.
+fn chunk_write(data: &[u8], mss: usize) -> Vec<QueuedSeg> {
     let mss = mss.max(1);
-    let mut out = Vec::with_capacity(data.len().div_ceil(mss).min(MAX_FRAGMENTS));
-    for (index, chunk) in data.chunks(mss).take(MAX_FRAGMENTS).enumerate() {
-        out.push(QueuedSeg {
+    data.chunks(mss)
+        .map(|chunk| QueuedSeg {
             data: Bytes::copy_from_slice(chunk),
-            frg: (255 - index) as u8,
-        });
-    }
-    out
+        })
+        .collect()
 }
 
 /// A segment that has been sent and is waiting to be acknowledged.
 struct OutSeg {
     data: Bytes,
-    frg: u8,
     /// Wire timestamp of the most recent transmission.
     ts: u32,
     /// Local send time of the most recent transmission, for RTT measurement.
@@ -550,7 +773,7 @@ struct OutSeg {
 
 struct Conn {
     cfg: KcpConfig,
-    conv: u32,
+    conv: u16,
     obfs: ObfsState,
     socket: Arc<UdpSocket>,
     peer: Option<SocketAddr>,
@@ -569,7 +792,10 @@ struct Conn {
     rcv_nxt: u32,
     rcv_buf: BTreeMap<u32, Bytes>,
     recv_queue: VecDeque<Bytes>,
-    ack_list: Vec<(u32, u32)>,
+    /// Segment numbers to acknowledge, and the newest DATA timestamp among them
+    /// (Xray's ACK carries the newest of the timestamps it covers).
+    ack_list: Vec<u32>,
+    ack_ts: u32,
 
     // RTT estimation (RFC 6298 style).
     srtt_us: u64,
@@ -577,13 +803,19 @@ struct Conn {
     rto_us: u64,
 
     // Windows and liveness.
-    peer_wnd: u16,
-    /// Window advertised on the last segment we sent, to notice when a reader
-    /// frees space in a window we had closed.
-    advertised_wnd: u16,
-    /// Set when the reader consumed data while the advertised window was zero.
+    /// Absolute right edge of the peer's receive window, as advertised in its
+    /// last ACK. Our credit is `peer_edge - snd_una` segments.
+    peer_edge: u32,
+    /// Edge advertised on the last ACK we sent.
+    advertised_edge: u32,
+    /// Set when the reader consumed data while the window we advertised was
+    /// closed, so the peer needs a window update promptly.
     window_update: bool,
-    next_probe: Instant,
+    /// The peer sent TERMINATE: reads drain then report end of stream.
+    peer_closed: bool,
+    /// We sent TERMINATE.
+    closing: bool,
+    next_ping: Instant,
     last_recv: Instant,
     last_send: Instant,
     read_waker: Option<Waker>,
@@ -594,7 +826,7 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(cfg: KcpConfig, conv: u32, socket: Arc<UdpSocket>, peer: Option<SocketAddr>) -> Self {
+    fn new(cfg: KcpConfig, conv: u16, socket: Arc<UdpSocket>, peer: Option<SocketAddr>) -> Self {
         let now = Instant::now();
         let wnd = u32::from(cfg.snd_wnd);
         // With congestion control enabled the window has to be earned; a fixed
@@ -618,16 +850,20 @@ impl Conn {
             rcv_buf: BTreeMap::new(),
             recv_queue: VecDeque::new(),
             ack_list: Vec::new(),
+            ack_ts: 0,
             srtt_us: 0,
             rttvar_us: 0,
             rto_us: 0,
-            // Until the peer tells us, assume it can take as much as we can
-            // send: a client must be able to push the first request without
-            // having received anything yet.
-            peer_wnd: cfg.snd_wnd,
-            advertised_wnd: cfg.rcv_wnd,
+            // Xray opens with a 32-segment credit (`remoteNextNumber: 32`), and
+            // the same is needed here: a client has to be able to push its
+            // first request before any ACK exists. Everything after that comes
+            // from the peer's advertised window edge.
+            peer_edge: 32.min(wnd),
+            advertised_edge: u32::from(cfg.rcv_wnd),
             window_update: false,
-            next_probe: now,
+            peer_closed: false,
+            closing: false,
+            next_ping: now,
             last_recv: now,
             last_send: now,
             read_waker: None,
@@ -686,27 +922,39 @@ impl Conn {
         } else {
             self.cwnd.clamp(1, u32::from(self.cfg.snd_wnd))
         };
-        own.min(u32::from(self.peer_wnd))
+        // Credit is the distance from the oldest unacknowledged segment to the
+        // peer's advertised window edge, exactly as Xray computes it.
+        let peer = self.peer_edge.saturating_sub(self.snd_una);
+        own.min(peer)
     }
 
     // -- sending ----------------------------------------------------------
+
+    /// Window we advertise: the first number we have not received plus the free
+    /// slots behind it. Xray's `ReceivingWindow` is this absolute edge, not a
+    /// count, and a sender derives its credit as `edge - first unacknowledged`.
+    fn window_edge(&self) -> u32 {
+        self.rcv_nxt.wrapping_add(u32::from(self.rcv_wnd_free()))
+    }
 
     fn send_segment(&mut self, seg: Segment, now: Instant) {
         let Some(peer) = self.peer else {
             return;
         };
-        let mut segment = Vec::with_capacity(SEGMENT_HEADER_LEN + seg.data.len());
-        encode_segment(self.conv, &seg, &mut segment);
+        let mut plain = Vec::with_capacity(seg.wire_len());
+        encode_segment(self.conv, &seg, &mut plain);
 
-        let mut datagram = Vec::with_capacity(segment.len() + self.cfg.obfs_overhead());
-        self.obfs.wrap(&segment, &mut datagram);
+        let mut datagram = Vec::with_capacity(plain.len() + self.cfg.obfs_overhead());
+        self.obfs.wrap(&plain, &mut datagram);
 
         // Non-blocking on purpose: backpressure has to be expressed by the KCP
         // window, not by a send queue inside the socket. A datagram the socket
         // refuses is simply not sent; the retransmission timer covers it.
         match self.socket.try_send_to(&datagram, peer) {
             Ok(sent) => {
-                self.advertised_wnd = seg.wnd;
+                if seg.cmd == CMD_ACK {
+                    self.advertised_edge = seg.window_edge;
+                }
                 self.stats.segments_sent += 1;
                 self.stats.bytes_sent += sent as u64;
                 self.last_send = now;
@@ -722,76 +970,54 @@ impl Conn {
         }
     }
 
-    fn send_push(&mut self, sn: u32, now: Instant) {
+    fn send_data(&mut self, sn: u32, now: Instant) {
         let Some(seg) = self.snd_buf.get(&sn) else {
             return;
         };
-        let (frg, ts, data) = (seg.frg, seg.ts, seg.data.clone());
-        let wnd = self.rcv_wnd_free();
-        let una = self.rcv_nxt;
-        self.send_segment(
-            Segment {
-                cmd: CMD_PUSH,
-                frg,
-                wnd,
-                ts,
-                sn,
-                una,
-                data: data.to_vec(),
-            },
-            now,
-        );
+        let (ts, data) = (seg.ts, seg.data.clone());
+        let sending_next = self.rcv_nxt;
+        self.send_segment(Segment::data(sn, sending_next, ts, data.to_vec()), now);
     }
 
-    fn send_ack(&mut self, now: Instant) {
+    /// Sends the pending acknowledgements, split over as many ACK segments as
+    /// the MTU requires, and then sends an empty ACK if the window has to be
+    /// reopened.
+    fn send_acks(&mut self, now: Instant) {
         if self.ack_list.is_empty() {
             return;
         }
-        let per_segment = (self.cfg.mss() / 8).max(1);
+        let per_segment = (self.cfg.mss() / 4).clamp(1, MAX_ACK_NUMBERS);
+        let ts = self.ack_ts;
         while !self.ack_list.is_empty() {
             let take = self.ack_list.len().min(per_segment);
-            let pairs: Vec<(u32, u32)> = self.ack_list.drain(..take).collect();
-            let mut data = Vec::with_capacity(pairs.len() * 8);
-            for (sn, ts) in pairs {
-                data.extend_from_slice(&sn.to_le_bytes());
-                data.extend_from_slice(&ts.to_le_bytes());
-            }
-            let seg = Segment {
-                cmd: CMD_ACK,
-                frg: 0,
-                wnd: self.rcv_wnd_free(),
-                ts: self.now_ms(now),
-                sn: 0,
-                una: self.rcv_nxt,
-                data,
-            };
+            let numbers: Vec<u32> = self.ack_list.drain(..take).collect();
+            let seg = Segment::ack(self.rcv_nxt, self.window_edge(), ts, numbers);
             self.send_segment(seg, now);
         }
     }
 
-    fn send_probe(&mut self, now: Instant) {
-        let seg = Segment {
-            cmd: CMD_WASK,
-            frg: 0,
-            wnd: self.rcv_wnd_free(),
-            ts: self.now_ms(now),
-            sn: 0,
-            una: self.rcv_nxt,
-            data: Vec::new(),
-        };
+    fn send_window_update(&mut self, now: Instant) {
+        let seg = Segment::ack(
+            self.rcv_nxt,
+            self.window_edge(),
+            self.now_ms(now),
+            Vec::new(),
+        );
         self.send_segment(seg, now);
     }
 
-    fn send_window_reply(&mut self, now: Instant) {
-        let seg = Segment {
-            cmd: CMD_WINS,
-            frg: 0,
-            wnd: self.rcv_wnd_free(),
-            ts: self.now_ms(now),
-            sn: 0,
-            una: self.rcv_nxt,
-            data: Vec::new(),
-        };
+    /// A PING doubles as a keepalive and as a cumulative acknowledgement of the
+    /// peer's stream, which is exactly how Xray uses it.
+    fn send_ping(&mut self, now: Instant) {
+        let rto = self.rto().as_millis() as u32;
+        let seg = Segment::command(CMD_PING, self.rcv_nxt, self.rcv_nxt, rto);
+        self.send_segment(seg, now);
+    }
+
+    fn send_terminate(&mut self, now: Instant) {
+        let rto = self.rto().as_millis() as u32;
+        let mut seg = Segment::command(CMD_TERMINATE, self.rcv_nxt, self.rcv_nxt, rto);
+        seg.option = OPTION_CLOSE;
         self.send_segment(seg, now);
     }
 
@@ -810,7 +1036,6 @@ impl Conn {
                 sn,
                 OutSeg {
                     data: queued.data,
-                    frg: queued.frg,
                     ts,
                     sent_at: now,
                     xmit: 1,
@@ -820,7 +1045,7 @@ impl Conn {
                     fast_xmit: 0,
                 },
             );
-            self.send_push(sn, now);
+            self.send_data(sn, now);
         }
     }
 
@@ -853,7 +1078,7 @@ impl Conn {
             self.stats.segments_retransmitted += 1;
             self.stats.fast_retransmits += 1;
             self.on_loss(true);
-            self.send_push(sn, now);
+            self.send_data(sn, now);
         }
 
         for sn in expired {
@@ -869,31 +1094,23 @@ impl Conn {
             seg.sent_at = now;
             let xmit = seg.xmit;
             if xmit > MAX_RETRIES {
-                tracing::debug!(
-                    conv = self.conv,
-                    sn,
-                    "mKCP segment exceeded its retry budget"
-                );
+                tracing::debug!("conv {} sn {sn} exceeded its retry budget", self.conv);
                 self.kill(io::ErrorKind::TimedOut);
                 return;
             }
             self.stats.segments_retransmitted += 1;
             self.stats.timer_retransmits += 1;
             self.on_loss(false);
-            self.send_push(sn, now);
+            self.send_data(sn, now);
         }
     }
 
-    /// Window probing and an idle keepalive, both through WASK/WINS.
+    /// Keepalive, window probing and the peer's liveness all ride on PING,
+    /// which is what a real Xray peer sends every three seconds when quiet.
     fn keepalive(&mut self, now: Instant) {
-        if self.peer_wnd == 0
-            && (!self.snd_queue.is_empty() || !self.snd_buf.is_empty())
-            && now >= self.next_probe
-        {
-            self.next_probe = now + self.rto().max(Duration::from_millis(200));
-            self.send_probe(now);
-        } else if now.duration_since(self.last_send) >= KEEPALIVE_IDLE {
-            self.send_probe(now);
+        if now >= self.next_ping {
+            self.next_ping = now + PING_IDLE;
+            self.send_ping(now);
         }
     }
 
@@ -901,8 +1118,12 @@ impl Conn {
         if self.dead.is_some() {
             return;
         }
-        if !self.snd_buf.is_empty() && now.duration_since(self.last_recv) > IDLE_TIMEOUT {
+        let silence = now.duration_since(self.last_recv);
+        if !self.snd_buf.is_empty() && silence > IDLE_TIMEOUT {
             self.kill(io::ErrorKind::TimedOut);
+        } else if silence > PEER_SILENCE_LIMIT {
+            // Probes have gone unanswered for a minute: the peer is gone.
+            self.kill(io::ErrorKind::ConnectionReset);
         }
     }
 
@@ -924,10 +1145,10 @@ impl Conn {
         if self.dead.is_some() || self.peer.is_none() {
             return;
         }
-        self.send_ack(now);
+        self.send_acks(now);
         if self.window_update && self.rcv_wnd_free() > 0 {
             self.window_update = false;
-            self.send_window_reply(now);
+            self.send_window_update(now);
         }
         self.fill_window(now);
         self.retransmit(now);
@@ -937,15 +1158,15 @@ impl Conn {
 
     // -- receiving --------------------------------------------------------
 
-    /// Feeds one deobfuscated segment. The socket demultiplexer has already
+    /// Feeds one deobfuscated datagram. The socket demultiplexer has already
     /// stripped the obfuscation, so this is what the driver calls.
-    fn on_segment(&mut self, segment: &[u8], from: SocketAddr, now: Instant) {
+    fn on_datagram(&mut self, plain: &[u8], from: SocketAddr, now: Instant) {
         if self.dead.is_some() {
             return;
         }
         // Anything larger than the MTU cannot be something we produced, so it is
         // either hostile or a configuration mismatch.
-        if segment.len() > self.cfg.mtu {
+        if plain.len() > self.cfg.mtu {
             return;
         }
         match self.peer {
@@ -953,29 +1174,77 @@ impl Conn {
             Some(peer) if peer != from => return,
             Some(_) => {}
         }
-        let Some(seg) = decode_segment(self.conv, segment) else {
-            return;
-        };
+        let conv = self.conv;
+        for seg in decode_datagram(conv, plain) {
+            self.stats.datagrams_received += 1;
+            self.last_recv = now;
+            self.on_segment(seg, now);
+            if self.dead.is_some() {
+                return;
+            }
+        }
+    }
 
-        self.last_recv = now;
-        self.peer_wnd = seg.wnd;
-        self.stats.datagrams_received += 1;
-
+    fn on_segment(&mut self, seg: Segment, now: Instant) {
+        // Any segment can carry the peer's cumulative acknowledgement of our
+        // stream (`SendingNext`), which is what frees the send buffer.
+        if seg.cmd != CMD_ACK {
+            self.process_peer_next(seg.sending_next);
+        }
         match seg.cmd {
-            CMD_PUSH => self.on_push(seg),
+            CMD_DATA => {
+                if seg.option == OPTION_CLOSE {
+                    self.peer_closed = true;
+                }
+                self.on_data(seg, now);
+            }
             CMD_ACK => self.on_ack(&seg, now),
-            CMD_WASK => self.send_window_reply(now),
-            CMD_WINS => self.next_probe = now,
+            CMD_PING => {
+                // The peer's RTO is advisory; the local estimate is what this
+                // implementation trusts. A PING needs no reply.
+                let _ = seg.peer_rto;
+            }
+            CMD_TERMINATE => {
+                self.peer_closed = true;
+                if let Some(waker) = self.read_waker.take() {
+                    waker.wake();
+                }
+            }
             _ => {}
         }
     }
 
-    fn on_push(&mut self, seg: Segment) {
+    /// Applies a cumulative acknowledgement from the peer.
+    fn process_peer_next(&mut self, next: u32) {
+        if next <= self.snd_una || next > self.snd_nxt {
+            return;
+        }
+        if let Some(seg) = self.snd_buf.get(&next.wrapping_sub(1))
+            && seg.xmit == 1
+        {
+            let sent_at = seg.sent_at;
+            self.update_rtt(sent_at.elapsed().as_micros() as u64);
+        }
+        let done: Vec<u32> = self.snd_buf.range(..next).map(|(sn, _)| *sn).collect();
+        if done.is_empty() {
+            return;
+        }
+        for sn in done {
+            self.snd_buf.remove(&sn);
+        }
+        self.snd_una = next;
+        if let Some(waker) = self.write_waker.take() {
+            waker.wake();
+        }
+    }
+
+    fn on_data(&mut self, seg: Segment, now: Instant) {
         let sn = seg.sn;
+        self.ack_ts = self.ack_ts.max(seg.ts);
         // Already delivered: re-acknowledge, because our earlier ACK was
         // probably the datagram that got lost.
         if sn < self.rcv_nxt {
-            self.ack_list.push((sn, seg.ts));
+            self.ack_list.push(sn);
             return;
         }
         if self.rcv_window_full() {
@@ -985,8 +1254,9 @@ impl Conn {
             self.stats.bytes_received += seg.data.len() as u64;
             Bytes::from(seg.data.clone())
         });
-        self.ack_list.push((sn, seg.ts));
+        self.ack_list.push(sn);
         self.deliver();
+        let _ = now;
     }
 
     /// Hands in-order segments to the reader. A slow reader stops delivery
@@ -1009,48 +1279,33 @@ impl Conn {
     }
 
     fn on_ack(&mut self, seg: &Segment, now: Instant) {
+        // The peer's window edge is absolute; our credit is the distance from
+        // the oldest unacknowledged segment to it.
+        self.peer_edge = self.peer_edge.max(seg.window_edge);
+        self.process_peer_next(seg.receiving_next);
+
+        if seg.numbers.is_empty() {
+            return;
+        }
         let mut acked = 0u32;
         let mut highest = self.snd_una;
-
-        // An ACK payload is `(sn, ts)` pairs. The `ts` half is the peer's echo of
-        // our wire timestamp, kept so the format stays standard; the RTT itself
-        // is measured from the local `sent_at`, which has microsecond resolution
-        // instead of the millisecond the wire field can carry.
-        let (pairs, _) = seg.data.as_chunks::<8>();
-        for pair in pairs {
-            let sn = u32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]);
-            if sn < self.snd_una || sn >= self.snd_nxt {
+        for sn in &seg.numbers {
+            if *sn < self.snd_una || *sn >= self.snd_nxt {
                 continue;
             }
-            if let Some(out) = self.snd_buf.get(&sn) {
-                // Karn's rule: only trust a sample from a segment that was sent
-                // exactly once, otherwise it is ambiguous which copy it covers.
+            if let Some(out) = self.snd_buf.get(sn) {
+                // Karn's rule: only a sample from a segment sent exactly once is
+                // unambiguous. The ACK's own `ts` is the peer's clock, which is
+                // not comparable with ours, so the local send time is used.
                 if out.xmit == 1 {
-                    self.update_rtt(now.duration_since(out.sent_at).as_micros() as u64);
+                    self.update_rtt(out.sent_at.elapsed().as_micros() as u64);
                 }
             }
-            if self.snd_buf.remove(&sn).is_some() {
+            if self.snd_buf.remove(sn).is_some() {
                 acked += 1;
                 highest = highest.max(sn.wrapping_add(1));
             }
         }
-
-        // Cumulative acknowledgement: everything below `una` is delivered.
-        if seg.una > self.snd_una {
-            if let Some(out) = self.snd_buf.get(&seg.una.wrapping_sub(1))
-                && out.xmit == 1
-            {
-                self.update_rtt(now.duration_since(out.sent_at).as_micros() as u64);
-            }
-            highest = highest.max(seg.una);
-            let done: Vec<u32> = self.snd_buf.range(..seg.una).map(|(sn, _)| *sn).collect();
-            acked += done.len() as u32;
-            for sn in done {
-                self.snd_buf.remove(&sn);
-            }
-            self.snd_una = seg.una;
-        }
-
         if acked > 0 {
             for (sn, out) in self.snd_buf.iter_mut() {
                 if *sn < highest {
@@ -1173,7 +1428,7 @@ impl Inbox {
 struct Hub {
     socket: Arc<UdpSocket>,
     obfs: KcpObfs,
-    routes: HashMap<u32, Arc<Inbox>>,
+    routes: HashMap<u16, Arc<Inbox>>,
     /// Route used by an `accept` that has not learned its conversation id yet.
     any: Option<Arc<Inbox>>,
     closed: bool,
@@ -1243,16 +1498,16 @@ async fn dispatch(hub: Arc<Mutex<Hub>>) {
         };
         // Header-only segments (ACK, WASK, WINS) are exactly the minimum size,
         // so this must be a strict comparison.
-        if n < obfs.header_len() + envelope::OVERHEAD + SEGMENT_HEADER_LEN {
+        if n < obfs.header_len() + envelope::OVERHEAD + CMD_ONLY_LEN {
             continue;
         }
         let Some(segment) = unwrap_datagram(obfs, &buf[..n]) else {
             continue;
         };
-        if segment.len() < SEGMENT_HEADER_LEN {
+        if segment.len() < SEGMENT_PREFIX_LEN {
             continue;
         }
-        let conv = u32::from_le_bytes([segment[0], segment[1], segment[2], segment[3]]);
+        let conv = u16::from_be_bytes([segment[0], segment[1]]);
         let hub = hub.lock();
         let target = hub.routes.get(&conv).or(hub.any.as_ref()).cloned();
         drop(hub);
@@ -1288,7 +1543,7 @@ pub struct KcpStream {
     inner: Arc<Mutex<Conn>>,
     hub: Arc<Mutex<Hub>>,
     key: usize,
-    conv: u32,
+    conv: u16,
     task: tokio::task::JoinHandle<()>,
     local: Option<SocketAddr>,
 }
@@ -1296,7 +1551,7 @@ pub struct KcpStream {
 impl KcpStream {
     /// Conversation id in use (generated when the config asked for `0`).
     pub fn conv(&self) -> u32 {
-        self.conv
+        u32::from(self.conv)
     }
 
     /// Local address of the underlying UDP socket.
@@ -1357,20 +1612,15 @@ pub async fn connect(peer: SocketAddr, cfg: KcpConfig) -> FluxResult<KcpStream> 
             FluxError::Network(format!("mKCP could not bind a local UDP socket: {e}"))
         })?);
     tune_socket(&socket);
+    let conv = cfg.conversation()?;
     let (hub, key) = hub_for(&socket, cfg.obfs);
-    let conv = if cfg.conv == 0 {
-        rand::random::<u32>()
-    } else {
-        cfg.conv
-    };
     let inbox = Inbox::new();
     hub.lock().routes.insert(conv, inbox.clone());
 
     let mut conn = Conn::new(cfg, conv, socket, Some(peer));
-    // One window probe makes the conversation recognisable to a peer that is
-    // waiting in `accept` before any payload exists.
-    let now = Instant::now();
-    conn.send_probe(now);
+    // One PING makes the conversation visible to a peer sitting in `accept`
+    // before any payload exists, and is what an Xray client does first anyway.
+    conn.send_ping(Instant::now());
     Ok(spawn_stream(conn, hub, key, inbox))
 }
 
@@ -1409,36 +1659,34 @@ pub async fn accept(socket: Arc<UdpSocket>, cfg: KcpConfig) -> FluxResult<KcpStr
             }
         }
     } else {
-        if hub.lock().routes.insert(cfg.conv, inbox.clone()).is_some() {
+        let wanted = cfg.conversation()?;
+        if hub.lock().routes.insert(wanted, inbox.clone()).is_some() {
             return Err(FluxError::Config(format!(
-                "mKCP conversation {:#x} is already accepted on this socket",
-                cfg.conv
+                "mKCP conversation {wanted:#06x} is already accepted on this socket"
             )));
         }
         match next_datagram(&inbox).await {
-            Ok(first) => (cfg.conv, first),
+            Ok(first) => (wanted, first),
             Err(e) => {
-                hub.lock().routes.remove(&cfg.conv);
+                hub.lock().routes.remove(&wanted);
                 return Err(e);
             }
         }
     };
 
     let mut conn = Conn::new(cfg, conv, socket, None);
-    conn.on_segment(&first.1, first.0, Instant::now());
+    conn.on_datagram(&first.1, first.0, Instant::now());
     Ok(spawn_stream(conn, hub, key, inbox))
 }
 
-fn conversation_of(segment: &[u8]) -> FluxResult<u32> {
-    if segment.len() < SEGMENT_HEADER_LEN {
+fn conversation_of(segment: &[u8]) -> FluxResult<u16> {
+    if segment.len() < SEGMENT_PREFIX_LEN {
         return Err(FluxError::Protocol {
             protocol: "mkcp",
-            message: "first datagram is shorter than a segment header".into(),
+            message: "first datagram is shorter than a segment prefix".into(),
         });
     }
-    Ok(u32::from_le_bytes([
-        segment[0], segment[1], segment[2], segment[3],
-    ]))
+    Ok(u16::from_be_bytes([segment[0], segment[1]]))
 }
 
 /// Waits for one datagram on `inbox`, giving up after [`ACCEPT_TIMEOUT`].
@@ -1498,7 +1746,7 @@ async fn drive(inner: Arc<Mutex<Conn>>, inbox: Arc<Inbox>) {
         let now = Instant::now();
         let mut conn = inner.lock();
         for (addr, segment) in batch {
-            conn.on_segment(&segment, addr, now);
+            conn.on_datagram(&segment, addr, now);
         }
         conn.flush(now);
         if conn.dead.is_some() {
@@ -1528,13 +1776,18 @@ impl AsyncRead for KcpStream {
             }
             // Freeing space in a window we had advertised as zero needs an
             // explicit update, or the peer stays parked in its probe loop.
-            if conn.advertised_wnd == 0 {
+            if conn.advertised_edge <= conn.rcv_nxt {
                 conn.window_update = true;
             }
             return Poll::Ready(Ok(()));
         }
         if let Some(kind) = conn.dead {
             return Poll::Ready(Err(io::Error::new(kind, "mKCP stream lost")));
+        }
+        if conn.peer_closed {
+            // TERMINATE arrived and everything it sent is delivered: EOF, the
+            // closest thing mKCP has to a half-close.
+            return Poll::Ready(Ok(()));
         }
         conn.read_waker = Some(cx.waker().clone());
         Poll::Pending
@@ -1551,6 +1804,12 @@ impl AsyncWrite for KcpStream {
         if let Some(kind) = conn.dead {
             return Poll::Ready(Err(io::Error::new(kind, "mKCP stream lost")));
         }
+        if conn.peer_closed || conn.closing {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "mKCP stream closed",
+            )));
+        }
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
@@ -1566,8 +1825,8 @@ impl AsyncWrite for KcpStream {
         }
 
         let take = buf.len().min(free.min(MAX_FRAGMENTS) * mss);
-        for segment in fragment(&buf[..take], mss) {
-            conn.snd_queue.push_back(segment);
+        for queued in chunk_write(&buf[..take], mss) {
+            conn.snd_queue.push_back(queued);
         }
         conn.flush(Instant::now());
         Poll::Ready(Ok(take))
@@ -1582,8 +1841,17 @@ impl AsyncWrite for KcpStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.poll_flush(cx)
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let mut conn = self.get_mut().inner.lock();
+        if conn.dead.is_none() && !conn.closing {
+            let now = Instant::now();
+            conn.closing = true;
+            // Xray's TERMINATE is the command that tells the peer this stream is
+            // finished; without it the peer would sit in a read that never ends.
+            conn.send_terminate(now);
+            conn.flush(now);
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1639,112 +1907,129 @@ mod tests {
     // -- codec ------------------------------------------------------------
 
     #[test]
-    fn segment_round_trip() {
-        let seg = Segment {
-            cmd: CMD_PUSH,
-            frg: 200,
-            wnd: 512,
-            ts: 7,
-            sn: 42,
-            una: 41,
-            data: b"hello kcp".to_vec(),
-        };
+    fn data_segment_round_trip() {
+        let seg = Segment::data(42, 41, 7, b"hello kcp".to_vec());
         let mut buf = Vec::new();
-        encode_segment(0xDEAD_BEEF, &seg, &mut buf);
-        assert_eq!(buf.len(), SEGMENT_HEADER_LEN + 9);
+        encode_segment(0xBEEF, &seg, &mut buf);
+        assert_eq!(buf.len(), DATA_OVERHEAD + 9);
 
-        let decoded = decode_segment(0xDEAD_BEEF, &buf).expect("valid segment");
-        assert_eq!(decoded.cmd, CMD_PUSH);
-        assert_eq!(decoded.frg, 200);
-        assert_eq!(decoded.wnd, 512);
+        let (decoded, used) = decode_segment(0xBEEF, &buf).expect("valid segment");
+        assert_eq!(used, buf.len());
+        assert_eq!(decoded.cmd, CMD_DATA);
+        assert_eq!(decoded.option, 0);
         assert_eq!(decoded.ts, 7);
         assert_eq!(decoded.sn, 42);
-        assert_eq!(decoded.una, 41);
+        assert_eq!(decoded.sending_next, 41);
         assert_eq!(decoded.data, b"hello kcp");
     }
 
     #[test]
-    fn segment_header_is_little_endian_and_24_bytes() {
-        let seg = Segment {
-            cmd: CMD_ACK,
-            frg: 0,
-            wnd: 0x0102,
-            ts: 0xAABB_CCDD,
-            sn: 0x1122_3344,
-            una: 0x5566_7788,
-            data: Vec::new(),
-        };
+    fn wire_layout_is_xray_shaped() {
+        // DATA: conv u16 ‖ 1 ‖ opt ‖ ts ‖ sn ‖ sendingNext ‖ len u16 ‖ payload,
+        // all big-endian, 18 bytes of overhead.
         let mut buf = Vec::new();
-        encode_segment(0x0A0B_0C0D, &seg, &mut buf);
-        assert_eq!(buf.len(), 24);
-        assert_eq!(&buf[0..4], &[0x0D, 0x0C, 0x0B, 0x0A]);
-        assert_eq!(buf[4], CMD_ACK);
-        assert_eq!(&buf[6..8], &[0x02, 0x01]);
-        assert_eq!(&buf[8..12], &[0xDD, 0xCC, 0xBB, 0xAA]);
-        assert_eq!(&buf[12..16], &[0x44, 0x33, 0x22, 0x11]);
-        assert_eq!(&buf[16..20], &[0x88, 0x77, 0x66, 0x55]);
-        assert_eq!(&buf[20..24], &[0, 0, 0, 0]);
+        encode_segment(
+            0x0A0B,
+            &Segment::data(0x1122_3344, 0x5566_7788, 0xAABB_CCDD, vec![0x99, 0x88]),
+            &mut buf,
+        );
+        assert_eq!(buf.len(), 20);
+        assert_eq!(&buf[0..2], &[0x0A, 0x0B]);
+        assert_eq!(buf[2], CMD_DATA);
+        assert_eq!(buf[3], 0);
+        assert_eq!(&buf[4..8], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(&buf[8..12], &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(&buf[12..16], &[0x55, 0x66, 0x77, 0x88]);
+        assert_eq!(&buf[16..18], &[0x00, 0x02]);
+        assert_eq!(&buf[18..20], &[0x99, 0x88]);
+
+        // ACK: conv ‖ 0 ‖ opt ‖ receivingWindow ‖ receivingNext ‖ ts ‖ count ‖ sn…
+        let mut buf = Vec::new();
+        encode_segment(
+            0x0A0B,
+            &Segment::ack(7, 519, 0x0102_0304, vec![5, 6]),
+            &mut buf,
+        );
+        assert_eq!(buf.len(), ACK_OVERHEAD + 8);
+        assert_eq!(&buf[0..2], &[0x0A, 0x0B]);
+        assert_eq!(buf[2], CMD_ACK);
+        assert_eq!(&buf[4..8], &[0, 0, 0x02, 0x07]); // 519
+        assert_eq!(&buf[8..12], &[0, 0, 0, 7]);
+        assert_eq!(&buf[12..16], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(buf[16], 2);
+        assert_eq!(&buf[17..21], &[0, 0, 0, 5]);
+        assert_eq!(&buf[21..25], &[0, 0, 0, 6]);
+
+        // PING: conv ‖ cmd ‖ opt ‖ sendingNext ‖ receivingNext ‖ peerRTO.
+        let mut buf = Vec::new();
+        encode_segment(0x0A0B, &Segment::command(CMD_PING, 3, 4, 5), &mut buf);
+        assert_eq!(buf.len(), CMD_ONLY_LEN);
+        assert_eq!(buf[2], CMD_PING);
+        assert_eq!(&buf[4..8], &[0, 0, 0, 3]);
+        assert_eq!(&buf[8..12], &[0, 0, 0, 4]);
+        assert_eq!(&buf[12..16], &[0, 0, 0, 5]);
     }
 
     #[test]
     fn overlong_len_field_is_rejected() {
-        let seg = Segment {
-            cmd: CMD_PUSH,
-            frg: 0,
-            wnd: 1,
-            ts: 1,
-            sn: 1,
-            una: 0,
-            data: vec![0u8; 16],
-        };
         let mut buf = Vec::new();
-        encode_segment(1, &seg, &mut buf);
-        // Claim 4096 bytes of payload in a 40-byte datagram.
-        buf[20..24].copy_from_slice(&4096u32.to_le_bytes());
+        encode_segment(1, &Segment::data(1, 0, 1, vec![0u8; 16]), &mut buf);
+        // Claim 4096 bytes of payload in an 18+16 byte datagram.
+        buf[16..18].copy_from_slice(&4096u16.to_be_bytes());
         assert!(decode_segment(1, &buf).is_none());
-        // A length larger than the MTU is rejected by the same check once the
-        // datagram is inspected as a whole.
-        assert!(decode_segment(1, &buf[..SEGMENT_HEADER_LEN]).is_none());
-    }
-
-    #[test]
-    fn truncated_segment_is_rejected() {
-        let seg = Segment {
-            cmd: CMD_PUSH,
-            frg: 0,
-            wnd: 1,
-            ts: 1,
-            sn: 1,
-            una: 0,
-            data: vec![7u8; 32],
-        };
-        let mut buf = Vec::new();
-        encode_segment(1, &seg, &mut buf);
-        // Cut the payload in half without touching the length field.
-        buf.truncate(SEGMENT_HEADER_LEN + 16);
-        assert!(decode_segment(1, &buf).is_none());
+        // A zero-length DATA cannot be parsed by Xray either, so neither can it
+        // be produced or accepted here.
+        let mut zero = Vec::new();
+        encode_segment(1, &Segment::data(1, 0, 1, Vec::new()), &mut zero);
+        assert_eq!(zero.len(), DATA_OVERHEAD);
+        assert!(decode_segment(1, &zero).is_none());
         // A datagram shorter than the header itself.
         assert!(decode_segment(1, &buf[..10]).is_none());
         assert!(decode_segment(1, &[]).is_none());
     }
 
     #[test]
-    fn unknown_conv_and_cmd_are_rejected() {
-        let seg = Segment {
-            cmd: CMD_PUSH,
-            frg: 0,
-            wnd: 1,
-            ts: 1,
-            sn: 1,
-            una: 0,
-            data: vec![1, 2, 3],
-        };
+    fn truncated_segment_is_rejected() {
         let mut buf = Vec::new();
-        encode_segment(0x1234, &seg, &mut buf);
+        encode_segment(1, &Segment::data(1, 0, 1, vec![7u8; 32]), &mut buf);
+        // Cut the payload in half without touching the length field.
+        buf.truncate(DATA_OVERHEAD + 16);
+        assert!(decode_segment(1, &buf).is_none());
+    }
+
+    #[test]
+    fn unknown_conv_and_cmd_are_rejected() {
+        let mut buf = Vec::new();
+        encode_segment(0x1234, &Segment::data(1, 0, 1, vec![1, 2, 3]), &mut buf);
         assert!(decode_segment(0x1235, &buf).is_none());
+        // The conversation id is 16 bits: a peer whose id differs in the high
+        // half of a 32-bit value is a different conversation, not a match.
+        assert!(decode_segment(0x0000, &[0x00, 0x00, 0x01, 0x00]).is_none());
         let mut bogus = buf.clone();
-        bogus[4] = 0x7F; // not a command we speak
+        bogus[2] = 0x7F; // not a command we speak
         assert!(decode_segment(0x1234, &bogus).is_none());
+        // An ACK that claims more numbers than it carries.
+        let mut ack = Vec::new();
+        encode_segment(0x1234, &Segment::ack(0, 0, 0, vec![1]), &mut ack);
+        ack[16] = 9;
+        assert!(decode_segment(0x1234, &ack).is_none());
+    }
+
+    #[test]
+    fn coalesced_segments_in_one_datagram_are_all_parsed() {
+        let mut buf = Vec::new();
+        encode_segment(0x1234, &Segment::data(1, 0, 1, b"a".to_vec()), &mut buf);
+        encode_segment(0x1234, &Segment::data(2, 1, 2, b"b".to_vec()), &mut buf);
+        encode_segment(0x1234, &Segment::ack(3, 100, 3, vec![1, 2]), &mut buf);
+        let segments = decode_datagram(0x1234, &buf);
+        assert_eq!(segments.len(), 3);
+        assert_eq!(segments[0].sn, 1);
+        assert_eq!(segments[1].data, b"b");
+        assert_eq!(segments[2].cmd, CMD_ACK);
+        assert_eq!(segments[2].numbers, vec![1, 2]);
+        // Trailing garbage stops the parse without discarding what came first.
+        buf.extend_from_slice(&[0u8; 3]);
+        assert_eq!(decode_datagram(0x1234, &buf).len(), 3);
     }
 
     #[test]
@@ -1835,13 +2120,14 @@ mod tests {
             obfs: KcpObfs::Srtp,
             ..KcpConfig::default()
         };
-        assert_eq!(cfg.mss(), 1350 - 24 - 4 - 6);
+        // Xray: mss = mtu - DataSegmentOverhead(18) - header - seed overhead.
+        assert_eq!(cfg.mss(), 1350 - DATA_OVERHEAD - 4 - 6);
         let plain = KcpConfig {
             mtu: 1350,
             obfs: KcpObfs::None,
             ..KcpConfig::default()
         };
-        assert_eq!(plain.mss(), 1350 - 24 - 6);
+        assert_eq!(plain.mss(), 1350 - DATA_OVERHEAD - 6);
         // A datagram built at the MTU must not exceed it.
         let mut state = ObfsState::new(KcpObfs::Srtp);
         let mut framed = Vec::new();
@@ -1870,31 +2156,53 @@ mod tests {
     }
 
     #[test]
-    fn fragments_count_down_from_255() {
+    fn a_write_is_split_into_contiguous_segments() {
         let cfg = KcpConfig::default();
         let mss = cfg.mss();
         let data = payload(mss * 3 + 7, 3);
-        let queued = fragment(&data, mss);
+        let queued = chunk_write(&data, mss);
 
         assert_eq!(queued.len(), 4);
-        let frg: Vec<u8> = queued.iter().map(|q| q.frg).collect();
-        assert_eq!(frg, vec![255, 254, 253, 252]);
-
-        // Reassembly is concatenation in order, which is what the reader does.
+        assert_eq!(queued[0].data.len(), mss);
+        assert_eq!(queued[3].data.len(), 7);
         let mut assembled = Vec::new();
         for item in &queued {
             assembled.extend_from_slice(&item.data);
         }
-        assert_eq!(assembled, data);
+        assert_eq!(assembled, data, "chunking must be lossless");
 
-        // The last fragment is short; the others are full.
-        assert_eq!(queued[3].data.len(), 7);
-        assert_eq!(queued[0].data.len(), mss);
+        // Xray has no fragment index: the segments are identified only by their
+        // consecutive numbers, which is what `fill_window` assigns.
+        let mut buf = Vec::new();
+        for (index, item) in queued.iter().enumerate() {
+            encode_segment(
+                1,
+                &Segment::data(index as u32, 0, 0, item.data.to_vec()),
+                &mut buf,
+            );
+        }
+        let segments = decode_datagram(1, &buf);
+        assert_eq!(segments.len(), 4);
+        let numbers: Vec<u32> = segments.iter().map(|seg| seg.sn).collect();
+        assert_eq!(numbers, vec![0, 1, 2, 3]);
+    }
 
-        // A write that fits in one segment is a single fragment.
-        let single = fragment(b"short", mss);
-        assert_eq!(single.len(), 1);
-        assert_eq!(single[0].frg, 255);
+    #[test]
+    fn a_conversation_id_above_16_bits_is_refused() {
+        let too_big = KcpConfig {
+            conv: 0x1_0000,
+            ..KcpConfig::default()
+        };
+        assert!(matches!(too_big.validate(), Ok(())));
+        assert!(matches!(too_big.conversation(), Err(FluxError::Config(_))));
+        let ok = KcpConfig {
+            conv: 0xFFFF,
+            ..KcpConfig::default()
+        };
+        assert_eq!(ok.conversation().unwrap(), 0xFFFF);
+        // Zero means "pick one", and what is picked is never zero.
+        let generated = KcpConfig::default().conversation().unwrap();
+        assert_ne!(generated, 0);
     }
 
     // -- end to end -------------------------------------------------------
@@ -1903,8 +2211,16 @@ mod tests {
     ///
     /// It pumps instead of reading the whole payload first, because two peers
     /// that each write their full payload before reading would deadlock once
-    /// the payload exceeds a receive window.
-    async fn echo_server(socket: Arc<UdpSocket>, cfg: KcpConfig, expect: usize) -> KcpStats {
+    /// the payload exceeds a receive window. It also stays alive until the
+    /// client says it is done: dropping the stream earlier would leave the
+    /// client waiting for segments nobody will retransmit, which is exactly what
+    /// a KCP peer without a close command looks like.
+    async fn echo_server(
+        socket: Arc<UdpSocket>,
+        cfg: KcpConfig,
+        expect: usize,
+        done: tokio::sync::oneshot::Receiver<()>,
+    ) -> KcpStats {
         let mut stream = tokio::time::timeout(Duration::from_secs(60), accept(socket, cfg))
             .await
             .expect("accept timed out")
@@ -1925,9 +2241,8 @@ mod tests {
         }
         stream.flush().await.expect("flush failed");
         let stats = stream.stats();
-        // Keep the conversation alive long enough for the last ACKs to arrive,
-        // so the client is not left retransmitting into a closed stream.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Hold the conversation open until the client has read everything back.
+        let _ = tokio::time::timeout(Duration::from_secs(30), done).await;
         stats
     }
 
@@ -1960,11 +2275,12 @@ mod tests {
         let socket = server_socket().await;
         let addr = socket.local_addr().unwrap();
         let cfg = KcpConfig {
-            conv: 0x5EED_0001,
+            conv: 0x5EE1,
             ..KcpConfig::default()
         };
 
-        let server = tokio::spawn(echo_server(socket, cfg, 1024 * 1024));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(echo_server(socket, cfg, 1024 * 1024, done_rx));
         let client = connect(addr, cfg).await.expect("connect failed");
         let data = payload(1024 * 1024, 5);
         let (echoed, stats) = exchange(client, data.clone()).await;
@@ -1972,6 +2288,7 @@ mod tests {
         assert_eq!(echoed.len(), data.len());
         assert!(echoed == data, "1 MiB round trip is not byte-exact");
         println!("1 MiB loopback: {stats:?}");
+        let _ = done_tx.send(());
         server.await.expect("server task panicked");
     }
 
@@ -2069,19 +2386,19 @@ mod tests {
         }
 
         /// Well-framed garbage that a real peer could send: a segment with a
-        /// lying length field, a truncated one, and one for a foreign
-        /// conversation. All of it is properly wrapped, so it reaches the
-        /// segment parser instead of dying in the obfuscation layer.
+        /// lying length field, a truncated one, one for a foreign conversation
+        /// and one with an unknown command. All of it is properly wrapped, so it
+        /// reaches the segment parser instead of dying in the obfuscation layer.
         fn hostile_datagrams(&self, datagram: &[u8]) -> Vec<Vec<u8>> {
             let mut out = Vec::new();
             // Not even a valid frame.
             out.push(vec![0xAA; 7]);
             out.push(datagram[..datagram.len() / 2].to_vec());
 
-            let Some(segment) = unwrap_datagram(self.obfs, datagram) else {
+            let Some(plain) = unwrap_datagram(self.obfs, datagram) else {
                 return out;
             };
-            if segment.len() < SEGMENT_HEADER_LEN {
+            if plain.len() < DATA_OVERHEAD {
                 return out;
             }
             let wrap = |plain: &[u8]| {
@@ -2091,25 +2408,25 @@ mod tests {
                 framed
             };
 
-            // A PUSH that claims 10 000 bytes of payload while carrying none.
-            let mut lying = segment.clone();
-            lying[20..24].copy_from_slice(&10_000u32.to_le_bytes());
+            // A DATA segment that claims 10 000 bytes of payload.
+            let mut lying = plain.clone();
+            lying[16..18].copy_from_slice(&10_000u16.to_be_bytes());
             out.push(wrap(&lying));
 
             // A foreign conversation id.
-            let mut foreign = segment.clone();
-            let conv = u32::from_le_bytes([foreign[0], foreign[1], foreign[2], foreign[3]]);
-            foreign[0..4].copy_from_slice(&conv.wrapping_add(1).to_le_bytes());
+            let mut foreign = plain.clone();
+            let conv = u16::from_be_bytes([foreign[0], foreign[1]]);
+            foreign[0..2].copy_from_slice(&conv.wrapping_add(1).to_be_bytes());
             out.push(wrap(&foreign));
 
             // A segment whose payload was cut off but whose length was not.
-            let mut truncated = segment.clone();
-            truncated.truncate(SEGMENT_HEADER_LEN + 1);
+            let mut truncated = plain.clone();
+            truncated.truncate(DATA_OVERHEAD + 1);
             out.push(wrap(&truncated));
 
             // An unknown command.
-            let mut bogus = segment;
-            bogus[4] = 0x7F;
+            let mut bogus = plain;
+            bogus[2] = 0x7F;
             out.push(wrap(&bogus));
             out
         }
@@ -2126,7 +2443,7 @@ mod tests {
         let socket = server_socket().await;
         let server_addr = socket.local_addr().unwrap();
         let cfg = KcpConfig {
-            conv: 0x5EED_0002,
+            conv: 0x5EE2,
             ..KcpConfig::default()
         };
 
@@ -2137,7 +2454,8 @@ mod tests {
         let relay_task = tokio::spawn(relay.run(stop_rx));
 
         const SIZE: usize = 256 * 1024;
-        let server = tokio::spawn(echo_server(socket, cfg, SIZE));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(echo_server(socket, cfg, SIZE, done_rx));
         let client = connect(relay_addr, cfg).await.expect("connect failed");
         let data = payload(SIZE, 11);
         let transfer = exchange(client, data.clone());
@@ -2156,6 +2474,7 @@ mod tests {
             stats.fast_retransmits + stats.timer_retransmits,
             "every retransmission should be attributable"
         );
+        let _ = done_tx.send(());
         let server_stats = server.await.expect("server task panicked");
         println!("20 % loss (server side): {server_stats:?}");
         let _ = stop_tx.send(());
@@ -2167,7 +2486,7 @@ mod tests {
         let socket = server_socket().await;
         let server_addr = socket.local_addr().unwrap();
         let cfg = KcpConfig {
-            conv: 0x5EED_0003,
+            conv: 0x5EE3,
             ..KcpConfig::default()
         };
 
@@ -2179,7 +2498,8 @@ mod tests {
         let relay_task = tokio::spawn(relay.run(stop_rx));
 
         const SIZE: usize = 64 * 1024;
-        let server = tokio::spawn(echo_server(socket, cfg, SIZE));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(echo_server(socket, cfg, SIZE, done_rx));
         let client = connect(relay_addr, cfg).await.expect("connect failed");
         let data = payload(SIZE, 17);
         let transfer = exchange(client, data.clone());
@@ -2188,6 +2508,7 @@ mod tests {
             .expect("reordered transfer did not finish in time");
         assert!(echoed == data, "reordered round trip is not byte-exact");
         println!("out of order: {stats:?}");
+        let _ = done_tx.send(());
 
         server.await.expect("server task panicked");
         let _ = stop_tx.send(());
@@ -2199,7 +2520,7 @@ mod tests {
         let socket = server_socket().await;
         let server_addr = socket.local_addr().unwrap();
         let cfg = KcpConfig {
-            conv: 0x5EED_0004,
+            conv: 0x5EE4,
             ..KcpConfig::default()
         };
 
@@ -2211,7 +2532,8 @@ mod tests {
         let relay_task = tokio::spawn(relay.run(stop_rx));
 
         const SIZE: usize = 32 * 1024;
-        let server = tokio::spawn(echo_server(socket, cfg, SIZE));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(echo_server(socket, cfg, SIZE, done_rx));
         let client = connect(relay_addr, cfg).await.expect("connect failed");
         let data = payload(SIZE, 23);
         let transfer = exchange(client, data.clone());
@@ -2221,17 +2543,18 @@ mod tests {
         assert!(echoed == data, "hostile datagrams corrupted the stream");
         println!("hostile: {stats:?}");
 
+        let _ = done_tx.send(());
         server.await.expect("server task panicked");
         let _ = stop_tx.send(());
         relay_task.await.expect("relay task panicked");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn write_larger_than_mtu_is_fragmented_and_reassembled() {
+    async fn write_larger_than_mtu_is_split_and_reassembled() {
         let socket = server_socket().await;
         let server_addr = socket.local_addr().unwrap();
         let cfg = KcpConfig {
-            conv: 0x5EED_0005,
+            conv: 0x5EE5,
             // A small MTU makes the fragmentation obvious on the wire.
             mtu: 300,
             ..KcpConfig::default()
@@ -2242,65 +2565,58 @@ mod tests {
         let expected_fragments = SIZE.div_ceil(mss);
         assert!(expected_fragments >= 3, "test needs real fragmentation");
 
-        // A tap that records the `frg` values of the PUSH segments of the first
-        // write. One write of SIZE bytes is one fragment run, so the first
-        // `expected_fragments` PUSH segments of the conversation are exactly it.
+        // A tap in front of the server that records the segment number of every
+        // DATA segment it forwards. Collecting a set rather than a sequence
+        // keeps the assertion honest: loopback delivery order and
+        // retransmissions are not something a test should depend on.
         let tap_socket = Arc::new(TokioUdp::bind("127.0.0.1:0").await.unwrap());
         let tap_addr = tap_socket.local_addr().unwrap();
-        let (frg_tx, frg_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
-        let tap = tokio::spawn(async move {
-            let mut buf = vec![0u8; MAX_DATAGRAM];
-            let mut client_addr: Option<SocketAddr> = None;
-            let mut seen: Vec<u8> = Vec::new();
-            let mut tx = Some(frg_tx);
-            loop {
-                let Ok((n, from)) = tap_socket.recv_from(&mut buf).await else {
-                    break;
-                };
-                if from == server_addr {
-                    if let Some(client) = client_addr {
-                        let _ = tap_socket.send_to(&buf[..n], client).await;
+        let seen = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let tap = tokio::spawn({
+            let seen = seen.clone();
+            async move {
+                let mut buf = vec![0u8; MAX_DATAGRAM];
+                let mut client_addr: Option<SocketAddr> = None;
+                loop {
+                    let Ok((n, from)) = tap_socket.recv_from(&mut buf).await else {
+                        break;
+                    };
+                    if from == server_addr {
+                        if let Some(client) = client_addr {
+                            let _ = tap_socket.send_to(&buf[..n], client).await;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                client_addr = Some(from);
-                if tx.is_some() {
-                    let seen_push = unwrap_datagram(cfg.obfs, &buf[..n])
-                        .and_then(|segment| decode_segment(cfg.conv, &segment))
-                        .filter(|seg| seg.cmd == CMD_PUSH && !seg.data.is_empty());
-                    if let Some(seg) = seen_push {
-                        seen.push(seg.frg);
-                        if seen.len() == expected_fragments
-                            && let Some(sender) = tx.take()
-                        {
-                            let _ = sender.send(std::mem::take(&mut seen));
+                    client_addr = Some(from);
+                    if let Some(plain) = unwrap_datagram(cfg.obfs, &buf[..n]) {
+                        for seg in decode_datagram(cfg.conv as u16, &plain) {
+                            if seg.cmd == CMD_DATA && !seg.data.is_empty() {
+                                seen.lock().push(seg.sn);
+                            }
                         }
                     }
+                    let _ = tap_socket.send_to(&buf[..n], server_addr).await;
                 }
-                let _ = tap_socket.send_to(&buf[..n], server_addr).await;
             }
         });
 
-        let server = tokio::spawn(echo_server(socket, cfg, SIZE));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(echo_server(socket, cfg, SIZE, done_rx));
         let client = connect(tap_addr, cfg).await.expect("connect failed");
         let data = payload(SIZE, 29);
         let (echoed, _stats) = exchange(client, data.clone()).await;
         assert!(echoed == data, "fragmented write is not byte-exact");
 
-        let frg = tokio::time::timeout(Duration::from_secs(5), frg_rx)
-            .await
-            .expect("tap never saw fragments")
-            .expect("tap dropped its channel");
-        assert_eq!(frg[0], 255, "first fragment must be 255");
-        assert_eq!(frg.len(), expected_fragments);
-        for window in frg.windows(2) {
-            assert_eq!(
-                window[1],
-                window[0].wrapping_sub(1),
-                "fragment indices must count down: {frg:?}"
-            );
-        }
+        let mut numbers: Vec<u32> = seen.lock().clone();
+        numbers.sort_unstable();
+        numbers.dedup();
+        let expected: Vec<u32> = (0..expected_fragments as u32).collect();
+        assert_eq!(
+            numbers, expected,
+            "a {SIZE}-byte write must leave as one contiguous run of segment numbers"
+        );
 
+        let _ = done_tx.send(());
         server.await.expect("server task panicked");
         tap.abort();
     }
@@ -2310,11 +2626,12 @@ mod tests {
         let socket = server_socket().await;
         let addr = socket.local_addr().unwrap();
         let cfg = KcpConfig {
-            conv: 0x5EED_000A,
+            conv: 0x5EEA,
             no_congestion: false,
             ..KcpConfig::default()
         };
-        let server = tokio::spawn(echo_server(socket, cfg, 128 * 1024));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(echo_server(socket, cfg, 128 * 1024, done_rx));
         let client = connect(addr, cfg).await.expect("connect failed");
         let data = payload(128 * 1024, 37);
         let (echoed, stats) = exchange(client, data.clone()).await;
@@ -2323,6 +2640,7 @@ mod tests {
             "congestion-controlled round trip is not byte-exact"
         );
         println!("congestion control: {stats:?}");
+        let _ = done_tx.send(());
         server.await.expect("server task panicked");
     }
 
@@ -2362,16 +2680,18 @@ mod tests {
         let socket = server_socket().await;
         let addr = socket.local_addr().unwrap();
         let cfg_a = KcpConfig {
-            conv: 0xC0DE_0001,
+            conv: 0xC0D1,
             ..KcpConfig::default()
         };
         let cfg_b = KcpConfig {
-            conv: 0xC0DE_0002,
+            conv: 0xC0D2,
             ..KcpConfig::default()
         };
 
-        let server_a = tokio::spawn(echo_server(socket.clone(), cfg_a, 4096));
-        let server_b = tokio::spawn(echo_server(socket.clone(), cfg_b, 8192));
+        let (done_a, done_a_rx) = tokio::sync::oneshot::channel();
+        let (done_b, done_b_rx) = tokio::sync::oneshot::channel();
+        let server_a = tokio::spawn(echo_server(socket.clone(), cfg_a, 4096, done_a_rx));
+        let server_b = tokio::spawn(echo_server(socket.clone(), cfg_b, 8192, done_b_rx));
 
         let client_a = connect(addr, cfg_a).await.expect("connect failed");
         let client_b = connect(addr, cfg_b).await.expect("connect failed");
@@ -2383,6 +2703,8 @@ mod tests {
         );
         assert!(echo_a.0 == data_a, "conversation A got the wrong bytes");
         assert!(echo_b.0 == data_b, "conversation B got the wrong bytes");
+        let _ = done_a.send(());
+        let _ = done_b.send(());
         server_a.await.expect("server A panicked");
         server_b.await.expect("server B panicked");
     }
@@ -2394,7 +2716,7 @@ mod tests {
         let blackhole = server_socket().await;
         let blackhole_addr = blackhole.local_addr().unwrap();
         let cfg = KcpConfig {
-            conv: 0x5EED_0008,
+            conv: 0x5EE8,
             snd_wnd: 64,
             ..KcpConfig::default()
         };
@@ -2431,6 +2753,109 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_far_larger_than_the_window_is_bounded_and_lossless() {
+        // 1 MiB through a 32-segment window: the write path has to accept it in
+        // slices and never buffer more than one window of it.
+        let socket = server_socket().await;
+        let addr = socket.local_addr().unwrap();
+        let cfg = KcpConfig {
+            conv: 0x5EEC,
+            snd_wnd: 32,
+            rcv_wnd: 32,
+            ..KcpConfig::default()
+        };
+        const SIZE: usize = 1024 * 1024;
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(echo_server(socket, cfg, SIZE, done_rx));
+        let client = connect(addr, cfg).await.expect("connect failed");
+        let inner = client.inner.clone();
+
+        // Watch the send buffer while the transfer runs: it must never exceed
+        // the configured window.
+        let watcher = tokio::spawn(async move {
+            let mut peak = 0usize;
+            for _ in 0..400 {
+                {
+                    let conn = inner.lock();
+                    peak = peak.max(conn.snd_buf.len() + conn.snd_queue.len());
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            peak
+        });
+
+        let data = payload(SIZE, 47);
+        let (echoed, _stats) = exchange(client, data.clone()).await;
+        assert!(
+            echoed == data,
+            "large write through a small window lost data"
+        );
+        let peak = watcher.await.expect("watcher panicked");
+        assert!(
+            peak <= usize::from(cfg.snd_wnd),
+            "send buffer peaked at {peak} segments for a window of {}",
+            cfg.snd_wnd
+        );
+        let _ = done_tx.send(());
+        server.await.expect("server task panicked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn memory_stays_bounded_when_the_reader_stops() {
+        // A peer that writes to us while we never read must not be able to make
+        // our receive buffer grow: the window closes instead.
+        let socket = server_socket().await;
+        let addr = socket.local_addr().unwrap();
+        let cfg = KcpConfig {
+            conv: 0x5EED,
+            snd_wnd: 32,
+            rcv_wnd: 32,
+            ..KcpConfig::default()
+        };
+
+        let (inner_tx, inner_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let stream = accept(socket, cfg).await.expect("accept failed");
+            let _ = inner_tx.send(stream.inner.clone());
+            // Hold the stream open and never read from it.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        });
+
+        let mut client = connect(addr, cfg).await.expect("connect failed");
+        let chunk = vec![0x5Au8; 64 * 1024];
+        let flood = async {
+            for _ in 0..200 {
+                client.write_all(&chunk).await.expect("write failed");
+            }
+        };
+        let blocked = tokio::time::timeout(Duration::from_millis(500), flood).await;
+        assert!(
+            blocked.is_err(),
+            "a reader that never reads must eventually block the writer"
+        );
+
+        let server_inner = inner_rx.await.expect("server never reported its state");
+        let (unread, queued, window) = {
+            let conn = server_inner.lock();
+            (
+                conn.rcv_buf.len() + conn.recv_queue.len(),
+                conn.snd_buf.len() + conn.snd_queue.len(),
+                usize::from(cfg.rcv_wnd),
+            )
+        };
+        assert!(
+            unread <= window,
+            "receive buffer holds {unread} segments for a window of {window}"
+        );
+        assert!(
+            queued <= usize::from(cfg.snd_wnd),
+            "send buffer grew past the window"
+        );
+        server.abort();
+    }
+
     // -- measurements -----------------------------------------------------
 
     /// Echoes single bytes back until told to stop: the latency counterpart of
@@ -2465,11 +2890,14 @@ mod tests {
     /// test is a measurement, not a flaky benchmark gate.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn measure_throughput_and_latency() {
-        const SIZE: usize = 4 * 1024 * 1024;
+        // Deliberately small: this is a measurement, not a stress test, so it
+        // must finish quickly in a debug build and in CI. The numbers that
+        // matter are quoted from a release build with `--nocapture`.
+        const SIZE: usize = 1024 * 1024;
         let socket = server_socket().await;
         let addr = socket.local_addr().unwrap();
         let cfg = KcpConfig {
-            conv: 0x5EED_0006,
+            conv: 0x5EE6,
             ..KcpConfig::default()
         };
 
@@ -2515,17 +2943,21 @@ mod tests {
 
         // --- mKCP bulk: same payload size, echoed back by the server.
         let mss = cfg.mss();
-        let server = tokio::spawn(echo_server(socket, cfg, SIZE));
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(echo_server(socket, cfg, SIZE, done_rx));
         let client = connect(addr, cfg).await.expect("connect failed");
         let data = payload(SIZE, 31);
         let kcp_start = Instant::now();
         let write_and_read = exchange(client, data.clone());
         // Joined with the server so a server-side failure surfaces here instead
-        // of turning into a silent stall on the client side.
-        let (transfer, server_result) = tokio::join!(
-            tokio::time::timeout(Duration::from_secs(180), write_and_read),
-            server
-        );
+        // of turning into a silent stall on the client side. Dropping the `done`
+        // sender releases the server, which otherwise holds the stream open.
+        let transfer = async move {
+            let result = tokio::time::timeout(Duration::from_secs(180), write_and_read).await;
+            drop(done_tx);
+            result
+        };
+        let (transfer, server_result) = tokio::join!(transfer, server);
         let kcp_elapsed = kcp_start.elapsed();
         server_result.expect("server task panicked");
         let (echoed, bulk_stats) = transfer.expect("mKCP measurement transfer did not finish");
@@ -2536,7 +2968,7 @@ mod tests {
         let latency_socket = server_socket().await;
         let latency_addr = latency_socket.local_addr().unwrap();
         let latency_cfg = KcpConfig {
-            conv: 0x5EED_0007,
+            conv: 0x5EE7,
             ..KcpConfig::default()
         };
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -2593,5 +3025,366 @@ mod tests {
             kcp_one_way < Duration::from_millis(50),
             "mKCP one-way latency collapsed: {kcp_one_way:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interop against the real Xray binary
+// ---------------------------------------------------------------------------
+
+/// These tests drive the actual `xray` process, so they are `#[ignore]`d and
+/// kept out of the hermetic gates. Run them with:
+///
+/// ```text
+/// XRAY_BIN=~/.local/bin/xray cargo test -p flux-transport --lib kcp::interop \
+///     -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod interop {
+    use super::*;
+    use std::net::TcpListener;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener as TokioTcpListener;
+
+    /// VLESS user id used by both directions of the test.
+    const UUID: &str = "5783a3e7-e373-51cd-8642-c83782b807c5";
+    /// Xray 26.3.27 removed `kcpSettings.header`/`seed` in favour of `finalmask`;
+    /// the SRTP header is the outermost layer and the "original" mask the inner
+    /// one, matching `header ‖ mask(segment)` on the wire.
+    const FINALMASK: &str =
+        r#""finalmask": {"udp": [{"type": "header-srtp"}, {"type": "mkcp-original"}]}"#;
+
+    fn xray_bin() -> Option<PathBuf> {
+        if let Ok(path) = std::env::var("XRAY_BIN") {
+            let path = PathBuf::from(path);
+            return path.is_file().then_some(path);
+        }
+        let home = std::env::var("HOME").ok()?;
+        let path = PathBuf::from(home).join(".local/bin/xray");
+        path.is_file().then_some(path)
+    }
+
+    fn some_uuid() -> Vec<u8> {
+        // Parse the textual UUID into its 16 bytes.
+        let hex: String = UUID.chars().filter(|c| *c != '-').collect();
+        (0..16)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn free_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// A running `xray run` with its config file cleaned up on drop.
+    struct Xray {
+        child: Child,
+        dir: PathBuf,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Xray {
+        /// Waits for the line Xray logs once every inbound is listening.
+        ///
+        /// Probing the port is not usable here: Xray binds UDP sockets with
+        /// `SO_REUSEPORT`, so a second bind succeeds and would report a
+        /// not-yet-started peer as ready.
+        fn wait_started(&self, what: &str) {
+            for _ in 0..200 {
+                {
+                    let log = self.log.lock();
+                    if log.iter().any(|line| line.contains("started")) {
+                        return;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let log = self.log.lock().join("\n");
+            panic!("xray ({what}) never reported that it started; log:\n{log}");
+        }
+    }
+
+    impl Drop for Xray {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn start_xray(config: &str) -> Xray {
+        let bin = xray_bin().expect("xray binary not found; set XRAY_BIN");
+        let dir = std::env::temp_dir().join(format!(
+            "flux-mkcp-interop-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, config).unwrap();
+
+        // Validate first so a config mistake is a clear test failure rather than
+        // a silent timeout.
+        let check = Command::new(&bin)
+            .arg("run")
+            .arg("-test")
+            .arg("-c")
+            .arg(&path)
+            .output()
+            .expect("failed to run xray");
+        assert!(
+            check.status.success(),
+            "xray rejected the config:\n{}\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
+        );
+
+        let mut child = Command::new(&bin)
+            .arg("run")
+            .arg("-c")
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start xray");
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let log = log.clone();
+            std::thread::spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stderr)
+                    .lines()
+                    .map_while(Result::ok)
+                {
+                    log.lock().push(line);
+                }
+            });
+        }
+        Xray { child, dir, log }
+    }
+
+    /// TCP echo server used as the traffic's destination.
+    async fn tcp_echo() -> u16 {
+        let listener = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    while let Ok(n) = socket.read(&mut buf).await {
+                        if n == 0 || socket.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// The VLESS request a client sends: version, user id, no addons, command,
+    /// port, address type and address.
+    fn vless_request(port: u16) -> Vec<u8> {
+        let mut out = vec![0u8];
+        out.extend_from_slice(&some_uuid());
+        out.push(0); // no addons
+        out.push(1); // TCP
+        out.extend_from_slice(&port.to_be_bytes());
+        out.push(1); // IPv4
+        out.extend_from_slice(&[127, 0, 0, 1]);
+        out
+    }
+
+    /// Reads a VLESS request from a stream, returning the destination port and
+    /// address. Anything the peer sends after the header is returned with it.
+    async fn read_vless_request<S>(stream: &mut S) -> std::io::Result<(u16, String)>
+    where
+        S: AsyncReadExt + Unpin,
+    {
+        let mut fixed = [0u8; 1 + 16 + 1];
+        stream.read_exact(&mut fixed).await?;
+        assert_eq!(fixed[0], 0, "VLESS version");
+        let addons = usize::from(fixed[17]);
+        if addons > 0 {
+            let mut skipped = vec![0u8; addons];
+            stream.read_exact(&mut skipped).await?;
+        }
+        let mut rest = [0u8; 1 + 2 + 1];
+        stream.read_exact(&mut rest).await?;
+        assert_eq!(rest[0], 1, "only TCP requests are handled here");
+        let port = u16::from_be_bytes([rest[1], rest[2]]);
+        let address = match rest[3] {
+            1 => {
+                let mut addr = [0u8; 4];
+                stream.read_exact(&mut addr).await?;
+                format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3])
+            }
+            2 => {
+                let mut len = [0u8; 1];
+                stream.read_exact(&mut len).await?;
+                let mut name = vec![0u8; usize::from(len[0])];
+                stream.read_exact(&mut name).await?;
+                String::from_utf8_lossy(&name).into_owned()
+            }
+            other => panic!("unexpected VLESS address type {other}"),
+        };
+        Ok((port, address))
+    }
+
+    /// Ours (client) → Xray (server): a VLESS request and payload over our KCP
+    /// stream, answered by xray's freedom outbound talking to a local echo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs the xray binary; see the module comment"]
+    async fn our_client_to_xray_server() {
+        if xray_bin().is_none() {
+            eprintln!("SKIP: no xray binary");
+            return;
+        }
+        let echo_port = tcp_echo().await;
+        let kcp_port = free_port();
+        let config = format!(
+            r#"{{
+  "log": {{"loglevel": "warning"}},
+  "inbounds": [{{
+    "port": {kcp_port}, "listen": "127.0.0.1", "protocol": "vless",
+    "settings": {{"clients": [{{"id": "{UUID}"}}], "decryption": "none"}},
+    "streamSettings": {{
+      "network": "kcp",
+      "kcpSettings": {{"mtu": 1350, "tti": 20, "uplinkCapacity": 5, "downlinkCapacity": 20, "congestion": false}},
+      {FINALMASK}
+    }}
+  }}],
+  "outbounds": [{{"protocol": "freedom"}}]
+}}"#
+        );
+        let xray = start_xray(&config);
+        xray.wait_started("kcp inbound");
+
+        let cfg = KcpConfig {
+            conv: 0x5EE1,
+            ..KcpConfig::default()
+        };
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect(format!("127.0.0.1:{kcp_port}").parse().unwrap(), cfg),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect failed");
+
+        let request = vless_request(echo_port);
+        let payload = b"flux-core speaks mkcp to xray";
+        stream.write_all(&request).await.unwrap();
+        stream.write_all(payload).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut header = [0u8; 2];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut header))
+            .await
+            .expect("no VLESS response header")
+            .expect("read failed");
+        assert_eq!(header[0], 0, "VLESS response version");
+        let addons = usize::from(header[1]);
+        if addons > 0 {
+            let mut skipped = vec![0u8; addons];
+            stream.read_exact(&mut skipped).await.unwrap();
+        }
+        let mut echoed = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+            .await
+            .expect("no echoed payload")
+            .expect("read failed");
+        assert_eq!(echoed, payload, "xray did not echo the payload back");
+        println!("our client -> xray server: {} bytes echoed", echoed.len());
+    }
+
+    /// Xray (client) → ours (server): xray's dokodemo-door inbound forwards to a
+    /// VLESS outbound over mKCP, which our `accept` terminates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs the xray binary; see the module comment"]
+    async fn xray_client_to_our_server() {
+        if xray_bin().is_none() {
+            eprintln!("SKIP: no xray binary");
+            return;
+        }
+        let echo_port = tcp_echo().await;
+        let our_port = free_port();
+        let door_port = free_port();
+
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind(("127.0.0.1", our_port))
+                .await
+                .unwrap(),
+        );
+        let cfg = KcpConfig {
+            conv: 0, // adopt whatever the client chose
+            ..KcpConfig::default()
+        };
+        let server = tokio::spawn(async move {
+            let mut stream = tokio::time::timeout(Duration::from_secs(20), accept(socket, cfg))
+                .await
+                .expect("accept timed out")
+                .expect("accept failed");
+            println!("accepted conversation {:#06x}", stream.conv());
+            let (port, address) = read_vless_request(&mut stream)
+                .await
+                .expect("VLESS request");
+            assert_eq!(port, echo_port, "unexpected destination port");
+            assert_eq!(address, "127.0.0.1");
+
+            let mut upstream = tokio::net::TcpStream::connect((address.as_str(), port))
+                .await
+                .expect("upstream connect failed");
+            // A VLESS response is the version and an empty addon list.
+            stream.write_all(&[0u8, 0u8]).await.unwrap();
+            stream.flush().await.unwrap();
+            tokio::io::copy_bidirectional(&mut stream, &mut upstream)
+                .await
+                .expect("relay failed");
+        });
+
+        let config = format!(
+            r#"{{
+  "log": {{"loglevel": "warning"}},
+  "inbounds": [{{
+    "port": {door_port}, "listen": "127.0.0.1", "protocol": "dokodemo-door",
+    "settings": {{"address": "127.0.0.1", "port": {echo_port}, "network": "tcp"}}
+  }}],
+  "outbounds": [{{
+    "protocol": "vless",
+    "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {our_port},
+      "users": [{{"id": "{UUID}", "encryption": "none"}}]}}]}},
+    "streamSettings": {{
+      "network": "kcp",
+      "kcpSettings": {{"mtu": 1350, "tti": 20, "uplinkCapacity": 5, "downlinkCapacity": 20, "congestion": false}},
+      {FINALMASK}
+    }}
+  }}]
+}}"#
+        );
+        let xray = start_xray(&config);
+        xray.wait_started("dokodemo-door inbound");
+
+        let mut door = tokio::net::TcpStream::connect(("127.0.0.1", door_port))
+            .await
+            .expect("dokodemo-door connect failed");
+        let payload = b"xray speaks mkcp to flux-core";
+        door.write_all(payload).await.unwrap();
+        let mut echoed = vec![0u8; payload.len()];
+        tokio::time::timeout(Duration::from_secs(20), door.read_exact(&mut echoed))
+            .await
+            .expect("xray never delivered the echoed bytes")
+            .expect("read failed");
+        assert_eq!(echoed, payload, "round trip through xray is not byte-exact");
+        println!("xray client -> our server: {} bytes echoed", echoed.len());
+        drop(door);
+        let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
     }
 }

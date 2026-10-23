@@ -52,6 +52,7 @@ sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
 rand = "0.8"
+idna = "1"
 dashmap = "6.1"
 lru = "0.18"
 ipnet = { version = "2.11", features = ["serde"] }
