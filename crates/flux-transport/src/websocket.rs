@@ -503,15 +503,15 @@ fn mask_in_place(key: [u8; 4], offset: usize, data: &mut [u8]) {
     for i in 0..4 {
         k[i] = key[(offset + i) & 3];
     }
-    let mut chunks = data.chunks_exact_mut(4);
-    for c in &mut chunks {
-        c[0] ^= k[0];
-        c[1] ^= k[1];
-        c[2] ^= k[2];
-        c[3] ^= k[3];
+    let ku32 = u32::from_ne_bytes(k);
+    let mut head = data;
+    while head.len() >= 4 {
+        let (word, rest) = head.split_at_mut(4);
+        let v = u32::from_ne_bytes([word[0], word[1], word[2], word[3]]) ^ ku32;
+        word.copy_from_slice(&v.to_ne_bytes());
+        head = rest;
     }
-    let rem = chunks.into_remainder();
-    for (i, b) in rem.iter_mut().enumerate() {
+    for (i, b) in head.iter_mut().enumerate() {
         *b ^= k[i & 3];
     }
 }
