@@ -1768,7 +1768,54 @@ impl TargetMimicry {
 /// boundaries of the target's TLS 1.3 server flight. Validates that the target
 /// actually speaks TLS 1.3 with an X25519 (or X25519MLKEM768) key share —
 /// exactly like the reference implementation.
+/// How long the probe waits for the *rest* of a target's TLS flight once the
+/// ServerHello has arrived. A real target sends the whole flight in one burst, so
+/// this only bounds the pathological case; it is not a handshake budget.
+const SEQUEL_IDLE: u64 = 100;
+
+/// Cached result of probing a fallback target, keyed by target string.
+///
+/// The record framing is a property of the target's TLS stack, not of the
+/// connection, so probing it per connection adds that cost to every handshake —
+/// measured as a 5 s stall against a rustls target before the probe loop was
+/// fixed, and still a needless round trip afterwards.
+static MIMICRY_CACHE: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<String, (std::time::Instant, TargetMimicry)>>,
+> = std::sync::OnceLock::new();
+
+const MIMICRY_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+const MIMICRY_CACHE_MAX: usize = 32;
+
+fn mimicry_cache() -> &'static parking_lot::Mutex<
+    std::collections::HashMap<String, (std::time::Instant, TargetMimicry)>,
+> {
+    MIMICRY_CACHE.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
 async fn probe_target_handshake(dest: &str, ch_record: &[u8]) -> FluxResult<TargetMimicry> {
+    {
+        let cache = mimicry_cache().lock();
+        if let Some((at, mimicry)) = cache.get(dest)
+            && at.elapsed() < MIMICRY_TTL
+        {
+            return Ok(*mimicry);
+        }
+    }
+    let mimicry = probe_target_handshake_uncached(dest, ch_record).await?;
+    {
+        let mut cache = mimicry_cache().lock();
+        if cache.len() >= MIMICRY_CACHE_MAX && !cache.contains_key(dest) {
+            cache.clear();
+        }
+        cache.insert(dest.to_string(), (std::time::Instant::now(), mimicry));
+    }
+    Ok(mimicry)
+}
+
+async fn probe_target_handshake_uncached(
+    dest: &str,
+    ch_record: &[u8],
+) -> FluxResult<TargetMimicry> {
     let addr = if let Ok(sa) = dest.parse::<std::net::SocketAddr>() {
         sa
     } else {
@@ -1808,8 +1855,21 @@ async fn probe_target_handshake(dest: &str, ch_record: &[u8]) -> FluxResult<Targ
     // record when the target omitted CCS, defeating the mimicry.
     let mut app_slot: usize = 2;
     for i in 0..7 {
+        // The first record gets the generous deadline (a slow target may still be
+        // connecting); every later one is part of a burst the target sends
+        // immediately, so waiting seconds for a record that is simply not coming
+        // only delays the handshake. This is what made a rustls fallback cost 5 s
+        // per connection while an OpenSSL one cost milliseconds: the loop was
+        // waiting out the deadline instead of noticing the flight had ended.
+        let until = if i == 0 {
+            deadline
+        } else {
+            let sequel =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(SEQUEL_IDLE);
+            sequel.min(deadline)
+        };
         let mut hdr = [0u8; 5];
-        let read = tokio::time::timeout_at(deadline, target.read_exact(&mut hdr)).await;
+        let read = tokio::time::timeout_at(until, target.read_exact(&mut hdr)).await;
         match read {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => return Err(FluxError::Io(e)),
@@ -1821,7 +1881,7 @@ async fn probe_target_handshake(dest: &str, ch_record: &[u8]) -> FluxResult<Targ
         }
         // Skip the body; we only need record boundaries.
         let mut body = vec![0u8; len];
-        tokio::time::timeout_at(deadline, target.read_exact(&mut body))
+        tokio::time::timeout_at(until, target.read_exact(&mut body))
             .await
             .map_err(|_| FluxError::Timeout("reality target read timed out".into()))?
             .map_err(FluxError::Io)?;
@@ -2545,6 +2605,75 @@ mod tests {
         assert!(s.is_err());
         let c = client.await.unwrap();
         assert!(c.is_err());
+    }
+
+    /// The full handshake against a **rustls** fallback must not cost seconds.
+    ///
+    /// This is the shape that broke in production: a REALITY deployment whose
+    /// `fallback` is another flux instance (rustls) paid a 5 s handshake per
+    /// connection, while the same deployment with an OpenSSL or Go fallback paid
+    /// milliseconds — because the probe waited out its deadline for a record that
+    /// rustls does not send instead of noticing the flight had ended.
+    #[tokio::test]
+    async fn a_rustls_fallback_does_not_stall_the_handshake() {
+        use std::time::{Duration, Instant};
+
+        // The fallback: a real rustls TLS 1.3 server, as another flux node would be.
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir().join(format!("reality_rb_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("c.pem");
+        let key_path = dir.join("k.pem");
+        std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+        std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+        let (certs, key) = crate::tls::TlsTransport::load_certs_and_key(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let acceptor =
+            crate::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(sock).await {
+                        let mut buf = [0u8; 4096];
+                        let _ = tls.read(&mut buf).await;
+                    }
+                });
+            }
+        });
+
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = X25519PublicKey::from(&server_secret);
+        let mut scfg = server_cfg(server_secret.to_bytes());
+        scfg.fallback = Some(fallback_addr.to_string());
+        let ccfg = RealityClientConfig {
+            server_name: "www.microsoft.com".into(),
+            public_key: server_public.to_bytes(),
+            short_id: vec![0x01, 0x02, 0x03, 0x04],
+        };
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server =
+            tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
+        let client =
+            tokio::spawn(async move { RealityHandshake::client_handshake(client_io, &ccfg).await });
+
+        let started = Instant::now();
+        let s = server.await.unwrap();
+        let elapsed = started.elapsed();
+        let _ = client.await;
+        if let Err(e) = &s {
+            panic!("the handshake against a rustls fallback failed: {e}");
+        }
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the handshake against a rustls fallback took {elapsed:?}; it must cost              milliseconds, not a timeout"
+        );
     }
 
     #[tokio::test]
