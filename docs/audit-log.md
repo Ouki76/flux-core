@@ -1805,3 +1805,41 @@ The same "cycles, not bytes" measurement applies to gRPC — the one path where 
 competitors beat us — and to VMess/WS. gRPC spends 14.5 s/GiB against sing-box's 33 and
 still loses on throughput, which is the signature of one round trip per message rather
 than one per buffer.
+
+---
+
+## Cycle 28 — 2026-10-24
+
+### The port race closed at the root
+
+Three attempts at this failed because they were all at the wrong level: retrying the
+same port cannot help when the port is gone, and twelve call sites build a config around
+a port before binding, so a builder refactor was the alternative.
+
+The allocator now keeps a `SO_REUSEPORT` listener on the port it hands out. That closes
+the probe-to-bind window at the root, and it does not block the bind that matters
+because every flux listener sets `SO_REUSEPORT` — the reservation is bound over. The one
+test that wants a *foreign* holder still gets one, because it binds a plain listener
+without `SO_REUSEPORT`.
+
+Five consecutive mux runs and the full suite are green, where the failure used to appear
+about one run in three.
+
+### gRPC: third attempt, third null
+
+The gRPC read path returned after one message even when the caller had room for more;
+fixed, measured, **no change** (100 MB/s either way). That is now three null attempts on
+this path — frame size, message batching on write, message batching on read — all in the
+"fewer cycles per buffer" direction that worked for WebSocket and Shadowsocks.
+
+The conclusion the evidence supports: gRPC is not bound by cycles in *our* framing code
+but by something below it — the HTTP/2 driver or the TLS stack. It is the one path where
+both competitors beat us on throughput (xray 184, sing-box 114, us 100) while we beat
+both on CPU (14.5 s/GiB against 33), so the next attempt must go after per-message
+latency in the h2 driver, not after our framing.
+
+### State
+
+**1051 tests, 0 failed.** Shadowsocks-2022 is now −2.7 % against sing-box (from −48 % at
+the start of the audit) with 28 % less CPU; every other path is within 22 % on throughput
+and ahead on CPU.
