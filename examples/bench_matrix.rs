@@ -47,12 +47,20 @@
 //!   --only SUBSTR   only run protocols whose name contains SUBSTR (case-insensitive)
 //!   --timeout SECS  per-transfer deadline; expiring is recorded as a result (default 120)
 //!   --no-singbox    skip the sing-box column (it degrades to "not installed" anyway)
+//!   --no-xray       skip the xray column (same, and rows without an xray
+//!                   equivalent say so)
 //!   --flux PATH     flux-core binary (default ./target/release/flux-core)
 //!   --singbox PATH  sing-box binary (default from PATH, then ~/.local/bin)
 //!
 //! Typical run:
 //!   cargo build --release -p flux-core --bin flux-core --example bench_matrix
 //!   ./target/release/examples/bench_matrix --rounds 3 --mb 200
+
+// The xray configs were validated against the real binary in
+// `tests/test_xray_matrix_configs.rs`; reusing them here means the benchmark cannot
+// drift from a configuration anybody has actually proven works.
+#[path = "../tests/xray_matrix_configs.rs"]
+mod xray_matrix_configs;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -88,6 +96,7 @@ struct Args {
     only: Option<String>,
     timeout: Duration,
     with_singbox: bool,
+    with_xray: bool,
     flux_bin: PathBuf,
     singbox_bin: Option<PathBuf>,
 }
@@ -100,6 +109,7 @@ impl Args {
             only: None,
             timeout: Duration::from_secs(120),
             with_singbox: true,
+            with_xray: true,
             flux_bin: PathBuf::from("./target/release/flux-core"),
             singbox_bin: find_in_path("sing-box"),
         };
@@ -121,6 +131,7 @@ impl Args {
                         Duration::from_secs(take(&mut i)?.parse().map_err(|e| format!("{e}"))?)
                 }
                 "--no-singbox" => args.with_singbox = false,
+                "--no-xray" => args.with_xray = false,
                 "--flux" => args.flux_bin = PathBuf::from(take(&mut i)?),
                 "--singbox" => args.singbox_bin = Some(PathBuf::from(take(&mut i)?)),
                 "--help" | "-h" => {
@@ -274,10 +285,11 @@ impl Drop for ProxyProc {
 // Proxy stacks
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Stack {
     Flux,
     Singbox,
+    Xray,
 }
 
 impl Stack {
@@ -285,6 +297,7 @@ impl Stack {
         match self {
             Stack::Flux => "flux-core",
             Stack::Singbox => "sing-box",
+            Stack::Xray => "xray",
         }
     }
 
@@ -298,7 +311,9 @@ impl Stack {
                 "-f".into(),
                 "json".into(),
             ],
-            Stack::Singbox => vec!["run".into(), "-c".into(), cfg.display().to_string()],
+            Stack::Singbox | Stack::Xray => {
+                vec!["run".into(), "-c".into(), cfg.display().to_string()]
+            }
         }
     }
 }
@@ -350,6 +365,11 @@ struct Setup {
     reality_public: String,
     /// TLS 1.3 echo target REALITY servers fetch their certificate from.
     decoy: Option<SocketAddr>,
+    /// SHA-256 of the leaf certificate, which an Xray 26 client must pin: the
+    /// `allowInsecure` option was removed and a config that uses it is refused.
+    cert_sha256_hex: String,
+    /// Shadowsocks-2022 pre-shared key (16 bytes, base64).
+    ss_password: String,
 }
 
 impl Setup {
@@ -367,12 +387,15 @@ impl Setup {
         let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
         let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public = x25519_dalek::PublicKey::from(&secret);
+        let cert_sha256_hex = xray_matrix_configs::cert_sha256_hex(&cert);
         Ok(Self {
             cert,
             key,
             reality_private: b64(secret.to_bytes().as_slice()),
             reality_public: b64(public.as_bytes().as_slice()),
             decoy: None,
+            cert_sha256_hex,
+            ss_password: xray_matrix_configs::ss2022_password(),
             dir,
         })
     }
@@ -508,11 +531,20 @@ fn flux_ws_server() -> String {
 }
 
 fn flux_ws_client() -> String {
-    format!(r#""framing":{{"type":"websocket","path":"{WS_PATH}","host":"{TLS_SNI}"}}"#)
+    format!(
+        r#""framing":{{"type":"websocket","path":"{WS_PATH}","headers":{{"Host":"{TLS_SNI}"}}}}"#
+    )
+}
+
+/// The *client* framing carries the gRPC service path; the inbound does not.
+fn flux_grpc_client() -> String {
+    format!(r#""framing":{{"type":"grpc","service_name":"{GRPC_SERVICE}"}}"#)
 }
 
 fn flux_grpc_server() -> String {
-    format!(r#""framing":{{"type":"grpc","service_name":"{GRPC_SERVICE}"}}"#)
+    // An inbound gRPC framing has no `service_name`: it accepts whatever `:path`
+    // the client sends. The server-side value here used to be silently ignored.
+    r#""framing":{"type":"grpc"}"#.to_string()
 }
 
 fn flux_vless(vision: bool) -> String {
@@ -671,7 +703,7 @@ impl Scenario {
             Kind::VlessGrpcTls => flux_out(
                 socks,
                 port,
-                &[flux_tls_client(true), flux_grpc_server()],
+                &[flux_tls_client(true), flux_grpc_client()],
                 &flux_vless(false),
             ),
             Kind::VlessReality => {
@@ -801,10 +833,49 @@ impl Scenario {
         )
     }
 
+    /// The scenario as the xray builders name it, or `None` where xray has no
+    /// equivalent (REALITY + Vision is an xray-only flow, and it is present).
+    fn xray_protocol(&self) -> Option<xray_matrix_configs::Protocol> {
+        use xray_matrix_configs::Protocol as P;
+        Some(match self.kind {
+            Kind::VlessTcp => P::VlessTcp,
+            Kind::VlessWsTls => P::VlessWs,
+            Kind::VlessGrpcTls => P::VlessGrpc,
+            Kind::VlessReality => P::Reality,
+            Kind::VlessRealityVision => P::RealityVision,
+            Kind::VmessWsTls => P::VmessWs,
+            Kind::TrojanTls => P::TrojanTls,
+            Kind::Ss2022 => P::Shadowsocks2022,
+            Kind::SsAead => return None,
+        })
+    }
+
+    fn xray_params<'a>(&self, s: &'a Setup, socks: u16, port: u16) -> xray_matrix_configs::Params<'a> {
+        xray_matrix_configs::Params {
+            server_port: port,
+            socks_port: socks,
+            uuid: UUID,
+            cert_path: &s.cert,
+            key_path: &s.key,
+            cert_sha256_hex: &s.cert_sha256_hex,
+            reality_private: &s.reality_private,
+            reality_public: &s.reality_public,
+            decoy_port: s.decoy.map(|d| d.port()).unwrap_or(0),
+            ss_password: &s.ss_password,
+        }
+    }
+
     fn configs(&self, stack: Stack, s: &Setup, socks: u16, port: u16) -> (String, String) {
         match stack {
             Stack::Flux => (self.flux_server(s, port), self.flux_client(s, socks, port)),
             Stack::Singbox => (self.sbox_server(s, port), self.sbox_client(s, socks, port)),
+            Stack::Xray => match self.xray_protocol() {
+                Some(p) => {
+                    let params = self.xray_params(s, socks, port);
+                    (p.server_config(&params), p.client_config(&params))
+                }
+                None => unreachable!("xray scenarios are filtered before this point"),
+            },
         }
     }
 
@@ -1196,6 +1267,7 @@ async fn run_scenario(
     echo: SocketAddr,
     flux_bin: &Path,
     sbox_bin: Option<&Path>,
+    xray_bin: Option<&Path>,
 ) -> Vec<(Stack, Outcome)> {
     let total_bytes = args.mb * 1024 * 1024;
     let mut results: Vec<(Stack, Outcome)> = Vec::new();
@@ -1223,100 +1295,109 @@ async fn run_scenario(
         }
     }
 
-    let mut flux_samples: Option<Vec<Sample>> = flux.as_ref().map(|_| Vec::new());
-    let mut sbox_samples: Option<Vec<Sample>> = sbox.as_ref().map(|_| Vec::new());
-    let mut flux_err: Option<String> = None;
-    let mut sbox_err: Option<String> = None;
+    let mut xray = None;
+    if args.with_xray {
+        match (xray_bin, scenario.xray_protocol()) {
+            (None, _) => results.push((
+                Stack::Xray,
+                Outcome::Skipped("not installed (no xray binary found)".into()),
+            )),
+            (Some(_), None) => results.push((
+                Stack::Xray,
+                Outcome::Skipped("no xray equivalent for this transport".into()),
+            )),
+            (Some(bin), Some(_)) => match prepare_tunnel(Stack::Xray, scenario, setup, bin, "xray").await {
+                Ok(t) => xray = Some(t),
+                Err(e) => results.push((Stack::Xray, Outcome::Skipped(e))),
+            },
+        }
+    }
+
+    let mut samples: std::collections::HashMap<Stack, Option<Vec<Sample>>> =
+        std::collections::HashMap::new();
+    let mut errors: std::collections::HashMap<Stack, Option<String>> =
+        std::collections::HashMap::new();
+    samples.insert(Stack::Flux, flux.as_ref().map(|_| Vec::new()));
+    errors.insert(Stack::Flux, None);
+    if sbox.is_some() {
+        samples.insert(Stack::Singbox, Some(Vec::new()));
+        errors.insert(Stack::Singbox, None);
+    }
+    if xray.is_some() {
+        samples.insert(Stack::Xray, Some(Vec::new()));
+        errors.insert(Stack::Xray, None);
+    }
 
     // A tunnel that cannot carry one warm-up transfer is not a throughput
     // result; fail it before measuring so the reason is quoted, not averaged.
     const WARMUP: usize = 4 * 1024 * 1024;
-    if let Some(t) = &flux
-        && let Err(e) = measure_round(t, echo, WARMUP, args.timeout).await
-    {
-        flux_err = Some(t.why(&format!("warm-up failed: {e}")));
-        flux_samples = None;
-    }
-    if let Some(t) = &sbox
-        && let Err(e) = measure_round(t, echo, WARMUP, args.timeout).await
-    {
-        sbox_err = Some(t.why(&format!("warm-up failed: {e}")));
-        sbox_samples = None;
+    for (stack, tunnel) in [
+        (Stack::Flux, &flux),
+        (Stack::Singbox, &sbox),
+        (Stack::Xray, &xray),
+    ] {
+        if let Some(t) = tunnel
+            && let Err(e) = measure_round(t, echo, WARMUP, args.timeout).await
+        {
+            errors.insert(stack, Some(t.why(&format!("warm-up failed: {e}"))));
+            samples.insert(stack, None);
+        }
     }
 
+    // Rounds are interleaved and the stack order alternates, so a machine that
+    // drifts during the run charges every stack equally.
+    let mut order = vec![Stack::Flux];
+    if sbox.is_some() {
+        order.push(Stack::Singbox);
+    }
+    if xray.is_some() {
+        order.push(Stack::Xray);
+    }
     for round in 1..=args.rounds {
-        let flux_first = round % 2 == 1;
-        let order = if flux_first {
-            [Stack::Flux, Stack::Singbox]
-        } else {
-            [Stack::Singbox, Stack::Flux]
-        };
-        for stack in order {
-            match stack {
-                Stack::Flux => {
-                    let (Some(t), Some(samples)) = (&flux, &mut flux_samples) else {
-                        continue;
-                    };
-                    if flux_err.is_some() {
-                        continue;
-                    }
-                    match measure_round(t, echo, total_bytes, args.timeout).await {
-                        Ok(sample) => {
-                            print_progress(round, stack, &sample);
-                            samples.push(sample);
-                        }
-                        Err(e) => {
-                            flux_err = Some(t.why(&format!("round {round}: {e}")));
-                            flux_samples = None;
-                        }
+        let mut this_round = order.clone();
+        if round % 2 == 0 {
+            this_round.reverse();
+        }
+        for stack in this_round {
+            let tunnel = match stack {
+                Stack::Flux => &flux,
+                Stack::Singbox => &sbox,
+                Stack::Xray => &xray,
+            };
+            let (Some(t), Some(acc)) = (tunnel, samples.get_mut(&stack)) else {
+                continue;
+            };
+            if errors.get(&stack).is_some_and(|e| e.is_some()) {
+                continue;
+            }
+            match measure_round(t, echo, total_bytes, args.timeout).await {
+                Ok(sample) => {
+                    print_progress(round, stack, &sample);
+                    if let Some(v) = acc {
+                        v.push(sample);
                     }
                 }
-                Stack::Singbox => {
-                    let (Some(t), Some(samples)) = (&sbox, &mut sbox_samples) else {
-                        continue;
-                    };
-                    if sbox_err.is_some() {
-                        continue;
-                    }
-                    match measure_round(t, echo, total_bytes, args.timeout).await {
-                        Ok(sample) => {
-                            print_progress(round, stack, &sample);
-                            samples.push(sample);
-                        }
-                        Err(e) => {
-                            sbox_err = Some(t.why(&format!("round {round}: {e}")));
-                            sbox_samples = None;
-                        }
-                    }
+                Err(e) => {
+                    errors.insert(stack, Some(t.why(&format!("round {round}: {e}"))));
+                    samples.insert(stack, None);
                 }
             }
         }
     }
 
-    // A stack whose `prepare_tunnel` already failed has its reason recorded in
-    // `results`; only a stack that came up but measured nothing needs a row here.
-    match (flux_samples, flux_err) {
-        (Some(samples), _) if !samples.is_empty() => {
-            results.push((Stack::Flux, Outcome::Measured(samples)))
+    for stack in [Stack::Flux, Stack::Singbox, Stack::Xray] {
+        if !samples.contains_key(&stack) && !errors.contains_key(&stack) {
+            continue;
         }
-        (_, Some(e)) => results.push((Stack::Flux, Outcome::Skipped(e))),
-        _ if flux.is_some() => {
-            results.push((Stack::Flux, Outcome::Skipped("no rounds recorded".into())))
+        let s = samples.remove(&stack).flatten();
+        let e = errors.remove(&stack).flatten();
+        if let Some(v) = s {
+            results.push((stack, Outcome::Measured(v)));
+        } else if let Some(e) = e {
+            results.push((stack, Outcome::Skipped(e)));
         }
-        _ => {}
     }
-    match (sbox_samples, sbox_err) {
-        (Some(samples), _) if !samples.is_empty() => {
-            results.push((Stack::Singbox, Outcome::Measured(samples)))
-        }
-        (_, Some(e)) => results.push((Stack::Singbox, Outcome::Skipped(e))),
-        _ if sbox.is_some() => results.push((
-            Stack::Singbox,
-            Outcome::Skipped("no rounds recorded".into()),
-        )),
-        _ => {}
-    }
-    results
+        results
 }
 
 fn print_progress(round: usize, stack: Stack, sample: &Sample) {
@@ -1505,6 +1586,11 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let xray_bin = if args.with_xray {
+        find_in_path("xray")
+    } else {
+        None
+    };
 
     // ---- header -----------------------------------------------------------
     println!(
@@ -1512,6 +1598,11 @@ async fn main() -> anyhow::Result<()> {
         binary_version(&args.flux_bin),
         args.flux_bin.display()
     );
+    match &xray_bin {
+        Some(bin) => println!("xray       : {}  ({})", binary_version(bin), bin.display()),
+        None if args.with_xray => println!("xray       : not installed — column skipped"),
+        None => {}
+    }
     match (&sbox_bin, args.with_singbox) {
         (Some(bin), _) => println!("sing-box   : {}  ({})", binary_version(bin), bin.display()),
         (None, true) => println!("sing-box   : not installed — sing-box rows will report n/a"),
@@ -1537,13 +1628,15 @@ async fn main() -> anyhow::Result<()> {
             echo,
             &args.flux_bin,
             sbox_bin.as_deref(),
+            xray_bin.as_deref(),
         )
         .await;
         let mut results = results;
-        // Stable presentation order: flux-core first, then sing-box.
+        // Stable presentation order: flux-core, then sing-box, then xray.
         results.sort_by_key(|(stack, _)| match stack {
             Stack::Flux => 0,
             Stack::Singbox => 1,
+            Stack::Xray => 2,
         });
         for (stack, outcome) in results {
             match outcome {
