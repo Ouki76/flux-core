@@ -372,8 +372,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> {
             // 1. Serve already-decoded payload.
             if !this.out.is_empty() {
                 let n = this.out.len().min(buf.remaining());
-                let chunk: Vec<u8> = this.out.drain(..n).collect();
-                buf.put_slice(&chunk);
+                // Copy straight out of the deque. The old form was
+                // `drain(..n).collect()`: a heap allocation and two copies per read,
+                // on the path Vision takes for every byte it delivers.
+                this.out.make_contiguous();
+                buf.put_slice(&this.out.as_slices().0[..n]);
+                this.out.drain(..n);
                 return Poll::Ready(Ok(()));
             }
 
