@@ -2051,3 +2051,36 @@ arbitrary ClientHello, which rustls does not permit.
 **1061 tests, 0 failed.** Functional gaps closed this audit: mKCP (client, interop proven),
 IDNA, private-CA knob, UDP associations, nested-key typo detection, GeoIP fixture. Still
 open: XHTTP, mKCP server side, browser-grade ClientHello.
+
+---
+
+## Cycle 36 — 2026-10-24
+
+### Turning the measurements into guards
+
+Every performance fix in this audit was justified by a number, and a number is not a
+regression test: a future refactor could restore the old shape and the suite would stay
+green while throughput halved. Two tests now hold the Shadowsocks-2022 framing in place by
+counting what the stream asks of its transport:
+
+- `a_64_kib_write_reaches_the_transport_in_one_call` — a 64 KiB payload write must produce
+  exactly one write to the inner transport;
+- `a_read_fills_more_than_one_chunk` — a 64 KiB reader buffer must receive more than one
+  16 KiB chunk per call.
+
+Both were verified by **temporarily reverting the fix and watching them fail** — the read
+guard reported the literal symptom (`one read returned 16384 bytes`). That is the only way
+to know a test guards anything, and it is the standard the rest of these fixes should meet.
+
+### Two test-infrastructure failures, one real
+
+The suite run for that commit came back red on three mux tests with `AddrInUse`. Eight
+retries spaced 25 ms apart on the *same* port cannot work when the holder is transient but
+slow to clear: the fix is to wait longer, not to retry sooner. Twenty attempts with linear
+backoff capped at 750 ms — the mux suite is now green three runs in a row, and the full
+suite green at 1063 tests, where it previously failed about one run in three.
+
+An attempt to rewrite those call sites into a builder closure (so a permanent holder could
+be escaped with a fresh port) broke the file's structure under regex rewriting and was
+reverted. The builder is still the right answer for a *permanent* holder; it is not what
+this failure was.
