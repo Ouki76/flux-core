@@ -319,6 +319,11 @@ pub enum SecurityConfig {
         insecure: bool,
         #[serde(default)]
         utls: Option<String>,
+        /// PEM file(s) with extra trust anchors, appended to the built-in roots.
+        /// A private CA should be pinned here rather than disabling verification
+        /// with `insecure: true`.
+        #[serde(default)]
+        ca_cert_path: Vec<String>,
     },
     #[serde(rename = "reality")]
     Reality {

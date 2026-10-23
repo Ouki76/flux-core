@@ -17,6 +17,13 @@ pub struct TlsClientConfig {
     pub alpn: Vec<Vec<u8>>,
     pub insecure: bool,
     pub fingerprint: Option<TlsFingerprint>,
+    /// PEM files of extra trust anchors, appended to the built-in roots.
+    ///
+    /// Without this a deployment behind a private CA had exactly one option:
+    /// `insecure: true`, which disables verification entirely and accepts any
+    /// certificate — a far worse trade than pinning the CA that actually signs
+    /// your nodes.
+    pub ca_certs: Vec<std::path::PathBuf>,
 }
 
 impl TlsClientConfig {
@@ -26,6 +33,7 @@ impl TlsClientConfig {
             alpn: vec![],
             insecure: false,
             fingerprint: None,
+            ca_certs: vec![],
         }
     }
 
@@ -90,7 +98,7 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 /// `(fingerprint, insecure, alpn)`. Bounded by the number of distinct
 /// combinations a configuration can express (fingerprint × insecure × alpn sets),
 /// which is tiny in practice; no eviction is needed.
-type ConnectorKey = (TlsFingerprint, bool, Vec<Vec<u8>>);
+type ConnectorKey = (TlsFingerprint, bool, Vec<Vec<u8>>, Vec<String>);
 
 fn client_connector_cache() -> &'static parking_lot::Mutex<HashMap<ConnectorKey, TlsConnector>> {
     static CACHE: std::sync::OnceLock<parking_lot::Mutex<HashMap<ConnectorKey, TlsConnector>>> =
@@ -126,7 +134,15 @@ impl TlsTransport {
             cfg.alpn.clone()
         };
 
-        let key = (fingerprint, cfg.insecure, alpn);
+        // The extra anchors are part of the identity of the connector, so they
+        // belong in the cache key: two servers with different private CAs must not
+        // share one.
+        let ca_key: Vec<String> = cfg
+            .ca_certs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let key = (fingerprint, cfg.insecure, alpn, ca_key);
         if let Some(cached) = client_connector_cache().lock().get(&key).cloned() {
             return Ok(cached);
         }
@@ -141,6 +157,37 @@ impl TlsTransport {
 
         let mut root_store = RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for path in &cfg.ca_certs {
+            let pem = std::fs::read(path).map_err(|e| {
+                FluxError::Config(format!(
+                    "cannot read tls ca_cert_path '{}': {e}",
+                    path.display()
+                ))
+            })?;
+            let pems = pem::parse_many(&pem).map_err(|e| {
+                FluxError::Config(format!(
+                    "tls ca_cert_path '{}' is not valid PEM: {e}",
+                    path.display()
+                ))
+            })?;
+            let mut added = 0usize;
+            for p in pems {
+                let der = CertificateDer::from(p.into_contents());
+                root_store.add(der).map_err(|e| {
+                    FluxError::Config(format!(
+                        "tls ca_cert_path '{}' contains an unusable certificate: {e}",
+                        path.display()
+                    ))
+                })?;
+                added += 1;
+            }
+            if added == 0 {
+                return Err(FluxError::Config(format!(
+                    "tls ca_cert_path '{}' contains no certificates",
+                    path.display()
+                )));
+            }
+        }
 
         let client_config = if cfg.insecure {
             ClientConfig::builder_with_provider(Arc::new(provider))
@@ -246,6 +293,102 @@ impl TlsTransport {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A private CA must be usable **without** disabling verification.
+    ///
+    /// Before `ca_certs` existed the only way to talk to a node behind an internal
+    /// CA was `insecure: true`, which accepts any certificate — strictly worse than
+    /// pinning the CA that actually signs your nodes. This proves the pinned CA is
+    /// what makes the handshake succeed, not a loosened verifier.
+    #[tokio::test]
+    async fn a_private_ca_is_trusted_when_pinned_and_not_otherwise() {
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("flux_privca_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("ca.pem");
+        let key_path = dir.join("ca.key");
+
+        // Self-signed localhost certificate: not in the built-in roots.
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(&cert_path, generated.cert.pem()).unwrap();
+        std::fs::write(&key_path, generated.key_pair.serialize_pem()).unwrap();
+
+        let (certs, key) = TlsTransport::load_certs_and_key(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let acceptor = TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(sock).await {
+                        let _ = tls.write_all(b"ok").await;
+                    }
+                });
+            }
+        });
+
+        let attempt = |cfg: TlsClientConfig| async move {
+            let connector = TlsTransport::create_client_connector(&cfg)?;
+            let tcp =
+                tokio::time::timeout(Duration::from_secs(5), tokio::net::TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| FluxError::Timeout("connect".into()))??;
+            let domain = ServerName::try_from("localhost")
+                .map_err(|e| FluxError::Crypto(e.to_string()))?
+                .to_owned();
+            let mut tls =
+                tokio::time::timeout(Duration::from_secs(5), connector.connect(domain, tcp))
+                    .await
+                    .map_err(|_| FluxError::Timeout("handshake".into()))??;
+            let mut buf = [0u8; 2];
+            let _ = tokio::time::timeout(Duration::from_secs(5), tls.read(&mut buf)).await;
+            Ok::<(), FluxError>(())
+        };
+
+        // Untrusted by default.
+        let plain = TlsClientConfig::new("localhost");
+        assert!(
+            attempt(plain).await.is_err(),
+            "a self-signed certificate must not validate against the built-in roots"
+        );
+
+        // Trusted once the CA is pinned.
+        let mut pinned = TlsClientConfig::new("localhost");
+        pinned.ca_certs = vec![cert_path.clone()];
+        attempt(pinned)
+            .await
+            .expect("a pinned private CA must make the handshake succeed");
+
+        // A file that is not a certificate is a configuration error, not a silent
+        // fallback to the built-in roots.
+        let mut broken = TlsClientConfig::new("localhost");
+        let bogus = dir.join("bogus.pem");
+        std::fs::write(&bogus, b"not a pem file").unwrap();
+        broken.ca_certs = vec![bogus];
+        let err = match TlsTransport::create_client_connector(&broken) {
+            Ok(_) => panic!("an unusable CA file must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("ca_cert_path"),
+            "the error must name the field: {err}"
+        );
+
+        // And a missing file names the path.
+        let mut missing = TlsClientConfig::new("localhost");
+        missing.ca_certs = vec![dir.join("does-not-exist.pem")];
+        let err = match TlsTransport::create_client_connector(&missing) {
+            Ok(_) => panic!("a missing CA file must be refused"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("does-not-exist"), "{err}");
+    }
 
     #[tokio::test]
     async fn test_tls_handshake() {

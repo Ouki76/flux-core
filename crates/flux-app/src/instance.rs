@@ -970,11 +970,13 @@ fn compile_client_securities(
                 alpn,
                 insecure,
                 utls,
+                ca_cert_path,
             } => {
                 let sni_str = sni.unwrap_or_else(|| default_sni.to_string());
                 let mut cfg = TlsClientConfig::new(sni_str)
                     .with_insecure(insecure)
                     .with_alpn(alpn);
+                cfg.ca_certs = ca_cert_path.into_iter().map(Into::into).collect();
                 if let Some(u) = utls
                     && let Some(fp) = flux_transport::TlsFingerprint::parse_str(&u)
                 {

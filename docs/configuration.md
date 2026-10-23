@@ -229,6 +229,11 @@ outbounds:
   # Certificate verification is ON by default. A server with a self-signed
   # certificate therefore needs an explicit `insecure: true`; omitting `security`
   # entirely no longer disables verification.
+  #
+  # A node behind a private CA should pin that CA instead — ca_cert_path takes one
+  # or more PEM files whose certificates are appended to the built-in roots, which
+  # is strictly better than turning verification off:
+  #   security: { type: tls, sni: "node.internal", ca_cert_path: ["/etc/flux/ca.pem"] }
   - tag: hy2-node
     carrier:  { type: udp, address: "1.2.3.4:443" }
     security: { type: tls, sni: "cdn.example.com", alpn: ["h3"], insecure: false }

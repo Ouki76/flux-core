@@ -436,6 +436,7 @@ impl ProxySpec {
                 alpn: self.alpn,
                 insecure: self.insecure,
                 utls: self.utls,
+                ca_cert_path: vec![],
             }))
         } else {
             None
