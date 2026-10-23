@@ -75,7 +75,12 @@ pub fn encode_vision_addons() -> Vec<u8> {
 
 /// Chooses the padding length for a frame, mirroring `XtlsPadding`.
 fn padding_len(content_len: usize, long: bool) -> usize {
-    let mut rng = rand::rngs::OsRng;
+    // A per-thread CSPRNG seeded once from the OS, not a syscall per draw. Vision
+    // pads every frame, and at 8 KiB frames the previous `OsRng` meant one
+    // `getrandom()` per 8 KiB of payload — the dominant cost of the whole Vision
+    // path. The padding only has to be unpredictable to a remote observer, which a
+    // per-thread CSPRNG still is.
+    let mut rng = rand::thread_rng();
     if content_len < PAD_LONG_THRESHOLD && long {
         ((rng.next_u32() as usize) % PAD_LONG_RANGE) + PAD_LONG_BASE - content_len
     } else {
@@ -155,6 +160,11 @@ pub struct VisionStream<S> {
     uuid_pending: bool,
     /// Still framing rather than raw pass-through.
     padding_phase: bool,
+    /// The END frame has been queued, so the peer's reader is in raw mode and
+    /// everything this side writes from now on must be copied verbatim.
+    direct: bool,
+    /// Scratch buffer reused for every encoded frame.
+    enc_buf: Vec<u8>,
     pending: Vec<u8>,
     pending_pos: usize,
     /// Bytes of the caller's buffer the pending frame accounts for.
@@ -178,6 +188,8 @@ impl<S> VisionStream<S> {
             uuid,
             uuid_pending: true,
             padding_phase: true,
+            direct: false,
+            enc_buf: Vec::new(),
             pending: Vec::new(),
             pending_pos: 0,
             plain_len: 0,
@@ -234,6 +246,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
             return Poll::Ready(Ok(0));
         }
 
+        // Direct copy (Xray's `switchToDirectCopy`): after the END frame both sides
+        // are in raw mode, so there is nothing to frame and the bytes go straight
+        // through — no per-write allocation, no 8 KiB chunking, no padding.
+        if this.direct && this.pending.is_empty() {
+            return Pin::new(&mut this.inner).poll_write(cx, buf);
+        }
+
         loop {
             // Flush a frame that was only partially written.
             while this.pending_pos < this.pending.len() {
@@ -252,7 +271,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
             }
             if !this.pending.is_empty() {
                 let consumed = this.plain_len;
-                this.pending.clear();
+                // Hand the allocation back for reuse instead of dropping it.
+                this.enc_buf = std::mem::take(&mut this.pending);
                 this.pending_pos = 0;
                 this.plain_len = 0;
                 return Poll::Ready(Ok(consumed));
@@ -262,7 +282,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
                 return Pin::new(&mut this.inner).poll_write(cx, buf);
             }
 
-            let mut encoded = Vec::with_capacity(MAX_CONTENT + 2 * FRAME_HEADER + PAD_LONG_BASE);
+            // Reused across frames: the old code allocated a fresh Vec per frame,
+            // which is one heap allocation per 8 KiB of payload.
+            let mut encoded = std::mem::take(&mut this.enc_buf);
+            encoded.clear();
+            encoded.reserve(MAX_CONTENT + 2 * FRAME_HEADER + PAD_LONG_BASE);
             // The first frame of a direction is UUID-prefixed and long-padded,
             // blurring the VLESS header length.
             if this.uuid_pending {
@@ -277,13 +301,20 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
 
             let content = &buf[..buf.len().min(MAX_CONTENT)];
             // The first ApplicationData record ends the handshake and with it the
-            // padded phase (Xray's `switchToDirectCopy`).
+            // padded phase (Xray's `switchToDirectCopy`). After the END frame the
+            // peer's reader switches to raw pass-through, so this side must too:
+            // our own reader already does exactly that in `end_of_frame`, and a
+            // writer that kept framing would corrupt the stream for a real peer.
             let command = if is_tls_appdata(content) {
                 this.padding_phase = false;
+                this.direct = true;
                 VISION_CMD_END
             } else {
                 VISION_CMD_CONTINUE
             };
+            if this.direct && command == VISION_CMD_END && !this.pending.is_empty() {
+                continue;
+            }
             let long_padding =
                 command == VISION_CMD_CONTINUE && (is_tls_handshake(content) || content.is_empty());
             encode_frame(&mut encoded, None, command, content, long_padding);
