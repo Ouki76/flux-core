@@ -258,97 +258,115 @@ where
     let mut eof_ba = false;
 
     let total = std::future::poll_fn(|cx| {
-        let mut progressed = false;
+        // Loop until a whole pass moves nothing, then park. The previous version
+        // called `wake_by_ref()` and returned `Pending` on every pass that moved
+        // data, which is *not* "poll again immediately": it hands the task back to
+        // the executor for a full reschedule, i.e. a futex wakeup per 64 KiB of
+        // payload. `strace` counted 26 658 futex calls for 64 MiB, 90 % of all
+        // syscall time, and every non-splice protocol path capped out near
+        // 195 MB/s.
+        // Bounded: a copy that always makes progress must still yield, or it
+        // monopolises the worker thread and starves every other task on it —
+        // measured as a Vision transfer that completed one round and then hung.
+        let mut spins = 0u32;
+        loop {
+            let mut progressed = false;
 
-        // 1. Flush a pending a->b write.
-        if let Some((start, end)) = pend_ab {
-            match Pin::new(&mut *b).poll_write(cx, &buf_ab[start..end]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(zero_write())),
-                Poll::Ready(Ok(n)) => {
-                    up += n as u64;
-                    progressed = true;
-                    if start + n >= end {
-                        pend_ab = None;
-                    } else {
-                        pend_ab = Some((start + n, end));
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
-            }
-        }
-
-        // 2. Flush a pending b->a write.
-        if let Some((start, end)) = pend_ba {
-            match Pin::new(&mut *a).poll_write(cx, &buf_ba[start..end]) {
-                Poll::Ready(Ok(0)) => return Poll::Ready(Err(zero_write())),
-                Poll::Ready(Ok(n)) => {
-                    down += n as u64;
-                    progressed = true;
-                    if start + n >= end {
-                        pend_ba = None;
-                    } else {
-                        pend_ba = Some((start + n, end));
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
-            }
-        }
-
-        // 3. Read more from a (only when nothing is outstanding for a->b).
-        if pend_ab.is_none() && !eof_ab {
-            let mut rb = ReadBuf::new(&mut buf_ab);
-            match Pin::new(&mut *a).poll_read(cx, &mut rb) {
-                Poll::Ready(Ok(())) => {
-                    let n = rb.filled().len();
-                    if n == 0 {
-                        eof_ab = true;
-                        // Propagate the half-close.
-                        match Pin::new(&mut *b).poll_shutdown(cx) {
-                            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {}
-                            Poll::Pending => {}
-                        }
-                    } else {
-                        pend_ab = Some((0, n));
+            // 1. Flush a pending a->b write.
+            if let Some((start, end)) = pend_ab {
+                match Pin::new(&mut *b).poll_write(cx, &buf_ab[start..end]) {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Err(zero_write())),
+                    Poll::Ready(Ok(n)) => {
+                        up += n as u64;
                         progressed = true;
-                    }
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
-            }
-        }
-
-        // 4. Read more from b.
-        if pend_ba.is_none() && !eof_ba {
-            let mut rb = ReadBuf::new(&mut buf_ba);
-            match Pin::new(&mut *b).poll_read(cx, &mut rb) {
-                Poll::Ready(Ok(())) => {
-                    let n = rb.filled().len();
-                    if n == 0 {
-                        eof_ba = true;
-                        match Pin::new(&mut *a).poll_shutdown(cx) {
-                            Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {}
-                            Poll::Pending => {}
+                        if start + n >= end {
+                            pend_ab = None;
+                        } else {
+                            pend_ab = Some((start + n, end));
                         }
-                    } else {
-                        pend_ba = Some((0, n));
-                        progressed = true;
                     }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {}
                 }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => {}
             }
-        }
 
-        if eof_ab && eof_ba && pend_ab.is_none() && pend_ba.is_none() {
-            return Poll::Ready(Ok((up, down)));
+            // 2. Flush a pending b->a write.
+            if let Some((start, end)) = pend_ba {
+                match Pin::new(&mut *a).poll_write(cx, &buf_ba[start..end]) {
+                    Poll::Ready(Ok(0)) => return Poll::Ready(Err(zero_write())),
+                    Poll::Ready(Ok(n)) => {
+                        down += n as u64;
+                        progressed = true;
+                        if start + n >= end {
+                            pend_ba = None;
+                        } else {
+                            pend_ba = Some((start + n, end));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {}
+                }
+            }
+
+            // 3. Read more from a (only when nothing is outstanding for a->b).
+            if pend_ab.is_none() && !eof_ab {
+                let mut rb = ReadBuf::new(&mut buf_ab);
+                match Pin::new(&mut *a).poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => {
+                        let n = rb.filled().len();
+                        if n == 0 {
+                            eof_ab = true;
+                            // Propagate the half-close.
+                            match Pin::new(&mut *b).poll_shutdown(cx) {
+                                Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {}
+                                Poll::Pending => {}
+                            }
+                        } else {
+                            pend_ab = Some((0, n));
+                            progressed = true;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {}
+                }
+            }
+
+            // 4. Read more from b.
+            if pend_ba.is_none() && !eof_ba {
+                let mut rb = ReadBuf::new(&mut buf_ba);
+                match Pin::new(&mut *b).poll_read(cx, &mut rb) {
+                    Poll::Ready(Ok(())) => {
+                        let n = rb.filled().len();
+                        if n == 0 {
+                            eof_ba = true;
+                            match Pin::new(&mut *a).poll_shutdown(cx) {
+                                Poll::Ready(Ok(())) | Poll::Ready(Err(_)) => {}
+                                Poll::Pending => {}
+                            }
+                        } else {
+                            pend_ba = Some((0, n));
+                            progressed = true;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => {}
+                }
+            }
+
+            if eof_ab && eof_ba && pend_ab.is_none() && pend_ba.is_none() {
+                return Poll::Ready(Ok((up, down)));
+            }
+            if progressed {
+                spins += 1;
+                if spins < 64 {
+                    continue;
+                }
+                // Cooperative yield: ask the executor to poll us again soon.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            return Poll::Pending;
         }
-        if progressed {
-            // Data moved: poll again immediately rather than waiting for a wakeup.
-            cx.waker().wake_by_ref();
-        }
-        Poll::Pending
     })
     .await?;
 
