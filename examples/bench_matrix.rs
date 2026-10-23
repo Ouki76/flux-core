@@ -1675,18 +1675,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- summary ---------------------------------------------------------
-    println!("\nPAIRWISE SUMMARY (medians; flux-core relative to sing-box)");
-    println!("{}", "-".repeat(104));
+    println!("\nPAIRWISE SUMMARY (medians; flux-core against each competitor)");
+    println!("{}", "-".repeat(126));
     println!(
-        "{:<38} {:>10} {:>10} {:>11} {:>10} {:>16}",
+        "{:<38} {:>10} {:>10} {:>10} {:>11} {:>11} {:>11} {:>11}",
         "Protocol / transport",
         "flux bulk",
         "sbox bulk",
-        "throughput",
-        "CPU ratio",
-        "setup flux/sbox"
+        "xray bulk",
+        "vs sbox",
+        "vs xray",
+        "CPU vs sbox",
+        "CPU vs xray"
     );
-    println!("{}", "-".repeat(104));
+    println!("{}", "-".repeat(126));
     let mut protocols: Vec<String> = Vec::new();
     for row in &rows {
         if !protocols.contains(&row.0) {
@@ -1706,16 +1708,23 @@ async fn main() -> anyhow::Result<()> {
         let s_cpu = cell(Stack::Singbox, |s| s.cpu_secs_per_gib);
         let f_setup = cell(Stack::Flux, |s| s.setup_ms);
         let s_setup = cell(Stack::Singbox, |s| s.setup_ms);
+        let x_bulk = cell(Stack::Xray, |s| s.bulk_mbps);
+        let x_cpu = cell(Stack::Xray, |s| s.cpu_secs_per_gib);
+        let _ = (f_setup, s_setup);
         let pct = match (f_bulk, s_bulk) {
             (Some(f), Some(s)) if s > 0.0 => format!("{:+.1}%", (f / s - 1.0) * 100.0),
+            _ => "-".to_string(),
+        };
+        let pct_x = match (f_bulk, x_bulk) {
+            (Some(f), Some(x)) if x > 0.0 => format!("{:+.1}%", (f / x - 1.0) * 100.0),
             _ => "-".to_string(),
         };
         let cpu_pct = match (f_cpu, s_cpu) {
             (Some(f), Some(s)) if s > 0.0 => format!("{:+.1}%", (f / s - 1.0) * 100.0),
             _ => "-".to_string(),
         };
-        let setup = match (f_setup, s_setup) {
-            (Some(f), Some(s)) => format!("{f:.1} / {s:.1} ms"),
+        let cpu_pct_x = match (f_cpu, x_cpu) {
+            (Some(f), Some(x)) if x > 0.0 => format!("{:+.1}%", (f / x - 1.0) * 100.0),
             _ => "-".to_string(),
         };
         let fmt = |v: Option<f64>| match v {
@@ -1723,16 +1732,18 @@ async fn main() -> anyhow::Result<()> {
             None => "-".to_string(),
         };
         println!(
-            "{:<38} {:>10} {:>10} {:>11} {:>10} {:>16}",
+            "{:<38} {:>10} {:>10} {:>10} {:>11} {:>11} {:>11} {:>11}",
             protocol,
             fmt(f_bulk),
             fmt(s_bulk),
+            fmt(x_bulk),
             pct,
+            pct_x,
             cpu_pct,
-            setup
+            cpu_pct_x
         );
     }
-    println!("{}", "-".repeat(104));
+    println!("{}", "-".repeat(126));
     println!(
         "MB/s = MiB/s (1048576 B) of payload. CPU s/GiB = CPU of both tunnel processes per GiB of\n\
          payload, lower is better. `throughput` and `CPU ratio` compare bulk rates, so a protocol\n\
