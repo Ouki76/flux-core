@@ -229,8 +229,12 @@ async fn start_flux(json: &str, port: u16) -> Instance {
             .expect("build flux instance");
         match instance.start().await {
             Ok(()) => break instance,
-            Err(e) if attempt < 8 && e.to_string().contains("already in use") => {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+            Err(e) if attempt < 20 && e.to_string().contains("already in use") => {
+                // The holder is almost always transient — another test's listener in
+                // its close path, or a socket in TIME_WAIT. Back off rather than
+                // hammering the same port, which is what eight 25 ms retries did.
+                let backoff = 25u64.saturating_mul(attempt as u64).min(750);
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
             }
             Err(e) => {
                 let report = common::diagnose_bind_failure(json, port, &e.to_string());
