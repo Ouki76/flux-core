@@ -47,12 +47,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.write_all(&payload).await?;
     stream.flush().await?;
     let mut got = vec![0u8; bytes];
-    tokio::time::timeout(std::time::Duration::from_secs(20), stream.read_exact(&mut got)).await??;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        stream.read_exact(&mut got),
+    )
+    .await??;
     let elapsed = started.elapsed();
 
     if got != payload {
-        let at = got.iter().zip(&payload).position(|(a, b)| a != b).unwrap_or(0);
-        return Err(format!("echo mismatch at byte {at}: got {:?}", &got[at..(at + 8).min(got.len())]).into());
+        let at = got
+            .iter()
+            .zip(&payload)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        return Err(format!(
+            "echo mismatch at byte {at}: got {:?}",
+            &got[at..(at + 8).min(got.len())]
+        )
+        .into());
     }
     println!(
         "OK conv={} setup={:?} echoed {bytes} bytes byte-exact in {:?} ({:.1} MiB/s)",

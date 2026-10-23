@@ -33,7 +33,10 @@ fn xray_bin() -> Option<String> {
 }
 
 fn which_xray() -> Option<String> {
-    let out = Command::new("sh").args(["-c", "command -v xray"]).output().ok()?;
+    let out = Command::new("sh")
+        .args(["-c", "command -v xray"])
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -88,7 +91,10 @@ async fn wait_for_udp(addr: SocketAddr) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         let out = Command::new("sh")
-            .args(["-c", &format!("ss -lun 2>/dev/null | grep -q ':{}'", addr.port())])
+            .args([
+                "-c",
+                &format!("ss -lun 2>/dev/null | grep -q ':{}'", addr.port()),
+            ])
             .status();
         if matches!(out, Ok(s) if s.success()) {
             return;
@@ -141,10 +147,13 @@ async fn vless_over_mkcp_reaches_a_real_xray_server() {
         obfs: flux_transport::KcpObfs::Srtp,
         ..Default::default()
     };
-    let mut stream = tokio::time::timeout(Duration::from_secs(10), flux_transport::connect(server_addr, kcp))
-        .await
-        .expect("kcp connect must not hang")
-        .expect("kcp connect");
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        flux_transport::connect(server_addr, kcp),
+    )
+    .await
+    .expect("kcp connect must not hang")
+    .expect("kcp connect");
 
     let target: flux_types::TargetAddress = format!("127.0.0.1:{echo_port}").parse().unwrap();
     flux_protocol::vless::VlessProtocol::write_request_header(
@@ -167,4 +176,122 @@ async fn vless_over_mkcp_reaches_a_real_xray_server() {
         .expect("the echo must come back")
         .expect("read echo");
     assert_eq!(got, payload, "the tunnel corrupted the payload");
+}
+
+/// The configuration path: `carrier: {type: "kcp"}` must reach the same place the
+/// library test proves, or the transport is unreachable for a user.
+///
+/// This drives a real SOCKS5 client through a flux-core `Instance` whose outbound
+/// carries VLESS over mKCP into a real Xray server.
+#[tokio::test]
+async fn a_node_configured_with_a_kcp_carrier_relays_through_xray() {
+    let Some(bin) = xray_bin() else {
+        panic!("the `xray` binary is required by this test but was not found");
+    };
+    let echo_port = echo_server().await;
+    let server_port = get_free_tcp_port().await;
+    let socks_port = get_free_tcp_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let xray_cfg = format!(
+        r#"{{
+  "log": {{"loglevel": "warning"}},
+  "inbounds": [{{
+    "port": {server_port}, "listen": "127.0.0.1", "protocol": "vless",
+    "settings": {{"clients": [{{"id": "{UUID}"}}], "decryption": "none"}},
+    "streamSettings": {{ {masks} }}
+  }}],
+  "outbounds": [{{"protocol": "freedom", "settings": {{}}}}]
+}}"#,
+        masks = kcp_masks()
+    );
+    let _xray = spawn_xray(&bin, &xray_cfg, dir.path());
+    let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+    wait_for_udp(server_addr).await;
+
+    let flux_cfg = format!(
+        r#"{{
+  "log": {{"level": "warn"}},
+  "inbounds": [{{
+    "tag": "socks-in",
+    "carrier": {{"type": "tcp", "listen": "127.0.0.1", "listen_port": {socks_port}}},
+    "protocol": {{"type": "socks"}}
+  }}],
+  "outbounds": [{{
+    "tag": "xray-kcp",
+    "carrier": {{"type": "kcp", "address": "127.0.0.1:{server_port}", "header": "srtp"}},
+    "protocol": {{"type": "vless", "uuid": "{UUID}"}}
+  }}],
+  "route": {{"final": "xray-kcp"}}
+}}"#
+    );
+    let instance =
+        flux_app::Instance::new(flux_app::Config::from_json_str(&flux_cfg).expect("config"))
+            .expect("instance");
+    instance.start().await.expect("start");
+
+    let payload: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    let got = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", socks_port))
+            .await
+            .ok()?;
+        s.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+        let mut m = [0u8; 2];
+        s.read_exact(&mut m).await.ok()?;
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&[127, 0, 0, 1]);
+        req.extend_from_slice(&echo_port.to_be_bytes());
+        s.write_all(&req).await.ok()?;
+        let mut head = [0u8; 10];
+        s.read_exact(&mut head).await.ok()?;
+        if head[1] != 0 {
+            return None;
+        }
+        s.write_all(&payload).await.ok()?;
+        let mut buf = vec![0u8; payload.len()];
+        s.read_exact(&mut buf).await.ok()?;
+        Some(buf)
+    })
+    .await
+    .expect("the tunnel must answer")
+    .expect("socks request must succeed");
+
+    assert_eq!(got, payload, "a kcp-carried node corrupted the payload");
+    let _ = instance.stop().await;
+}
+
+/// A header name we do not implement must be a configuration error, not a silent
+/// fallback to a different camouflage.
+#[tokio::test]
+async fn an_unknown_kcp_header_is_refused() {
+    let cfg = format!(
+        r#"{{
+  "inbounds": [{{
+    "tag": "socks-in",
+    "carrier": {{"type": "tcp", "listen": "127.0.0.1", "listen_port": {}}},
+    "protocol": {{"type": "socks"}}
+  }}],
+  "outbounds": [{{
+    "tag": "n", "carrier": {{"type": "kcp", "address": "127.0.0.1:1", "header": "aes-256-gcm"}},
+    "protocol": {{"type": "vless", "uuid": "{UUID}"}}
+  }}]
+}}"#,
+        get_free_tcp_port_blocking()
+    );
+    let parsed = flux_app::Config::from_json_str(&cfg).expect("config parses");
+    let err = match flux_app::Instance::new(parsed) {
+        Ok(_) => panic!("an unknown kcp header must be refused"),
+        Err(e) => e,
+    };
+    let msg = format!("{err}");
+    assert!(msg.contains("kcp header"), "{msg}");
+    assert!(
+        msg.contains("aes-256-gcm"),
+        "the error must name the value: {msg}"
+    );
+}
+
+fn get_free_tcp_port_blocking() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    l.local_addr().unwrap().port()
 }

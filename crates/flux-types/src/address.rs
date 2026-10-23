@@ -299,7 +299,10 @@ mod idna_tests {
     fn a_unicode_domain_becomes_its_ascii_form() {
         assert_eq!(normalize_domain("пример.рф"), "xn--e1afmkfd.xn--p1ai");
         assert_eq!(normalize_domain("例え.テスト"), "xn--r8jz45g.xn--zckzah");
-        assert_eq!(TargetAddress::domain("пример.рф", 443).host(), "xn--e1afmkfd.xn--p1ai");
+        assert_eq!(
+            TargetAddress::domain("пример.рф", 443).host(),
+            "xn--e1afmkfd.xn--p1ai"
+        );
     }
 
     /// The common path must not change what it did before.

@@ -51,10 +51,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.write_all(&payload).await?;
     stream.flush().await?;
     let mut got = vec![0u8; bytes];
-    tokio::time::timeout(std::time::Duration::from_secs(20), stream.read_exact(&mut got)).await??;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        stream.read_exact(&mut got),
+    )
+    .await??;
     let elapsed = started.elapsed();
     if got != payload {
-        let at = got.iter().zip(&payload).position(|(a, b)| a != b).unwrap_or(0);
+        let at = got
+            .iter()
+            .zip(&payload)
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
         return Err(format!("mismatch at byte {at}").into());
     }
     println!(

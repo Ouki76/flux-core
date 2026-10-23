@@ -281,6 +281,92 @@ pub enum CarrierConfig {
         #[serde(default)]
         port: Option<u16>,
     },
+    /// Xray's mKCP: a reliable byte stream over UDP.
+    #[serde(rename = "kcp", alias = "mkcp")]
+    Kcp {
+        #[serde(default)]
+        address: Option<String>,
+        #[serde(default)]
+        server: Option<String>,
+        #[serde(default)]
+        port: Option<u16>,
+        /// Conversation id. Omitted (or 0) means "pick one", and for a server it
+        /// means "adopt whatever the peer chooses", which is what a real peer does.
+        #[serde(default)]
+        conv: Option<u16>,
+        #[serde(default = "default_kcp_mtu")]
+        mtu: usize,
+        #[serde(default = "default_kcp_wnd")]
+        snd_wnd: u16,
+        #[serde(default = "default_kcp_wnd")]
+        rcv_wnd: u16,
+        #[serde(default = "default_kcp_interval")]
+        interval_ms: u32,
+        #[serde(default = "default_kcp_resend")]
+        resend: u32,
+        /// Header camouflage. Xray calls these `header-*`; `srtp` is the common one.
+        #[serde(default = "default_kcp_header")]
+        header: String,
+    },
+}
+
+fn default_kcp_mtu() -> usize {
+    1350
+}
+fn default_kcp_wnd() -> u16 {
+    512
+}
+fn default_kcp_interval() -> u32 {
+    10
+}
+fn default_kcp_resend() -> u32 {
+    2
+}
+fn default_kcp_header() -> String {
+    "srtp".to_string()
+}
+
+impl CarrierConfig {
+    /// Builds the mKCP configuration for this carrier, if it is one.
+    pub fn as_kcp(&self) -> FluxResult<Option<flux_transport::KcpConfig>> {
+        let CarrierConfig::Kcp {
+            conv,
+            mtu,
+            snd_wnd,
+            rcv_wnd,
+            interval_ms,
+            resend,
+            header,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        let obfs = match header.to_ascii_lowercase().as_str() {
+            "none" => flux_transport::KcpObfs::None,
+            "srtp" => flux_transport::KcpObfs::Srtp,
+            "utp" => flux_transport::KcpObfs::Utp,
+            "wechat-video" | "wechatvideo" | "wechat" => flux_transport::KcpObfs::WechatVideo,
+            "dtls" => flux_transport::KcpObfs::Dtls,
+            "wireguard" | "wg" => flux_transport::KcpObfs::Wireguard,
+            other => {
+                return Err(FluxError::Config(format!(
+                    "unknown kcp header '{other}'; expected none, srtp, utp, wechat-video, \
+                     dtls or wireguard (Xray's seed/AES-GCM masks are not implemented)"
+                )));
+            }
+        };
+        Ok(Some(flux_transport::KcpConfig {
+            conv: conv.unwrap_or(0) as u32,
+            mtu: *mtu,
+            snd_wnd: *snd_wnd,
+            rcv_wnd: *rcv_wnd,
+            interval_ms: *interval_ms,
+            resend: *resend,
+            no_congestion: true,
+            obfs,
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

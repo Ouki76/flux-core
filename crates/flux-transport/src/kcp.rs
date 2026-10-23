@@ -489,7 +489,10 @@ fn encode_segment(conv: u16, seg: &Segment, out: &mut Vec<u8>) {
 pub fn debug_parse(obfs: KcpObfs, datagram: &[u8]) -> String {
     let header_len = obfs.header_len();
     if datagram.len() < header_len {
-        return format!("datagram of {} bytes is shorter than the {header_len}-byte header", datagram.len());
+        return format!(
+            "datagram of {} bytes is shorter than the {header_len}-byte header",
+            datagram.len()
+        );
     }
     let header = &datagram[..header_len];
     let Some(plain) = envelope::open(&datagram[header_len..]) else {
@@ -500,7 +503,11 @@ pub fn debug_parse(obfs: KcpObfs, datagram: &[u8]) -> String {
         );
     };
     if plain.len() < 4 {
-        return format!("header={} envelope payload {} bytes, too short", hex(header), plain.len());
+        return format!(
+            "header={} envelope payload {} bytes, too short",
+            hex(header),
+            plain.len()
+        );
     }
     let conv = u16::from_be_bytes([plain[0], plain[1]]);
     match decode_segment(conv, &plain) {

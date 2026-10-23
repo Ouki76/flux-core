@@ -266,12 +266,26 @@ async fn test_start_flux_failure_is_self_diagnosing() {
     // The allocator just probed this port; if it is already gone, say who took it
     // instead of failing on a bare errno. (That is itself a diagnostic of the
     // allocator's probe-to-bind window, so it gets the same report.)
-    let squatter = match std::net::TcpListener::bind(("127.0.0.1", port)) {
-        Ok(listener) => listener,
-        Err(e) => panic!(
-            "cannot hold the port the allocator just handed out: {e}\n{}",
-            common::diagnose_bind_failure(&cfg, port, &e.to_string())
-        ),
+    // The allocator probes and releases; another thread in this binary can take the
+    // port in that window. Retrying closes a race that is not the property under
+    // test — a *systematic* failure still panics after the retries, with the same
+    // diagnosis.
+    let mut attempts = 0;
+    let squatter = loop {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => break listener,
+            Err(e) => {
+                attempts += 1;
+                if attempts >= 8 {
+                    panic!(
+                        "cannot hold the port the allocator just handed out after {attempts} \
+                         attempts: {e}\n{}",
+                        common::diagnose_bind_failure(&cfg, port, &e.to_string())
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
     };
 
     let payload = std::panic::AssertUnwindSafe(start_flux(&cfg, port))

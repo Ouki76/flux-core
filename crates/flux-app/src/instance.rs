@@ -867,6 +867,25 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
 fn parse_outbound_carrier(carrier: &CarrierConfig) -> FluxResult<(TargetAddress, bool)> {
     match carrier {
+        // mKCP runs over UDP but is a *stream* carrier: the protocol above it
+        // (VLESS, Trojan, …) is the same code, so it takes the layered path and the
+        // dialer opens a KCP stream instead of a TCP one.
+        CarrierConfig::Kcp {
+            address,
+            server,
+            port,
+            ..
+        } => {
+            if let Some(addr_str) = address {
+                Ok((addr_str.parse::<TargetAddress>()?, false))
+            } else if let (Some(s), Some(p)) = (server, port) {
+                Ok((TargetAddress::domain(s, *p), false))
+            } else {
+                Err(FluxError::Config(
+                    "kcp carrier must specify address or server+port".into(),
+                ))
+            }
+        }
         CarrierConfig::Tcp {
             address,
             server,
@@ -1228,13 +1247,16 @@ fn build_layered_outbound(
 
     let securities = compile_client_securities(node.security.clone(), &target.host())?;
     let framings = compile_client_framings(node.framing)?;
-    let dialer: Arc<dyn flux_types::StreamDialer> =
-        Arc::new(flux_outbound::LazyPipelineDialer::new_multi(
-            target.clone(),
-            resolver.clone(),
-            securities,
-            framings,
-        ));
+    let mut lazy = flux_outbound::LazyPipelineDialer::new_multi(
+        target.clone(),
+        resolver.clone(),
+        securities,
+        framings,
+    );
+    if let Some(kcp) = node.carrier.as_kcp()? {
+        lazy.kcp = Some(kcp);
+    }
+    let dialer: Arc<dyn flux_types::StreamDialer> = Arc::new(lazy);
 
     // Multiplexing is opt-in per node and only exists for the stream protocols.
     let mux = node

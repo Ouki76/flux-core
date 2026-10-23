@@ -8,6 +8,8 @@ use std::time::Duration;
 /// An asynchronous dialer that resolves the target address dynamically via `DnsResolver`
 /// and executes the layered transport pipeline (Carrier ──► Security ──► Framing).
 pub struct LazyPipelineDialer {
+    /// mKCP carrier, when the node's `carrier` is `kcp`.
+    pub kcp: Option<flux_transport::KcpConfig>,
     pub server_address: TargetAddress,
     pub resolver: Arc<DnsResolver>,
     pub securities: Vec<SecurityLayer>,
@@ -23,6 +25,7 @@ impl LazyPipelineDialer {
         framing: FramingLayer,
     ) -> Self {
         Self {
+            kcp: None,
             server_address,
             resolver,
             securities: vec![security],
@@ -33,6 +36,7 @@ impl LazyPipelineDialer {
 
     pub fn new_raw(server_address: TargetAddress, resolver: Arc<DnsResolver>) -> Self {
         Self {
+            kcp: None,
             server_address,
             resolver,
             securities: Vec::new(),
@@ -48,6 +52,7 @@ impl LazyPipelineDialer {
         framings: Vec<FramingLayer>,
     ) -> Self {
         Self {
+            kcp: None,
             server_address,
             resolver,
             securities,
@@ -66,8 +71,12 @@ impl LazyPipelineDialer {
 impl StreamDialer for LazyPipelineDialer {
     async fn dial(&self) -> FluxResult<BoxedStream> {
         let resolved = self.resolver.resolve(&self.server_address).await?;
-        let pipeline = LayeredTransportPipeline::new(self.server_address.clone(), resolved)
-            .with_timeout(self.connect_timeout)
+        let mut pipeline = LayeredTransportPipeline::new(self.server_address.clone(), resolved)
+            .with_timeout(self.connect_timeout);
+        if let Some(kcp) = &self.kcp {
+            pipeline = pipeline.with_kcp(*kcp);
+        }
+        let pipeline = pipeline
             .with_securities(self.securities.clone())
             .with_framings(self.framings.clone())
             .with_host_header(self.server_address.host());

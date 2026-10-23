@@ -41,6 +41,8 @@ pub enum FramingLayer {
 /// Dynamic, composable layered transport pipeline:
 /// [L4 Carrier] ──► [L5 Security Layer] ──► [L6 Framing Layer]
 pub struct LayeredTransportPipeline {
+    /// Set when the node's carrier is mKCP instead of TCP.
+    pub kcp: Option<crate::kcp::KcpConfig>,
     server_address: TargetAddress,
     resolved_addr: std::net::SocketAddr,
     connect_timeout: Duration,
@@ -53,6 +55,7 @@ impl LayeredTransportPipeline {
     pub fn new(server_address: TargetAddress, resolved_addr: std::net::SocketAddr) -> Self {
         let host = server_address.host();
         Self {
+            kcp: None,
             server_address,
             resolved_addr,
             connect_timeout: Duration::from_secs(10),
@@ -60,6 +63,12 @@ impl LayeredTransportPipeline {
             framings: Vec::new(),
             host_header: host,
         }
+    }
+
+    /// Selects mKCP as the carrier instead of TCP.
+    pub fn with_kcp(mut self, kcp: crate::kcp::KcpConfig) -> Self {
+        self.kcp = Some(kcp);
+        self
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -101,10 +110,25 @@ impl LayeredTransportPipeline {
 impl StreamDialer for LayeredTransportPipeline {
     async fn dial(&self) -> FluxResult<BoxedStream> {
         let dial_fut = async {
-            // 1. Layer 1 (Carrier): Establish base TCP connection
-            let tcp_stream =
-                TcpTransport::connect(self.resolved_addr, self.connect_timeout).await?;
-            let mut stream: BoxedStream = Box::new(tcp_stream);
+            // 1. Layer 1 (Carrier): TCP, or mKCP when the node asks for it. KCP is a
+            // reliable byte stream over UDP, so everything above this line — TLS,
+            // REALITY, WebSocket, the protocol itself — is unchanged.
+            let mut stream: BoxedStream = match &self.kcp {
+                Some(kcp_cfg) => {
+                    let kcp_stream = tokio::time::timeout(
+                        self.connect_timeout,
+                        crate::kcp::connect(self.resolved_addr, *kcp_cfg),
+                    )
+                    .await
+                    .map_err(|_| FluxError::Timeout("mKCP connect timed out".into()))??;
+                    Box::new(kcp_stream)
+                }
+                None => {
+                    let tcp_stream =
+                        TcpTransport::connect(self.resolved_addr, self.connect_timeout).await?;
+                    Box::new(tcp_stream)
+                }
+            };
 
             // 2. Layer 2 (Security): Sequentially apply security layers
             for sec in &self.securities {

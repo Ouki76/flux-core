@@ -21,11 +21,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let mut stream = flux_transport::accept(socket, cfg).await?;
-    println!("accepted conv={} from {:?}", stream.conv(), stream.peer_addr());
+    println!(
+        "accepted conv={} from {:?}",
+        stream.conv(),
+        stream.peer_addr()
+    );
     let mut total = 0usize;
     let mut buf = vec![0u8; 16 * 1024];
     loop {
-        match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf)).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut buf)).await
+        {
             Ok(Ok(0)) => {
                 println!("EOF after {total} bytes");
                 break;
