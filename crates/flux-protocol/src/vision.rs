@@ -305,7 +305,14 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VisionStream<S> {
             // peer's reader switches to raw pass-through, so this side must too:
             // our own reader already does exactly that in `end_of_frame`, and a
             // writer that kept framing would corrupt the stream for a real peer.
-            let command = if is_tls_appdata(content) {
+            // The padding phase exists to blur the TLS handshake, so it ends as soon
+            // as the inner stream stops being one. Waiting specifically for
+            // ApplicationData meant that a non-TLS inner stream — the normal case
+            // when the transport is already REALITY or TLS — never ended it, and every
+            // byte was framed into 8 KiB padded frames forever: `strace` counted 3 691
+            // writes of exactly 8 192 bytes for 16 MiB, and this path was the only one
+            // where flux spent *more* CPU per byte than sing-box.
+            let command = if is_tls_appdata(content) || !is_tls_handshake(content) {
                 this.padding_phase = false;
                 this.direct = true;
                 VISION_CMD_END
