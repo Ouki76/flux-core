@@ -1039,7 +1039,11 @@ mod tests {
         let mut got = Vec::new();
         let mut buf = vec![0u8; 4096];
         for _ in 0..dgrams.len() {
-            let n = tokio::time::timeout(Duration::from_secs(5), rx.recv(&mut buf))
+            // Generous on purpose: this asserts *ordering*, and a loaded machine (a
+            // release build plus benchmarks running beside the suite) can delay a
+            // loopback wakeup well past a tight bound. The failure this guards
+            // against is a reordered burst, not a slow one.
+            let n = tokio::time::timeout(Duration::from_secs(30), rx.recv(&mut buf))
                 .await
                 .expect("datagram did not arrive")
                 .unwrap();
