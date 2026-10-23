@@ -128,6 +128,69 @@ port explicitly instead of timing out.
 
 ---
 
+## Cycle 14 — 2026-10-23
+
+### Baseline
+
+fmt, clippy `-D warnings`, 972 tests, audit, deny, doc — green at `b172f1e`.
+
+### Outbound groups: state that lives for the process, not for the request
+
+`selector`, `loadbalance` (url-test), `fallback` and `probe` decide which server a
+user's traffic leaves through, and they hold state across requests — a selected
+member, a probe loop, a health opinion. The defects found were all of that shape:
+
+- `fallback` and `urltest` started a **new probe loop on every call**, guarded by a
+  one-shot cancellation token. This is the third time that exact pattern has caused
+  a defect in this codebase (the rule-set fetchers and the traffic sampler were the
+  others): a token that has been cancelled cannot be re-armed, so "start" silently
+  becomes "start once and then never again", or spawns a second loop. The loop token
+  now lives in a mutex slot and starting is idempotent — a cancelled token is
+  replaced, a live one is respected.
+- `selector` looked up only the currently selected tag. If a reload removed that
+  member, the dial failed instead of falling through to a member that still exists;
+  it now uses the first member that resolves and logs the substitution.
+- `loadbalance` with an **empty member list** reached the selection step with nothing
+  to select; it now fails with `OutboundNotFound` instead of indexing.
+- `probe` waited for a complete response before deciding health; it now returns as
+  soon as the bytes cannot be the HTTP/1.x status prefix, so a non-HTTP responder
+  fails fast instead of consuming the whole probe budget.
+- `block` is pinned to refuse both TCP and UDP with the `Blocked` variant rather than
+  a stringly-typed message.
+
+**Process note, recorded because it affects how much this cycle is worth:** the audit
+agent was interrupted before it could report, so the diff was reviewed and verified
+here rather than trusted. What I verified: the crate's unit tests went from ~30 to
+65 and pass, `test_outbound_groups`, `test_fallback_loadbalance` and
+`test_protocols_e2e` pass, clippy and fmt are clean, and the production hunks are the
+five behaviours described above. What I cannot claim: a complete list of what that
+audit would have found had it finished.
+
+### Tooling: the field audit was passing on the bug it exists to find
+
+`scripts/config_field_audit.py` reports configuration fields that are accepted and
+never consumed. It counted *any* mention as consumption — `self.flux = other.flux`
+in the merge, `self.flux.is_some()`, a destructuring binding — so it reported every
+field as consumed, including fields that do nothing.
+
+It now counts a read: `.field` used as a value rather than an assignment target,
+`field: <expr>` where the value is not a plain copy, with `Config::merge` and struct
+patterns containing `..` excluded. Verified both ways — with the validation pass
+removed it reports `flux`, with it restored it passes.
+
+Its limit is now written into the script instead of being left implicit: it cannot
+see a field that is read, forwarded into a lower-layer config struct and ignored by
+that layer (`tuic.congestion_control` is read here, placed into `TuicV5Config`, and
+the TUIC outbound never looks at it). That needs a semantic check per field, which is
+why `Config::validate` refuses the unimplemented cases — the script passing is
+necessary but not sufficient.
+
+### State
+
+**1006 tests, 0 failed** (was 972).
+
+---
+
 ## Cycle 13 — 2026-10-22
 
 ### Baseline
