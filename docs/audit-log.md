@@ -1725,3 +1725,46 @@ for the TLS paths (N tunnels, count timeouts), then bisect the copier yield.
 `bench_tls`'s correction from cycle 24 changed what the harness measures; its REALITY
 cost is 9 % over TLS and TLS is 49 % over plain framing, so the TLS layer — not the
 record layer — is where the throughput goes on every encrypted path.
+
+---
+
+## Cycle 26 — 2026-10-24
+
+### The hang: measured, not reproduced, and made attributable
+
+Thirty Trojan/TLS rounds with a fresh tunnel each — no hang. The two observed cases both
+happened while three stacks ran beside my own builds, so the most likely trigger is
+contention rather than a deadlock.
+
+Rather than guess, a timeout now reports what the kernel sees about both tunnel
+processes: state, thread count, cumulative CPU ticks, `wchan` and the state of the first
+threads. Verified with a forced timeout:
+
+```
+server pid=22357: State: S (sleeping); threads=26; cpu_ticks=39;
+                  wchan=futex_do_wait; task states: 22357(S) 22358(S) …
+```
+
+The next occurrence will be explainable instead of being filed as a flake.
+
+### gRPC: the frame cap was not the problem either
+
+Message size was 16 KiB against a 64 KiB copy buffer — the exact shape that cost
+WebSocket ~20 % — so it was raised to 64 KiB. **No change**: 100 MB/s before and after.
+
+The CPU column says why: 14.5 s/GiB against sing-box's 33 means we are not compute-bound,
+we are latency-bound per message, and halving the message count did not move it. Flow
+control is not the cause either — the stream window is 1 MiB and the connection window
+2 MiB against HTTP/2's 64 KiB default.
+
+Kept because it is structurally cheaper (fewer messages, copies, flushes; 58 gRPC tests
+pass) and recorded as a null throughput result, the same way as the Shadowsocks parser.
+
+gRPC is now the one path where **both** competitors beat us on throughput (xray 184,
+sing-box 117, us 100) while we beat both on CPU. That combination — cheap and slow —
+says the next attempt must attack latency per message, not bytes per message.
+
+### State
+
+**1051 tests, 0 failed.** Matrix standing: ahead of xray on 4 of 8 paths, ahead of both
+on CPU nearly everywhere, behind on gRPC (both) and Vision (not like-for-like).
