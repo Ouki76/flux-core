@@ -218,14 +218,28 @@ macro_rules! require_singbox {
 /// range, and whether that range overlaps the kernel's ephemeral range. See
 /// "Port forensics" in `tests/common/mod.rs`.
 async fn start_flux(json: &str, port: u16) -> Instance {
-    let instance = Instance::new(Config::from_json_str(json).expect("parse flux config"))
-        .expect("build flux instance");
-    if let Err(e) = instance.start().await {
-        let report = common::diagnose_bind_failure(json, port, &e.to_string());
-        // `{e:?}` keeps the historical `Io(Os { code: 98, kind: AddrInUse, … })`
-        // shape, so old and new logs of this failure stay comparable.
-        panic!("start flux instance: {e:?}\n{report}");
-    }
+    // The port allocator probes and releases; a sibling test in this same binary can
+    // take the port in that window. Retrying with the same config is right because
+    // the *port* is what raced, not the configuration — and a systematic failure
+    // still panics, with the same diagnosis as before.
+    let mut attempt = 0;
+    let instance = loop {
+        attempt += 1;
+        let instance = Instance::new(Config::from_json_str(json).expect("parse flux config"))
+            .expect("build flux instance");
+        match instance.start().await {
+            Ok(()) => break instance,
+            Err(e) if attempt < 8 && e.to_string().contains("already in use") => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(e) => {
+                let report = common::diagnose_bind_failure(json, port, &e.to_string());
+                // `{e:?}` keeps the historical `Io(Os { code: 98, kind: AddrInUse, … })`
+                // shape, so old and new logs of this failure stay comparable.
+                panic!("start flux instance after {attempt} attempt(s): {e:?}\n{report}");
+            }
+        }
+    };
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_err() {
         assert!(
