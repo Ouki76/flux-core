@@ -222,6 +222,57 @@ handshake against a real rustls fallback and fails without the fix with
 
 ---
 
+## Cycle 17 — 2026-10-23
+
+### Where the matrix stands after this cycle
+
+| path | flux | sing-box | throughput | CPU |
+|---|---|---|---|---|
+| Trojan / TLS | **741** | 662 | **+11.9 %** | **−27.0 %** |
+| VLESS / gRPC + TLS | 295 | 301 | −2.3 % | **−24.4 %** |
+| VLESS / TCP | 982 | 1042 | −5.7 % | **−29.7 %** |
+| Shadowsocks-AEAD | 434 | 478 | −9.1 % | +17.9 % |
+| VLESS / WS + TLS | 506 → **522** | 638 | −18.3 % | **−9.4 %** |
+| VLESS / REALITY | 512 | 652 | −21.4 % | +17.4 % |
+| VMess / WS + TLS | 340 | 485 | −30.0 % | +6.4 % |
+| Shadowsocks-2022 | 534 | 800 | −33.2 % | +56.9 % |
+| VLESS / REALITY + Vision | 222 | 626 | −64.5 % | +179.3 % |
+
+Three paths now win or tie on throughput and win on CPU. The WebSocket row moved from
+−41 % to −18 % in one cycle; Shadowsocks-2022 from −50 % to −33 %.
+
+### WebSocket: the frame cap was the whole story
+
+`poll_write` capped a frame at 16 KiB, so a 64 KiB write from the relay became four
+frames — four copies, four masks, four syscalls. The cap is 64 KiB now, matching the
+relay's copy buffer. Two read-side costs went with it: a 16 KiB stack array
+zero-initialised on every poll (now a reused buffer) and a read capped at 16 KiB
+regardless of the caller's buffer. Measured: **421 → 522 MB/s**, and CPU is now below
+sing-box on that row (3.3 vs 3.6 s/GiB) while still losing 18 % on throughput.
+
+**A methodological lesson worth keeping:** `bench_layers` showed *no* movement from
+these same changes and I nearly reverted them on that evidence. The matrix — the thing
+being optimised — showed +20 %. So `bench_layers` is not a trustworthy proxy for this
+layer, and a change that matters should be judged on the end-to-end path.
+
+### Shadowsocks: reading into a temporary then copying it
+
+Both variants read into a temp buffer and memcpy'd into the real one: a second copy of
+every payload byte, and a cap on how much one read could return (8 KiB for 2022 against
+16 KiB chunks — two syscalls per chunk). Reading straight into the destination:
+Shadowsocks-2022 **483 → 534 MB/s**, Shadowsocks-AEAD 428 → 434.
+
+The remaining 2022 gap is not crypto — this machine's AES-128-GCM runs at 5.9 GB/s
+(measured with `openssl speed`), so at 534 MB/s the cipher is ~9 % of the budget. The
+gap is in copy and syscall structure, and finding it needs a profiler: `perf` is not
+installed here, which is the recorded blocker.
+
+### State
+
+**1013 tests, 0 failed.**
+
+---
+
 ## Cycle 16 — 2026-10-23
 
 ### Final matrix (5 interleaved rounds × 200 MiB, quiet window)
