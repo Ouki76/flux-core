@@ -222,6 +222,62 @@ handshake against a real rustls fallback and fails without the fix with
 
 ---
 
+## Cycle 23 — 2026-10-24
+
+### The copier was rescheduling the task after every 64 KiB
+
+Chasing the Shadowsocks gap led somewhere better than Shadowsocks. `ss_bench` (new)
+shows the protocol code runs at **962 MiB/s in-process**, while the same code through
+the proxy ran at ~190 — so the cost was in the relay around it, not in the protocol.
+
+`strace -f -c` on a 64 MiB Shadowsocks transfer: **26 658 futex calls, 90 % of all
+syscall time**, and reads of 2-3 KiB. The cause was one line in
+`copy_bidirectional_buffered`: on every pass that moved data it called
+`cx.waker().wake_by_ref()` and returned `Pending`. The comment claimed that meant "poll
+again immediately"; it means "hand the task back to the executor", which is a futex
+wakeup and a queue round-trip per 64 KiB.
+
+This is why **every path that cannot use splice** — WebSocket, gRPC, Shadowsocks, TLS —
+sat at ~195 MB/s while splice-based VLESS/TCP reached 454. It was never the protocols.
+
+| path | before | after | vs sing-box | CPU vs sing-box |
+|---|---|---|---|---|
+| VLESS / TCP | 546 | **650** | **+19.5 %** | −52 % |
+| VLESS / WS + TLS | 199 | **237** | −16.5 % | −27 % |
+| VLESS / gRPC | 100 | 100 | −10.8 % | −55 % |
+| VLESS / REALITY | 156 | **242** | −22.0 % | −24 % |
+| VMess / WS | 133 | **178** | −7.0 % | −38 % |
+| Trojan / TLS | 220 | **289** | −2.0 % | −38 % |
+| Shadowsocks-2022 | 187 | **288** | −15.7 % | −26 % |
+| Shadowsocks-AEAD | 129 | **239** | −1.7 % | −28 % |
+
+futex 26 658 → 6 944, syscall time 37.9 s → 23.7 s on the same workload. **Every row is
+now within 22 % on throughput and ahead on CPU**, which was true of no row before.
+
+The first version of the fix had no yield at all: a copy that always has work never
+returns `Pending`, so it monopolises its worker thread and starves every other task on
+it. That appeared as a Vision transfer completing one round and then hanging; the loop
+now yields after 64 consecutive passes that moved data. Caught before commit, which is
+the only reason it is a footnote rather than a regression.
+
+### Shadowsocks: the 18-byte reads, and a null result worth keeping
+
+The chunk length (2 bytes + 16-byte tag) was read in a socket call of its own: 2 566
+reads of exactly 18 bytes per 16 MiB. A wider read is not the fix — with a coalesced
+write the surplus belongs to the next chunk, and dropping it desynchronised the stream
+(tunnel reset after seven chunks). The receive buffer is now persistent with a consumed
+offset. 18-byte reads went to **zero**, total recvfrom 15 486 → 6 212 — and throughput
+**did not move**. The syscalls were waste, not the bottleneck; kept because the parser
+is correct and cheaper, but recorded as a null performance result.
+
+### Method note
+
+`perf` cannot sample on this host at all — zero samples even for a busy `yes`, so
+`perf_event_paranoid` is not the reason. All profiling here is syscall-level (`strace
+-c`) plus in-process micro-benchmarks, and that was enough to find both faults.
+
+---
+
 ## Cycle 22 — 2026-10-23
 
 ### The matrix now has three columns
