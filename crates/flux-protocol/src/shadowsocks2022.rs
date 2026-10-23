@@ -1522,3 +1522,137 @@ mod udp_replay_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod batching_guard_tests {
+    // (module doc below)
+    //! Guards for the framing work, written so they fail if the one-chunk-per-call
+    //! behaviour ever comes back.
+    //!
+    //! The fixes were originally justified by measurement alone, and measurement is
+    //! not a regression test: a future refactor could restore the old shape and no
+    //! test would go red. These count what the stream asks of its transport.
+
+    use super::*;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    /// Records the size of every `poll_write` the wrapper performs.
+    #[derive(Default)]
+    struct CountingWriter {
+        writes: Vec<usize>,
+        /// How much the inner transport accepts per call.
+        accept: usize,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = buf.len().min(self.accept.max(1));
+            self.writes.push(n);
+            Poll::Ready(Ok(n))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for CountingWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A 64 KiB write from the relay must reach the transport as one write, not four.
+    ///
+    /// This is the fix that took Shadowsocks-2022 from −48 % to −2.7 % against
+    /// sing-box: the relay writes 64 KiB and the chunk size is 16 KiB, so one chunk
+    /// per call meant four frames, four seals and four syscalls per buffer.
+    #[tokio::test]
+    async fn a_64_kib_write_reaches_the_transport_in_one_call() {
+        let psk = b"1234567890123456";
+        let method = Ss2022CipherMethod::Blake3Aes128Gcm;
+        let destination = TargetAddress::domain("example.com", 443);
+
+        let mut stream = Ss2022Protocol::client_handshake(
+            CountingWriter {
+                writes: Vec::new(),
+                accept: usize::MAX,
+            },
+            method,
+            psk,
+            &destination,
+        )
+        .await
+        .expect("client handshake");
+
+        // The first flight carries the handshake header; the property under test is
+        // what a *payload* write does, so the record starts after it.
+        let handshake_writes = stream.inner.writes.len();
+
+        let payload = vec![0x5au8; 64 * 1024];
+        let written = tokio::io::AsyncWriteExt::write(&mut stream, &payload)
+            .await
+            .expect("write");
+
+        let calls = stream.inner.writes[handshake_writes..].to_vec();
+        assert_eq!(written, 64 * 1024, "the whole buffer must be accepted");
+        assert_eq!(
+            calls.len(),
+            1,
+            "64 KiB must reach the transport as one write, not {} (sizes: {calls:?})",
+            calls.len()
+        );
+    }
+
+    /// A reader asking for 64 KiB must get more than one 16 KiB chunk per call.
+    ///
+    /// Before the fix `poll_read` returned after every decrypted chunk, so the relay
+    /// needed four read/write cycles per buffer. This fails if that returns.
+    #[tokio::test]
+    async fn a_read_fills_more_than_one_chunk() {
+        let psk = b"1234567890123456";
+        let method = Ss2022CipherMethod::Blake3Aes128Gcm;
+        let destination = TargetAddress::domain("example.com", 443);
+        let replay = ReplayFilter::new(1000);
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+        let server = tokio::spawn(async move {
+            let (mut srv, _target, _extra) =
+                Ss2022Protocol::server_handshake(server_io, method, psk, &replay)
+                    .await
+                    .expect("server handshake");
+            let mut buf = vec![0u8; 64 * 1024];
+            tokio::io::AsyncReadExt::read(&mut srv, &mut buf)
+                .await
+                .expect("read")
+        });
+
+        let mut client = Ss2022Protocol::client_handshake(client_io, method, psk, &destination)
+            .await
+            .expect("client handshake");
+        let payload = vec![0x11u8; 48 * 1024];
+        tokio::io::AsyncWriteExt::write_all(&mut client, &payload)
+            .await
+            .expect("write");
+
+        let got = server.await.expect("server task");
+        assert!(
+            got > 16 * 1024,
+            "one read returned {got} bytes: the reader is still stopping at a single \
+             16 KiB chunk instead of filling the caller's buffer"
+        );
+    }
+}
