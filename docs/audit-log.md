@@ -2032,7 +2032,11 @@ now in the repo and seven tests cover it, including the two cases that matter:
 
 `81.2.69.142 → GB`, `216.160.83.56 → US`, `89.160.20.128 → SE`, `2.125.160.216 → GB`.
 
-### Cycle 35 — fingerprints: what they are, and what they are not
+---
+
+## Cycle 35 — 2026-10-24
+
+### Fingerprints: what they are, and what they are not
 
 The profiles were called uTLS-style with nothing pinning their output. Measured:
 
