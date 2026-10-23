@@ -222,6 +222,41 @@ handshake against a real rustls fallback and fails without the fix with
 
 ---
 
+## Cycle 18 — 2026-10-23
+
+### Functional gap closed: a private CA can be pinned
+
+A deployment behind an internal CA had exactly one option: `insecure: true`, which
+turns verification off entirely and accepts any certificate — strictly worse than
+trusting the CA that actually signs your nodes. `security.ca_cert_path` now takes one
+or more PEM files whose certificates are appended to the built-in roots.
+
+Three details that matter more than the feature itself:
+
+- The extra anchors are part of the **connector cache key**. Two outbounds with
+  different private CAs must not share a cached connector; otherwise one could trust a
+  certificate the other should reject.
+- An unreadable, malformed or empty CA file is a configuration error naming the file.
+  Falling back to the public roots would produce an `UnknownIssuer` far from the cause.
+- The loader is one shared function used by the stream client **and** the QUIC clients.
+  The first commit wired only stream TLS, which would have made a private CA work for a
+  WebSocket node and silently fail for a Hysteria 2 node in the same deployment; the
+  second commit closed that.
+
+The test proves the pin is what makes the handshake succeed: a self-signed localhost
+certificate fails against the built-in roots with `InvalidCertificate(UnknownIssuer)`,
+succeeds once listed, and fails again when the wiring is removed.
+
+### State
+
+**1014 tests, 0 failed.**
+
+Remaining from the functional list: mKCP and XHTTP transports, IDNA, a GeoIP test
+fixture, UDP associations in the connection table, nested config-key typo detection,
+and a browser-grade TLS fingerprint.
+
+---
+
 ## Cycle 17 — 2026-10-23
 
 ### Where the matrix stands after this cycle
