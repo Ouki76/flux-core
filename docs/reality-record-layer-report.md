@@ -1,3 +1,14 @@
+# REALITY record layer
+
+> **Correction (cycle 23, 2026-10-24).** Every number below was measured with the
+> `security` block nested **inside** `carrier`, where the configuration parser
+> silently ignored it. The tunnel was therefore plain VLESS over TCP: "REALITY 729"
+> and "VLESS+TLS 660" were not REALITY or TLS numbers at all. With the block in its
+> correct place the same harness measures, on the homelab server, **VLESS/TCP
+> 520 MB/s, VLESS+TLS 264, REALITY 239** — REALITY costs 9 % over TLS, and TLS itself
+> costs half the throughput. The analysis below is kept for the record layer design,
+> not as a performance claim.
+
 # REALITY record layer: 375 → 729 MB/s
 
 > **Dated experiment report.** The figures below are that cycle's interleaved

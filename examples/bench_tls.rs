@@ -624,12 +624,12 @@ fn socks_inbound(port: u16) -> String {
 /// Node (server) side: VLESS inbound with an optional security layer, direct
 /// outbound.
 fn node_config(port: u16, security: Option<&str>) -> String {
-    let sec = security
-        .map(|s| format!(r#", "security": {s}"#))
+    let sec_inner = security
+        .map(|s| format!(r#""security": {s}, "#))
         .unwrap_or_default();
     format!(
         r#"{{
-            "inbounds": [{{ "tag": "in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {port} }}{sec}, "protocol": {{ "type": "vless", "uuid": "{VLESS_UUID}" }} }}],
+            "inbounds": [{{ "tag": "in", "carrier": {{ "type": "tcp", "listen": "127.0.0.1", "listen_port": {port} }}, {sec_inner} "protocol": {{ "type": "vless", "uuid": "{VLESS_UUID}" }} }}],
             "outbounds": [{{ "type": "direct", "tag": "direct" }}],
             "route": {{ "final": "direct" }}
         }}"#
@@ -640,12 +640,12 @@ fn node_config(port: u16, security: Option<&str>) -> String {
 /// optional client security layer.
 fn edge_config(port: u16, node_port: u16, security: Option<&str>) -> String {
     let sec = security
-        .map(|s| format!(r#", "security": {s}"#))
+        .map(|s| format!(r#""security": {s}, "#))
         .unwrap_or_default();
     format!(
         r#"{{
             "inbounds": [{}],
-            "outbounds": [{{ "tag": "node", "carrier": {{ "type": "tcp", "address": "127.0.0.1:{node_port}" }}{sec}, "protocol": {{ "type": "vless", "uuid": "{VLESS_UUID}" }} }}],
+            "outbounds": [{{ "tag": "node", "carrier": {{ "type": "tcp", "address": "127.0.0.1:{node_port}" }}, {sec} "protocol": {{ "type": "vless", "uuid": "{VLESS_UUID}" }} }}],
             "route": {{ "final": "node" }}
         }}"#,
         socks_inbound(port)
@@ -740,16 +740,32 @@ async fn main() -> anyhow::Result<()> {
         "plain_edge",
     );
 
-    let tls_sec_server = r#"{ "type": "tls", "server_name": "localhost" }"#;
-    let tls_sec_client = r#"{ "type": "tls", "sni": "localhost", "insecure": true }"#;
+    // The server needs a real certificate: a TLS inbound with only `server_name`
+    // does not start, and before this the whole `security` block sat inside
+    // `carrier`, where it was silently dropped — so the "TLS" rows were measuring
+    // plain VLESS over TCP and the numbers were a lie.
+    let cert_dir = std::env::temp_dir().join(format!("bench_tls_certs_{}", std::process::id()));
+    std::fs::create_dir_all(&cert_dir).expect("create cert dir");
+    let cert_path = cert_dir.join("cert.pem");
+    let key_path = cert_dir.join("key.pem");
+    let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate self-signed certificate");
+    std::fs::write(&cert_path, generated.cert.pem()).expect("write cert");
+    std::fs::write(&key_path, generated.key_pair.serialize_pem()).expect("write key");
+    let tls_sec_server = format!(
+        r#"{{ "type": "tls", "certificate_path": "{}", "key_path": "{}" }}"#,
+        cert_path.display(),
+        key_path.display()
+    );
+    let tls_sec_client = r#"{ "type": "tls", "sni": "localhost", "insecure": true }"#.to_string();
     let tls_node = spawn_proxy(
         &args.flux_bin,
-        &node_config(ports[3], Some(tls_sec_server)),
+        &node_config(ports[3], Some(&tls_sec_server)),
         "tls_node",
     );
     let tls_edge = spawn_proxy(
         &args.flux_bin,
-        &edge_config(ports[4], ports[3], Some(tls_sec_client)),
+        &edge_config(ports[4], ports[3], Some(&tls_sec_client)),
         "tls_edge",
     );
 
