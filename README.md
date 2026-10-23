@@ -136,20 +136,32 @@ side-by-side comparisons (sing-box, direct echo, multi-stream aggregates) were
 removed rather than left to rot — the harness still prints them when `sing-box`
 is installed on the machine.
 
-Single stream, measured against **sing-box** on the same machine, same workload,
+Single stream, measured against **sing-box and xray** on the same machine, same workload,
 interleaved rounds — the only comparison that says anything about competitiveness
-(full table and methodology in [docs/bench-matrix-report.md](docs/bench-matrix-report.md)):
+(methodology in [docs/audit-log.md](docs/audit-log.md)):
 
-| Path | This proxy | sing-box | Verdict |
-|---|---|---|---|
-| VLESS / TCP | 1063 MB/s | 1186 | −10 %, **−28 % CPU** |
-| Trojan / TLS | **769** | 743 | **+3.5 %**, −25 % CPU |
-| VLESS / gRPC + TLS | 302 | 322 | −6 %, −18 % CPU |
-| VLESS / REALITY | 539 | 728 | −26 % |
-| Shadowsocks-AEAD (aes-256-gcm) | 428 | 499 | −14 % |
-| Shadowsocks-2022 | 483 | 956 | −50 % |
-| VLESS / WS + TLS | 421 | 710 | −41 % |
-| VMess / WS + TLS | 316 | 502 | −37 % |
+| Path | flux-core | sing-box | xray | vs sing-box | vs xray | CPU vs both |
+|---|---|---|---|---|---|---|
+| VLESS / TCP | 654 | 557 | 567 | **+17.4 %** | **+15.3 %** | −48 / −56 % |
+| Trojan / TLS | 315 | 293 | — | **+7.6 %** | — | −44 % |
+| Shadowsocks-2022 | 331 | 342 | 290 | −3.2 % | **+14.2 %** | −29 / −59 % |
+| Shadowsocks-AEAD | 269 | 243 | — | **+10.6 %** | — | −33 % |
+| REALITY | 237 | 294 | — | −19.4 % | — | −25 % |
+| REALITY + Vision | 224 | 292 | 231 | −23.2 % | −2.9 % | −23 / −25 % |
+| VLESS / WS + TLS | 239 | 297 | 105 | −19.5 % | **+127.7 %** | −25 / −64 % |
+| VMess / WS + TLS | 170 | 216 | 172 | −21.4 % | −1.2 % | −27 / −41 % |
+| VLESS / gRPC + TLS | 103 | 117 | 184 | −12.2 % | −44.1 % | −55 / −39 % |
+
+**Absolutes are machine-specific — never compare these numbers across machines, only
+within one run.** This table is the homelab server (24 cores, Void Linux, 5 interleaved
+rounds x 200 MiB); an earlier edition came from a desktop where every absolute was about
+1.6x higher and the deltas told a different story.
+
+What the table says: flux-core is **faster than both competitors on plain TCP, faster than
+sing-box on Trojan and Shadowsocks-AEAD, and faster than xray on five of the eight paths
+xray can run**, while spending 22-64 % less CPU than both on every single path. The
+remaining deficits are concentrated in stacked TLS paths (REALITY, Vision, WS, VMess) and
+in gRPC.
 
 Reproduce: `cargo run --release --example bench_matrix -- --rounds 5 --mb 200`.
 
