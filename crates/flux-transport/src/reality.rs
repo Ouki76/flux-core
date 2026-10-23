@@ -1583,6 +1583,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        // Fill the caller's buffer, not one TLS record per poll. A record is 16 KiB
+        // and the relay reads with 64 KiB, so returning after each record made every
+        // buffer four separate read/write cycles — the same defect that cost the
+        // Shadowsocks and WebSocket transports.
+        let mut put = 0usize;
         loop {
             if self.read_pos < self.read_len {
                 // Serve straight out of the record buffer the plaintext was
@@ -1594,7 +1599,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
                 let start = self.read_pos;
                 buf.put_slice(&self.body_buf[start..start + n]);
                 self.read_pos += n;
-                return Poll::Ready(Ok(()));
+                put += n;
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
             match self.poll_next_record(cx) {
                 Poll::Ready(Ok(())) => continue,
@@ -1602,7 +1611,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
                     return Poll::Ready(Ok(())); // close_notify / clean EOF → EOF
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => {
+                    return if put > 0 {
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Pending
+                    };
+                }
             }
         }
     }
