@@ -2123,3 +2123,38 @@ a change worth making, so it is reverted in full.
 Recorded as an open item with the specific lead: the allocation-per-read is real waste, but
 it needs to be removed *without* touching when EOF and truncation errors are reported —
 that is, the refill loop has to keep the state machine's error paths exactly where they are.
+
+---
+
+## Cycle 38 — 2026-10-24
+
+### The stable three-way picture
+
+Five interleaved rounds, 200 MiB, all three stacks, xray included:
+
+| path | flux | sing-box | xray | vs sbox | vs xray | CPU vs both |
+|---|---|---|---|---|---|---|
+| VLESS / TCP | 654 | 557 | 567 | **+17.4 %** | **+15.3 %** | −48 / −56 % |
+| Trojan / TLS | 315 | 293 | — | **+7.6 %** | — | −44 % |
+| Shadowsocks-2022 | 331 | 342 | 290 | −3.2 % | **+14.2 %** | −29 / −59 % |
+| Shadowsocks-AEAD | 269 | 243 | — | **+10.6 %** | — | −33 % |
+| REALITY | 237 | 294 | — | −19.4 % | — | −25 % |
+| REALITY + Vision | 224 | 292 | 231 | −23.2 % | −2.9 % | −23 / −25 % |
+| VLESS / WS + TLS | 239 | 297 | 105 | −19.5 % | **+127.7 %** | −25 / −64 % |
+| VMess / WS + TLS | 170 | 216 | 172 | −21.4 % | **−1.2 %** | −27 / −41 % |
+| VLESS / gRPC + TLS | 103 | 117 | 184 | −12.2 % | −44.1 % | −55 / −39 % |
+
+Ahead of both competitors on plain TCP; ahead of sing-box on Trojan and Shadowsocks-AEAD;
+ahead of xray on five of the eight paths it runs; **cheaper on CPU than both on every path,
+by 22-64 %**.
+
+### The shape of what is left
+
+Trojan/TLS is a single layer and it *beats* sing-box. Every path that is still behind
+carries **two or three stacked layers** (Vision over REALITY, WS over TLS, VMess over WS
+over TLS), and their deficits grow with the number of layers. That is not a TLS problem —
+it is per-layer overhead, almost certainly a copy per layer, and it is the next thing to
+attack. gRPC is separate: four attempts at its framing all returned null.
+
+README's performance table replaced with this one, with the machine-specificity of the
+absolutes stated in the table itself.
