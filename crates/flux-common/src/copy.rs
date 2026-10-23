@@ -233,6 +233,16 @@ mod tests {
 /// This drives both directions from one task with 64 KiB buffers: no split (which
 /// in tokio is a mutex around the whole stream taken on every poll), no per-chunk
 /// allocation, and a quarter of the syscalls.
+/// Aborts a spawned task when the copier finishes, so the ticker does not outlive the
+/// transfer it belongs to.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub async fn copy_bidirectional_buffered<A, B>(
     a: &mut A,
     b: &mut B,
@@ -257,7 +267,57 @@ where
     let mut eof_ab = false;
     let mut eof_ba = false;
 
+    // Liveness backstop.
+    //
+    // Three times now a tunnel has stalled with both ends asleep in `futex` and a CPU
+    // count that does not move: a wakeup was registered by someone and never
+    // delivered. It only reproduces under three-stack load, so it cannot be bisected
+    // from a stack dump, and a 120 s hang is a worse outcome than a 200 ms delay.
+    //
+    // This ticker re-polls the copier while it is parked. Every fire also logs, so the
+    // next occurrence names the path it happened on instead of being filed as a flake.
+    struct Backstop {
+        waker: Option<std::task::Waker>,
+        last_poll: std::time::Instant,
+    }
+    let backstop = std::sync::Arc::new(std::sync::Mutex::new(Backstop {
+        waker: None,
+        last_poll: std::time::Instant::now(),
+    }));
+    let ticker_state = backstop.clone();
+    let ticker = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let (waker, idle_for) = {
+                let st = ticker_state.lock().unwrap_or_else(|e| e.into_inner());
+                (st.waker.clone(), st.last_poll.elapsed())
+            };
+            // Only poke a copier that has stopped being polled: a busy transfer
+            // re-registers constantly and needs nothing from this task.
+            if idle_for >= std::time::Duration::from_millis(500)
+                && let Some(w) = waker
+            {
+                {
+                    tracing::warn!(
+                        "relay copier was parked for {:?} with no wakeup — re-polling",
+                        idle_for
+                    );
+                    w.wake();
+                }
+            }
+        }
+    });
+    let _ticker_guard = AbortOnDrop(ticker);
+
     let total = std::future::poll_fn(|cx| {
+        {
+            let mut st = backstop.lock().unwrap_or_else(|e| e.into_inner());
+            st.last_poll = std::time::Instant::now();
+            match &st.waker {
+                Some(existing) if existing.will_wake(cx.waker()) => {}
+                _ => st.waker = Some(cx.waker().clone()),
+            }
+        }
         // Loop until a whole pass moves nothing, then park. The previous version
         // called `wake_by_ref()` and returned `Pending` on every pass that moved
         // data, which is *not* "poll again immediately": it hands the task back to
