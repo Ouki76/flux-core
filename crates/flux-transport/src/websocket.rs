@@ -496,8 +496,23 @@ impl Utf8Check {
 /// inverse, and `offset` keeps the key phase continuous across chunks of one
 /// frame.
 fn mask_in_place(key: [u8; 4], offset: usize, data: &mut [u8]) {
-    for (i, b) in data.iter_mut().enumerate() {
-        *b ^= key[(offset + i) % 4];
+    // Four bytes per iteration with a rotated mask, then a tail. The modulo in the
+    // original loop is a division per byte unless the optimiser proves it away, and
+    // this runs over every payload byte that crosses a masked WebSocket frame.
+    let mut k = [0u8; 4];
+    for i in 0..4 {
+        k[i] = key[(offset + i) & 3];
+    }
+    let mut chunks = data.chunks_exact_mut(4);
+    for c in &mut chunks {
+        c[0] ^= k[0];
+        c[1] ^= k[1];
+        c[2] ^= k[2];
+        c[3] ^= k[3];
+    }
+    let rem = chunks.into_remainder();
+    for (i, b) in rem.iter_mut().enumerate() {
+        *b ^= k[i & 3];
     }
 }
 
@@ -569,6 +584,8 @@ pub struct WebSocketStream<S> {
     buffered_pos: usize,
     // Robust writer state machine.
     write_buf: Vec<u8>,
+    /// Reused staging buffer for unmasking incoming payload.
+    staging: Vec<u8>,
     write_pos: usize,
     pending_chunk_len: usize,
 }
@@ -598,6 +615,7 @@ impl<S> WebSocketStream<S> {
             buffered_excess: excess,
             buffered_pos: 0,
             write_buf: Vec::with_capacity(4096),
+            staging: vec![0u8; UNMASK_CHUNK],
             write_pos: 0,
             pending_chunk_len: 0,
         }
@@ -1024,9 +1042,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
                         return Poll::Ready(Ok(()));
                     }
 
-                    let want = this.payload_rem.min(buf.remaining()).min(UNMASK_CHUNK);
-                    let mut tmp = [0u8; UNMASK_CHUNK];
-                    match this.poll_fill(cx, &mut tmp[..want]) {
+                    // No 16 KiB cap: the staging buffer is reused and grows, so a
+                    // reader with a 64 KiB buffer gets its payload in one go instead
+                    // of four round trips through this state machine.
+                    let want = this.payload_rem.min(buf.remaining());
+                    // A stack array here was zero-initialised on every poll — 16 KiB
+                    // of memset per read, on the hottest path of the transport.
+                    let mut staging = std::mem::take(&mut this.staging);
+                    if staging.len() < want {
+                        staging.resize(want, 0);
+                    }
+                    let res = this.poll_fill(cx, &mut staging[..want]);
+                    this.staging = staging;
+                    match res {
                         Poll::Ready(Ok(0)) => {
                             return Poll::Ready(Err(io::Error::new(
                                 io::ErrorKind::UnexpectedEof,
@@ -1034,7 +1062,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
                             )));
                         }
                         Poll::Ready(Ok(n)) => {
-                            let chunk = &mut tmp[..n];
+                            let chunk = &mut this.staging[..n];
                             if let Some(mask) = this.mask_key {
                                 mask_in_place(mask, this.mask_idx, chunk);
                             }
@@ -1107,8 +1135,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
             return Poll::Ready(Ok(0));
         }
 
-        // Step 2: Frame a new payload chunk
-        let chunk_len = buf.len().min(16384);
+        // Step 2: Frame a new payload chunk. The cap used to be 16 KiB, so a 64 KiB
+        // write became four frames — four copies, four masks and four syscalls — on
+        // the single hottest path of this transport. 64 KiB matches the relay's copy
+        // buffer, so a normal write is framed once.
+        let chunk_len = buf.len().min(64 * 1024);
         this.write_buf.clear();
         encode_frame_into(
             &mut this.write_buf,
