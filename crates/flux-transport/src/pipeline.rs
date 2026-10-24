@@ -280,7 +280,10 @@ impl ServerTransportPipeline {
                     ServerSecurityLayer::None => stream,
                     ServerSecurityLayer::Tls(acceptor) => {
                         let s = acceptor.accept(stream).await.map_err(FluxError::Io)?;
-                        Box::new(s)
+                        // rustls delivers one TLS record per `poll_read`; the relay
+                        // reads 64 KiB at a time. Coalescing at the boundary leaves
+                        // rustls untouched (see `coalesce.rs`).
+                        Box::new(crate::coalesce::CoalesceReader::new(s))
                     }
                     ServerSecurityLayer::Reality(cfg) => {
                         let s = RealityHandshake::server_handshake(stream, cfg).await?;

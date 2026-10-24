@@ -296,7 +296,10 @@ impl TlsTransport {
             ))
         })?;
 
-        Ok(Box::new(tls_stream))
+        // rustls hands back one TLS record (16 KiB) per `poll_read`; the relay reads in
+        // 64 KiB buffers. Coalescing here keeps the reads whole without touching the
+        // dependency.
+        Ok(Box::new(crate::coalesce::CoalesceReader::new(tls_stream)))
     }
 }
 

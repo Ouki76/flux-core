@@ -1,3 +1,4 @@
+pub mod coalesce;
 pub mod fingerprint;
 pub mod fragment;
 pub mod grpc;
