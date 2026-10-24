@@ -101,6 +101,54 @@ fn spawn_flux(bin: &std::path::Path, listen_port: u16) -> Child {
         .expect("failed to spawn flux-core")
 }
 
+/// A competitor's SOCKS5 inbound with UDP enabled, pointed at a direct outbound.
+///
+/// Returns `None` when the binary is not installed: a missing competitor must not make the
+/// benchmark fail, only shrink the table.
+fn spawn_vendor(name: &str, listen_port: u16) -> Option<Child> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let bin = [
+        format!("{home}/.local/bin/{name}"),
+        format!("/usr/local/bin/{name}"),
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).is_file())
+    .or_else(|| {
+        let out = std::process::Command::new("sh")
+            .args(["-c", &format!("command -v {name}")])
+            .output()
+            .ok()?;
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!path.is_empty()).then_some(path)
+    })?;
+
+    let (cfg, args): (String, Vec<&str>) = if name.contains("sing-box") {
+        (
+            format!(
+                r#"{{"log":{{"level":"error"}},"inbounds":[{{"type":"socks","tag":"in","listen":"127.0.0.1","listen_port":{listen_port}}}],"outbounds":[{{"type":"direct","tag":"direct"}}]}}"#
+            ),
+            vec!["run", "-c"],
+        )
+    } else {
+        (
+            format!(
+                r#"{{"log":{{"loglevel":"error"}},"inbounds":[{{"port":{listen_port},"listen":"127.0.0.1","protocol":"socks","settings":{{"udp":true}}}}],"outbounds":[{{"protocol":"freedom","settings":{{}}}}]}}"#
+            ),
+            vec!["run", "-c"],
+        )
+    };
+    let path = std::env::temp_dir().join(format!("bench_udp_{name}.json"));
+    std::fs::write(&path, cfg).ok()?;
+    let mut argv = args;
+    argv.push(path.to_str()?);
+    Command::new(&bin)
+        .args(&argv)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
 /// Performs the SOCKS5 UDP ASSOCIATE handshake and returns the relay socket
 /// address together with the TCP control connection (which must stay open).
 async fn socks5_udp_associate(proxy: SocketAddr) -> (SocketAddr, TcpStream) {
@@ -273,6 +321,41 @@ async fn main() {
         );
     }
 
+    // The same measurement against each competitor, so the row is comparable rather
+    // than merely large. Every stack gets the same payload, window and round count.
+    let mut vendors: Vec<(&str, f64)> = Vec::new();
+    for name in ["sing-box", "xray"] {
+        let port = get_free_port().await;
+        let Some(mut child) = spawn_vendor(name, port) else {
+            continue;
+        };
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut up = false;
+        for _ in 0..200 {
+            if TcpStream::connect(addr).await.is_ok() {
+                up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        if up
+            && let Ok((relay, _ctl)) =
+                async { Ok::<_, std::io::Error>(socks5_udp_associate(addr).await) }.await
+        {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut samples = Vec::new();
+            for _ in 0..args.rounds {
+                samples.push(
+                    measure_udp(&client, relay, echo_addr, &payload, args.count, args.window).await,
+                );
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            vendors.push((name, samples[samples.len() / 2]));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     let _ = flux.kill();
     let _ = flux.wait();
 
@@ -290,6 +373,9 @@ async fn main() {
     println!("{}", "-".repeat(72));
     println!("{:<34}{:>18.0}", "Direct UDP echo (baseline)", d);
     println!("{:<34}{:>18.0}", "flux-core (SOCKS5 UDP relay)", f);
+    for (name, pps) in &vendors {
+        println!("{:<34}{:>18.0}", format!("{name} (SOCKS5 UDP relay)"), pps);
+    }
     println!("{}", "-".repeat(72));
     println!(
         "flux-core: {:.0} pps, {:.1} Mbit/s payload, {:.1} µs/round-trip",
@@ -298,6 +384,9 @@ async fn main() {
         1e6 / f
     );
     println!("relay overhead vs direct: {:+.1}%", (f / d - 1.0) * 100.0);
+    for (name, pps) in &vendors {
+        println!("flux-core vs {name}: {:+.1}%", (f / pps - 1.0) * 100.0);
+    }
     println!("{}", "=".repeat(72));
 
     assert!(
