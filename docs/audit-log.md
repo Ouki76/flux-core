@@ -2599,3 +2599,31 @@ Six consecutive full-matrix runs since the establishment bound landed have been 
 where three of the previous five failed. That is encouraging and it is **not** proof: the
 failure rate was never high enough for six runs to settle it, and the detector has not
 caught a recurrence yet. Recorded as "not seen in six runs", not as "fixed".
+
+---
+
+## Cycle 52 — 2026-10-24
+
+### The routing model, written down where it matters
+
+`flux-router` had 78 undocumented public items — the whole rule model among them. The
+crate root now states what the types cannot: conditions are ANDed, empty ones are ignored,
+rules are evaluated in configuration order and the first match wins, registries are
+injected — and **a rule whose registry is missing fails to match rather than matching
+everything**, which is a security property and was previously only true by accident of the
+code being read by whoever wrote it.
+
+Every field of `Rule`, `RuleSet`, `CompiledRuleSet`, `GeoIpConfig`, `IpRangeSet` and
+`PortRange` is documented, and the constructors explain their subtleties
+(`from_cidrs` merges overlaps so lookups stay logarithmic; `compile_cidrs` exists so that
+matching never parses).
+
+Enabling `#![warn(missing_docs)]` immediately paid for itself twice: strict
+`cargo doc -D warnings` caught a redundant explicit link, and clippy refused to build the
+crate until the remaining 42 items were done — which is how a lint should behave.
+
+### Three crates done, three to go
+
+`flux-types` (63 items), `flux-common` (14) and `flux-router` (78) are documented and
+enforced. Remaining: `flux-dns` (271), `flux-protocol`, `flux-transport`, `flux-inbound`,
+`flux-outbound`, `flux-app` — the largest crates, in their own cycles.
