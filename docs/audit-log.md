@@ -2452,3 +2452,49 @@ Applied to both sides of the TLS layer.
 
 Two tests pin the adapter's contract, including the case that matters — a short inner
 stream must still end cleanly rather than look like a hang.
+
+---
+
+## Cycle 48 — 2026-10-24
+
+### The stall is real, is not mine, and is now bounded by evidence
+
+Wrapping the server side of the TLS layer in the coalescing adapter correlated with warm-up
+hangs, so that half was reverted — the client-side wrap carries the whole measured gain
+(Trojan 288.6 vs sing-box 291.7). An unproven half is not worth a hang.
+
+But removing **both** wraps does not remove the stall:
+
+    4 runs of `--only WS`, flux + sing-box + xray running together:
+    failures 0, 0, 0, 3
+
+So it predates this cycle and only appears under that specific load. What the diagnostics
+establish, which is more than before:
+
+- both flux processes report `cpu_ticks=2` and sleep in `futex` — nothing is spinning;
+- the copier's liveness backstop never fires — the copier is not the parked task;
+- only TLS-carrying paths do it; plain TCP never has.
+
+Which narrows it to a stall **before** the data path: the TLS/WS handshake, or process
+start, under contention. The next attempt should first make the harness snapshot the pids
+of the processes that actually timed out (it may be reporting ones already respawned) and
+then instrument the handshake, not the relay.
+
+### Where the matrix stands after the framing work
+
+Five interleaved rounds, 200 MiB, all three stacks — fluxes present on every row except the
+one that hung:
+
+| path | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | 669 | 607 | 591 | **+10.3 %** | **+13.2 %** |
+| REALITY | 286 | 318 | 227 | −10.1 % | **+26.1 %** |
+| REALITY + Vision | 295 | 296 | 237 | **−0.4 %** | **+24.5 %** |
+| VMess / WS | 180 | 191 | 162 | −5.8 % | **+11.0 %** |
+| Trojan / TLS | 278 | 290 | — | −4.0 % | — |
+| Shadowsocks-2022 | 290 | 344 | 269 | −15.8 % | **+7.8 %** |
+| Shadowsocks-AEAD | 259 | 243 | — | **+6.4 %** | — |
+| gRPC | 95 | 114 | 190 | −17.1 % | −49.9 % |
+
+Ahead of xray on six of eight, within 11 % of sing-box on everything but gRPC and
+Shadowsocks-2022, and 14-58 % cheaper on CPU everywhere.
