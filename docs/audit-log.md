@@ -2920,3 +2920,51 @@ per byte. Measured on WS+TLS: **262 vs 258 MB/s** — noise. Reverted rather tha
 
 **Seven of eight against xray, two of nine against sing-box, within 12 % on the rest**, and
 28-68 % cheaper on CPU everywhere with a third of the memory.
+
+---
+
+## Cycle 61 — 2026-10-24
+
+### mKCP server side: the last functional gap closed
+
+Every inbound used to bind its own TCP listener, so there was nowhere to hand an
+already-established stream — and `carrier: kcp` on an inbound was refused with a sentence
+explaining exactly that. The sentence was accurate, and it also described the refactor
+needed to remove it.
+
+The refactor was smaller than the sentence implied: `serve_connection` takes a plain stream
+instead of a socket, so the transport layers, the VLESS handshake and dispatch are the
+*same code* for TCP and for mKCP. The carrier is now just where the bytes come from.
+
+Verified in both directions against the real binary:
+
+| direction | test |
+|---|---|
+| our client → Xray server | `vless_over_mkcp_reaches_a_real_xray_server` |
+| **Xray client → our server** | `a_real_xray_client_reaches_our_mkcp_server` |
+
+Two details needed care, and both were caught by tests rather than by thought:
+
+1. mKCP is a **stream** carrier that travels over UDP, so it must skip the datagram
+   branches (`shadowsocks`/`hysteria2`/`tuic`) that `is_udp` selects. Its config parsed and
+   then failed with "carrier UDP currently supports…" until that was made explicit.
+2. The socket tuning (`optimize_tcp_socket`) is TCP-only, so it had to stay out of the
+   shared path.
+
+The test that asserted the *refusal* was replaced by one that asserts the behaviour.
+
+### Functional gaps: closed
+
+| gap | state |
+|---|---|
+| mKCP | ✅ client **and server**, interop proven both ways |
+| XHTTP | ✅ stream-one, interop proven, measured at +24 % over xray |
+| IDNA | ✅ |
+| GeoIP fixture | ✅ |
+| private-CA knob | ✅ |
+| UDP associations | ✅ |
+| nested config-key typo detection | ✅ |
+| browser-grade ClientHello | partial — rustls cannot emit one; documented and pinned by tests |
+
+The only item left marked partial is the one that is a property of the TLS library rather
+than of this codebase, and it is written down as such rather than claimed.
