@@ -2820,3 +2820,55 @@ is 96/114 = 18 %, and the entire remaining gap to sing-box on this row is our ow
 framing above h2 — not TLS, not the transport, not flow control. That is the most precise
 statement this audit can make about the row, and it is written here rather than chased
 further.
+
+---
+
+## Cycle 59 — 2026-10-24
+
+### XHTTP, closed — and how the reference implementation made it quick
+
+The last transport gap in the objective is now implemented and proven: XHTTP (`splithttp`)
+in `stream-one` mode, interoperating with Xray 26.3.27 in both directions.
+
+XHTTP carries the tunnel inside ordinary HTTP — upload is a POST body, download is the
+response body — and of its three modes, `stream-one` is the one where a single request
+keeps both directions open. It is also the mode Xray itself selects when XHTTP is used with
+REALITY, and the only one that needs no sequence numbers or reassembly. The other two
+(`packet-up`, `stream-up`) are not implemented, and the configuration does not pretend
+otherwise.
+
+Because it is built on the HTTP/2 machinery this workspace already had, the transport was
+mostly a request shape: a POST whose body is the upload and whose response is the download
+is what `h2::shared` already knew how to do.
+
+**Four details had to match Xray, and each was found by reading its server rather than by
+guessing:**
+
+| what | what happened without it |
+|---|---|
+| `x_padding` query parameter | `invalid padding (query, key=x_padding) length:0` |
+| its **encoded** length within 100-1000 | `length:1287` |
+| path normalised with a trailing slash | `failed to validate path, request:/tunnel, config:/tunnel/` |
+| **no session id in the path** | `stream-up mode is not allowed` |
+
+That last one is the whole trick of `stream-one`: the absence of a session id is what
+selects the mode. Adding one silently turned the request into a different transport mode,
+and the server named it.
+
+The loop stayed short because the reference implementation *is* the specification, and it
+answers every mistake with a specific sentence. `tests/test_xhttp_interop.rs` relays 32 KiB
+through a real Xray node and compares every byte.
+
+### Functional gaps, scored
+
+| gap | state |
+|---|---|
+| mKCP | ✅ client, interop proven both ways |
+| **XHTTP** | ✅ **stream-one, interop proven** |
+| IDNA | ✅ |
+| GeoIP fixture | ✅ |
+| private-CA knob | ✅ |
+| UDP associations | ✅ |
+| nested config-key typo detection | ✅ |
+| browser-grade ClientHello | partial — rustls cannot emit one; the cipher table is Chrome's, GREED is absent, and tests pin what is actually sent |
+| mKCP server side | open — needs every inbound to accept an injected stream |
