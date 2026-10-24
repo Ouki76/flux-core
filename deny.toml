@@ -17,11 +17,10 @@
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
-# RUSTSEC-2024-0449: unsafe-libyaml (transitive via serde_yaml_ng) is unmaintained.
-# Accepted risk: no safe drop-in replacement exists yet (saphyr migration tracked
-# separately); the YAML parser only processes trusted local operator config, never
-# untrusted network input.
-ignore = ["RUSTSEC-2024-0449"]
+# No advisory is currently accepted. The previous entry (RUSTSEC-2024-0449,
+# unsafe-libyaml via serde_yaml_ng) is gone because the dependency was replaced with
+# serde_norway, which does not vendor libyaml.
+ignore = []
 
 [licenses]
 # The workspace is MIT-licensed; permit the standard permissive set used by

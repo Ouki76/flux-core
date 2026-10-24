@@ -1383,12 +1383,12 @@ impl Config {
     /// Parse configuration from a YAML string (with env vars).
     pub fn from_yaml_str(raw: &str) -> FluxResult<Self> {
         let expanded = expand_env_vars_skipping_comments(raw).map_err(FluxError::Config)?;
-        let cfg: Self = serde_yaml_ng::from_str(&expanded)
+        let cfg: Self = serde_norway::from_str(&expanded)
             .map_err(|e| FluxError::Config(format!("failed to parse yaml config: {}", e)))?;
         // Same deep key check as the JSON path: YAML is converted to JSON so one
         // implementation covers both.
         if let (Ok(raw_v), Ok(typed)) = (
-            serde_yaml_ng::from_str::<serde_json::Value>(&expanded),
+            serde_norway::from_str::<serde_json::Value>(&expanded),
             serde_json::to_value(&cfg),
         ) {
             reject_unknown_keys(&raw_v, &typed, "config")?;
