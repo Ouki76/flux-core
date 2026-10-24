@@ -2346,3 +2346,33 @@ Carrying the same 200 MiB Shadowsocks-2022 transfer, two processes each:
 20-68 % less CPU on every path. That is now stated in the README next to the throughput
 table, because a proxy that is fast and cheap is the actual goal, not a fast one that
 pins a core and a hundred megabytes.
+
+---
+
+## Cycle 44 — 2026-10-24
+
+### Two correctness bugs that only a hostile peer would find
+
+**tokio's unsound `AsyncFd::new`.** Upgrading tokio (cycle 42) made the compiler refuse the
+TUN inbound: `AsyncFd::new` is deprecated as unsound because it cannot prove the descriptor
+stays open and unreused for the reactor's lifetime. Migrated to `AsyncFd::register`, whose
+contract is exactly what passing an `OwnedFd` provides, with the reason written at the call
+site rather than in a commit message.
+
+**A legal Shadowsocks-2022 chunk that would hang the connection.** The chunk length prefix
+is 16 bits, so a peer may send a **65 535-byte** chunk — larger than the 64 KiB receive
+buffer. The read loop would then ask the socket for zero bytes forever: a hang, from a
+perfectly legal frame.
+
+The test needed a raw peer, because our own writer frames at 16 KiB and a normal round trip
+never produces the case. It seals the fixed header, the address chunk and one 65 535-byte
+chunk by hand with the same AEAD the protocol uses. Verified failing without the buffer
+growth, passing with it.
+
+### Fuzzing the parsers that face the network first
+
+The pseudo-fuzz harness covered ten parsers but not WebSocket frames or mKCP segments —
+both driven by unauthenticated peers. Added: 500 WebSocket cases in both roles (no panic,
+no hang, bounded output) and 12 000 mKCP datagrams across all six obfuscation modes.
+
+**1069 tests, 0 failed**; clippy, fmt, `cargo audit`, `cargo deny`, `cargo doc` all clean.
