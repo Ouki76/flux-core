@@ -226,6 +226,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_get_is_refused() {
+        // `stream-one` is the POST branch; a GET belongs to `stream-down`, which this
+        // implementation does not speak. Answering 200 would leave a client waiting for
+        // a download stream that never carries anything.
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move { accept(server_io, "/tunnel").await.is_err() });
+        let mut client = shared::client_handshake(client_io, "xhttp")
+            .await
+            .expect("client");
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/tunnel/")
+            .body(())
+            .unwrap();
+        let _ = client.send_request(request, false);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("must not hang")
+                .expect("task")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deep_path_under_the_base_is_accepted() {
+        // Xray appends things to the base path; the prefix rule must not be exact-match.
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let server = tokio::spawn(async move {
+            let mut s = accept(server_io, "/tunnel").await.expect("accept");
+            let mut buf = [0u8; 3];
+            s.read_exact(&mut buf).await.expect("read");
+            s.write_all(&buf).await.expect("write");
+            let _ = s.shutdown().await;
+        });
+        let mut client = shared::client_handshake(client_io, "xhttp")
+            .await
+            .expect("client");
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/tunnel/session-a")
+            .body(())
+            .unwrap();
+        let (response, mut send) = client.send_request(request, false).expect("send");
+        let response = response.await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        send.send_data(Bytes::from_static(b"abc"), false)
+            .expect("data");
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(5), body.data())
+            .await
+            .expect("must not hang")
+            .expect("chunk")
+            .expect("ok");
+        assert_eq!(&chunk[..], b"abc");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    }
+
+    #[tokio::test]
     async fn a_path_outside_the_base_is_refused() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move { accept(server_io, "/tunnel").await.is_err() });
