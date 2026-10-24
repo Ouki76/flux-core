@@ -7,7 +7,10 @@ use std::str::FromStr;
 /// Target address representation supporting both IP addresses and domain names.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TargetAddress {
+    /// A literal IP address and port, as it appeared on the wire.
     Ip(SocketAddr),
+    /// A domain name and port. The name is stored as it arrived; normalisation is a
+    /// separate, explicit step because it can fail.
     Domain(String, u16),
 }
 
@@ -30,10 +33,12 @@ pub fn normalize_domain(host: &str) -> String {
 }
 
 impl TargetAddress {
+    /// A destination from an already-parsed IP and a port.
     pub fn ip(ip: IpAddr, port: u16) -> Self {
         Self::Ip(SocketAddr::new(ip, port))
     }
 
+    /// An IPv4 destination from its four octets, for tests and literals.
     pub fn ipv4(a: u8, b: u8, c: u8, d: u8, port: u16) -> Self {
         Self::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port))
     }
@@ -49,6 +54,7 @@ impl TargetAddress {
         Self::Domain(normalize_domain(&domain.into()), port)
     }
 
+    /// The destination port, whichever variant this is.
     pub fn port(&self) -> u16 {
         match self {
             Self::Ip(addr) => addr.port(),
@@ -56,6 +62,8 @@ impl TargetAddress {
         }
     }
 
+    /// The destination host as text: the address in its usual notation, or the
+    /// domain name exactly as it was stored.
     pub fn host(&self) -> String {
         match self {
             Self::Ip(addr) => addr.ip().to_string(),
@@ -63,14 +71,17 @@ impl TargetAddress {
         }
     }
 
+    /// True when this is an IPv4 literal.
     pub fn is_ipv4(&self) -> bool {
         matches!(self, Self::Ip(SocketAddr::V4(_)))
     }
 
+    /// True when this is an IPv6 literal.
     pub fn is_ipv6(&self) -> bool {
         matches!(self, Self::Ip(SocketAddr::V6(_)))
     }
 
+    /// True when this is a domain name rather than an address.
     pub fn is_domain(&self) -> bool {
         matches!(self, Self::Domain(..))
     }

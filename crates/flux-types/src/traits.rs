@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 
 /// A bidirectional stream of bytes with downcasting capabilities.
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Sync + Unpin {
+    /// The concrete stream behind the trait object, for the places that need to ask
+    /// a transport layer what it is (splice eligibility, for instance).
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
@@ -16,31 +18,41 @@ impl<T: AsyncRead + AsyncWrite + Send + Sync + Unpin + 'static> AsyncStream for 
     }
 }
 
+/// An erased stream, as it travels between the inbound, the dispatcher and the
+/// outbound.
 pub type BoxedStream = Box<dyn AsyncStream>;
 
 /// Composable stream dialer establishing carrier, security, and transport framing layers.
 #[async_trait]
 pub trait StreamDialer: Send + Sync {
+    /// Establishes one stream, with every configured layer already applied.
     async fn dial(&self) -> FluxResult<BoxedStream>;
 }
 
 /// A UDP packet endpoint representing an outbound association.
 #[async_trait]
 pub trait PacketEndpoint: Send + Sync {
+    /// Sends one datagram over the association.
     async fn send_packet(&self, packet: UdpPacket) -> FluxResult<()>;
+    /// Waits for the next datagram on the association.
     async fn recv_packet(&self) -> FluxResult<UdpPacket>;
 }
 
 /// Inbound adapter listening for client connections or packets.
 #[async_trait]
 pub trait Inbound: Send + Sync {
+    /// The tag this inbound was configured with; routing rules match on it.
     fn tag(&self) -> &str;
+    /// The protocol name, for logs and diagnostics.
     fn protocol(&self) -> &'static str {
         "inbound"
     }
+    /// Where this inbound listens, for logs. `None` for inbounds that do not bind a
+    /// socket (a transparent interceptor using an inherited descriptor, for example).
     fn listen_addr(&self) -> Option<String> {
         None
     }
+    /// Binds and begins accepting. Returns once the listener is up, not when it stops.
     async fn start(&self, dispatcher: Arc<dyn Dispatcher>) -> FluxResult<()>;
 
     /// Stops listening and releases the listening socket.
@@ -63,11 +75,15 @@ pub trait Inbound: Send + Sync {
 /// Outbound adapter routing connections to their ultimate destination.
 #[async_trait]
 pub trait Outbound: Send + Sync {
+    /// The outbound's configured tag; routing refers to it by this name.
     fn tag(&self) -> &str;
+    /// The protocol name, for logs and diagnostics.
     fn protocol(&self) -> &'static str {
         "outbound"
     }
+    /// Opens a stream to the session's destination through this outbound.
     async fn dial_stream(&self, meta: &SessionMeta) -> FluxResult<BoxedStream>;
+    /// Opens a datagram association to the session's destination.
     async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>>;
 
     /// Whether this outbound is a group (Selector, UrlTest, etc.)
@@ -117,20 +133,27 @@ pub trait Outbound: Send + Sync {
 
 /// Lookup registry for outbound groups (selector, urltest) to find candidate outbounds.
 pub trait OutboundLookup: Send + Sync {
+    /// Looks an outbound up by its configured tag.
     fn get(&self, tag: &str) -> Option<Arc<dyn Outbound>>;
 }
 
 /// Core dispatcher routing traffic from Inbounds to appropriate Outbounds.
 #[async_trait]
 pub trait Dispatcher: Send + Sync {
+    /// Routes a stream: picks an outbound, dials it, and relays until either side
+    /// closes. This is the entry point every stream inbound calls.
     async fn dispatch_stream(&self, meta: SessionMeta, inbound_stream: BoxedStream);
+    /// Dials the outbound a route selects, without relaying — for callers that need
+    /// the stream for something other than a straight copy.
     async fn dial_outbound(&self, meta: &SessionMeta) -> FluxResult<BoxedStream>;
+    /// Relays between two already-established streams.
     async fn bridge_streams(
         &self,
         meta: SessionMeta,
         inbound_stream: BoxedStream,
         outbound_stream: BoxedStream,
     );
+    /// Routes a datagram association, relaying until the channel closes.
     async fn dispatch_packet(
         &self,
         meta: SessionMeta,

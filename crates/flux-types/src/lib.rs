@@ -1,6 +1,17 @@
+#![warn(missing_docs)]
+
+//! Shared types: addressed destinations, the error enum, session metadata and the
+//! traits the crates in this workspace implement each other against.
+//!
+//! Nothing here performs I/O; it is the vocabulary the rest of the workspace shares.
+
+/// Destination addresses and their normalisation.
 pub mod address;
+/// The workspace error type and its result alias.
 pub mod error;
+/// Session metadata handed to routing and the connection table.
 pub mod session;
+/// The traits the crates in this workspace implement each other against.
 pub mod traits;
 
 pub use address::*;
