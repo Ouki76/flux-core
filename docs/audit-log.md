@@ -3242,3 +3242,46 @@ each inspected:
 So the strict-lint pass found nothing to fix. That is worth writing down precisely because it
 is unglamorous: the code is clean under much harsher rules than it enforces, and the reason
 to say so is that a future reader can stop looking.
+
+---
+
+## Cycle 68 — 2026-10-25
+
+### The plain-TLS row, and the measurement error it exposes
+
+Added `VLESS / TLS` — the cipher with no framing above it, for all three stacks. Three
+back-to-back runs of that single row, same binary, same command:
+
+| run | flux | sing-box | xray | vs sing-box | vs xray |
+|---|---|---|---|---|---|
+| 1 | 298.8 | 273.2 | 234.4 | +9.3 % | +27.4 % |
+| 2 | 266.0 | 324.8 | 210.3 | −18.1 % | +26.5 % |
+| 3 | 280.3 | 285.5 | 257.8 | −1.8 % | +8.7 % |
+
+**±15 % between runs.** This audit has been quoting single-run deltas of 5-16 % as if they
+were facts about the code. Most of them are not: they are inside the noise band of this
+host, which has been running benchmarks for hours.
+
+The repeatability test separates the two kinds of number:
+
+| row | run 1 | run 2 | run 3 | reading |
+|---|---|---|---|---|
+| VLESS / WS + TLS | −15.7 % | −7.0 % | −13.4 % | **a real ~13 % gap** — our absolute is stable at 247-258 while sing-box swings 275-306 |
+| VMess / WS + TLS | +3.3 % | −13.3 % | −1.4 % | parity, inside the noise |
+| VLESS / TLS | +9.3 % | −18.1 % | −1.8 % | parity, inside the noise |
+
+The rule this yields, and that the README now has to respect: **a difference smaller than
+about 15 % on this host is not evidence**, and a single run cannot distinguish "we are
+behind" from "the other stack had a good minute". Comparisons against xray survive this
+better, because xray's own numbers barely move (+22 to +28 % on the TLS rows every time).
+
+### WebSocket: two hypotheses, both dead
+
+| hypothesis | measurement |
+|---|---|
+| the mask loop (four bytes per iteration, manual assembly) | widened to eight bytes: 769 vs 771 MB/s |
+| masking itself | disabled entirely: 745 vs 769 MB/s — **masking is free** |
+
+So the 25 % that WebSocket costs over an HttpUpgrade layer (769 against 993) is not in the
+masking and not in the frame loop width. It is somewhere this cycle did not find, and the
+two experiments above are recorded so the next attempt starts past them.
