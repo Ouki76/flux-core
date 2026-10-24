@@ -19,13 +19,20 @@ use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use uuid::Uuid;
 
+/// The only TUIC version this implementation speaks.
 pub const TUIC_VERSION: u8 = 5;
+/// Authenticate the session.
 pub const TUIC_CMD_AUTHENTICATE: u8 = 0x00;
+/// Open a stream.
 pub const TUIC_CMD_CONNECT: u8 = 0x01;
+/// Send a datagram.
 pub const TUIC_CMD_PACKET: u8 = 0x02;
+/// Close a stream or association.
 pub const TUIC_CMD_DISSOCIATE: u8 = 0x03;
+/// Keepalive.
 pub const TUIC_CMD_HEARTBEAT: u8 = 0x04;
 
+/// Length of the fixed authentication frame.
 pub const TUIC_AUTH_LEN: usize = 2 + 16 + 32;
 
 /// Accepted clock skew for the stream-mode AUTH timestamp.
@@ -44,21 +51,30 @@ const ATYP_IPV6: u8 = 0x02;
 const ATYP_EMPTY: u8 = 0xff;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Settings for a TUIC v5 outbound.
 pub struct TuicV5Config {
+    /// Server host or address.
     pub server: String,
+    /// Server port.
     pub server_port: u16,
+    /// The user identity.
     pub uuid: Uuid,
+    /// The shared secret.
     pub password: String,
     #[serde(default = "default_congestion")]
+    /// Congestion-control algorithm, as named by the peer.
     pub congestion_control: String,
     #[serde(default = "default_zero_rtt")]
+    /// Whether to attempt 0-RTT, which is faster and weaker.
     pub zero_rtt: bool,
     #[serde(default)]
+    /// Skip certificate verification. Tests and pinned certificates only.
     pub insecure: bool,
     /// Extra trust anchors (PEM paths) pinned on top of the built-in roots.
     #[serde(skip)]
     pub ca_certs: Vec<std::path::PathBuf>,
     #[serde(default)]
+    /// SNI to present.
     pub server_name: Option<String>,
     /// ALPN protocols for the QUIC TLS handshake (default: ["tuic", "tuic-v5", "h3"]).
     #[serde(default)]
@@ -79,6 +95,7 @@ fn proto_err(msg: impl Into<String>) -> FluxError {
     }
 }
 
+/// Session setup and framing for TUIC v5.
 pub struct TuicV5Protocol;
 
 impl TuicV5Protocol {
@@ -133,6 +150,7 @@ impl TuicV5Protocol {
         now.abs_diff(ts) <= TUIC_STREAM_TOKEN_WINDOW_SECS
     }
 
+    /// The authentication frame for a session.
     pub fn build_auth_frame(uuid: &Uuid, token: &[u8; 32]) -> Vec<u8> {
         let mut buf = Vec::with_capacity(TUIC_AUTH_LEN);
         buf.push(TUIC_VERSION);

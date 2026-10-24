@@ -99,6 +99,7 @@ use tracing::{debug, trace, warn};
 /// This is the same pseudo-address sing-box uses (`sing-mux.Destination`), so
 /// either side can detect "this authenticated connection carries smux frames".
 pub const MUX_DESTINATION_FQDN: &str = "sp.mux.sing-box.arpa";
+/// The reserved destination port that marks a mux session.
 pub const MUX_DESTINATION_PORT: u16 = 444;
 
 /// smux protocol version spoken on the wire.
@@ -106,10 +107,15 @@ pub const SMUX_VERSION: u8 = 1;
 /// Frame header size in bytes.
 pub const FRAME_HEADER_LEN: usize = 8;
 
+/// Opens a stream.
 pub const CMD_SYN: u8 = 0;
+/// Closes one stream.
 pub const CMD_FIN: u8 = 1;
+/// Carries payload for a stream.
 pub const CMD_PSH: u8 = 2;
+/// Keepalive; ignored by the receiver.
 pub const CMD_NOP: u8 = 3;
+/// Updates the receive window; part of the smux keepalive.
 pub const CMD_UPD: u8 = 4;
 
 /// Preface version 0 (legacy, no padding field).
@@ -167,10 +173,12 @@ fn smux_eof(message: impl Into<String>) -> std::io::Error {
 /// the wire but not implemented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MuxProtocol {
+    /// The `Smux` variant.
     Smux,
 }
 
 impl MuxProtocol {
+    /// Parses a configuration value, rejecting anything unrecognised.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "smux" => Some(Self::Smux),
@@ -178,6 +186,7 @@ impl MuxProtocol {
         }
     }
 
+    /// The canonical name, as used in configuration.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Smux => "smux",
@@ -194,6 +203,7 @@ impl MuxProtocol {
 /// Runtime multiplex settings shared by the client and server halves.
 #[derive(Clone, Debug)]
 pub struct MuxConfig {
+    /// Which protocol this describes.
     pub protocol: MuxProtocol,
     /// Streams per session. The client treats it as a pooling target (it opens
     /// another session, then reuses the least loaded one); the server enforces
@@ -289,13 +299,18 @@ pub fn is_mux_destination(address: &TargetAddress) -> bool {
 /// A decoded smux frame header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
+    /// Protocol version byte.
     pub version: u8,
+    /// Frame command.
     pub cmd: u8,
+    /// Payload length for PSH frames.
     pub length: u16,
+    /// Stream this frame belongs to.
     pub stream_id: u32,
 }
 
 impl FrameHeader {
+    /// Builds the value with the protocol defaults.
     pub fn new(cmd: u8, stream_id: u32, length: u16) -> Self {
         Self {
             version: SMUX_VERSION,
@@ -1304,7 +1319,9 @@ impl MuxStream {
 /// The request that opens a multiplexed stream.
 #[derive(Clone, Debug)]
 pub struct StreamRequest {
+    /// Where a newly opened stream should go.
     pub destination: TargetAddress,
+    /// Only streams can be multiplexed.
     pub network: NetworkType,
     /// Per-datagram addressing (sing-box's `flagAddr`): every datagram carries
     /// its own destination instead of relying on the stream's.
@@ -1757,6 +1774,7 @@ pub struct MuxClient {
 }
 
 impl MuxClient {
+    /// Builds the value with the protocol defaults.
     pub fn new(dialer: Arc<dyn StreamDialer>, config: MuxConfig) -> Arc<Self> {
         Arc::new(Self {
             dialer,
@@ -1910,8 +1928,11 @@ impl PacketEndpoint for MuxPacketEndpoint {
 
 /// A stream accepted from a multiplexed session.
 pub struct AcceptedStream {
+    /// The underlying multiplexed stream.
     pub stream: MuxStream,
+    /// Where a newly opened stream should go.
     pub destination: TargetAddress,
+    /// Only streams can be multiplexed.
     pub network: NetworkType,
     /// Whether datagrams carry their own destination prefix.
     pub packet_addr: bool,

@@ -40,6 +40,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// The flow name a client sends to request Vision.
 pub const VISION_FLOW: &str = "xtls-rprx-vision";
 
 /// Continue: another padded frame follows.

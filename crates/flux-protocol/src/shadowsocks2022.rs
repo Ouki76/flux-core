@@ -13,17 +13,24 @@ use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+/// The BLAKE3 context string that separates session subkeys from anything else.
 pub const SS_2022_KDF_CONTEXT: &str = "shadowsocks 2022 session subkey";
+/// How far a timestamp may drift before a salt is rejected as a replay.
 pub const SS_2022_REPLAY_WINDOW_SECS: u64 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A Shadowsocks 2022 method, which fixes both key and salt length.
 pub enum Ss2022CipherMethod {
+    /// BLAKE3 key derivation with AES-128-GCM.
     Blake3Aes128Gcm,
+    /// BLAKE3 key derivation with AES-256-GCM.
     Blake3Aes256Gcm,
+    /// BLAKE3 key derivation with ChaCha20-Poly1305.
     Blake3ChaCha20Poly1305,
 }
 
 impl Ss2022CipherMethod {
+    /// `parse_str`.
     pub fn parse_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "2022-blake3-aes-128-gcm" => Some(Self::Blake3Aes128Gcm),
@@ -33,6 +40,7 @@ impl Ss2022CipherMethod {
         }
     }
 
+    /// Key length for this method.
     pub fn key_len(&self) -> usize {
         match self {
             Self::Blake3Aes128Gcm => 16,
@@ -41,6 +49,7 @@ impl Ss2022CipherMethod {
         }
     }
 
+    /// Salt length for this method.
     pub fn salt_len(&self) -> usize {
         match self {
             Self::Blake3Aes128Gcm => 16,
@@ -50,11 +59,13 @@ impl Ss2022CipherMethod {
     }
 }
 
+/// Remembers salts that have been seen, to reject replays.
 pub struct ReplayFilter {
     cache: Mutex<LruCache<Vec<u8>, u64>>,
 }
 
 impl ReplayFilter {
+    /// Builds the value with the protocol defaults.
     pub fn new(capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
@@ -62,6 +73,7 @@ impl ReplayFilter {
         }
     }
 
+    /// Records a salt; false means it was already seen or too old.
     pub fn check_and_insert(&self, salt: &[u8], timestamp: u64) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -80,6 +92,7 @@ impl ReplayFilter {
         true
     }
 
+    /// Records a salt with no timestamp check.
     pub fn check_and_insert_salt(&self, salt: &[u8]) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -94,6 +107,7 @@ impl ReplayFilter {
     }
 }
 
+/// `derive_2022_subkey`.
 pub fn derive_2022_subkey(psk: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
     let mut material = Vec::with_capacity(psk.len() + salt.len());
     material.extend_from_slice(psk);
@@ -208,6 +222,7 @@ fn increase_nonce(nonce: &mut [u8; 12]) {
     }
 }
 
+/// A stream carrying Shadowsocks 2022 chunks.
 pub struct Ss2022Stream<S> {
     inner: S,
     method: Ss2022CipherMethod,
@@ -277,6 +292,7 @@ impl<S> Ss2022Stream<S> {
         self.chunk_pos = 0;
     }
 
+    /// Client half of the handshake.
     pub fn new_client(
         inner: S,
         method: Ss2022CipherMethod,
@@ -322,6 +338,7 @@ impl<S> Ss2022Stream<S> {
         }
     }
 
+    /// Server half of the handshake.
     pub fn new_server(
         inner: S,
         method: Ss2022CipherMethod,
@@ -942,6 +959,7 @@ impl UdpReplayWindow {
     }
 }
 
+/// Seals and opens Shadowsocks 2022 datagrams.
 pub struct Ss2022UdpPacketCipher {
     method: Ss2022CipherMethod,
     psk: Vec<u8>,
@@ -971,6 +989,7 @@ pub struct Ss2022UdpPacketCipher {
 const UDP_PEER_CACHE: usize = 1024;
 
 impl Ss2022UdpPacketCipher {
+    /// Builds the value with the protocol defaults.
     pub fn new(method: Ss2022CipherMethod, psk: &[u8]) -> Self {
         let mut session_id = [0u8; 8];
         rand::rngs::OsRng.fill_bytes(&mut session_id);
@@ -995,6 +1014,7 @@ impl Ss2022UdpPacketCipher {
         nonce
     }
 
+    /// Seals one UDP datagram.
     pub fn encrypt_packet(
         &self,
         destination: &TargetAddress,
@@ -1025,6 +1045,7 @@ impl Ss2022UdpPacketCipher {
         Ok(out)
     }
 
+    /// Opens one UDP datagram.
     pub async fn decrypt_packet(&self, buf: &[u8]) -> FluxResult<(TargetAddress, bytes::Bytes)> {
         if buf.len() < 8 + 8 + 8 + 1 + 16 {
             return Err(FluxError::Protocol {
@@ -1124,6 +1145,7 @@ impl Ss2022UdpPacketCipher {
     }
 }
 
+/// Handshakes and framing for Shadowsocks 2022.
 pub struct Ss2022Protocol;
 
 impl Ss2022Protocol {

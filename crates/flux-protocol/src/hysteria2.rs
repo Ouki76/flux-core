@@ -7,32 +7,46 @@ use tokio::time::sleep;
 /// Budget for the complete Hysteria 2 HTTP/3 authentication exchange.
 pub const HY2_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The only Hysteria 2 version this implementation speaks.
 pub const HYSTERIA2_VERSION: u8 = 2;
+/// Command for a stream request.
 pub const HYSTERIA2_CMD_TCP: u8 = 1;
+/// Command for datagrams.
 pub const HYSTERIA2_CMD_UDP: u8 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// Settings for a Hysteria 2 outbound.
 pub struct Hysteria2Config {
+    /// Server host or address.
     pub server: String,
+    /// Ports to try, in preference order.
     pub ports: Vec<u16>,
+    /// The shared secret.
     pub password: String,
+    /// Advertised upload bandwidth, used by the congestion controller.
     pub up_mbps: u64,
+    /// Advertised download bandwidth, used by the congestion controller.
     pub down_mbps: u64,
     #[serde(default = "default_hop_interval_secs")]
+    /// Seconds between port hops.
     pub hop_interval_secs: u64,
     #[serde(default)]
+    /// Skip certificate verification. Tests and pinned certificates only.
     pub insecure: bool,
     /// Extra trust anchors (PEM paths) pinned on top of the built-in roots.
     #[serde(skip)]
     pub ca_certs: Vec<std::path::PathBuf>,
     #[serde(default)]
+    /// SNI to present.
     pub server_name: Option<String>,
     #[serde(default)]
+    /// Obfuscation password, when any.
     pub obfs: Option<String>,
     /// ALPN protocols for the QUIC TLS handshake (default: ["h3", "hysteria2"]).
     #[serde(default)]
     pub alpn: Option<Vec<String>>,
     #[serde(default)]
+    /// Whether to carry the stream over HTTP/3 rather than raw QUIC.
     pub h3: bool,
 }
 
@@ -56,6 +70,7 @@ pub struct BrutalPacer {
 }
 
 impl BrutalPacer {
+    /// Builds the value with the protocol defaults.
     pub fn new(mbps: u64) -> Self {
         // Clamp before multiplying: `mbps * 1_000_000` overflows for values above
         // ~1.8e13 (panic in debug, wrap in release), and a wrapped zero would
@@ -103,6 +118,7 @@ pub struct PortHopper {
 }
 
 impl PortHopper {
+    /// Builds the value with the protocol defaults.
     pub fn new(ports: Vec<u16>, hop_interval_secs: u64) -> Self {
         let clean_ports = if ports.is_empty() { vec![443] } else { ports };
         Self {
@@ -123,6 +139,7 @@ impl PortHopper {
     }
 }
 
+/// Handshakes and framing for Hysteria 2.
 pub struct Hysteria2Protocol;
 
 impl Hysteria2Protocol {

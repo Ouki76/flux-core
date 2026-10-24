@@ -6,8 +6,10 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use uuid::Uuid;
 
+/// The only protocol version this implementation speaks.
 pub const VLESS_VERSION: u8 = 0x00;
 
+/// Command for a stream request.
 pub const VLESS_CMD_TCP: u8 = 0x01;
 /// Classic UDP: the destination comes from the request header and each datagram
 /// is a bare `[len u16 BE][payload]`.
@@ -17,15 +19,23 @@ pub const VLESS_CMD_UDP: u8 = 0x02;
 /// an inbound that only understands [`VLESS_CMD_UDP`] cannot serve it.
 pub const VLESS_CMD_PACKETADDR: u8 = 0x03;
 
+/// Address type: IPv4 literal.
 pub const VLESS_ATYP_IPV4: u8 = 0x01;
+/// Address type: domain name.
 pub const VLESS_ATYP_DOMAIN: u8 = 0x02;
+/// Address type: IPv6 literal.
 pub const VLESS_ATYP_IPV6: u8 = 0x03;
 
 #[derive(Clone, Debug)]
+/// A parsed VLESS request header.
 pub struct VlessRequest {
+    /// The user identity.
     pub uuid: Uuid,
+    /// Which command the client sent: stream or datagram.
     pub command: u8,
+    /// Where the client asked to go.
     pub address: TargetAddress,
+    /// Whether the client negotiated the Vision flow.
     pub is_vision: bool,
 }
 
@@ -40,6 +50,7 @@ pub struct VlessClientStream<S> {
 }
 
 impl<S> VlessClientStream<S> {
+    /// Builds the value with the protocol defaults.
     pub fn new(inner: S) -> Self {
         Self {
             inner,
@@ -149,6 +160,7 @@ fn constant_time_eq_uuid(a: &Uuid, b: &Uuid) -> bool {
     flux_common::constant_time_eq(a.as_bytes(), b.as_bytes())
 }
 
+/// Handshakes and header encoding for VLESS.
 pub struct VlessProtocol;
 
 impl VlessProtocol {

@@ -70,6 +70,7 @@ impl VmessHasher {
     }
 }
 
+/// `vmess_kdf`.
 pub fn vmess_kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
     let mut creator: Box<dyn Fn() -> VmessHasher> =
         Box::new(|| VmessHasher::new_hmac(&VmessHasher::new_sha256, b"VMess AEAD KDF"));
@@ -92,6 +93,7 @@ fn nonce12(full: &[u8; 32]) -> [u8; 12] {
     n
 }
 
+/// `vmess_kdf_16`.
 pub fn vmess_kdf_16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
     let full = vmess_kdf(key, path);
     let mut out = [0u8; 16];
@@ -99,6 +101,7 @@ pub fn vmess_kdf_16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
     out
 }
 
+/// `crc32_ieee`.
 pub fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
@@ -114,6 +117,7 @@ pub fn crc32_ieee(data: &[u8]) -> u32 {
     !crc
 }
 
+/// `vmess_user_cmd_key`.
 pub fn vmess_user_cmd_key(uuid: &Uuid) -> [u8; 16] {
     use md5::{Digest, Md5};
     let mut hasher = Md5::new();
@@ -133,15 +137,23 @@ pub fn vmess_user_cmd_key(uuid: &Uuid) -> [u8; 16] {
 /// was sized from the wire) an out-of-bounds slice panic.
 pub const MAX_VMESS_RESP_HDR: usize = 4;
 
+/// The only protocol version this implementation speaks.
 pub const VMESS_VERSION: u8 = 1;
+/// Security type byte: aes-128-gcm.
 pub const VMESS_SECURITY_AES_128_GCM: u8 = 3;
+/// Security type byte: chacha20-poly1305.
 pub const VMESS_SECURITY_CHACHA20_POLY1305: u8 = 4;
 
+/// Command byte for a stream request.
 pub const VMESS_CMD_TCP: u8 = 1;
+/// Command byte for datagrams.
 pub const VMESS_CMD_UDP: u8 = 2;
 
+/// Address type byte: IPv4 literal.
 pub const VMESS_ATYP_IPV4: u8 = 1;
+/// Address type byte: domain name.
 pub const VMESS_ATYP_DOMAIN: u8 = 2;
+/// Address type byte: IPv6 literal.
 pub const VMESS_ATYP_IPV6: u8 = 3;
 
 use sha3::Shake128;
@@ -150,17 +162,27 @@ use sha3::digest::{ExtendableOutput, Update, XofReader};
 type Shake128Xof = <Shake128 as ExtendableOutput>::Reader;
 
 #[derive(Clone, Debug)]
+/// A parsed VMess request header.
 pub struct VmessRequest {
+    /// The user identity.
     pub uuid: Uuid,
+    /// Which command the client sent: stream or datagram.
     pub command: u8,
+    /// Where the client asked to go.
     pub address: TargetAddress,
+    /// Which cipher the payload is sealed with.
     pub security: u8,
+    /// Per-session key derived from the user id.
     pub session_key: [u8; 16],
+    /// IV derived for this session, which seeds the chunk nonces.
     pub session_iv: [u8; 16],
+    /// The response header byte the peer must see.
     pub resp_header: u8,
+    /// Feature bits: chunk masking and the masking algorithm.
     pub option: u8,
 }
 
+/// Handshakes and header encoding for VMess.
 pub struct VmessProtocol;
 
 impl VmessProtocol {
@@ -628,6 +650,7 @@ fn derive_resp_key_iv(key: &[u8; 16], iv: &[u8; 16]) -> ([u8; 16], [u8; 16]) {
     (resp_key, resp_iv)
 }
 
+/// A stream carrying VMess chunks.
 pub struct VmessStream<S> {
     inner: S,
     enc_cipher: VmessCipher,
@@ -668,10 +691,12 @@ pub struct VmessStream<S> {
 }
 
 impl<S> VmessStream<S> {
+    /// Builds the value with the protocol defaults.
     pub fn new(inner: S, key: [u8; 16], iv: [u8; 16], security: u8) -> Self {
         Self::new_client(inner, key, iv, security, 0x55, 0x05)
     }
 
+    /// Client half of the handshake.
     pub fn new_client(
         inner: S,
         key: [u8; 16],
@@ -727,6 +752,7 @@ impl<S> VmessStream<S> {
         }
     }
 
+    /// Server half of the handshake.
     pub fn new_server(
         inner: S,
         key: [u8; 16],

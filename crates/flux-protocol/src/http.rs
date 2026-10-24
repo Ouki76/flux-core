@@ -2,6 +2,7 @@ use base64::prelude::*;
 use flux_types::{FluxError, FluxResult, TargetAddress};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// HTTP CONNECT and absolute-form request parsing.
 pub struct HttpHandshake;
 
 impl HttpHandshake {

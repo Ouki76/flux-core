@@ -3,9 +3,12 @@ use flux_types::{FluxError, FluxResult, NetworkType, TargetAddress};
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Command for a stream request.
 pub const TROJAN_CMD_CONNECT: u8 = 0x01;
+/// Command for datagrams.
 pub const TROJAN_CMD_UDP: u8 = 0x03;
 
+/// The SHA-224 hex digest Trojan authenticates with.
 pub fn hash_trojan_password(password: &str) -> String {
     let mut hasher = Sha224::new();
     hasher.update(password.as_bytes());
@@ -13,6 +16,7 @@ pub fn hash_trojan_password(password: &str) -> String {
     format!("{:x}", result)
 }
 
+/// Handshake and framing for Trojan.
 pub struct TrojanProtocol;
 
 impl TrojanProtocol {

@@ -92,22 +92,34 @@ fn kdf3(key: &[u8; 32], data: &[u8]) -> ([u8; 32], [u8; 32], [u8; 32]) {
 
 /// Standard WireGuard default message types
 pub const WG_MSG_INITIATION: u8 = 1;
+/// `WG_MSG_RESPONSE` — a protocol constant.
 pub const WG_MSG_RESPONSE: u8 = 2;
+/// `WG_MSG_COOKIE` — a protocol constant.
 pub const WG_MSG_COOKIE: u8 = 3;
+/// `WG_MSG_DATA` — a protocol constant.
 pub const WG_MSG_DATA: u8 = 4;
 
 /// AmneziaWG (AWG) Advanced Obfuscation Settings
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AwgConfig {
-    pub jc: u16,   // Junk packet count
+    /// AmneziaWG: number of junk packets sent before the handshake.
+    pub jc: u16, // Junk packet count
+    /// AmneziaWG: smallest junk packet, in bytes.
     pub jmin: u16, // Minimum junk packet size
+    /// AmneziaWG: largest junk packet, in bytes.
     pub jmax: u16, // Maximum junk packet size
-    pub s1: u16,   // Initiation junk prefix size
-    pub s2: u16,   // Response junk prefix size
-    pub h1: u32,   // Initiation message type (default: 1)
-    pub h2: u32,   // Response message type (default: 2)
-    pub h3: u32,   // Cookie message type (default: 3)
-    pub h4: u32,   // Data message type (default: 4)
+    /// AmneziaWG: extra bytes prepended to the initiation packet.
+    pub s1: u16, // Initiation junk prefix size
+    /// AmneziaWG: extra bytes prepended to the response packet.
+    pub s2: u16, // Response junk prefix size
+    /// AmneziaWG: magic header for the initiation packet.
+    pub h1: u32, // Initiation message type (default: 1)
+    /// AmneziaWG: magic header for the response packet.
+    pub h2: u32, // Response message type (default: 2)
+    /// Whether to carry the stream over HTTP/3 rather than raw QUIC.
+    pub h3: u32, // Cookie message type (default: 3)
+    /// AmneziaWG: magic header for the transport packet.
+    pub h4: u32, // Data message type (default: 4)
 }
 
 impl Default for AwgConfig {
@@ -127,16 +139,22 @@ impl Default for AwgConfig {
 }
 
 #[derive(Clone, Debug)]
+/// Settings for a WireGuard or AmneziaWG peer.
 pub struct WireGuardConfig {
+    /// This peer’s static private key.
     pub private_key: [u8; 32],
+    /// The other peer’s static public key.
     pub peer_public_key: [u8; 32],
+    /// Optional pre-shared key mixed into the handshake.
     pub preshared_key: Option<[u8; 32]>,
+    /// The address and port to send transport packets to.
     pub server_address: TargetAddress,
     /// Local tunnel IP address used as the source address of encapsulated IP packets.
     /// Defaults to 10.0.0.2 (or fd00::2 for IPv6 destinations) when not configured.
     pub local_address: Option<std::net::IpAddr>,
     /// Persistent keepalive interval in seconds (WireGuard NAT keepalive). Default: 25.
     pub keepalive_secs: Option<u64>,
+    /// AmneziaWG parameters, when this peer is one.
     pub awg: Option<AwgConfig>,
 }
 
@@ -152,12 +170,14 @@ pub const WG_DATA_HEADER_LEN: usize = 16;
 pub const WG_AEAD_TAG_LEN: usize = 16;
 
 #[derive(Clone, Debug, Default)]
+/// The AntiReplayWindow type.
 pub struct AntiReplayWindow {
     last_counter: u64,
     bitmap: u64,
 }
 
 impl AntiReplayWindow {
+    /// Builds the value with the protocol defaults.
     pub fn new() -> Self {
         Self {
             last_counter: 0,
@@ -217,6 +237,7 @@ fn wg_data_key(key: &[u8; 32]) -> LessSafeKey {
     LessSafeKey::new(unbound)
 }
 
+/// The WireGuardSession type.
 pub struct WireGuardSession {
     /// Data-packet AEAD for each direction.
     ///
@@ -229,16 +250,24 @@ pub struct WireGuardSession {
     /// ChaCha20 runs four blocks in parallel. Same switch as the shadowsocks-2022
     /// data plane; see `Ss2022Aead` there.
     pub send_cipher: LessSafeKey,
+    /// The transport cipher for received packets.
     pub recv_cipher: LessSafeKey,
+    /// Nonce counter for outgoing transport packets.
     pub send_counter: u64,
+    /// Highest nonce seen on received transport packets.
     pub recv_counter: u64,
+    /// This side’s session index, chosen at handshake time.
     pub sender_index: u32,
+    /// The peer’s session index, echoed in transport packets.
     pub receiver_index: u32,
+    /// AmneziaWG parameters, when this peer is one.
     pub awg: AwgConfig,
+    /// Bitmap of recently seen counters, to reject replays.
     pub replay_window: AntiReplayWindow,
 }
 
 impl WireGuardSession {
+    /// Builds the value with the protocol defaults.
     pub fn new(
         send_key: [u8; 32],
         recv_key: [u8; 32],
@@ -403,16 +432,25 @@ fn blake2s_mix_hash(h: &[u8; 32], data: &[u8]) -> [u8; 32] {
 }
 
 #[derive(Clone, Debug)]
+/// The WireGuardHandshakeState type.
 pub struct WireGuardHandshakeState {
+    /// The chaining key, carried between handshake messages.
     pub c: [u8; 32],
+    /// The handshake hash, carried between handshake messages.
     pub h: [u8; 32],
+    /// This side’s static private key.
     pub local_static_priv: [u8; 32],
+    /// This handshake’s ephemeral private key.
     pub ephemeral_priv: [u8; 32],
+    /// The session index this side assigns.
     pub local_index: u32,
+    /// AmneziaWG parameters, when this peer is one.
     pub awg: AwgConfig,
+    /// The pre-shared key, when one is configured.
     pub psk: Option<[u8; 32]>,
 }
 
+/// The WireGuardHandshake type.
 pub struct WireGuardHandshake;
 
 impl WireGuardHandshake {
@@ -872,7 +910,9 @@ type HandshakeParts = (Vec<u8>, WireGuardSession, [u8; 32], [u8; 12]);
 /// An authorized WireGuard peer entry for server-side handshake authentication.
 #[derive(Clone, Debug)]
 pub struct WireGuardPeerAuth {
+    /// The public key to advertise in a parse result.
     pub public_key: [u8; 32],
+    /// Optional pre-shared key mixed into the handshake.
     pub preshared_key: Option<[u8; 32]>,
 }
 

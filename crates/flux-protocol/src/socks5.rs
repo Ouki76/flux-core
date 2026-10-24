@@ -2,36 +2,59 @@ use flux_types::{FluxError, FluxResult, TargetAddress};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// The only version this implementation speaks.
 pub const SOCKS5_VERSION: u8 = 0x05;
+/// No authentication required.
 pub const METHOD_NO_AUTH: u8 = 0x00;
+/// Username and password.
 pub const METHOD_PASSWORD: u8 = 0x02;
+/// No offered method is acceptable; the server closes.
 pub const METHOD_NO_ACCEPTABLE: u8 = 0xFF;
 
+/// Open a stream to the requested address.
 pub const CMD_CONNECT: u8 = 0x01;
+/// Listen for an inbound connection; rarely used, but defined.
 pub const CMD_BIND: u8 = 0x02;
+/// Open a datagram association.
 pub const CMD_UDP_ASSOCIATE: u8 = 0x03;
 
+/// Address type: IPv4 literal.
 pub const ATYP_IPV4: u8 = 0x01;
+/// Address type: domain name.
 pub const ATYP_DOMAIN: u8 = 0x03;
+/// Address type: IPv6 literal.
 pub const ATYP_IPV6: u8 = 0x04;
 
+/// The request succeeded.
 pub const REP_SUCCESS: u8 = 0x00;
+/// A server-side failure with no more specific code.
 pub const REP_GENERAL_FAILURE: u8 = 0x01;
+/// A rule refused the connection.
 pub const REP_CONNECTION_NOT_ALLOWED: u8 = 0x02;
+/// The destination refused the connection.
 pub const REP_CONNECTION_REFUSED: u8 = 0x05;
+/// The command is not supported by this server.
 pub const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
+/// The address type is not supported.
 pub const REP_ADDRESS_TYPE_NOT_SUPPORTED: u8 = 0x08;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// The three commands a client may send.
 pub enum Socks5Command {
+    /// The `Connect` variant.
     Connect,
+    /// The `UdpAssociate` variant.
     UdpAssociate,
+    /// The `Bind` variant.
     Bind,
 }
 
 #[derive(Clone, Debug)]
+/// A parsed SOCKS5 request.
 pub struct Socks5Request {
+    /// /// Which command was requested.
     pub command: Socks5Command,
+    /// /// The requested destination.
     pub address: TargetAddress,
 }
 

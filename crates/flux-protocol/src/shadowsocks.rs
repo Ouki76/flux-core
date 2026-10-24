@@ -11,21 +11,31 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// The HKDF info string that derives the per-connection subkey.
 pub const SS_SUBKEY_INFO: &[u8] = b"ss-subkey";
+/// Length of the AEAD tag, in bytes.
 pub const TAG_LEN: usize = 16;
+/// Salt length for the AEAD key derivation.
 pub const SALT_LEN: usize = 32;
+/// Largest chunk the AEAD framing allows, from the specification.
 pub const MAX_PAYLOAD_LEN: usize = 0x3FFF; // 16383 bytes (Shadowsocks AEAD RFC specification)
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// A Shadowsocks cipher: the AEAD methods plus the 2022 family.
 pub enum CipherKind {
     #[default]
+    /// ChaCha20-Poly1305 with the IETF nonce.
     ChaCha20IetfPoly1305,
+    /// AES-256-GCM.
     Aes256Gcm,
+    /// AES-128-GCM.
     Aes128Gcm,
+    /// A Shadowsocks 2022 method, which has its own framing.
     Ss2022(crate::shadowsocks2022::Ss2022CipherMethod),
 }
 
 impl CipherKind {
+    /// `parse_str`.
     pub fn parse_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "chacha20-ietf-poly1305" | "chacha20" | "chacha20-poly1305" => {
@@ -46,6 +56,7 @@ impl CipherKind {
         }
     }
 
+    /// Key length for this method.
     pub fn key_len(&self) -> usize {
         match self {
             Self::ChaCha20IetfPoly1305 | Self::Aes256Gcm => 32,
@@ -54,6 +65,7 @@ impl CipherKind {
         }
     }
 
+    /// Salt length for this method.
     pub fn salt_len(&self) -> usize {
         match self {
             Self::ChaCha20IetfPoly1305 | Self::Aes256Gcm => 32,
@@ -69,6 +81,7 @@ pub fn derive_master_key_for_kind(password: &str, kind: CipherKind) -> Vec<u8> {
     derive_master_key_len(password, kind.key_len())
 }
 
+/// `derive_master_key_len`.
 pub fn derive_master_key_len(password: &str, key_len: usize) -> Vec<u8> {
     let clean = password.trim();
     use base64::Engine;
@@ -130,10 +143,12 @@ pub struct ShadowsocksCipher {
 }
 
 impl ShadowsocksCipher {
+    /// Builds the value with the protocol defaults.
     pub fn new(subkey: &[u8]) -> Self {
         Self::with_kind(CipherKind::ChaCha20IetfPoly1305, subkey)
     }
 
+    /// A cipher for `kind`, keyed from `subkey`.
     pub fn with_kind(kind: CipherKind, subkey: &[u8]) -> Self {
         use crate::shadowsocks2022::Ss2022CipherMethod as M;
         let alg = match kind {
@@ -161,6 +176,7 @@ impl ShadowsocksCipher {
         }
     }
 
+    /// The method this cipher was built for.
     pub fn kind(&self) -> CipherKind {
         self.kind
     }
@@ -176,6 +192,7 @@ impl ShadowsocksCipher {
         n
     }
 
+    /// Encrypts one piece, advancing the nonce.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> FluxResult<Vec<u8>> {
         let nonce = self.next_nonce();
         let mut out = Vec::with_capacity(plaintext.len() + TAG_LEN);
@@ -184,6 +201,7 @@ impl ShadowsocksCipher {
         Ok(out)
     }
 
+    /// Decrypts one piece, advancing the nonce.
     pub fn decrypt(&mut self, ciphertext: &[u8]) -> FluxResult<Vec<u8>> {
         let nonce = self.next_nonce();
         let mut out = Vec::with_capacity(ciphertext.len());
@@ -300,6 +318,7 @@ pub struct ShadowsocksStream<S> {
 }
 
 impl<S> ShadowsocksStream<S> {
+    /// Builds the value with the protocol defaults.
     pub fn new(
         inner: S,
         enc: ShadowsocksCipher,
@@ -309,6 +328,7 @@ impl<S> ShadowsocksStream<S> {
         Self::new_with_initial_chunk(inner, enc, dec, master_key, vec![])
     }
 
+    /// Client half, with the first payload chunk already decided.
     pub fn new_with_initial_chunk(
         inner: S,
         enc: ShadowsocksCipher,
