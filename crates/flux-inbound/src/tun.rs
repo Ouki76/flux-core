@@ -1909,13 +1909,17 @@ impl Inbound for TunInbound {
                             e
                         ),
                     }
-                    let async_fd = tokio::io::unix::AsyncFd::new(owned_fd).map_err(|e| {
+                    // SAFETY: `owned_fd` is an `OwnedFd` moved into the `AsyncFd`, so the
+                    // descriptor stays open for exactly as long as the reactor holds it
+                    // and no other owner can close or reuse it.
+                    let async_fd = unsafe { tokio::io::unix::AsyncFd::register(owned_fd) }.map_err(|e| {
                         self.running.store(false, Ordering::SeqCst);
+                        let cause: std::io::Error = e.into();
                         FluxError::Io(std::io::Error::new(
-                            e.kind(),
+                            cause.kind(),
                             format!(
                                 "tun inbound '{}': failed to register device with the reactor: {}",
-                                self.tag, e
+                                self.tag, cause
                             ),
                         ))
                     })?;

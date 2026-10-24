@@ -635,8 +635,19 @@ impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
             // `__memcpy_avx`, with exactly one call per chunk (2 052 calls for 32 MiB).
             // Decrypting where the bytes already are removes that copy entirely.
             let total_payload_enc = this.payload_len + 16;
+            // The length prefix is 16 bits, so a peer may legitimately send a 65 535-byte
+            // chunk — larger than the 64 KiB default buffer. Without this the read loop
+            // would ask for zero bytes forever and the connection would hang. Grow to fit
+            // (compacting first so the growth is only as large as it must be).
+            this.compact_chunk();
+            if this.chunk_buf.len() < this.chunk_pos + total_payload_enc {
+                this.chunk_buf.resize(this.chunk_pos + total_payload_enc, 0);
+            }
             while this.chunk_filled - this.chunk_pos < total_payload_enc {
                 this.compact_chunk();
+                if this.chunk_buf.len() < this.chunk_pos + total_payload_enc {
+                    this.chunk_buf.resize(this.chunk_pos + total_payload_enc, 0);
+                }
                 let filled = this.chunk_filled;
                 let mut tmp_buf = ReadBuf::new(&mut this.chunk_buf[filled..]);
                 match Pin::new(&mut this.inner).poll_read(cx, &mut tmp_buf) {
@@ -1674,5 +1685,83 @@ mod batching_guard_tests {
             "one read returned {got} bytes: the reader is still stopping at a single \
              16 KiB chunk instead of filling the caller's buffer"
         );
+    }
+
+    /// A chunk may be as large as the 16-bit length prefix allows: 65 535 bytes of
+    /// payload, which does not fit the 64 KiB receive buffer. Our own writer never emits
+    /// one (it frames at 16 KiB), so this drives a **raw peer** that seals the stream by
+    /// hand — the only way to test the case.
+    #[tokio::test]
+    async fn a_peer_may_send_a_maximum_size_chunk() {
+        let psk = b"1234567890123456";
+        let method = Ss2022CipherMethod::Blake3Aes128Gcm;
+        let replay = ReplayFilter::new(1000);
+
+        // Seal a record with `aead` at `nonce`, returning payload‖tag.
+        let seal = |aead: &Ss2022Aead, nonce: [u8; 12], plain: &[u8]| {
+            let mut out = plain.to_vec();
+            aead.seal_tail(nonce, &mut out, 0).expect("seal");
+            out
+        };
+
+        let salt = [0x5au8; 16];
+        let subkey = derive_2022_subkey(psk, &salt, method.key_len());
+        let aead = Ss2022Aead::new(method, &subkey);
+
+        let mut nonce = [0u8; 12];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Fixed header: type, timestamp, address-chunk length.
+        let var_chunk = [0x01u8, 127, 0, 0, 1, 0, 80]; // IPv4 127.0.0.1:80
+        let mut fixed = Vec::new();
+        fixed.push(0x00);
+        fixed.extend_from_slice(&now.to_be_bytes());
+        fixed.extend_from_slice(&(var_chunk.len() as u16).to_be_bytes());
+        let enc_fixed = seal(&aead, nonce, &fixed);
+        increase_nonce(&mut nonce);
+        let enc_var = seal(&aead, nonce, &var_chunk);
+        increase_nonce(&mut nonce);
+
+        // One chunk carrying the largest length the 16-bit prefix allows.
+        let payload: Vec<u8> = (0..65_535).map(|i| (i % 251) as u8).collect();
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        let enc_big = seal(&aead, nonce, &framed);
+        increase_nonce(&mut nonce);
+        let enc_payload = seal(&aead, nonce, &payload);
+
+        let mut stream_bytes = Vec::new();
+        stream_bytes.extend_from_slice(&salt);
+        stream_bytes.extend_from_slice(&enc_fixed);
+        stream_bytes.extend_from_slice(&enc_var);
+        stream_bytes.extend_from_slice(&enc_big);
+        stream_bytes.extend_from_slice(&enc_payload);
+
+        let (peer, server_io) = tokio::io::duplex(1024 * 1024);
+        tokio::spawn(async move {
+            let mut peer = peer;
+            tokio::io::AsyncWriteExt::write_all(&mut peer, &stream_bytes)
+                .await
+                .expect("write stream");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        });
+
+        let (mut srv, _target, _extra) =
+            Ss2022Protocol::server_handshake(server_io, method, psk, &replay)
+                .await
+                .expect("server handshake");
+
+        let mut got = vec![0u8; 65_535];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tokio::io::AsyncReadExt::read_exact(&mut srv, &mut got),
+        )
+        .await
+        .expect("a maximum-size chunk must not hang")
+        .expect("read the whole chunk");
+        assert_eq!(got, payload, "a 65 535-byte chunk must survive intact");
     }
 }
