@@ -7,22 +7,35 @@ where that is not true, it says so.
 
 ---
 
-## 0. Where things stand right now (2026-10-24, after cycle 41)
+## 0. Where things stand right now (2026-10-24, after cycle 62)
 
-**1066 tests, 0 failed.** fmt, `clippy -D warnings` and `cargo doc` clean. Three-column
-matrix, 5 interleaved rounds x 200 MiB on the homelab server:
+**1074 tests, 0 failed.** fmt, `clippy -D warnings`, `cargo doc -D warnings`, `cargo
+audit` and `cargo deny` clean. **The whole workspace is documented** — 1143 public items
+across nine crates, each crate enforcing `#![warn(missing_docs)]`.
+
+Three-column matrix, 3 interleaved rounds x 200 MiB on the homelab server:
 
 | path | flux | sing-box | xray | vs sbox | vs xray | CPU vs both |
 |---|---|---|---|---|---|---|
-| VLESS / TCP | 684 | 544 | 604 | **+25.9 %** | **+13.2 %** | −47 / −51 % |
-| VLESS / REALITY | 300 | 299 | 228 | **+0.5 %** | **+31.6 %** | −38 / −49 % |
-| REALITY + Vision | 283 | 309 | 221 | −8.2 % | **+27.9 %** | −34 / −41 % |
-| VLESS / WS + TLS | 262 | 287 | 103 | −8.8 % | **+153.1 %** | −38 / −68 % |
-| VMess / WS + TLS | 191 | 198 | 172 | −3.5 % | **+11.0 %** | −41 / −51 % |
-| Trojan / TLS | 300 | 335 | — | −10.3 % | — | −33 % |
-| Shadowsocks-2022 | 319 | 389 | 283 | −18.1 % | **+12.9 %** | −20 / −58 % |
-| Shadowsocks-AEAD | 249 | 238 | — | **+4.6 %** | — | −21 % |
-| VLESS / gRPC + TLS | 105 | 117 | 182 | −10.3 % | −42.5 % | −55 / −36 % |
+| VLESS / TCP | **719** | 607 | 617 | **+18.5 %** | **+16.6 %** | −42 / −57 % |
+| VLESS / XHTTP | **152** | — (unsupported) | 114 | — | **+33.9 %** | −59 % |
+| VLESS / REALITY | 280 | 308 | 247 | −8.9 % | **+13.6 %** | −38 / −45 % |
+| REALITY + Vision | 268 | 287 | 203 | −6.9 % | **+31.9 %** | −36 / −46 % |
+| VLESS / WS + TLS | 244 | 290 | 105 | −16.0 % | **+131 %** | −30 / −66 % |
+| VMess / WS + TLS | 185 | 200 | 152 | −7.2 % | **+21.8 %** | −37 / −47 % |
+| Trojan / TLS | 255 | 290 | — | −12.0 % | — | −32 % |
+| Shadowsocks-2022 | 292 | 338 | 286 | −13.6 % | **+2.3 %** | −19 / −56 % |
+| Shadowsocks-AEAD | **240** | 236 | — | **+1.7 %** | — | −27 % |
+| VLESS / gRPC + TLS | 91 | 114 | 179 | −19.8 % | −49.0 % | −51 / −33 % |
+
+Absolute rates move ±5-10 % between runs on this host (hours of benchmarking, thermal
+state); the gaps are the stable quantity. Never compare absolutes across machines.
+
+**Functional gaps vs the competitors: closed.** mKCP (both directions, interop proven),
+XHTTP (stream-one, interop proven and measured), IDNA, GeoIP fixture, private-CA knob, UDP
+associations, nested config-key typo detection. The one partial item is the browser-grade
+ClientHello, which is a property of the TLS library rather than of this codebase and is
+documented as such.
 
 **The single defect behind almost all of it:** every path framed *one unit per call*
 (one 16 KiB chunk, one TLS record, one WebSocket frame, one gRPC message) while the relay
