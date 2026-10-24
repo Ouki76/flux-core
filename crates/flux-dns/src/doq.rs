@@ -17,9 +17,13 @@ const DOQ_IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const MAX_DOQ_MESSAGE: usize = u16::MAX as usize;
 
 #[derive(Clone)]
+/// A DNS-over-QUIC client for one endpoint.
 pub struct DoqClient {
+    /// Host to connect to.
     pub server_host: String,
+    /// QUIC port, normally 853.
     pub server_port: u16,
+    /// SNI to present, which need not match `server_host`.
     pub sni: String,
     connection: Arc<tokio::sync::Mutex<Option<quinn::Connection>>>,
     endpoint: Arc<tokio::sync::Mutex<Option<quinn::Endpoint>>>,
@@ -59,6 +63,7 @@ fn read_error_is_stale(e: &quinn::ReadExactError) -> bool {
 }
 
 impl DoqClient {
+    /// Parses `quic://host:port` or a bare `host:port` into a client.
     pub fn new(url_or_addr: &str) -> Self {
         let clean = url_or_addr
             .strip_prefix("quic://")
@@ -150,6 +155,7 @@ impl DoqClient {
     /// Returns the parsed [`Answer`] so the caller can follow a CNAME that came
     /// back without its target record and distinguish a clean NODATA from a
     /// transport failure (which decides negative caching).
+    /// Resolves `name`/`qtype` over QUIC.
     pub async fn query_doq(
         &self,
         name: &Name,

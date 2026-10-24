@@ -29,26 +29,45 @@ use std::str::FromStr;
 // Record type / class / rcode constants
 // ---------------------------------------------------------------------------
 
+/// IPv4 address.
 pub const QTYPE_A: u16 = 1;
+/// Authoritative nameserver.
 pub const QTYPE_NS: u16 = 2;
+/// Canonical name, i.e. an alias.
 pub const QTYPE_CNAME: u16 = 5;
+/// Start of authority for a zone.
 pub const QTYPE_SOA: u16 = 6;
+/// Pointer, used for reverse lookups.
 pub const QTYPE_PTR: u16 = 12;
+/// Mail exchange.
 pub const QTYPE_MX: u16 = 15;
+/// Free-form text.
 pub const QTYPE_TXT: u16 = 16;
+/// IPv6 address.
 pub const QTYPE_AAAA: u16 = 28;
+/// EDNS(0) pseudo-record, additional section only.
 pub const QTYPE_OPT: u16 = 41;
+/// Service binding.
 pub const QTYPE_SVCB: u16 = 64;
+/// HTTPS service binding, carrying ALPN and address hints.
 pub const QTYPE_HTTPS: u16 = 65;
+/// Any type; few servers still answer it.
 pub const QTYPE_ANY: u16 = 255;
 
+/// The internet class, the only one this resolver speaks.
 pub const QCLASS_IN: u16 = 1;
 
+/// No error.
 pub const RCODE_NOERROR: u8 = 0;
+/// The query was malformed.
 pub const RCODE_FORMERR: u8 = 1;
+/// The server could not answer.
 pub const RCODE_SERVFAIL: u8 = 2;
+/// The name does not exist.
 pub const RCODE_NXDOMAIN: u8 = 3;
+/// The server does not implement the query.
 pub const RCODE_NOTIMP: u8 = 4;
+/// The server refused to answer.
 pub const RCODE_REFUSED: u8 = 5;
 
 /// Maximum encoded length of a domain name (RFC 1035 §2.3.4).
@@ -74,25 +93,30 @@ pub const MAX_UDP_RESPONSE: usize = 4096;
 /// Labels are byte strings, not `String`, because DNS labels are arbitrary
 /// octets (RFC 1035 §3.1); the textual form escapes anything ambiguous.
 #[derive(Clone, PartialEq, Eq, Default)]
+/// A domain name as a list of labels, without the root label.
 pub struct Name {
     labels: Vec<Vec<u8>>,
 }
 
 impl Name {
     /// The root name (".").
+    /// The root name, `.`.
     pub fn root() -> Self {
         Self::default()
     }
 
+    /// Whether this is the root name.
     pub fn is_root(&self) -> bool {
         self.labels.is_empty()
     }
 
+    /// The labels, outermost first, without lengths.
     pub fn labels(&self) -> &[Vec<u8>] {
         &self.labels
     }
 
     /// Encoded wire length, including the terminating root label.
+    /// Length this name occupies on the wire, root label included.
     pub fn wire_len(&self) -> usize {
         self.labels.iter().map(|l| l.len() + 1).sum::<usize>() + 1
     }
@@ -101,6 +125,7 @@ impl Name {
     ///
     /// Names built by [`Name::from_str`] or decoded by the parser are always
     /// within [`MAX_NAME_LEN`]; the `debug_assert` keeps that visible.
+    /// Appends the wire form: each label length-prefixed, then a zero octet.
     pub fn write_wire(&self, out: &mut Vec<u8>) {
         debug_assert!(self.wire_len() <= MAX_NAME_LEN);
         for label in &self.labels {
@@ -111,6 +136,7 @@ impl Name {
     }
 
     /// Case-insensitive comparison (DNS names are case-insensitive, RFC 1035 §2.3.3).
+    /// Case-insensitive comparison, which is how DNS names must be compared.
     pub fn eq_ignore_ascii_case(&self, other: &Name) -> bool {
         self.labels.len() == other.labels.len()
             && self
@@ -121,6 +147,7 @@ impl Name {
     }
 
     /// True when `self` is `suffix` or a subdomain of it.
+    /// Whether this name is `suffix` or something under it.
     pub fn is_subdomain_of(&self, suffix: &Name) -> bool {
         if self.labels.len() < suffix.labels.len() {
             return false;
@@ -133,6 +160,7 @@ impl Name {
     }
 
     /// The name with its leftmost label removed, `None` for the root.
+    /// The name with its first label removed; `None` for a single-label name.
     pub fn parent(&self) -> Option<Name> {
         if self.labels.is_empty() {
             None
@@ -238,6 +266,7 @@ impl FromStr for Name {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Why a message could not be parsed.
 pub enum ParseError {
     /// The packet ended in the middle of a field, name or rdata block.
     Truncated(&'static str),
@@ -245,6 +274,7 @@ pub enum ParseError {
     ReservedLabelType(u8),
     /// The name was empty inside a label list, or an escape was invalid.
     BadName(String),
+    /// The name exceeded 255 bytes once encoded.
     NameTooLong,
     /// A compression pointer pointed forward or at itself.
     CompressionLoop,
@@ -296,10 +326,16 @@ impl From<ParseError> for FluxError {
 /// may be remembered as "this name does not resolve", and the SOA-derived TTL it
 /// carries decides for how long.
 #[derive(Debug)]
+/// Why a query failed after a well-formed response arrived.
 pub enum QueryError {
     /// A clean NXDOMAIN / NODATA answer. `ttl` is the negative TTL advertised by
     /// the response's SOA record, when there was one.
-    Negative { ttl: Option<u32>, message: String },
+    Negative {
+        /// Negative TTL advertised by the response's SOA, when there was one.
+        ttl: Option<u32>,
+        /// Human-readable reason, for logs.
+        message: String,
+    },
     /// The response could not be understood (bad packet, CNAME loop, ...).
     Malformed(String),
     /// The server never answered / the connection failed. Never cached.
@@ -307,6 +343,7 @@ pub enum QueryError {
 }
 
 impl QueryError {
+    /// A negative answer with the authority TTL that should be cached.
     pub fn negative(message: impl Into<String>, ttl: Option<u32>) -> Self {
         QueryError::Negative {
             ttl,
@@ -314,12 +351,14 @@ impl QueryError {
         }
     }
 
+    /// A response that did not match the query that was sent.
     pub fn malformed(message: impl Into<String>) -> Self {
         QueryError::Malformed(message.into())
     }
 
     /// Converts into the user-facing error, preserving transport variants so
     /// callers can tell a timeout from a "does not resolve".
+    /// Converts to the workspace error type for callers outside this crate.
     pub fn into_flux(self) -> FluxError {
         match self {
             QueryError::Negative { message, .. } | QueryError::Malformed(message) => {
@@ -353,33 +392,52 @@ impl From<QueryError> for FluxError {
 
 /// The decoded rdata of one resource record.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Record data, in the shapes this resolver understands.
 pub enum RData {
+    /// IPv4 address.
     A(Ipv4Addr),
+    /// IPv6 address.
     Aaaa(Ipv6Addr),
+    /// Authoritative nameserver.
     Ns(Name),
+    /// Alias target.
     Cname(Name),
+    /// Reverse-lookup target.
     Ptr(Name),
     /// SOA: primary NS, responsible mailbox, serial, refresh, retry, expire,
     /// minimum. `minimum` is the negative-caching TTL (RFC 2308 §5).
     Soa {
+        /// Primary nameserver for the zone.
         mname: Name,
+        /// Contact mailbox for the zone.
         rname: Name,
+        /// Zone serial number.
         serial: u32,
+        /// Seconds a secondary should wait before refreshing.
         refresh: u32,
+        /// Seconds to wait after a failed refresh.
         retry: u32,
+        /// Seconds after which the zone is no longer authoritative.
         expire: u32,
+        /// Negative-caching TTL.
         minimum: u32,
     },
     /// One or more `<character-string>`s (RFC 1035 §3.3.14).
     Txt(Vec<Vec<u8>>),
+    /// Mail exchange with its preference.
     Mx {
+        /// Lower is preferred.
         preference: u16,
+        /// Host that accepts mail.
         exchange: Name,
     },
     /// HTTPS/SVCB (RFC 9460): priority, target and the raw service parameters.
     Https {
+        /// Service priority, lower is preferred.
         priority: u16,
+        /// Target host for the service.
         target: Name,
+        /// Service parameters as (key, value) pairs.
         params: Vec<(u16, Vec<u8>)>,
     },
     /// Any type this crate does not model; bytes preserved so callers can relay
@@ -389,6 +447,7 @@ pub enum RData {
 
 impl RData {
     /// The record type this rdata belongs to.
+    /// The record type this data belongs to.
     pub fn rtype(&self) -> u16 {
         match self {
             RData::A(_) => QTYPE_A,
@@ -404,6 +463,7 @@ impl RData {
         }
     }
 
+    /// The address, for A and AAAA records.
     pub fn as_ip(&self) -> Option<IpAddr> {
         match self {
             RData::A(v4) => Some(IpAddr::V4(*v4)),
@@ -413,6 +473,7 @@ impl RData {
     }
 
     /// Writes the uncompressed wire encoding of this rdata.
+    /// Appends the wire form of this data.
     pub fn encode(&self, out: &mut Vec<u8>) {
         match self {
             RData::A(ip) => out.extend_from_slice(&ip.octets()),
@@ -468,62 +529,102 @@ impl RData {
 
 /// One resource record.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One resource record.
 pub struct Record {
+    /// Owner name of the record.
     pub name: Name,
+    /// Record type.
     pub rtype: u16,
+    /// Record class; only `QCLASS_IN` is meaningful here.
     pub rclass: u16,
+    /// Seconds the record may be cached for.
     pub ttl: u32,
+    /// The record data.
     pub rdata: RData,
 }
 
 /// One question (entry of the question section).
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One entry of the question section.
 pub struct Question {
+    /// Owner name of the record.
     pub name: Name,
+    /// Type asked for.
     pub qtype: u16,
+    /// Class asked for; only `QCLASS_IN` is meaningful here.
     pub qclass: u16,
 }
 
 /// The outcome of looking for an address of a given type in one response.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// What a response meant, once parsed against the query it answers.
 pub enum Answer {
     /// An address of the requested type. `ttl` is the minimum over the whole
     /// CNAME chain that led to it.
-    Address { ip: IpAddr, ttl: u32 },
+    Address {
+        /// The address found.
+        ip: IpAddr,
+        /// Seconds it may be cached for.
+        ttl: u32,
+    },
     /// The name is an alias and the response carried no address for it: the
     /// caller should re-query `target` (bounded by [`MAX_CNAME_CHAIN`]).
-    Alias { target: Name, ttl: u32 },
+    Alias {
+        /// The name to re-query.
+        target: Name,
+        /// Seconds the alias may be cached for.
+        ttl: u32,
+    },
     /// Clean negative: NXDOMAIN, or NOERROR with no record of the requested type.
-    Negative { rcode: u8, ttl: Option<u32> },
+    Negative {
+        /// The response code: `RCODE_NXDOMAIN` or `RCODE_NOERROR`.
+        rcode: u8,
+        /// Negative TTL to cache, when the response advertised one.
+        ttl: Option<u32>,
+    },
     /// The response's CNAME chain loops or exceeds [`MAX_CNAME_CHAIN`].
-    CnameLoop { chain: Vec<Name> },
+    CnameLoop {
+        /// The names followed before the loop was detected.
+        chain: Vec<Name>,
+    },
 }
 
 /// A parsed DNS message.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A parsed DNS message.
 pub struct Message {
+    /// Transaction id, echoed from the query.
     pub id: u16,
+    /// The raw header flags.
     pub flags: u16,
+    /// The question section.
     pub questions: Vec<Question>,
+    /// The answer section.
     pub answers: Vec<Record>,
+    /// The authority section, where SOA lives for negative answers.
     pub authority: Vec<Record>,
+    /// The additional section, where EDNS(0) OPT lives.
     pub additional: Vec<Record>,
 }
 
 impl Message {
+    /// The response code from the header.
     pub fn rcode(&self) -> u8 {
         (self.flags & 0x000F) as u8
     }
 
+    /// Whether this message is a response rather than a query.
     pub fn is_response(&self) -> bool {
         self.flags & 0x8000 != 0
     }
 
+    /// Whether the TC bit is set, i.e. the answer did not fit.
     pub fn is_truncated(&self) -> bool {
         self.flags & 0x0200 != 0
     }
 
     /// Parses a complete message. Bounded and panic-free on any input.
+    /// Parses a whole message. Every length and pointer is validated.
     pub fn parse(data: &[u8]) -> Result<Message, ParseError> {
         let mut r = Reader::new(data);
         let id = r.u16()?;
@@ -727,6 +828,7 @@ impl Message {
     /// The chain is followed inside the answer section (which is how recursive
     /// resolvers return it) and is bounded by [`MAX_CNAME_CHAIN`]; a loop is
     /// reported as [`Answer::CnameLoop`] instead of spinning.
+    /// Interprets this response as the answer to `qname`/`qtype`.
     pub fn answer(&self, qname: &Name, qtype: u16) -> Answer {
         let rcode = self.rcode();
         if rcode != RCODE_NOERROR {
@@ -791,6 +893,7 @@ impl Message {
 
     /// Negative-caching TTL from the SOA record (RFC 2308 §5): the SOA `MINIMUM`
     /// field capped by the SOA record's own TTL.
+    /// The TTL to cache a negative answer for, from SOA or the record itself.
     pub fn negative_ttl(&self) -> Option<u32> {
         self.authority
             .iter()
@@ -809,6 +912,7 @@ impl Message {
     /// RFC 1035 §4.2.1 requires. The upper bound is [`MAX_UDP_RESPONSE`]: it is
     /// the largest datagram this resolver ever emits, so a hostile client cannot
     /// talk an upstream into a larger amplification factor than that.
+    /// The payload size the peer advertised through EDNS(0), or the default.
     pub fn udp_payload_size(&self) -> usize {
         self.additional
             .iter()
@@ -820,6 +924,7 @@ impl Message {
 
     /// First address record of any family, ignoring owner names. Used by the
     /// legacy single-record helpers (and by the fuzz target).
+    /// The first address in the answer, with its TTL.
     pub fn first_address(&self) -> Option<(IpAddr, u32)> {
         self.answers
             .iter()
@@ -827,6 +932,7 @@ impl Message {
     }
 
     /// First address record of `qtype`, ignoring owner names.
+    /// The first address of a specific type, with its TTL.
     pub fn first_address_of(&self, qtype: u16) -> Option<(IpAddr, u32)> {
         self.answers
             .iter()
@@ -952,15 +1058,18 @@ fn read_name(
 // Builder / convenience API
 // ---------------------------------------------------------------------------
 
+/// Builders and parsers for the wire format, grouped for discoverability.
 pub struct DnsMessage;
 
 impl DnsMessage {
     /// Builds a standard DNS query packet in binary wireformat.
+    /// A query for `domain`/`qtype` with a random transaction id.
     pub fn build_query(domain: &str, qtype: u16) -> Vec<u8> {
         Self::build_query_with_ecs(domain, qtype, None)
     }
 
     /// Builds a DNS query packet with optional EDNS0 Client Subnet (ECS, RFC 7871).
+    /// A query carrying an EDNS Client Subnet option.
     pub fn build_query_with_ecs(
         domain: &str,
         qtype: u16,
@@ -971,6 +1080,7 @@ impl DnsMessage {
     }
 
     /// Builds a DNS query packet with specific Transaction ID and optional EDNS0 Client Subnet.
+    /// A query carrying ECS and an explicit transaction id, for tests.
     pub fn build_query_with_ecs_id(
         domain: &str,
         qtype: u16,
@@ -985,6 +1095,7 @@ impl DnsMessage {
     }
 
     /// Builds a query for an already-parsed [`Name`] (used when following CNAMEs).
+    /// A query built from an already-parsed name.
     pub fn build_query_for_name(
         name: &Name,
         qtype: u16,
@@ -1047,6 +1158,7 @@ impl DnsMessage {
 
     /// True when `domain` is a syntactically valid DNS name: 1..=255 bytes, no
     /// empty labels, every label 1..=63 bytes.
+    /// Whether `domain` is a syntactically valid name to query.
     pub fn is_valid_domain(domain: &str) -> bool {
         if domain.is_empty() || domain.len() > 255 {
             return false;
@@ -1062,12 +1174,14 @@ impl DnsMessage {
     ///
     /// Returns `(transaction_id, flags, qname, qtype, question_end_offset)`.
     /// `None` when the packet is too short or the name is malformed.
+    /// Transaction id, flags, name as text, qtype and the question length.
     pub fn parse_question(data: &[u8]) -> Option<(u16, u16, String, u16, usize)> {
         let (tx_id, flags, name, qtype, end) = Self::parse_question_name(data)?;
         Some((tx_id, flags, name.to_string(), qtype, end))
     }
 
     /// Like [`Self::parse_question`] but returns the structured [`Name`].
+    /// Like `parse_question`, but returns the parsed name.
     pub fn parse_question_name(data: &[u8]) -> Option<(u16, u16, Name, u16, usize)> {
         if data.len() < 12 {
             return None;
@@ -1095,12 +1209,14 @@ impl DnsMessage {
     /// as a single A record with a 1-second TTL, which is what a fake-IP resolver
     /// wants (the mapping must be short-lived). When `answer` is `None` the
     /// response carries no records (NODATA) so clients fail over quickly.
+    /// An A-record response to `query`, or NXDOMAIN when `answer` is `None`.
     pub fn build_response(query: &[u8], answer: Option<Ipv4Addr>) -> Option<Vec<u8>> {
         Self::build_response_ip(query, answer.map(IpAddr::V4))
     }
 
     /// Like [`Self::build_response`] but for either family: the record type
     /// follows the address family.
+    /// An A or AAAA response, matching the query type.
     pub fn build_response_ip(query: &[u8], answer: Option<IpAddr>) -> Option<Vec<u8>> {
         let answers: Vec<(RData, u32)> = match answer {
             Some(IpAddr::V4(v4)) => vec![(RData::A(v4), 1)],
@@ -1112,6 +1228,7 @@ impl DnsMessage {
 
     /// Builds a response carrying one PTR record pointing at `target` (used to
     /// reverse-map fake addresses back to their domain).
+    /// A PTR response, for reverse lookups.
     pub fn build_response_ptr(query: &[u8], target: &Name) -> Option<Vec<u8>> {
         Self::build_response_records(query, RCODE_NOERROR, &[(RData::Ptr(target.clone()), 1)])
     }
@@ -1121,6 +1238,7 @@ impl DnsMessage {
     /// Answer names are encoded as a pointer to the question name, which is
     /// correct here because every record we synthesise is owned by the queried
     /// name.
+    /// A response carrying arbitrary records.
     pub fn build_response_records(
         query: &[u8],
         rcode: u8,
@@ -1154,6 +1272,7 @@ impl DnsMessage {
     /// client's UDP buffer: the question is echoed, no records are carried and
     /// TC is set so the client retries over a transport that can carry it
     /// (RFC 1035 §4.2.1, RFC 2181 §9).
+    /// A response with the TC bit set and no records..
     pub fn build_truncated_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
         let mut out = Self::build_response_records(query, rcode, &[])?;
         let flags = u16::from_be_bytes([out[2], out[3]]) | 0x0200; // TC
@@ -1166,6 +1285,7 @@ impl DnsMessage {
     ///
     /// Falls back to [`DEFAULT_UDP_PAYLOAD`] when the query does not parse, which
     /// is the safe direction: an unparseable query never earns a large answer.
+    /// The EDNS(0) payload size a client advertised, or the default.
     pub fn client_udp_payload_size(query: &[u8]) -> usize {
         Message::parse(query)
             .map(|m| m.udp_payload_size())
@@ -1177,6 +1297,8 @@ impl DnsMessage {
     /// - matching transaction ID
     /// - QR flag is 1 (response)
     /// - RCODE is 0 (NoError)
+    ///
+    /// Rejects a datagram that is not a response to the query just sent.
     pub fn validate_response(data: &[u8], expected_tx_id: u16) -> FluxResult<()> {
         Self::validate_response_header(data, expected_tx_id)?;
         let flags = u16::from_be_bytes([data[2], data[3]]);
@@ -1195,6 +1317,7 @@ impl DnsMessage {
     /// Transports use this so that NXDOMAIN/NODATA reach the parser, which turns
     /// them into a cacheable negative with the SOA-derived TTL instead of a
     /// generic transport failure.
+    /// The header-only form of `validate_response`, for truncation handling.
     pub fn validate_response_header(data: &[u8], expected_tx_id: u16) -> FluxResult<()> {
         if data.len() < 12 {
             return Err(FluxError::Dns("DNS response too short".into()));
@@ -1219,6 +1342,7 @@ impl DnsMessage {
     /// This is the entry point every transport (UDP, DoH, DoT, DoQ) uses, so the
     /// caching rules downstream see one consistent classification: a clean
     /// negative is distinguishable from a broken or truncated packet.
+    /// Parses and interprets a response to `qname`/`qtype`.
     pub fn parse_response(data: &[u8], qname: &Name, qtype: u16) -> Result<Answer, QueryError> {
         let msg = Message::parse(data)
             .map_err(|e| QueryError::Malformed(format!("unparseable DNS response: {e}")))?;
@@ -1249,6 +1373,7 @@ impl DnsMessage {
 
     /// Parses a response and returns the address for `qtype`, or a clean
     /// [`QueryError`] explaining why there is none.
+    /// Interprets a parsed message as the answer to a query.
     pub fn parse_answer(
         data: &[u8],
         qname: &Name,
@@ -1289,6 +1414,7 @@ impl DnsMessage {
     }
 
     /// Legacy helper: first A (preferred) or AAAA address in the response.
+    /// The address and TTL of a single-record response.
     pub fn parse_ip_record_with_ttl(data: &[u8]) -> FluxResult<(IpAddr, u32)> {
         let msg = Message::parse(data)?;
         if let Some(v4) = msg.first_address_of(QTYPE_A) {
@@ -1303,11 +1429,13 @@ impl DnsMessage {
     }
 
     /// Legacy helper: first A (preferred) or AAAA address in the response.
+    /// The address of a single-record response, discarding the TTL.
     pub fn parse_ip_record(data: &[u8]) -> FluxResult<IpAddr> {
         Self::parse_ip_record_with_ttl(data).map(|(ip, _)| ip)
     }
 
     /// Parses the first A (IPv4) record from a DNS response in wireformat.
+    /// The IPv4 address of an A record response.
     pub fn parse_a_record(data: &[u8]) -> FluxResult<Ipv4Addr> {
         let msg = Message::parse(data)?;
         match msg.first_address_of(QTYPE_A) {
@@ -1320,6 +1448,7 @@ impl DnsMessage {
     }
 
     /// Parses the first AAAA (IPv6) record from a DNS response in wireformat.
+    /// The IPv6 address of an AAAA record response.
     pub fn parse_aaaa_record(data: &[u8]) -> FluxResult<Ipv6Addr> {
         let msg = Message::parse(data)?;
         match msg.first_address_of(QTYPE_AAAA) {
@@ -1333,6 +1462,7 @@ impl DnsMessage {
 
     /// Parses the first record of `target_qtype` in a response, following CNAMEs
     /// starting at the response's own question name.
+    /// The address and TTL of a response, requiring a specific record type.
     pub fn parse_specific_record_with_ttl(
         data: &[u8],
         target_qtype: u16,
@@ -1358,6 +1488,7 @@ impl DnsMessage {
 // ---------------------------------------------------------------------------
 
 /// Builds the `in-addr.arpa` / `ip6.arpa` name for an address.
+/// The `in-addr.arpa` / `ip6.arpa` name used to look an address up in reverse.
 pub fn ip_to_ptr_name(ip: &IpAddr) -> Name {
     let mut labels: Vec<Vec<u8>> = Vec::new();
     match ip {

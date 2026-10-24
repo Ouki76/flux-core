@@ -85,9 +85,13 @@ where
 }
 
 #[derive(Clone)]
+/// A DNS-over-TLS client for one endpoint.
 pub struct DotClient {
+    /// Host to connect to.
     pub server_host: String,
+    /// TLS port, normally 853.
     pub server_port: u16,
+    /// SNI to present, which need not match `server_host`.
     pub sni: String,
     stream: Arc<Mutex<Option<BoxedStream>>>,
     /// Test-only seam: replaces the real TLS dial. Production code always dials
@@ -114,6 +118,7 @@ impl std::fmt::Debug for DotClient {
 }
 
 impl DotClient {
+    /// Parses `tls://host:port` or a bare `host:port` into a client.
     pub fn new(url_or_addr: &str) -> Self {
         let clean = url_or_addr
             .strip_prefix("tls://")
@@ -169,6 +174,7 @@ impl DotClient {
     /// Returns the parsed [`Answer`] so the caller can follow a CNAME that came
     /// back without its target record and distinguish a clean NODATA from a
     /// transport failure (which decides negative caching).
+    /// Resolves `name`/`qtype` over TLS.
     pub async fn query_dot(
         &self,
         name: &Name,

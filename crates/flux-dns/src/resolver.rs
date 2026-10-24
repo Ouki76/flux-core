@@ -110,9 +110,13 @@ struct CachedDnsEntry {
 
 /// User-facing split-DNS rule (kept for config compatibility).
 #[derive(Clone, Debug, Default)]
+/// A split-DNS rule: which servers answer for which domains.
 pub struct DnsRule {
+    /// Domain suffixes this rule applies to.
     pub domains: Vec<String>,
+    /// Servers to use for them, in preference order.
     pub servers: Vec<String>,
+    /// EDNS Client Subnet to send with these queries.
     pub client_subnet: Option<ipnet::IpNet>,
 }
 
@@ -184,12 +188,14 @@ struct ResolverInner {
 }
 
 #[derive(Clone)]
+/// The resolver: server selection, caching and Fake-IP integration.
 pub struct DnsResolver {
     fake_ip_pool: Option<Arc<FakeIpPool>>,
     inner: Arc<ResolverInner>,
 }
 
 impl DnsResolver {
+    /// A resolver that may consult `fake_ip_pool` before going to the network.
     pub fn new(fake_ip_pool: Option<Arc<FakeIpPool>>) -> Self {
         let cache_shards: Vec<Mutex<LruCache<String, CachedDnsEntry>>> = (0..NUM_DNS_CACHE_SHARDS)
             .map(|_| Mutex::new(LruCache::new(SHARD_DNS_CACHE_CAPACITY)))
@@ -222,6 +228,7 @@ impl DnsResolver {
         (hasher.finish() as usize) % NUM_DNS_CACHE_SHARDS
     }
 
+    /// Whether `domain` already has a cached answer.
     pub fn contains_cached(&self, domain: &str) -> bool {
         let domain_lower = domain.to_ascii_lowercase();
         let idx = self.cache_shard_index(&domain_lower);
@@ -242,22 +249,26 @@ impl DnsResolver {
         false
     }
 
+    /// Sets the upstream servers used when no rule matches.
     pub fn with_servers(mut self, servers: Vec<String>) -> Self {
         Arc::make_mut(&mut self.inner).upstream_servers = servers;
         self
     }
 
+    /// Sets the split-DNS rules, compiled once here.
     pub fn with_rules(mut self, rules: Vec<DnsRule>) -> Self {
         Arc::make_mut(&mut self.inner).rules =
             rules.iter().map(CompiledDnsRule::from_rule).collect();
         self
     }
 
+    /// Sets the EDNS Client Subnet sent when no rule overrides it.
     pub fn with_client_subnet(mut self, ecs: Option<ipnet::IpNet>) -> Self {
         Arc::make_mut(&mut self.inner).client_subnet = ecs;
         self
     }
 
+    /// The Fake-IP pool, when one is configured.
     pub fn fake_ip(&self) -> Option<&Arc<FakeIpPool>> {
         self.fake_ip_pool.as_ref()
     }
@@ -301,6 +312,7 @@ impl DnsResolver {
         }
     }
 
+    /// Resolves a name to one address, consulting the cache and Fake-IP first.
     pub async fn resolve_domain(&self, domain: &str, port: u16) -> FluxResult<SocketAddr> {
         // Reject invalid names up front: the wire encoder cannot represent them,
         // and silently compiling a *different* name would resolve (and cache) the

@@ -162,6 +162,7 @@ impl V6Pool {
 }
 
 #[derive(Debug)]
+/// Hands out synthetic addresses that map back to the names that were asked for.
 pub struct FakeIpPool {
     network: Ipv4Net,
     start_ip: u32,
@@ -176,6 +177,7 @@ pub struct FakeIpPool {
 impl FakeIpPool {
     /// Creates the IPv4 pool. The IPv6 side stays disabled; see
     /// [`FakeIpPool::with_inet6`].
+    /// A pool covering `cidr`, sized for `capacity` entries.
     pub fn new(cidr: &str, capacity: usize) -> Result<Self, ipnet::AddrParseError> {
         let network: Ipv4Net = cidr.parse()?;
         let cap = NonZeroUsize::new(capacity).unwrap_or(DEFAULT_CAPACITY);
@@ -256,6 +258,7 @@ impl FakeIpPool {
         }
     }
 
+    /// The documented default pool and size.
     pub fn default_pool() -> Self {
         match Self::new(DEFAULT_INET4_RANGE, DEFAULT_FAKEIP_CAPACITY) {
             Ok(p) => p,
@@ -291,6 +294,7 @@ impl FakeIpPool {
         }
     }
 
+    /// The IPv4 range this pool hands out.
     pub fn inet4_network(&self) -> Ipv4Net {
         self.network
     }
@@ -300,6 +304,7 @@ impl FakeIpPool {
         self.v6.as_ref().map(|v| v.network)
     }
 
+    /// Whether this pool also hands out IPv6 addresses.
     pub fn has_inet6(&self) -> bool {
         self.v6.is_some()
     }

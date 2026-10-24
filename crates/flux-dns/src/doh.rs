@@ -255,11 +255,17 @@ where
 }
 
 #[derive(Clone)]
+/// A DNS-over-HTTPS client for one endpoint.
 pub struct DohClient {
+    /// Address to connect to, which may be an IP literal.
     pub server_ip: String,
+    /// TCP port of the endpoint.
     pub server_port: u16,
+    /// Host header and SNI, which need not match `server_ip`.
     pub host_header: String,
+    /// Request path, e.g. `/dns-query`.
     pub path: String,
+    /// Whether the endpoint is HTTPS rather than plain HTTP.
     pub is_tls: bool,
     streams: Arc<[Mutex<Option<BoxedStream>>]>,
     counter: Arc<std::sync::atomic::AtomicUsize>,
@@ -278,6 +284,7 @@ impl std::fmt::Debug for DohClient {
 }
 
 impl DohClient {
+    /// Parses an endpoint URL into a client.
     pub fn new(url: &str) -> Self {
         let is_tls = !url.starts_with("http://");
         let clean = url
@@ -337,6 +344,7 @@ impl DohClient {
     /// Returns the parsed [`Answer`] rather than an address so the caller can
     /// follow a CNAME returned without its target record and can tell a clean
     /// NODATA from a transport failure (which decides negative caching).
+    /// Resolves `name`/`qtype` over HTTPS.
     pub async fn query_doh(&self, name: &Name, qtype: u16) -> Result<Answer, QueryError> {
         // RFC 8484 §4.1: the ID of a DoH query SHOULD be 0. There is no
         // transaction-id matching on this transport — HTTP/1.1 on a dedicated
