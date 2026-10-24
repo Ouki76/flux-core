@@ -2284,3 +2284,43 @@ paths alike) is now rejected by name rather than dropped.
 **Result: parity or better against sing-box on three paths, within 10 % on four more, and
 ahead of xray on six of eight — at 20-68 % less CPU on every path.** gRPC remains the one
 clear loss to both, closed as unresolved with its measurements recorded.
+
+---
+
+## Cycle 42 — 2026-10-24
+
+### The security gates were listed but never installed
+
+`cargo audit` and `cargo deny` are named in this audit's own objective and had **never
+been run on this host** — neither tool was installed. Installed and run, they found two
+real issues immediately:
+
+- **tokio 1.53.1 is marked unsound** (RUSTSEC-2026-0386, published 2026-10-13):
+  `AsyncFd::new` and related constructors violate I/O safety. We use `AsyncFd` directly in
+  the TUN inbound, so this was not theoretical. Upgraded to 1.54.1.
+- **unsafe-libyaml is unmaintained** (RUSTSEC-2024-0449) via `serde_yaml_ng`. `deny.toml`
+  carried a note claiming no safe replacement existed — out of date: `serde_norway` is the
+  maintained fork and does not vendor libyaml. Switched, which removes both the parser and
+  the advisory.
+
+Both gates now pass: `cargo audit` exits 0 with no findings; `cargo deny check` reports
+`advisories ok, bans ok, licenses ok, sources ok`, and its ignore list is empty because the
+entry it held matches nothing any more.
+
+### Shadowsocks-2022: the copy removed, the number unchanged
+
+callgrind put 34 % of the SS-2022 path in `__memcpy_avx` with exactly one call per chunk:
+the ciphertext was copied out of the receive buffer into `payload_buf` before decryption.
+The chunk is now decrypted where it arrived and served from there — one buffer and one
+`memcpy` per chunk fewer. Measured **304 vs 305 MB/s: neutral**. The cost is the cipher
+itself; sing-box's AES-NI path is ~15 % ahead of ours. Kept for the memory traffic, not for
+a number.
+
+Getting it right needed one detail worth recording: after an in-place decrypt the read
+cursor has to move past the plaintext *and* the trailing 16-byte tag. Missing that made the
+next chunk fail with "bad tag" — and the read-batching guard test from cycle 36 caught it,
+which is exactly what a guard is for.
+
+### Still open
+
+gRPC (documented, five attempts), mKCP server side, XHTTP, browser-grade ClientHello.
