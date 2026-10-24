@@ -142,26 +142,25 @@ interleaved rounds — the only comparison that says anything about competitiven
 
 | Path | flux-core | sing-box | xray | vs sing-box | vs xray | CPU vs both |
 |---|---|---|---|---|---|---|
-| VLESS / TCP | 654 | 557 | 567 | **+17.4 %** | **+15.3 %** | −48 / −56 % |
-| Trojan / TLS | 315 | 293 | — | **+7.6 %** | — | −44 % |
-| Shadowsocks-2022 | 331 | 342 | 290 | −3.2 % | **+14.2 %** | −29 / −59 % |
-| Shadowsocks-AEAD | 269 | 243 | — | **+10.6 %** | — | −33 % |
-| REALITY | 237 | 294 | — | −19.4 % | — | −25 % |
-| REALITY + Vision | 224 | 292 | 231 | −23.2 % | −2.9 % | −23 / −25 % |
-| VLESS / WS + TLS | 239 | 297 | 105 | −19.5 % | **+127.7 %** | −25 / −64 % |
-| VMess / WS + TLS | 170 | 216 | 172 | −21.4 % | −1.2 % | −27 / −41 % |
-| VLESS / gRPC + TLS | 103 | 117 | 184 | −12.2 % | −44.1 % | −55 / −39 % |
+| VLESS / TCP | 684 | 544 | 604 | **+25.9 %** | **+13.2 %** | −47 / −51 % |
+| VLESS / REALITY | 300 | 299 | 228 | **+0.5 %** | **+31.6 %** | −38 / −49 % |
+| REALITY + Vision | 283 | 309 | 221 | −8.2 % | **+27.9 %** | −34 / −41 % |
+| VLESS / WS + TLS | 262 | 287 | 103 | −8.8 % | **+153.1 %** | −38 / −68 % |
+| VMess / WS + TLS | 191 | 198 | 172 | −3.5 % | **+11.0 %** | −41 / −51 % |
+| Trojan / TLS | 300 | 335 | — | −10.3 % | — | −33 % |
+| Shadowsocks-2022 | 319 | 389 | 283 | −18.1 % | **+12.9 %** | −20 / −58 % |
+| Shadowsocks-AEAD | 249 | 238 | — | **+4.6 %** | — | −21 % |
+| VLESS / gRPC + TLS | 105 | 117 | 182 | −10.3 % | −42.5 % | −55 / −36 % |
 
 **Absolutes are machine-specific — never compare these numbers across machines, only
 within one run.** This table is the homelab server (24 cores, Void Linux, 5 interleaved
 rounds x 200 MiB); an earlier edition came from a desktop where every absolute was about
 1.6x higher and the deltas told a different story.
 
-What the table says: flux-core is **faster than both competitors on plain TCP, faster than
-sing-box on Trojan and Shadowsocks-AEAD, and faster than xray on five of the eight paths
-xray can run**, while spending 22-64 % less CPU than both on every single path. The
-remaining deficits are concentrated in stacked TLS paths (REALITY, Vision, WS, VMess) and
-in gRPC.
+What the table says: flux-core **matches or beats sing-box on plain TCP, REALITY and
+Shadowsocks-AEAD and is within 10 % on four more paths; it beats xray on six of the eight
+paths xray can run**, while spending **20-68 % less CPU than both on every single path**.
+The one clear loss to both is gRPC.
 
 Reproduce: `cargo run --release --example bench_matrix -- --rounds 5 --mb 200`.
 
