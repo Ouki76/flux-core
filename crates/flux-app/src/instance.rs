@@ -25,21 +25,26 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use uuid::Uuid;
 
 #[derive(Clone, Default)]
+/// /// Outbounds by tag.
 pub struct OutboundRegistry {
+    /// The outbounds themselves.
     pub map: Arc<DashMap<String, Arc<dyn Outbound>>>,
 }
 
 impl OutboundRegistry {
+    /// An empty registry.
     pub fn new() -> Self {
         Self {
             map: Arc::new(DashMap::new()),
         }
     }
 
+    /// Adds or replaces an outbound.
     pub fn insert(&self, tag: String, outbound: Arc<dyn Outbound>) {
         self.map.insert(tag, outbound);
     }
 
+    /// Looks an outbound up by tag.
     pub fn get_outbound(&self, tag: &str) -> Option<Arc<dyn Outbound>> {
         self.map.get(tag).map(|e| e.value().clone())
     }
@@ -59,13 +64,21 @@ struct RemoteRuleSetSpec {
     cache_path: Option<std::path::PathBuf>,
 }
 
+/// /// A running proxy built from a configuration.
 pub struct Instance {
+    /// The listeners this instance started.
     pub inbounds: Vec<Arc<dyn Inbound>>,
+    /// Outbounds by tag.
     pub registry: Arc<OutboundRegistry>,
+    /// The component that joins inbounds to outbounds.
     pub dispatcher: Arc<dyn Dispatcher>,
+    /// The routing rules.
     pub router: Arc<Router>,
+    /// Traffic counters and the connection table.
     pub meter: Arc<TrafficMeter>,
+    /// The management API, when one is configured.
     pub api_server: Option<Arc<ApiServer>>,
+    /// The resolver the dispatcher uses.
     pub resolver: Arc<DnsResolver>,
     /// Remote rule sets to fetch in the background.
     remote_rulesets: Vec<RemoteRuleSetSpec>,
@@ -85,6 +98,7 @@ pub struct Instance {
 }
 
 impl Instance {
+    /// Builds everything the configuration describes, without starting it.
     pub fn new(config: Config) -> FluxResult<Self> {
         config.validate()?;
 
@@ -603,6 +617,7 @@ impl Instance {
         (matched, active)
     }
 
+    /// Binds every listener and starts serving.
     pub async fn start(&self) -> FluxResult<()> {
         let mut started = self.started.lock().await;
         if *started {
@@ -767,6 +782,7 @@ impl Instance {
         }
     }
 
+    /// Stops every listener, releasing the sockets before it returns.
     pub async fn stop(&self) -> FluxResult<()> {
         let mut started = self.started.lock().await;
         let mut first_error = None;

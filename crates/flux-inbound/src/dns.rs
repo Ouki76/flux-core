@@ -2,7 +2,7 @@
 //!
 //! Answers `A` (and, when the pool has a v6 range, `AAAA`) queries from the
 //! fake-IP pool so that clients connect to a synthetic address inside the pool
-//! range; [`FakeIpPool`]'s reverse mapping then turns that address back into the
+//! range; `FakeIpPool`'s reverse mapping then turns that address back into the
 //! domain name in the dispatcher, which is what makes domain-based routing work
 //! for applications that resolve names themselves (browsers, TLS stacks,
 //! anything that does not use a SOCKS5 domain request).

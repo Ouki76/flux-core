@@ -18,24 +18,43 @@ use std::collections::HashMap;
 /// Canonical specification of a proxy outbound node built from URI links.
 #[derive(Clone, Debug, Default)]
 pub struct ProxySpec {
+    /// The tag this node is referred to by.
     pub tag: String,
+    /// Scheme, e.g. `vless`.
     pub protocol: String,
+    /// Server host.
     pub server: String,
+    /// Server port.
     pub port: u16,
-    pub auth: Option<String>,     // uuid for vless, password for trojan/ss
+    /// The credential: a UUID for VLESS/VMess, a password for the rest.
+    pub auth: Option<String>, // uuid for vless, password for trojan/ss
+    /// Account name, for the protocols that use one.
     pub username: Option<String>, // socks/http username
+    /// Password, for the protocols that use one.
     pub password: Option<String>, // socks/http/trojan password
-    pub method: Option<String>,   // cipher method for ss
-    pub flow: Option<String>,     // flow for vless (e.g. xtls-rprx-vision)
+    /// Cipher method, for Shadowsocks.
+    pub method: Option<String>, // cipher method for ss
+    /// Flow to request, e.g. `xtls-rprx-vision`.
+    pub flow: Option<String>, // flow for vless (e.g. xtls-rprx-vision)
+    /// SNI to present.
     pub sni: Option<String>,
+    /// Whether certificate verification is off.
     pub insecure: bool,
+    /// ALPN protocols.
     pub alpn: Vec<String>,
+    /// Browser profile to imitate.
     pub utls: Option<String>,
+    /// REALITY public key, when the URI names it explicitly.
     pub reality_public_key: Option<String>,
+    /// REALITY short id.
     pub reality_short_id: Option<String>,
+    /// Transport named in the URI, e.g. `ws`.
     pub transport_type: Option<String>,
+    /// Request path for the HTTP-shaped transports.
     pub transport_path: Option<String>,
+    /// gRPC service name.
     pub transport_service_name: Option<String>,
+    /// Extra headers for the HTTP-shaped transports.
     pub transport_headers: HashMap<String, String>,
     /// TLS security requested explicitly (`security=tls`) or implicitly (trojan).
     pub security_hint_tls: bool,
@@ -43,11 +62,17 @@ pub struct ProxySpec {
     /// `build()` turns this into a configuration error.
     pub reality_missing_pbk: bool,
     // TUIC / Hysteria 2 extras (from generic query params).
+    /// Congestion-control algorithm.
     pub congestion_control: Option<String>,
+    /// Advertised upload bandwidth.
     pub up_mbps: Option<u64>,
+    /// Advertised download bandwidth.
     pub down_mbps: Option<u64>,
+    /// Seconds between port hops.
     pub hop_interval_secs: Option<u64>,
+    /// Obfuscation type, e.g. `salamander`.
     pub obfs: Option<String>,
+    /// Obfuscation password.
     pub obfs_password: Option<String>,
 }
 
@@ -58,16 +83,23 @@ pub struct ProxySpec {
 #[serde(default)]
 pub struct UriParams {
     #[serde(alias = "peer")]
+    /// SNI to present.
     pub sni: Option<String>,
+    /// Security layer named in the URI.
     pub security: Option<String>,
+    /// Flow to request, e.g. `xtls-rprx-vision`.
     pub flow: Option<String>,
     #[serde(alias = "pbk", alias = "public_key", alias = "publicKey")]
+    /// Public key, for REALITY.
     pub public_key: Option<String>,
     #[serde(alias = "sid", alias = "short_id", alias = "shortId")]
+    /// REALITY short id.
     pub short_id: Option<String>,
     #[serde(alias = "fp", alias = "fingerprint", alias = "utls")]
+    /// Browser profile to imitate.
     pub utls: Option<String>,
     #[serde(deserialize_with = "de_comma_list")]
+    /// ALPN protocols.
     pub alpn: Vec<String>,
     #[serde(
         alias = "allowInsecure",
@@ -75,21 +107,27 @@ pub struct UriParams {
         alias = "skip-cert-verify",
         deserialize_with = "de_bool"
     )]
+    /// Whether certificate verification is off.
     pub insecure: bool,
     /// Transport/framing selector (`ws`, `httpupgrade`, `h2`, `grpc`, ...).
     #[serde(alias = "type", alias = "transport", alias = "headerType")]
     pub transport: Option<String>,
+    /// Request path for the HTTP-shaped transports.
     pub path: Option<String>,
     /// WebSocket/H2 Host header.
     pub host: Option<String>,
     #[serde(alias = "serviceName", alias = "service_name")]
+    /// gRPC service name.
     pub service_name: Option<String>,
     #[serde(alias = "congestion_control", alias = "congestionControl")]
+    /// Congestion-control algorithm.
     pub congestion_control: Option<String>,
     /// Hysteria 2 bandwidth hints.
     #[serde(alias = "upmbps", deserialize_with = "de_opt_u64")]
+    /// Advertised upload bandwidth.
     pub up_mbps: Option<u64>,
     #[serde(alias = "downmbps", deserialize_with = "de_opt_u64")]
+    /// Advertised download bandwidth.
     pub down_mbps: Option<u64>,
     /// Hysteria 2 port-hopping list ("443,8000-9000") and interval.
     pub ports: Option<String>,
@@ -98,10 +136,12 @@ pub struct UriParams {
         alias = "hopInterval",
         deserialize_with = "de_opt_u64"
     )]
+    /// Seconds between port hops.
     pub hop_interval_secs: Option<u64>,
     /// Hysteria 2 Salamander obfuscation.
     pub obfs: Option<String>,
     #[serde(alias = "obfs-password", alias = "obfsPassword")]
+    /// Obfuscation password.
     pub obfs_password: Option<String>,
     /// Everything else, preserved for forward compatibility.
     #[serde(flatten)]
@@ -275,6 +315,7 @@ fn parse_params(query: Option<&str>) -> FluxResult<UriParams> {
 }
 
 impl ProxySpec {
+    /// Parses a proxy URI into its parts.
     pub fn new(
         tag: impl Into<String>,
         protocol: impl Into<String>,

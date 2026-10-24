@@ -12,12 +12,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 use tracing::info;
 
+/// /// One live connection, as the API sees it.
 pub struct ActiveConnection {
+    /// Opaque identifier, stable for the life of the connection.
     pub id: String,
+    /// When the connection was accepted.
     pub start_time: Instant,
+    /// What the connection is: source, destination, inbound, network.
     pub meta: SessionMeta,
+    /// Bytes sent towards the destination.
     pub upload: Arc<AtomicU64>,
+    /// Bytes received from it.
     pub download: Arc<AtomicU64>,
+    /// Signalling channel that cancels the connection.
     pub cancel_tx: tokio::sync::broadcast::Sender<()>,
 }
 
@@ -27,11 +34,17 @@ struct Sampler {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// Traffic counters, the speed sampler and the connection table.
 pub struct TrafficMeter {
+    /// Bytes sent since start.
     pub upload_total: Arc<AtomicU64>,
+    /// Bytes received since start.
     pub download_total: Arc<AtomicU64>,
+    /// Bytes per second sent, sampled once a second.
     pub upload_speed: AtomicU64,
+    /// Bytes per second, sampled once a second.
     pub download_speed: AtomicU64,
+    /// The live connections, keyed by id.
     pub connections: Arc<DashMap<String, Arc<ActiveConnection>>>,
     /// The 1 s sampler, if it is running.
     ///
@@ -47,6 +60,7 @@ pub struct TrafficMeter {
 // which is not a state any caller should be able to reach by accident. `new()`
 // starts the sampler and `start()`/`stop()` control it from there.
 impl TrafficMeter {
+    /// A meter with no listeners, already sampling.
     pub fn new() -> Arc<Self> {
         let this = Arc::new(Self {
             upload_total: Arc::new(AtomicU64::new(0)),
@@ -156,11 +170,13 @@ impl TrafficMeter {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Adds to the totals; called by the relay as it moves bytes.
     pub fn record_traffic(&self, up: u64, down: u64) {
         self.upload_total.fetch_add(up, Ordering::Relaxed);
         self.download_total.fetch_add(down, Ordering::Relaxed);
     }
 
+    /// Registers a live connection and returns its id, handle and cancel channel.
     pub fn register_connection(
         &self,
         meta: &SessionMeta,
@@ -183,10 +199,12 @@ impl TrafficMeter {
         (id, conn, rx)
     }
 
+    /// Drops a connection from the table.
     pub fn remove_connection(&self, id: &str) {
         self.connections.remove(id);
     }
 
+    /// Cancels one connection; false when the id is unknown.
     pub fn close_connection(&self, id: &str) -> bool {
         if let Some((_, conn)) = self.connections.remove(id) {
             let _ = conn.cancel_tx.send(());
@@ -196,6 +214,7 @@ impl TrafficMeter {
         }
     }
 
+    /// Cancels every connection; returns how many there were.
     pub fn close_all_connections(&self) -> usize {
         let mut count = 0;
         let ids: Vec<String> = self.connections.iter().map(|e| e.key().clone()).collect();
@@ -209,17 +228,27 @@ impl TrafficMeter {
 }
 
 #[derive(Clone)]
+/// Everything the API handlers read: routing, outbounds, counters.
 pub struct ApiContext {
+    /// Outbounds by tag, for switching a selector.
     pub registry: Arc<OutboundRegistry>,
+    /// Traffic counters and the connection table.
     pub meter: Arc<TrafficMeter>,
+    /// The listeners this instance started.
     pub inbounds: Vec<Arc<dyn Inbound>>,
+    /// The rules, when the API is allowed to see them.
     pub router: Option<Arc<Router>>,
+    /// The resolver, when the API is allowed to see it.
     pub resolver: Option<Arc<DnsResolver>>,
+    /// Bearer secret required on every request.
     pub secret: Option<String>,
+    /// Whether unauthenticated access is allowed.
     pub allow_insecure: bool,
+    /// When the connection was accepted.
     pub start_time: Instant,
 }
 
+/// The management API listener.
 pub struct ApiServer {
     listen: String,
     ctx: ApiContext,
@@ -232,6 +261,7 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
+    /// A server for `context` on `listen_addr`, or over a socket if that is configured.
     pub fn new(
         listen: impl ToString,
         registry: Arc<OutboundRegistry>,
@@ -256,21 +286,25 @@ impl ApiServer {
         }
     }
 
+    /// Exposes routing state to the API.
     pub fn with_router(mut self, router: Arc<Router>) -> Self {
         self.ctx.router = Some(router);
         self
     }
 
+    /// Exposes the listeners to the API.
     pub fn with_inbounds(mut self, inbounds: Vec<Arc<dyn Inbound>>) -> Self {
         self.ctx.inbounds = inbounds;
         self
     }
 
+    /// Exposes the resolver to the API.
     pub fn with_resolver(mut self, resolver: Arc<DnsResolver>) -> Self {
         self.ctx.resolver = Some(resolver);
         self
     }
 
+    /// Requires this bearer secret on every request.
     pub fn with_secret(mut self, secret: Option<String>) -> Self {
         // An empty/whitespace-only secret is not a secret. Treating it as `Some("")`
         // would defeat the unsafe-bind guard (which checks `is_none()`) and let a
@@ -279,11 +313,13 @@ impl ApiServer {
         self
     }
 
+    /// Permits unauthenticated access; only for a loopback listener.
     pub fn with_allow_insecure(mut self, allow: bool) -> Self {
         self.ctx.allow_insecure = allow;
         self
     }
 
+    /// Binds the API listener and begins serving.
     pub async fn start(&self) -> FluxResult<()> {
         self.running.store(true, Ordering::SeqCst);
         let ctx = Arc::new(self.ctx.clone());
@@ -380,6 +416,7 @@ impl ApiServer {
         Ok(())
     }
 
+    /// Stops the listener, releasing the socket before it returns.
     pub async fn stop(&self) -> FluxResult<()> {
         self.running.store(false, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(());

@@ -7,10 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Which syntax a configuration file is written in.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ConfigFormat {
+    /// Detect from the file extension, falling back to JSON.
     Auto,
+    /// Parse as JSON.
     Json,
+    /// Parse as YAML.
     Yaml,
 }
 
@@ -61,26 +65,39 @@ pub fn load_any_config(path: impl AsRef<Path>, format: Option<ConfigFormat>) -> 
 // Reject unknown keys: a typo (`fake_ip_range` instead of `fakeip.inet4_range`)
 // used to be ignored silently, which silently disabled the feature the user
 // thought they had configured.
+/// /// The whole configuration file.
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Other files to merge into this one.
     #[serde(default, rename = "include", alias = "$include")]
     pub include: Vec<String>,
+    /// Log level override in the short form the CLI accepts.
     pub flux: Option<String>,
+    /// Logging configuration.
     pub log: Option<LogConfig>,
+    /// DNS settings.
     pub dns: Option<DnsConfig>,
+    /// Everything that accepts connections.
     #[serde(default)]
     pub inbounds: Vec<InboundConfig>,
+    /// Everything that dials out.
     #[serde(default, deserialize_with = "deserialize_outbounds")]
     pub outbounds: Vec<OutboundConfig>,
+    /// Routing configuration.
     pub route: Option<RouteConfig>,
+    /// The local management API.
     pub api: Option<ApiConfig>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// /// The management API.
 #[serde(deny_unknown_fields)]
 pub struct ApiConfig {
+    /// Address to listen on.
     pub listen: Option<String>,
+    /// Bearer secret for the API.
     pub secret: Option<String>,
+    /// Permit unauthenticated API access; loopback only.
     #[serde(default)]
     pub allow_insecure_api: bool,
 }
@@ -113,42 +130,56 @@ where
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// /// Logging.
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
+    /// Log level.
     pub level: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// /// DNS: servers, split rules and Fake-IP.
 #[serde(deny_unknown_fields)]
 pub struct DnsConfig {
     /// Address to serve DNS on (e.g. `127.0.0.1:5353`). When set, a DNS inbound
     /// is started; with `fakeip.enabled` it hands out fake addresses so that
     /// domain-based routing also works for applications that resolve names
     /// themselves.
+    /// Address to listen on.
     #[serde(default)]
     pub listen: Option<String>,
+    /// Upstream servers, in preference order.
     #[serde(default)]
     pub servers: Vec<String>,
+    /// Fake-IP pool settings, for transparent proxying.
     pub fakeip: Option<FakeIpConfig>,
+    /// EDNS Client Subnet to send with DNS queries.
     #[serde(default)]
     pub client_subnet: Option<String>,
+    /// Routing rules, evaluated in order.
     #[serde(default)]
     pub rules: Vec<DnsRuleConfig>,
 }
 
+/// /// A split-DNS rule: which servers answer for which domains.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DnsRuleConfig {
+    /// Domains this rule applies to.
     #[serde(default)]
     pub domains: Vec<String>,
+    /// Upstream servers, in preference order.
     #[serde(default)]
     pub servers: Vec<String>,
+    /// EDNS Client Subnet to send with DNS queries.
     #[serde(default)]
     pub client_subnet: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// /// Fake-IP pool settings.
 #[serde(deny_unknown_fields)]
 pub struct FakeIpConfig {
+    /// Whether this feature is on.
     pub enabled: Option<bool>,
     /// IPv4 range handed out for fake addresses (default `198.18.0.0/15`).
     #[serde(default)]
@@ -162,59 +193,87 @@ pub struct FakeIpConfig {
     pub inet6_range: Option<String>,
 }
 
+/// /// One username and password.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SocksUserConfig {
+    /// Account name.
     pub username: String,
+    /// The shared secret.
     pub password: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// /// An inbound the operating system routes to us rather than a listening port.
 #[serde(tag = "type")]
 pub enum SystemInboundConfig {
+    /// A TUN device with a userspace IP stack.
     #[serde(rename = "tun")]
     Tun {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Name to give the interface.
         #[serde(default)]
         interface_name: Option<String>,
+        /// Largest packet the link may carry.
         #[serde(default)]
         mtu: Option<usize>,
     },
+    /// SOCKS5 and HTTP on one port.
     #[serde(rename = "mixed")]
     Mixed {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Address to listen on.
         listen: String,
+        /// Port to listen on.
         listen_port: u16,
+        /// Accepted username and password pairs.
         #[serde(default)]
         users: Vec<SocksUserConfig>,
+        /// Connection-rate limits for this inbound.
         #[serde(default)]
         rate_limit: Option<RateLimitConfig>,
     },
+    /// Transparent interception with the REDIRECT (nat) target.
     #[serde(rename = "redirect")]
     Redirect {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Address to listen on.
         listen: String,
+        /// Port to listen on.
         listen_port: u16,
     },
+    /// Transparent interception with the TPROXY target.
     #[serde(rename = "tproxy")]
     Tproxy {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Address to listen on.
         listen: String,
+        /// Port to listen on.
         listen_port: u16,
     },
     /// WireGuard / AmneziaWG server-side inbound (L3 tunnel over UDP).
+    /// WireGuard or AmneziaWG.
     #[serde(rename = "wireguard")]
     WireGuard {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Address to listen on.
         listen: String,
+        /// Port to listen on.
         listen_port: u16,
         /// Server static private key (32-byte hex or base64).
         private_key: String,
         /// Authorized peers; at least one is required.
         peers: Vec<WireGuardPeerConfig>,
         /// Inner IP MTU (default: 1420).
+        /// Largest packet the link may carry.
         #[serde(default)]
         mtu: Option<usize>,
         /// AmneziaWG obfuscation parameters (must match the peer's config).
+        /// AmneziaWG parameters, when this peer is one.
         #[serde(default)]
         awg: Option<flux_protocol::wireguard::AwgConfig>,
     },
@@ -225,6 +284,7 @@ pub enum SystemInboundConfig {
 pub struct WireGuardPeerConfig {
     /// Peer static public key (32-byte hex or base64).
     pub public_key: String,
+    /// Optional pre-shared key.
     #[serde(default)]
     pub preshared_key: Option<String>,
     /// Allowed inner source IPs for this peer (CIDR). Empty = allow any.
@@ -233,6 +293,7 @@ pub struct WireGuardPeerConfig {
 }
 
 impl SystemInboundConfig {
+    /// The tag of the outbound or inbound this refers to.
     pub fn tag(&self) -> &str {
         match self {
             Self::Tun { tag, .. }
@@ -245,13 +306,17 @@ impl SystemInboundConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// An inbound: where it listens and what it speaks.
 #[serde(untagged)]
 pub enum InboundConfig {
+    /// One fully described inbound node.
     Node(Box<LayeredInboundNode>),
+    /// An inbound described by the operating system, e.g. redirect.
     System(SystemInboundConfig),
 }
 
 impl InboundConfig {
+    /// The tag of the outbound or inbound this refers to.
     pub fn tag(&self) -> &str {
         match self {
             Self::Node(node) => &node.tag,
@@ -261,50 +326,69 @@ impl InboundConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// How an outbound connection is carried.
 #[serde(tag = "type")]
 pub enum CarrierConfig {
+    /// Carried over TCP.
     #[serde(rename = "tcp")]
     Tcp {
+        /// Address to connect to.
         #[serde(default)]
         address: Option<String>,
+        /// Server host, when it is not the address this node dials.
         #[serde(default)]
         server: Option<String>,
+        /// Port, when it is not the listener's own.
         #[serde(default)]
         port: Option<u16>,
     },
+    /// Carried over UDP.
     #[serde(rename = "udp")]
     Udp {
+        /// Address to connect to.
         #[serde(default)]
         address: Option<String>,
+        /// Server host, when it is not the address this node dials.
         #[serde(default)]
         server: Option<String>,
+        /// Port, when it is not the listener's own.
         #[serde(default)]
         port: Option<u16>,
     },
     /// Xray's mKCP: a reliable byte stream over UDP.
     #[serde(rename = "kcp", alias = "mkcp")]
     Kcp {
+        /// Address to connect to.
         #[serde(default)]
         address: Option<String>,
+        /// Server host, when it is not the address this node dials.
         #[serde(default)]
         server: Option<String>,
+        /// Port, when it is not the listener's own.
         #[serde(default)]
         port: Option<u16>,
         /// Conversation id. Omitted (or 0) means "pick one", and for a server it
         /// means "adopt whatever the peer chooses", which is what a real peer does.
+        /// mKCP conversation id.
         #[serde(default)]
         conv: Option<u16>,
+        /// Largest packet the link may carry.
         #[serde(default = "default_kcp_mtu")]
         mtu: usize,
+        /// mKCP send window, in packets.
         #[serde(default = "default_kcp_wnd")]
         snd_wnd: u16,
+        /// mKCP receive window, in packets.
         #[serde(default = "default_kcp_wnd")]
         rcv_wnd: u16,
+        /// mKCP flush interval, in milliseconds.
         #[serde(default = "default_kcp_interval")]
         interval_ms: u32,
+        /// mKCP fast-resend threshold.
         #[serde(default = "default_kcp_resend")]
         resend: u32,
         /// Header camouflage. Xray calls these `header-*`; `srtp` is the common one.
+        /// mKCP obfuscation header type.
         #[serde(default = "default_kcp_header")]
         header: String,
     },
@@ -370,23 +454,32 @@ impl CarrierConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// How an inbound receives its connections.
 #[serde(tag = "type")]
 pub enum InboundCarrierConfig {
+    /// Carried over TCP.
     #[serde(rename = "tcp")]
     Tcp {
+        /// Address to listen on.
         #[serde(default)]
         listen: Option<String>,
+        /// Port to listen on.
         #[serde(default)]
         listen_port: Option<u16>,
+        /// Address to connect to.
         #[serde(default)]
         address: Option<String>,
     },
+    /// Carried over UDP.
     #[serde(rename = "udp")]
     Udp {
+        /// Address to listen on.
         #[serde(default)]
         listen: Option<String>,
+        /// Port to listen on.
         #[serde(default)]
         listen_port: Option<u16>,
+        /// Address to connect to.
         #[serde(default)]
         address: Option<String>,
     },
@@ -397,57 +490,78 @@ pub enum InboundCarrierConfig {
     /// get.
     #[serde(rename = "kcp", alias = "mkcp")]
     Kcp {
+        /// Address to listen on.
         #[serde(default)]
         listen: Option<String>,
+        /// Port to listen on.
         #[serde(default)]
         listen_port: Option<u16>,
+        /// Address to connect to.
         #[serde(default)]
         address: Option<String>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// /// The security layer over a carrier.
 #[serde(tag = "type")]
 pub enum SecurityConfig {
+    /// TLS, under the `SecurityConfig` it belongs to.
     #[serde(rename = "tls")]
     Tls {
+        /// SNI to present.
         #[serde(default)]
         sni: Option<String>,
+        /// ALPN protocols to offer.
         #[serde(default)]
         alpn: Vec<String>,
+        /// Skip certificate verification.
         #[serde(default)]
         insecure: bool,
+        /// Browser profile to imitate, under the name Xray uses.
         #[serde(default)]
         utls: Option<String>,
         /// PEM file(s) with extra trust anchors, appended to the built-in roots.
         /// A private CA should be pinned here rather than disabling verification
         /// with `insecure: true`.
+        /// Extra CA certificates to trust.
         #[serde(default)]
         ca_cert_path: Vec<String>,
     },
+    /// REALITY: TLS that cannot be attributed to this server.
     #[serde(rename = "reality")]
     Reality {
+        /// SNI to present.
         #[serde(default)]
         sni: Option<String>,
+        /// The server's REALITY public key.
         public_key: String,
+        /// REALITY short id, which authenticates the client.
         #[serde(default)]
         short_id: Option<String>,
     },
+    /// ShadowTLS: a real TLS handshake, then hijacked.
     #[serde(rename = "shadowtls")]
     ShadowTls {
         /// Only v3 is implemented; anything else is refused at load time rather
         /// than silently served as v3.
         #[serde(default = "default_shadowtls_version")]
         version: u8,
+        /// The shared secret.
         password: String,
+        /// SNI to present.
         sni: String,
     },
+    /// Splits the TLS ClientHello.
     #[serde(rename = "fragment")]
     Fragment {
+        /// Smallest fragment, in bytes.
         #[serde(default = "default_length_min")]
         length_min: usize,
+        /// Largest fragment, in bytes.
         #[serde(default = "default_length_max")]
         length_max: usize,
+        /// mKCP flush interval, in milliseconds.
         #[serde(default = "default_interval_ms")]
         interval_ms: u64,
     },
@@ -470,67 +584,94 @@ fn default_interval_ms() -> u64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// The security layer an inbound terminates.
 #[serde(tag = "type")]
 pub enum InboundSecurityConfig {
+    /// TLS, under the `SecurityConfig` it belongs to.
     #[serde(rename = "tls")]
     Tls {
+        /// Name the certificate must be valid for.
         #[serde(default)]
         server_name: Option<String>,
+        /// PEM certificate chain to present.
         #[serde(default)]
         certificate_path: Option<String>,
+        /// PEM private key that matches the certificate.
         #[serde(default)]
         key_path: Option<String>,
     },
+    /// REALITY: TLS that cannot be attributed to this server.
     #[serde(rename = "reality")]
     Reality {
+        /// Names this node will answer for.
         server_names: Vec<String>,
+        /// This node's REALITY private key.
         private_key: String,
+        /// Accepted REALITY short ids.
         short_ids: Vec<String>,
+        /// Member to use when the preferred one fails.
         #[serde(default)]
         fallback: Option<String>,
     },
+    /// ShadowTLS: a real TLS handshake, then hijacked.
     #[serde(rename = "shadowtls")]
     ShadowTls {
         /// Only v3 is implemented; anything else is refused at load time.
         #[serde(default = "default_shadowtls_version")]
         version: u8,
+        /// The shared secret.
         password: String,
+        /// Member to use when the preferred one fails.
         fallback: String,
         /// Cover host names this server will accept in the SNI. Empty disables
         /// the check (the previous behaviour); a configured list is fail-closed.
+        /// Names this node will answer for.
         #[serde(default)]
         server_names: Vec<String>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// The framing layer over an outbound's security layer.
 #[serde(tag = "type")]
 pub enum FramingConfig {
+    /// WebSocket framing, RFC 6455.
     #[serde(rename = "ws", alias = "websocket")]
     WebSocket {
+        /// Request path for the HTTP-shaped transports.
         #[serde(default = "default_ws_path")]
         path: String,
+        /// Extra headers sent with the HTTP-shaped transports.
         #[serde(default)]
         headers: HashMap<String, String>,
     },
+    /// HTTPUpgrade framing.
     #[serde(rename = "httpupgrade", alias = "upgrade")]
     HttpUpgrade {
+        /// Request path for the HTTP-shaped transports.
         #[serde(default = "default_ws_path")]
         path: String,
+        /// Extra headers sent with the HTTP-shaped transports.
         #[serde(default)]
         headers: HashMap<String, String>,
     },
+    /// Raw HTTP/2 framing.
     #[serde(rename = "h2", alias = "http2")]
     Http2 {
+        /// Request path for the HTTP-shaped transports.
         #[serde(default = "default_ws_path")]
         path: String,
+        /// Extra headers sent with the HTTP-shaped transports.
         #[serde(default)]
         headers: HashMap<String, String>,
     },
+    /// gRPC framing over HTTP/2.
     #[serde(rename = "grpc", alias = "gun")]
     Grpc {
+        /// gRPC service name, which appears in the request path.
         #[serde(default = "default_grpc_service")]
         service_name: String,
+        /// Extra headers sent with the HTTP-shaped transports.
         #[serde(default)]
         headers: HashMap<String, String>,
     },
@@ -548,65 +689,96 @@ fn default_hy2_mbps() -> u64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// The framing layer an inbound expects under its security.
 #[serde(tag = "type")]
 pub enum InboundFramingConfig {
+    /// WebSocket framing, RFC 6455.
     #[serde(rename = "ws", alias = "websocket")]
     WebSocket {
+        /// Request path for the HTTP-shaped transports.
         #[serde(default)]
         path: Option<String>,
     },
+    /// HTTPUpgrade framing.
     #[serde(rename = "httpupgrade", alias = "upgrade")]
     HttpUpgrade {
+        /// Request path for the HTTP-shaped transports.
         #[serde(default)]
         path: Option<String>,
     },
+    /// Raw HTTP/2 framing.
     #[serde(rename = "h2", alias = "http2")]
     Http2,
+    /// gRPC framing over HTTP/2.
     #[serde(rename = "grpc", alias = "gun")]
     Grpc,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// The protocol spoken on a node.
 #[serde(tag = "type")]
 pub enum ProtocolConfig {
+    /// VLESS.
     #[serde(rename = "vless")]
     Vless {
+        /// The user id.
         uuid: String,
+        /// The flow to request, e.g. `xtls-rprx-vision`.
         #[serde(default)]
         flow: Option<String>,
     },
+    /// Shadowsocks.
     #[serde(rename = "shadowsocks", alias = "ss")]
     Shadowsocks {
+        /// The shared secret.
         password: String,
+        /// The cipher, for Shadowsocks.
         #[serde(default)]
         method: Option<String>,
     },
+    /// Trojan, with one password.
     #[serde(rename = "trojan")]
-    Trojan { password: String },
+    Trojan {
+        /// The shared secret.
+        password: String,
+    },
+    /// VMess.
     #[serde(rename = "vmess")]
     Vmess {
+        /// The user id.
         uuid: String,
+        /// The security layer over the carrier.
         #[serde(default)]
         security: Option<String>,
     },
+    /// SOCKS5.
     #[serde(rename = "socks", alias = "socks5")]
     Socks {
+        /// Account name.
         #[serde(default)]
         username: Option<String>,
+        /// The shared secret.
         #[serde(default)]
         password: Option<String>,
     },
+    /// Plain HTTP proxying.
     #[serde(rename = "http")]
     Http {
+        /// Account name.
         #[serde(default)]
         username: Option<String>,
+        /// The shared secret.
         #[serde(default)]
         password: Option<String>,
     },
+    /// WireGuard or AmneziaWG.
     #[serde(rename = "wireguard", alias = "awg")]
     WireGuard {
+        /// This node's REALITY private key.
         private_key: String,
+        /// The peer's static public key.
         peer_public_key: String,
+        /// Optional pre-shared key.
         #[serde(default)]
         preshared_key: Option<String>,
         /// Local tunnel IP used as source of encapsulated packets (e.g. "10.0.0.2").
@@ -615,16 +787,22 @@ pub enum ProtocolConfig {
         /// Persistent NAT keepalive interval in seconds (0 disables). Default: 25.
         #[serde(default)]
         keepalive_secs: Option<u64>,
+        /// AmneziaWG parameters, when this peer is one.
         #[serde(default)]
         awg: Option<flux_protocol::wireguard::AwgConfig>,
     },
+    /// Hysteria 2 over QUIC.
     #[serde(rename = "hysteria2", alias = "hy2")]
     Hysteria2 {
+        /// The shared secret.
         password: String,
+        /// Advertised upload bandwidth.
         #[serde(default = "default_hy2_mbps")]
         up_mbps: u64,
+        /// Advertised download bandwidth.
         #[serde(default = "default_hy2_mbps")]
         down_mbps: u64,
+        /// Seconds between port hops.
         #[serde(default)]
         hop_interval_secs: Option<u64>,
         /// Optional: authentication is always HTTP/3, so `true` is accepted (it
@@ -633,30 +811,41 @@ pub enum ProtocolConfig {
         #[serde(default)]
         h3: Option<bool>,
         /// Salamander obfuscation mode ("salamander"); requires obfs_password.
+        /// Obfuscation settings.
         #[serde(default)]
         obfs: Option<String>,
+        /// Salamander obfuscation password.
         #[serde(default)]
         obfs_password: Option<String>,
     },
+    /// TUIC v5 over QUIC.
     #[serde(rename = "tuic", alias = "tuic5")]
     Tuic {
+        /// The user id.
         uuid: String,
+        /// The shared secret.
         password: String,
+        /// Congestion-control algorithm.
         #[serde(default)]
         congestion_control: Option<String>,
+        /// Whether to attempt 0-RTT.
         #[serde(default)]
         zero_rtt: Option<bool>,
     },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// A value that may be written as one item or a list of them.
 #[serde(untagged)]
 pub enum FlexibleList<T> {
+    /// Exactly one value of this shape.
     Single(T),
+    /// Several values of the same shape.
     Multiple(Vec<T>),
 }
 
 impl<T> FlexibleList<T> {
+    /// The values as a vector, consuming the list.
     pub fn into_vec(self) -> Vec<T> {
         match self {
             Self::Single(item) => vec![item],
@@ -664,6 +853,7 @@ impl<T> FlexibleList<T> {
         }
     }
 
+    /// The values as a slice, whether there is one or many.
     pub fn as_slice(&self) -> &[T] {
         match self {
             Self::Single(item) => std::slice::from_ref(item),
@@ -682,6 +872,7 @@ pub struct MultiplexConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Multiplex protocol. Only "smux" is implemented.
+    /// The protocol spoken on this node.
     #[serde(default = "default_mux_protocol")]
     pub protocol: String,
     /// Streams carried by one physical connection (0 = unlimited).
@@ -763,33 +954,48 @@ impl MultiplexConfig {
     }
 }
 
+/// /// An outbound with its carrier, security and framing already resolved.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayeredOutboundNode {
+    /// The name this element is referred to by elsewhere in the configuration.
     pub tag: String,
+    /// How the connection is carried: TCP, UDP or mKCP.
     pub carrier: CarrierConfig,
+    /// The protocol spoken on this node.
     pub protocol: ProtocolConfig,
+    /// The security layer over the carrier.
     #[serde(default)]
     pub security: Option<FlexibleList<SecurityConfig>>,
+    /// The framing layer over the security layer.
     #[serde(default)]
     pub framing: Option<FlexibleList<FramingConfig>>,
     /// Optional stream multiplexing (off by default).
+    /// Multiplexing settings; only streams can be multiplexed.
     #[serde(default)]
     pub multiplex: Option<MultiplexConfig>,
 }
 
+/// /// An inbound with its carrier, security and framing already resolved.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LayeredInboundNode {
+    /// The name this element is referred to by elsewhere in the configuration.
     pub tag: String,
+    /// How the connection is carried: TCP, UDP or mKCP.
     pub carrier: InboundCarrierConfig,
+    /// The protocol spoken on this node.
     pub protocol: ProtocolConfig,
+    /// The security layer over the carrier.
     #[serde(default)]
     pub security: Option<FlexibleList<InboundSecurityConfig>>,
+    /// The framing layer over the security layer.
     #[serde(default)]
     pub framing: Option<FlexibleList<InboundFramingConfig>>,
     /// Optional connection rate limiting (DoS hardening for public listeners).
+    /// Connection-rate limits for this inbound.
     #[serde(default)]
     pub rate_limit: Option<RateLimitConfig>,
     /// Optional stream multiplexing (off by default).
+    /// Multiplexing settings; only streams can be multiplexed.
     #[serde(default)]
     pub multiplex: Option<MultiplexConfig>,
 }
@@ -809,6 +1015,7 @@ pub struct RateLimitConfig {
 }
 
 impl RateLimitConfig {
+    /// Builds the limiter this configuration describes.
     pub fn build(&self) -> Arc<flux_common::RateLimiter> {
         let rate = self.max_conn_per_ip_per_sec.unwrap_or(0);
         let burst = self
@@ -820,53 +1027,81 @@ impl RateLimitConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// An outbound that chooses between other outbounds.
 #[serde(tag = "type")]
 pub enum OutboundGroupConfig {
+    /// Connects straight to the destination.
     #[serde(rename = "direct")]
     Direct {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// ClientHello fragmentation settings.
         #[serde(default)]
         tls_fragment: Option<flux_transport::fragment::FragmentationConfig>,
     },
+    /// A routing target that refuses the connection.
     #[serde(rename = "block")]
-    Block { tag: String },
+    Block {
+        /// The tag this outbound is referred to by.
+        tag: String,
+    },
+    /// One member, chosen by hand or through the API.
     #[serde(rename = "selector")]
     Selector {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Everything that dials out.
         outbounds: Vec<String>,
+        /// Member used before any measurement has been taken.
         #[serde(default)]
         default: Option<String>,
     },
+    /// Measures members and uses the fastest.
     #[serde(rename = "urltest")]
     UrlTest {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Everything that dials out.
         outbounds: Vec<String>,
+        /// URL to probe, for the urltest and health-check groups.
         #[serde(default)]
         url: Option<String>,
+        /// How often to re-probe, e.g. `3m`.
         #[serde(default)]
         interval: Option<String>,
+        /// How far members may lag the fastest before a switch.
         #[serde(default)]
         tolerance: Option<u64>,
     },
+    /// Tries members in order, falling back when one fails.
     #[serde(rename = "fallback")]
     Fallback {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Everything that dials out.
         outbounds: Vec<String>,
+        /// URL to probe, for the urltest and health-check groups.
         #[serde(default)]
         url: Option<String>,
+        /// How often to re-probe, e.g. `3m`.
         #[serde(default)]
         interval: Option<String>,
     },
+    /// Spreads connections across its members.
     #[serde(rename = "loadbalance")]
     LoadBalance {
+        /// The name this element is referred to by elsewhere in the configuration.
         tag: String,
+        /// Everything that dials out.
         outbounds: Vec<String>,
+        /// How a load-balance group spreads connections.
         #[serde(default)]
         strategy: Option<String>,
     },
 }
 
 impl OutboundGroupConfig {
+    /// The tag of the outbound or inbound this refers to.
     pub fn tag(&self) -> &str {
         match self {
             Self::Direct { tag, .. }
@@ -880,13 +1115,17 @@ impl OutboundGroupConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+/// An outbound: how to reach a server and what to speak to it.
 #[serde(untagged)]
 pub enum OutboundConfig {
+    /// One fully described outbound node.
     Node(Box<LayeredOutboundNode>),
+    /// A group of outbounds: selector, urltest, fallback or load-balance.
     Group(OutboundGroupConfig),
 }
 
 impl OutboundConfig {
+    /// The tag of the outbound or inbound this refers to.
     pub fn tag(&self) -> &str {
         match self {
             Self::Node(node) => &node.tag,
@@ -895,25 +1134,33 @@ impl OutboundConfig {
     }
 }
 
+/// /// Routing: rules and the default outbound.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RouteConfig {
+    /// Path to the GeoIP database.
     #[serde(default)]
     pub geoip_path: Option<String>,
+    /// External rule sets, defined here.
     #[serde(default)]
     pub rule_set: Vec<RuleSetConfig>,
+    /// Routing rules, evaluated in order.
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
+    /// Outbound used when no rule matches.
     #[serde(rename = "final")]
     pub final_outbound: Option<String>,
 }
 
+/// /// An external rule set.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuleSetConfig {
+    /// The name this element is referred to by elsewhere in the configuration.
     pub tag: String,
     /// "local" (default, file at `path`), "inline" (embedded lists) or
     /// "remote" (http(s) URL at `path`, fetched in the background).
     #[serde(rename = "type")]
     pub set_type: Option<String>,
+    /// Request path for the HTTP-shaped transports.
     #[serde(default)]
     pub path: Option<String>,
     /// Optional periodic refresh interval for remote rule sets (e.g. "24h", "30m").
@@ -925,12 +1172,16 @@ pub struct RuleSetConfig {
     /// `$XDG_CACHE_HOME/flux-core/rulesets/<tag>-<urlhash>.txt`
     #[serde(default)]
     pub cache_path: Option<String>,
+    /// Destination CIDRs.
     #[serde(default)]
     pub ip_cidr: Vec<String>,
+    /// Exact domains.
     #[serde(default)]
     pub domain: Vec<String>,
+    /// Domain suffixes.
     #[serde(default)]
     pub domain_suffix: Vec<String>,
+    /// Domain keywords.
     #[serde(default)]
     pub domain_keyword: Vec<String>,
 }
@@ -973,38 +1224,54 @@ where
     })
 }
 
+/// /// One routing rule, as written in the configuration.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuleConfig {
+    /// Inbound tags this rule applies to.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub inbound: Vec<String>,
+    /// Exact domains.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub domain: Vec<String>,
+    /// Domain suffixes.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub domain_suffix: Vec<String>,
+    /// Domain keywords.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub domain_keyword: Vec<String>,
+    /// Destination CIDRs.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub ip_cidr: Vec<String>,
+    /// Port, when it is not the listener's own.
     #[serde(default, deserialize_with = "deserialize_port_list")]
     pub port: Vec<u16>,
+    /// Destination port ranges, e.g. `443` or `1000-2000`.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub port_range: Vec<String>,
+    /// Tags of external rule sets to consult.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub rule_set: Vec<String>,
+    /// Named domain sets to match.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub geosite: Vec<String>,
+    /// ISO country codes to match.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub geoip: Vec<String>,
+    /// Process names, where the platform can attribute a connection.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub process_name: Vec<String>,
+    /// Stream or datagram.
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub network: Vec<String>,
+    /// Inverts the rule: matches when its conditions do not.
     #[serde(default)]
     pub invert: bool,
+    /// Outbound this rule selects.
     pub outbound: String,
 }
 
 impl RuleConfig {
+    /// Compiles this configuration into a router rule.
     pub fn to_rule(&self) -> FluxResult<Rule> {
         let mut domains = Vec::new();
         for d in &self.domain {

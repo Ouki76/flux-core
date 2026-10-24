@@ -127,6 +127,7 @@ fn drop_failed_endpoint(
 /// Upper bound on nested per-destination endpoints for one outbound tag.
 const MAX_ENDPOINTS_PER_TAG: usize = 256;
 
+/// /// The dispatcher: applies routing, then relays.
 pub struct DefaultDispatcher {
     router: Arc<Router>,
     outbounds: Arc<dyn OutboundLookup>,
@@ -135,6 +136,7 @@ pub struct DefaultDispatcher {
 }
 
 impl DefaultDispatcher {
+    /// A dispatcher over these rules and this outbound table.
     pub fn new(router: Arc<Router>, outbounds: Arc<dyn OutboundLookup>) -> Self {
         Self {
             router,
@@ -144,11 +146,13 @@ impl DefaultDispatcher {
         }
     }
 
+    /// Counts traffic per connection and registers it in the table.
     pub fn with_meter(mut self, meter: Arc<TrafficMeter>) -> Self {
         self.meter = Some(meter);
         self
     }
 
+    /// Supplies a resolver, so domain rules can match on the resolved address.
     pub fn with_resolver(mut self, resolver: Arc<flux_dns::DnsResolver>) -> Self {
         self.resolver = Some(resolver);
         self
