@@ -7,37 +7,42 @@ where that is not true, it says so.
 
 ---
 
-## 0. Where things stand right now (2026-10-24, after cycle 62)
+## 0. Where things stand right now (2026-10-25, after cycle 64)
 
-**1074 tests, 0 failed.** fmt, `clippy -D warnings`, `cargo doc -D warnings`, `cargo
+**1081 tests, 0 failed.** fmt, `clippy -D warnings`, `cargo doc -D warnings`, `cargo
 audit` and `cargo deny` clean. **The whole workspace is documented** — 1143 public items
-across nine crates, each crate enforcing `#![warn(missing_docs)]`.
+across nine crates, each enforcing `#![warn(missing_docs)]`. **The intermittent stall is
+fixed** (see below); 25 rounds x 64 MiB of the worst-affected path ran without one.
 
 Three-column matrix, 3 interleaved rounds x 200 MiB on the homelab server:
 
 | path | flux | sing-box | xray | vs sbox | vs xray | CPU vs both |
 |---|---|---|---|---|---|---|
-| VLESS / TCP | **719** | 607 | 617 | **+18.5 %** | **+16.6 %** | −42 / −57 % |
-| VLESS / XHTTP | **152** | — (unsupported) | 114 | — | **+33.9 %** | −59 % |
-| VLESS / REALITY | 280 | 308 | 247 | −8.9 % | **+13.6 %** | −38 / −45 % |
-| REALITY + Vision | 268 | 287 | 203 | −6.9 % | **+31.9 %** | −36 / −46 % |
-| VLESS / WS + TLS | 244 | 290 | 105 | −16.0 % | **+131 %** | −30 / −66 % |
-| VMess / WS + TLS | 185 | 200 | 152 | −7.2 % | **+21.8 %** | −37 / −47 % |
-| Trojan / TLS | 255 | 290 | — | −12.0 % | — | −32 % |
-| Shadowsocks-2022 | 292 | 338 | 286 | −13.6 % | **+2.3 %** | −19 / −56 % |
-| Shadowsocks-AEAD | **240** | 236 | — | **+1.7 %** | — | −27 % |
-| VLESS / gRPC + TLS | 91 | 114 | 179 | −19.8 % | −49.0 % | −51 / −33 % |
+| VLESS / TCP | **680** | 581 | 625 | **+17.1 %** | **+8.8 %** | −40 / −49 % |
+| VLESS / XHTTP | **139** | — (unsupported) | 114 | — | **+22.1 %** | −57 % |
+| VLESS / WS + TLS | 258 | 269 | 104 | −3.8 % | **+149 %** | −32 / −68 % |
+| VMess / WS + TLS | 182 | 188 | 158 | −3.1 % | **+15.6 %** | −41 / −46 % |
+| VLESS / REALITY | 276 | 300 | 218 | −7.8 % | **+26.6 %** | −32 / −42 % |
+| REALITY + Vision | 276 | 298 | 233 | −7.2 % | **+18.4 %** | −35 / −44 % |
+| Trojan / TLS | 286 | 308 | — | −7.3 % | — | −30 % |
+| Shadowsocks-2022 | 289 | 314 | 301 | −8.0 % | −4.0 % | −19 / −55 % |
+| Shadowsocks-AEAD | 235 | 255 | — | −7.5 % | — | −19 % |
+| VLESS / gRPC + TLS | 91 | 117 | 190 | −21.6 % | −51.8 % | −49 / −31 % |
 
-Absolute rates move ±5-10 % between runs on this host (hours of benchmarking, thermal
-state); the gaps are the stable quantity. Never compare absolutes across machines.
+Absolute rates move ±5-10 % between runs on this host; the gaps are the stable quantity.
+Never compare absolutes across machines.
 
 **Functional gaps vs the competitors: closed.** mKCP (both directions, interop proven),
 XHTTP (stream-one, interop proven and measured), IDNA, GeoIP fixture, private-CA knob, UDP
 associations, nested config-key typo detection. The one partial item is the browser-grade
-ClientHello, which is a property of the TLS library rather than of this codebase and is
-documented as such.
+ClientHello, which is a property of the TLS library rather than of this codebase.
 
-**The single defect behind almost all of it:** every path framed *one unit per call*
+**The defect that hid for thirty cycles was a missing `poll_flush`** in the relay's
+copier: writers above a socket hold accepted bytes until flushed, so the tail of a transfer
+never left and both directions parked. It is fixed and proven by
+`buffered_bytes_reach_the_peer_without_a_close`.
+
+**The single defect behind almost all of the throughput:** every path framed *one unit per call*
 (one 16 KiB chunk, one TLS record, one WebSocket frame, one gRPC message) while the relay
 works in 64 KiB buffers. Found and fixed in the shared copier, WebSocket, both Shadowsocks
 variants, REALITY (writes and reads), Vision and VMess — seven places, one bug. If a path
