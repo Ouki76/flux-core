@@ -3207,3 +3207,38 @@ silently broken every TLS 1.2 client while looking like a 2 % win.
 
 GHASH dominates AES-GCM here, which is why the round count barely matters. That closes the
 cipher micro-optimisation line: four experiments, all null, all reverted.
+
+---
+
+## Cycle 67 — 2026-10-25
+
+### A 30-minute soak, because "no leaks" is a claim that needs a number
+
+```
+requests: 24 631 216, errors: 0, bytes proxied: 192 431 MB
+RSS min/max: 13.4 / 18.9 MB | head-median: 16.9 | tail-median: 18.2
+final FDs: 267 | final threads: 26
+OK: bounded memory (tail/head median delta 1.3 MB, 8%)
+```
+
+192 GB through a proxy that lives in 18 MB, at 24.6 million requests with **not one error**,
+file descriptors flat around 550 under load and 267 at rest, threads constant at 26. The
+first seven minutes take RSS from 14.9 to 18.0 MB and the remaining twenty-two add 0.2 MB,
+which is allocator growth reaching its plateau rather than a per-request leak — a leak at
+this rate would have added tens of megabytes in the same window.
+
+### The pedantic lint audit: no defects found, which is itself the result
+
+`clippy::pedantic` across the workspace raises ~2 600 suggestions. Most are style (631
+`format!` captures, 323 missing doc backticks). The categories that could hide a bug were
+each inspected:
+
+| lint | count | finding |
+|---|---|---|
+| `cast_possible_truncation` | 110 + 66 | every `usize → u16/u8` is either guarded by a length check (DoQ/DoT framing, mux fillers bounded at 768) or truncates a TXT string to its 255-byte spec limit |
+| `cast_possible_wrap` | 5 in production | `take as i64` on a length, `mtu as c_int`, a u8 filename byte — all bounded |
+| `arithmetic_side_effects` | 1 125 | timeouts and counters on `u64`; not worth changing and not worth suppressing |
+
+So the strict-lint pass found nothing to fix. That is worth writing down precisely because it
+is unglamorous: the code is clean under much harsher rules than it enforces, and the reason
+to say so is that a future reader can stop looking.
