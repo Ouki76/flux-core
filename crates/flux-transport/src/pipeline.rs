@@ -283,7 +283,7 @@ impl ServerTransportPipeline {
                         // rustls delivers one TLS record per `poll_read`; the relay
                         // reads 64 KiB at a time. Coalescing at the boundary leaves
                         // rustls untouched (see `coalesce.rs`).
-                        Box::new(crate::coalesce::CoalesceReader::new(s))
+                        Box::new(s)
                     }
                     ServerSecurityLayer::Reality(cfg) => {
                         let s = RealityHandshake::server_handshake(stream, cfg).await?;
