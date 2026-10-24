@@ -2657,3 +2657,25 @@ blank line between a doc list and the summary sentence that follows it.
 `flux-types` (63), `flux-common` (14), `flux-router` (78), `flux-dns` (108) — four crates
 closed and enforced, 263 public items. Remaining: `flux-protocol`, `flux-transport`,
 `flux-inbound`, `flux-outbound`, `flux-app`, in their own cycles.
+
+---
+
+## Cycle 54 — 2026-10-24
+
+### Transport documented: 149 items, and the reasons behind the settings
+
+Fifth crate closed and enforced. The interesting part is not the count but that the
+settings which look arbitrary now say why they are not:
+
+- `FragmentationConfig::interval_ms` — "the point is to defeat reassembly";
+- `TlsClientConfig::insecure` — tests and pinned self-signed setups only;
+- `RealityServerConfig::fallback_address` — forwarding probes there is REALITY's
+  anti-probing core, not an ordinary fallback;
+- the pipeline's layer order on both sides, because getting it wrong yields a connection
+  that works and does not do what the configuration says.
+
+The crate root now states the design in one sentence: every transport is a stream wrapper
+and `pipeline` composes them, which is why no transport has its own connection type.
+
+Five crates done: types (63), common (14), router (78), dns (108), transport (149) — **412
+public items**. Remaining: protocol, inbound, outbound, app.
