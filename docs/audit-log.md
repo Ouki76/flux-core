@@ -2968,3 +2968,46 @@ The test that asserted the *refusal* was replaced by one that asserts the behavi
 
 The only item left marked partial is the one that is a property of the TLS library rather
 than of this codebase, and it is written down as such rather than claimed.
+
+---
+
+## Cycle 62 — 2026-10-24
+
+### The full matrix, re-measured
+
+| path | flux | sing-box | xray | vs sbox | vs xray | CPU vs sbox | CPU vs xray |
+|---|---|---|---|---|---|---|---|
+| VLESS / TCP | **719** | 607 | 617 | **+18.5 %** | **+16.6 %** | −42 % | −57 % |
+| VLESS / XHTTP | **152** | — | 114 | — | **+33.9 %** | — | −59 % |
+| VLESS / WS + TLS | 244 | 290 | 105 | −16.0 % | **+131 %** | −30 % | −66 % |
+| VLESS / gRPC + TLS | 91 | 114 | 179 | −19.8 % | −49.0 % | −51 % | −33 % |
+| VLESS / REALITY | 280 | 308 | 247 | −8.9 % | **+13.6 %** | −38 % | −45 % |
+| REALITY + Vision | 268 | 287 | 203 | −6.9 % | **+31.9 %** | −36 % | −46 % |
+| VMess / WS + TLS | 185 | 200 | 152 | −7.2 % | **+21.8 %** | −37 % | −47 % |
+| Trojan / TLS | 255 | 290 | — | −12.0 % | — | −32 % | — |
+| Shadowsocks-2022 | 292 | 354 | 284 | −17.6 % | +2.7 % | −19 % | −56 % |
+| Shadowsocks-AEAD | **240** | 236 | — | **+1.7 %** | — | −27 % | — |
+
+**Seven of eight against xray** (gRPC the exception), **two of nine against sing-box**.
+
+Note the honest part: several sing-box gaps widened compared with the earlier run — WS
+from −11.9 % to −16.0 %, Shadowsocks-2022 from −5.5 % to −17.6 %, Trojan from −6.1 % to
+−12.0 %. The machine has been running benchmarks for hours, and the five-round table in
+the README was taken on a cooler one. Both are recorded rather than the flattering one
+being kept, because a table that only ever shows its best run is not a measurement.
+
+### gRPC: ninth hypothesis, also null
+
+Found the actual reason the earlier zero-copy attempt broke four hardening tests: a gRPC
+message body is not the payload, it is a length-delimited **protobuf field 1 that wraps**
+it, and the fast path had skipped that envelope entirely — so malformed varints sailed
+through. Rewritten to parse the envelope on the slice (zero copy, same validation, falling
+through to the slow path on anything unexpected), and all 58 tests passed.
+
+Measured: **90 vs 91 MB/s. No change.** Reverted, because a second code path through
+framing logic that buys nothing is exactly the complexity this audit exists to remove.
+
+Nine hypotheses for this row have now been tested and rejected. What the numbers say is
+narrow and worth writing down: XHTTP moves 152 MB/s over the same HTTP/2 machinery gRPC
+reaches 91 with, so the loss is in per-message behaviour, not in bytes moved — and it is
+not copies, not buffer sizes, not flow control, not the framing format.
