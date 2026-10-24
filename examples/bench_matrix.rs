@@ -1220,10 +1220,18 @@ async fn measure_round(
 
     let done = match outcome {
         Err(_) => {
+            // How much CPU the tunnel burned while "doing nothing" separates a parked
+            // tunnel from a spinning one, which is the whole question about this stall.
+            let burned = match (cpu_before, cpu_after) {
+                (Some(b), Some(a)) => format!("{:.3} s CPU", (a - b).max(0.0)),
+                _ => "CPU unknown".to_string(),
+            };
             return Err(format!(
-                "timeout: no completion within {}s ({} MiB attempted)",
+                "timeout: no completion within {}s ({} MiB attempted); the tunnel used {} \
+                 during the attempt",
                 timeout.as_secs(),
-                total_bytes / (1024 * 1024)
+                total_bytes / (1024 * 1024),
+                burned
             ));
         }
         Ok(Err(e)) => return Err(e),
