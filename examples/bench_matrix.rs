@@ -1922,6 +1922,59 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     println!("{}", "-".repeat(126));
+
+    // The same comparison on each stack's *best* round rather than its median.
+    //
+    // Medians are the right summary for an idle box, but this one is shared: load average
+    // moved between 8.3 and 1.6 during a single audit session, which is +/-20% on every
+    // absolute. A best-of-N is the closest thing to a capability measurement under
+    // interference — every stack gets the same chance at a quiet moment — so a difference
+    // that shows up here but not in the medians is worth more than one that shows up only
+    // in the medians.
+    println!(
+        "\nBEST-OF-{} SUMMARY (each stack's fastest round; least sensitive to external load)",
+        args.rounds
+    );
+    println!("{}", "-".repeat(126));
+    println!(
+        "{:<38} {:>10} {:>10} {:>10} {:>11} {:>11}",
+        "Protocol / transport", "flux best", "sbox best", "xray best", "vs sbox", "vs xray"
+    );
+    println!("{}", "-".repeat(126));
+    let mut protocols: Vec<String> = Vec::new();
+    for row in &rows {
+        if !protocols.contains(&row.0) {
+            protocols.push(row.0.clone());
+        }
+    }
+    for protocol in &protocols {
+        let best = |stack: Stack| -> Option<f64> {
+            rows.iter()
+                .find(|r| &r.0 == protocol && r.1 == stack)
+                .and_then(|r| r.2.as_ref())
+                .map(|samples| samples.iter().map(|s| s.bulk_mbps).fold(f64::MIN, f64::max))
+        };
+        let (f, sb, xr) = (best(Stack::Flux), best(Stack::Singbox), best(Stack::Xray));
+        let pct = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(a), Some(b)) if b > 0.0 => format!("{:+.1}%", (a / b - 1.0) * 100.0),
+            _ => "-".to_string(),
+        };
+        let fmt = |v: Option<f64>| match v {
+            Some(v) => format!("{v:.1}"),
+            None => "-".to_string(),
+        };
+        println!(
+            "{:<38} {:>10} {:>10} {:>10} {:>11} {:>11}",
+            protocol,
+            fmt(f),
+            fmt(sb),
+            fmt(xr),
+            pct(f, sb),
+            pct(f, xr)
+        );
+    }
+    println!("{}", "-".repeat(126));
+
     println!(
         "MB/s = MiB/s (1048576 B) of payload. CPU s/GiB = CPU of both tunnel processes per GiB of\n\
          payload, lower is better. `throughput` and `CPU ratio` compare bulk rates, so a protocol\n\

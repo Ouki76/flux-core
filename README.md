@@ -140,28 +140,33 @@ Single stream, measured against **sing-box and xray** on the same machine, same 
 interleaved rounds — the only comparison that says anything about competitiveness
 (methodology in [docs/audit-log.md](docs/audit-log.md)):
 
-| Path | flux-core | sing-box | xray | vs sing-box | vs xray | CPU vs both |
-|---|---|---|---|---|---|---|
-| VLESS / TCP | **680** | 581 | 625 | **+17.1 %** | **+8.8 %** | −40 / −49 % |
-| VLESS / XHTTP | **139** | — (unsupported) | 114 | — | **+22.1 %** | −57 % |
-| VLESS / WS + TLS | 258 | 269 | 104 | −3.8 % | **+149 %** | −32 / −68 % |
-| VMess / WS + TLS | 182 | 188 | 158 | −3.1 % | **+15.6 %** | −41 / −46 % |
-| VLESS / REALITY | 276 | 300 | 218 | −7.8 % | **+26.6 %** | −32 / −42 % |
-| REALITY + Vision | 276 | 298 | 233 | −7.2 % | **+18.4 %** | −35 / −44 % |
-| Trojan / TLS | 286 | 308 | — | −7.3 % | — | −30 % |
-| Shadowsocks-2022 | 289 | 314 | 301 | −8.0 % | −4.0 % | −19 / −55 % |
-| Shadowsocks-AEAD | 235 | 255 | — | −7.5 % | — | −19 % |
-| VLESS / gRPC + TLS | 91 | 117 | 190 | −21.6 % | −51.8 % | −49 / −31 % |
+Best-of-4 (each stack's fastest round — the comparison least sensitive to a shared machine;
+medians are in `docs/audit-log.md`):
+
+| Path | flux-core | sing-box | xray | vs sing-box | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | **721** | 674 | 625 | **+6.9 %** | **+15.4 %** |
+| VLESS / TLS | 306 | 327 | 276 | −6.4 % | **+10.9 %** |
+| VLESS / XHTTP | **147** | — (unsupported) | 131 | — | **+11.5 %** |
+| VLESS / WS + TLS | **289** | 267 | 113 | **+8.1 %** | **+157 %** |
+| VMess / WS + TLS | **230** | 211 | 167 | **+9.2 %** | **+38.1 %** |
+| VLESS / REALITY | 270 | 315 | 248 | −14.2 % | **+9.0 %** |
+| REALITY + Vision | **336** | 310 | 222 | **+8.3 %** | **+51.2 %** |
+| Shadowsocks-2022 | 344 | 362 | 296 | −5.0 % | **+16.2 %** |
+| Shadowsocks-AEAD | **284** | 255 | — | **+11.8 %** | — |
+| VLESS / gRPC + TLS | 97 | 117 | 196 | −17.7 % | −50.8 % |
 
 **Absolutes are machine-specific — never compare these numbers across machines, only
-within one run.** This table is the homelab server (24 cores, Void Linux, 3 interleaved
-rounds x 200 MiB); an earlier edition came from a desktop where every absolute was about
+within one run.** This table is the homelab server (24 cores, Void Linux, 4 interleaved
+rounds x 200 MiB); run-to-run spread on one row reaches ±15 %, which is why the fastest
+round of each stack is the number quoted here; an earlier edition came from a desktop where every absolute was about
 1.6x higher and the deltas told a different story.
 
-What the table says: flux-core **beats xray on six of the eight paths xray can run**,
-matches or beats sing-box on plain TCP, and is within 8 % on six more — while spending
-**19-68 % less CPU than both on every single path** and using a third of the memory. The one
-clear loss to both is gRPC, at roughly half of sing-box's rate.
+What the table says: flux-core **beats xray on eight of the nine paths xray can run** and
+**beats sing-box on five of the ten it can run**, while spending **19-68 % less CPU than
+both on every single path** and using a third of the memory. The clear loss to both is gRPC,
+at roughly half of sing-box's rate; the other is plain REALITY, which is slower than its own
+Vision flow because Vision stops re-framing what TLS already framed.
 
 Reproduce: `cargo run --release --example bench_matrix -- --rounds 5 --mb 200`.
 
