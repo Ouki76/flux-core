@@ -169,7 +169,21 @@ async fn main() {
         if one_way { "one-way" } else { "echo" }
     );
     println!("layer            round 1        round 2        round 3        median MB/s");
+    // `--only ws` (or a comma list) narrows the run: profiling a layer under
+    // callgrind is useless when the h2 path, which costs orders of magnitude more
+    // instructions per byte, is measured in the same process.
+    let only: Option<Vec<String>> = args
+        .iter()
+        .position(|a| a == "--only")
+        .and_then(|i| args.get(i + 1))
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect());
+
     for name in ["raw", "ws", "upgrade", "h2", "grpc"] {
+        if let Some(only) = &only
+            && !only.iter().any(|o| o == name)
+        {
+            continue;
+        }
         let mut vals = Vec::new();
         for _ in 0..rounds {
             vals.push(measure(name, mb, chunk, one_way).await);
