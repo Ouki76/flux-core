@@ -2699,3 +2699,30 @@ measured rather than assumed. Full matrix, 3 rounds x 200 MiB, on tokio 1.54.1:
 
 Same corridor as before the upgrade, and **every row completed** — no stall in this run.
 CPU is 28-68 % below sing-box and 34-68 % below xray throughout.
+
+---
+
+## Cycle 55 — 2026-10-24
+
+### Protocols documented — and the placeholder trap avoided
+
+Sixth crate closed: `flux-protocol`, 215 public items including every wire constant, every
+cipher method and every configuration field, with the lint on.
+
+The first pass was generated, and it produced **103 placeholder docs** — "Field `x`." and
+"The `FOO` constant defined by the protocol." They satisfy `missing_docs` perfectly and
+teach a reader nothing, which is the same failure this audit keeps finding elsewhere: a gate
+that exists on paper. All of them were rewritten with real content — which byte a constant
+is, what each AmneziaWG parameter does (`jc` junk packets, `s1`/`s2` bytes prepended,
+`h1..h4` magic headers), what a replay window holds, what `session_iv` seeds.
+
+Verified by grep rather than by assertion: zero `Field \`` docs remain.
+
+The hand-written parts say the things that matter: the crate root explains that every
+protocol is a stream wrapper (so it rides any transport) and that every parser validates
+before use, naming the fuzz harness that keeps it true.
+
+### Six crates, 627 public items documented and enforced
+
+types 63, common 14, router 78, dns 108, transport 149, protocol 215. Remaining: inbound
+(83), outbound (81), app (352).
