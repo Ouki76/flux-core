@@ -296,30 +296,84 @@ fn get_free_tcp_port_blocking() -> u16 {
     l.local_addr().unwrap().port()
 }
 
-/// An inbound `carrier: kcp` must fail with a sentence, not with serde's
-/// untagged-enum message. The client side works; the server side needs every inbound
-/// to accept an already-established stream, which is a cross-cutting change.
+/// **A real Xray client → our mKCP server.**
+///
+/// The direction that used to be missing: every inbound used to bind its own TCP
+/// listener, so there was nowhere to hand an already-established stream. `serve_connection`
+/// now takes a plain stream, and the mKCP listener calls it — the handshake, the transport
+/// layers and dispatch are the same code that serves TCP, which is what makes this test
+/// worth having.
 #[tokio::test]
-async fn a_kcp_inbound_says_what_is_missing() {
-    let port = get_free_tcp_port().await;
-    let cfg = format!(
+async fn a_real_xray_client_reaches_our_mkcp_server() {
+    let Some(bin) = xray_bin() else {
+        panic!("the `xray` binary is required by this test but was not found");
+    };
+    let echo_port = echo_server().await;
+    let server_port = get_free_tcp_port().await;
+    let socks_port = get_free_tcp_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Our server: VLESS over mKCP, straight to a direct outbound.
+    let server_cfg = format!(
         r#"{{
+  "log": {{"level": "error"}},
   "inbounds": [{{
-    "tag": "kcp-in",
-    "carrier": {{"type": "kcp", "listen": "127.0.0.1", "listen_port": {port}}},
+    "tag": "in",
+    "carrier": {{"type": "kcp", "listen": "127.0.0.1", "listen_port": {server_port}}},
     "protocol": {{"type": "vless", "uuid": "{UUID}"}}
   }}],
-  "outbounds": [{{"type": "direct", "tag": "d"}}]
+  "outbounds": [{{"type": "direct", "tag": "direct"}}],
+  "route": {{"final": "direct"}}
 }}"#
     );
-    let parsed = flux_app::Config::from_json_str(&cfg).expect("the carrier must parse");
-    let err = match flux_app::Instance::new(parsed) {
-        Ok(_) => panic!("a kcp inbound must be refused"),
-        Err(e) => format!("{e}"),
-    };
-    assert!(err.contains("inbound carrier 'kcp'"), "{err}");
-    assert!(
-        err.contains("client side works"),
-        "the error must say what does work: {err}"
+    let instance = flux_app::Instance::new(
+        flux_app::Config::from_json_str(&server_cfg).expect("parse our server config"),
+    )
+    .expect("build our server");
+    instance.start().await.expect("start our server");
+
+    let client_cfg = format!(
+        r#"{{
+  "log": {{"loglevel": "warning"}},
+  "inbounds": [{{"port": {socks_port}, "listen": "127.0.0.1", "protocol": "socks",
+                 "settings": {{"udp": false}}}}],
+  "outbounds": [{{
+    "protocol": "vless",
+    "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {server_port},
+      "users": [{{"id": "{UUID}", "encryption": "none"}}]}}]}},
+    "streamSettings": {{ {masks} }}
+  }}]
+}}"#,
+        masks = kcp_masks()
     );
+    let _xray = spawn_xray(&bin, &client_cfg, dir.path());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut sock = tokio::net::TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+        .await
+        .expect("connect to the xray socks listener");
+    sock.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut hello = [0u8; 2];
+    sock.read_exact(&mut hello).await.unwrap();
+    let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+    req.extend_from_slice(&echo_port.to_be_bytes());
+    sock.write_all(&req).await.unwrap();
+    let mut rep = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(30), sock.read_exact(&mut rep))
+        .await
+        .expect("the SOCKS reply must arrive over mKCP")
+        .unwrap();
+    assert_eq!(rep[1], 0x00, "the CONNECT must succeed");
+
+    let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    sock.write_all(&payload).await.expect("write payload");
+    sock.flush().await.expect("flush");
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(30), sock.read_exact(&mut got))
+        .await
+        .expect("the echo must come back through mKCP")
+        .expect("read echo");
+    assert_eq!(got, payload, "mKCP corrupted the payload");
+
+    instance.stop().await.expect("stop our server");
 }

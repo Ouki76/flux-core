@@ -1472,13 +1472,24 @@ fn build_layered_outbound(
 
 fn parse_inbound_carrier(carrier: &InboundCarrierConfig) -> FluxResult<(SocketAddr, bool)> {
     match carrier {
-        InboundCarrierConfig::Kcp { .. } => Err(FluxError::Config(
-            "inbound carrier 'kcp' is not implemented yet: the client side works and \
-             interoperates with Xray, but serving mKCP needs every inbound to accept an \
-             already-established stream rather than binding its own TCP listener. Use a \
-             tcp carrier on the server for now."
-                .into(),
-        )),
+        InboundCarrierConfig::Kcp {
+            listen,
+            listen_port,
+            address,
+            ..
+        } => {
+            // The port is ordinary; only the carrier differs. VLESS is the protocol
+            // wired to it so far.
+            let l_str = address
+                .clone()
+                .or_else(|| listen.clone())
+                .unwrap_or_else(|| "0.0.0.0".to_string());
+            let s = format!("{}:{}", l_str, listen_port.unwrap_or(0));
+            let a = s
+                .parse::<SocketAddr>()
+                .map_err(|e| FluxError::Config(format!("invalid listen addr {}: {}", s, e)))?;
+            Ok((a, true))
+        }
         InboundCarrierConfig::Tcp {
             listen,
             listen_port,
@@ -1643,6 +1654,9 @@ fn build_layered_inbound(
 ) -> FluxResult<()> {
     let tag = node.tag;
     let (addr, is_udp) = parse_inbound_carrier(&node.carrier)?;
+    // mKCP is a stream carrier that happens to travel over UDP: the protocol above it
+    // is unchanged, so it must not take the datagram paths.
+    let is_kcp = matches!(node.carrier, InboundCarrierConfig::Kcp { .. });
     let rate_limiter = node.rate_limit.as_ref().map(|c| c.build());
     // Multiplexing needs a stream carrier and a stream protocol.
     let mux = node
@@ -1673,7 +1687,9 @@ fn build_layered_inbound(
     }
     let mux = mux.filter(|_| !is_udp);
 
-    if is_udp {
+    // mKCP is a stream carrier that travels over UDP: its protocol is handled below,
+    // like TCP, and must not fall into the datagram branches.
+    if is_udp && !is_kcp {
         match node.protocol {
             ProtocolConfig::Shadowsocks { password, method } => {
                 let cipher_kind = match method.as_deref() {
@@ -1751,6 +1767,9 @@ fn build_layered_inbound(
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid vless uuid {}: {}", uuid, e)))?;
             let mut ib = flux_inbound::VlessInbound::new(tag, addr, vec![parsed_uuid], pipeline);
+            if is_kcp {
+                ib = ib.with_kcp(flux_transport::KcpConfig::default());
+            }
             if let Some(rl) = rate_limiter.clone() {
                 ib = ib.with_rate_limiter(rl);
             }
