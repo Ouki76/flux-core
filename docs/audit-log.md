@@ -2376,3 +2376,28 @@ both driven by unauthenticated peers. Added: 500 WebSocket cases in both roles (
 no hang, bounded output) and 12 000 mKCP datagrams across all six obfuscation modes.
 
 **1069 tests, 0 failed**; clippy, fmt, `cargo audit`, `cargo deny`, `cargo doc` all clean.
+
+---
+
+## Cycle 45 — 2026-10-24
+
+### gRPC: sixth hypothesis, sixth null — closed
+
+Raised the HTTP/2 stream window from 1 MiB to 8 MiB and the connection window to 16 MiB,
+the last plausible flow-control explanation. **No change: 98 vs 100 MB/s.** Reverted.
+
+The complete list of what has been tried on this path, all null: message size (16 KiB →
+64 KiB), write batching, read batching, a buffered wrapper to cut 4 KiB syscalls, and flow
+control. What is measured and known:
+
+- echo mode 18 MB/s, streaming 103 MB/s;
+- throughput barely scales with message size, so it is a **bandwidth** cap, not per-message
+  latency;
+- we spend 14.5 s/GiB against sing-box's 33 — cheap and slow, the signature of round trips
+  rather than wasted work;
+- the one place it differs from the h2 path we already own (114 MB/s in the same harness)
+  is our own framing above it.
+
+Six null attempts is enough. It stays the single path where both competitors beat us, it is
+written down here and in `docs/HANDOFF.md` with these facts, and the next person should
+start by instrumenting the h2 driver's wake and capacity events rather than the framing.
