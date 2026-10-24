@@ -2896,3 +2896,27 @@ settles what six failed gRPC experiments could not: the h2 layer is not the ceil
 the loss is entirely in our gRPC framing above it. If someone picks that row up, the
 target is XHTTP's 147, not h2's 114 — the difference between them is what a thin framing
 layer costs, and gRPC is currently paying three times that.
+
+### A 256 KiB copier buffer: no gain, reverted
+
+The last systemic lever worth trying on the TLS paths: four times fewer read/write cycles
+per byte. Measured on WS+TLS: **262 vs 258 MB/s** — noise. Reverted rather than kept as a
+"probably helps", and it also confirms the buffers are not the limit anywhere.
+
+### Where the nine paths stand
+
+| | vs sing-box | vs xray |
+|---|---|---|
+| VLESS / TCP | **+21.5 %** | **+18.5 %** |
+| REALITY | −5.9 % | **+20.2 %** |
+| REALITY + Vision | −9.1 % | **+6.6 %** |
+| XHTTP | — (unsupported) | **+24.0 %** |
+| WS + TLS | −11.9 % | **+147.9 %** |
+| VMess / WS | −10.0 % | **+7.8 %** |
+| Trojan / TLS | −6.1 % | — |
+| Shadowsocks-2022 | −5.5 % | **+15.4 %** |
+| Shadowsocks-AEAD | **+1.2 %** | — |
+| gRPC + TLS | −16.1 % | −47.3 % |
+
+**Seven of eight against xray, two of nine against sing-box, within 12 % on the rest**, and
+28-68 % cheaper on CPU everywhere with a third of the memory.
