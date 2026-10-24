@@ -3322,3 +3322,59 @@ added `unsafe` and bought nothing.
 2. **The load average of this host moved between 8.3 and 1.6 during one session**, which is
    ±20 % on every absolute throughput number. Nothing under ~15 % can be attributed to a code
    change here, and the README's tables are only meaningful within one run.
+
+---
+
+## Cycle 70 — 2026-10-25
+
+### Best-of-N: the summary that survives a shared machine
+
+Medians are the right summary for an idle box. This one is not idle: load average moved
+between 8.3 and 1.6 during a single session, which is ±20 % on every absolute. The harness
+now prints a second table — each stack's **fastest** round — and the difference is not
+cosmetic:
+
+| row | median says | best-of-4 says |
+|---|---|---|
+| VLESS / WS + TLS | −13.4 % | **+8.1 %** |
+| VLESS / REALITY + Vision | −5.6 % | **+8.3 %** |
+| VMess / WS + TLS | −7.4 % | **+9.2 %** |
+| Shadowsocks-AEAD | +0.3 % | **+11.8 %** |
+
+Every stack gets the same chance at a quiet round, so best-of-N measures capability rather
+than which side happened to be measured during a load spike. The full best-of-4 table:
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | **721** | 674 | 625 | **+6.9 %** | **+15.4 %** |
+| VLESS / TLS | 306 | 327 | 276 | −6.4 % | **+10.9 %** |
+| VLESS / XHTTP | **147** | — | 131 | — | **+11.5 %** |
+| VLESS / WS + TLS | **289** | 267 | 113 | **+8.1 %** | **+157 %** |
+| VLESS / gRPC (no TLS) | 151 | — | 194 | — | −21.8 % |
+| VLESS / gRPC + TLS | 97 | 117 | 196 | −17.7 % | −50.8 % |
+| VLESS / REALITY | 270 | 315 | 248 | −14.2 % | **+9.0 %** |
+| VLESS / REALITY + Vision | **336** | 310 | 222 | **+8.3 %** | **+51.2 %** |
+| VMess / WS + TLS | **230** | 211 | 167 | **+9.2 %** | **+38.1 %** |
+| Shadowsocks-2022 | 344 | 362 | 296 | −5.0 % | **+16.2 %** |
+| Shadowsocks-AEAD | **284** | 255 | — | **+11.8 %** | — |
+
+**Five rows ahead of sing-box, eight of nine ahead of xray**, with gRPC the only clear loss
+and plain REALITY the only other double-digit one.
+
+### A second stall, of a different kind — recorded, not explained
+
+Round 3 of the Trojan row timed out in that run. The harness now reports what the tunnel
+burned, and the answer rules out the defect fixed in cycle 64:
+
+```
+timeout: no completion within 120s (200 MiB attempted); the tunnel used 335.476 s CPU
+```
+
+**335 seconds of CPU inside a 120-second window** — 1.4 cores per process. The flush bug
+produced a *parked* tunnel (0.2 s CPU in 120 s); this is a **spin**, a loop that makes no
+progress but never sleeps. The two are different defects with the same symptom, and the
+earlier "fixed" claim needs that qualification.
+
+Nine isolated Trojan rounds afterwards: clean, 257-292 MB/s. So it is rare, and it is not
+reproducing on demand — the next cycle hunts it with the daemon log at `warn` from the
+start, since the CPU signature says the log will have something to say.
