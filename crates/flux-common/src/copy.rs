@@ -453,14 +453,15 @@ where
             // payload (`up=down=4194304`) and then hangs, with the backstop re-polling
             // into a void.
             if !progressed {
-                if pend_ab.is_none()
-                    && matches!(Pin::new(&mut *b).poll_flush(cx), Poll::Ready(Ok(())))
-                    && pend_ba.is_none()
-                {
-                    // A successful flush pushes buffered bytes out; give the loop one
-                    // more pass so a writer that freed its buffer can accept more.
-                    progressed = true;
-                } else if pend_ba.is_none() {
+                // Flush both writers, and treat neither result as progress. A flush that
+                // succeeds on a quiet tunnel has *not* moved any payload — counting it as
+                // progress made this loop repeat forever whenever the connection was
+                // idle, which surfaced as a run that burned 335 s of CPU inside a 120 s
+                // window while transferring nothing.
+                if pend_ab.is_none() {
+                    let _ = Pin::new(&mut *b).poll_flush(cx);
+                }
+                if pend_ba.is_none() {
                     let _ = Pin::new(&mut *a).poll_flush(cx);
                 }
             }
@@ -514,6 +515,81 @@ fn zero_write() -> std::io::Error {
 mod buffered_copy_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A quiet tunnel must stay quiet. The pre-park flush used to be counted as progress,
+    /// so a pass that moved nothing set `progressed`, the loop repeated, and an *idle*
+    /// connection spun at a full core per direction — reported once as a run that burned
+    /// 335 s of CPU inside a 120 s window without transferring a byte. This counts the
+    /// polls instead of the CPU so it fails deterministically.
+    struct Counting<R> {
+        inner: R,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counting<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<R: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Counting<R> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_relay_does_not_spin() {
+        let (a_client, a_proxy) = tokio::io::duplex(64 * 1024);
+        let (b_proxy, _b_server) = tokio::io::duplex(64 * 1024);
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut a = Counting {
+            inner: a_proxy,
+            reads: reads.clone(),
+        };
+        let mut b = Counting {
+            inner: b_proxy,
+            reads: reads.clone(),
+        };
+        let copier = tokio::spawn(async move {
+            let _ = copy_bidirectional_buffered(&mut a, &mut b, 8 * 1024).await;
+        });
+
+        // Both ends stay open and silent, exactly like a connection waiting for a request.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let polls = reads.load(std::sync::atomic::Ordering::Relaxed);
+
+        copier.abort();
+        drop(a_client);
+        // A parked copier is polled once or twice; a spinning one thousands of times.
+        assert!(
+            polls < 100,
+            "an idle relay was polled {polls} times in 250 ms: it is spinning, not parked"
+        );
+    }
 
     /// A writer that accepts bytes but only releases them on flush, like a TLS record
     /// or a WebSocket frame being assembled above the socket. Without the copier's
