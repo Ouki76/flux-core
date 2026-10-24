@@ -13,6 +13,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
+/// /// A SOCKS5 listener.
 pub struct SocksInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -27,6 +28,7 @@ pub struct SocksInbound {
 }
 
 impl SocksInbound {
+    /// A listener named `tag` on `listen_addr`.
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
@@ -41,16 +43,19 @@ impl SocksInbound {
         }
     }
 
+    /// Rejects connections above the limiter before any per-connection work.
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self
     }
 
+    /// Requires username/password authentication with one of these pairs.
     pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
         self.users = users;
         self
     }
 
+    /// Applies a transport pipeline to accepted connections.
     pub fn with_pipeline(
         mut self,
         pipe: flux_transport::pipeline::ServerTransportPipeline,

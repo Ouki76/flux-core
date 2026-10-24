@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
+/// /// A Shadowsocks listener.
 pub struct ShadowsocksInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -35,6 +36,7 @@ pub struct ShadowsocksInbound {
 }
 
 impl ShadowsocksInbound {
+    /// A listener with one password, defaulting to ChaCha20-Poly1305.
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr, password: &str) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         let cipher_kind = CipherKind::ChaCha20IetfPoly1305;
@@ -55,17 +57,20 @@ impl ShadowsocksInbound {
         }
     }
 
+    /// Rejects connections above the limiter before any per-connection work.
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self
     }
 
+    /// Uses this cipher instead of the default.
     pub fn with_cipher_kind(mut self, kind: CipherKind) -> Self {
         self.cipher_kind = kind;
         self.master_key = derive_master_key_for_kind(&self.password, kind);
         self
     }
 
+    /// Applies a transport pipeline to accepted connections.
     pub fn with_pipeline(
         mut self,
         pipeline: flux_transport::pipeline::ServerTransportPipeline,

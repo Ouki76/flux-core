@@ -6,20 +6,33 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
+/// /// TCP FIN flag.
 pub const TCP_FIN: u8 = 0x01;
+/// /// TCP SYN flag.
 pub const TCP_SYN: u8 = 0x02;
+/// /// TCP RST flag.
 pub const TCP_RST: u8 = 0x04;
+/// /// TCP PSH flag.
 pub const TCP_PSH: u8 = 0x08;
+/// /// TCP ACK flag.
 pub const TCP_ACK: u8 = 0x10;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+/// /// One packet read from the TUN device, decoded far enough to route it.
 pub struct ParsedPacket {
+    /// The packet’s source, as the stack saw it.
     pub src: SocketAddr,
+    /// Where the packet is going.
     pub dst: SocketAddr,
+    /// Stream or datagram, decided from the IP protocol.
     pub network: NetworkType,
+    /// The L4 payload, copied out of the frame.
     pub payload: Bytes,
+    /// TCP sequence number, for stream bookkeeping.
     pub tcp_seq: u32,
+    /// TCP acknowledgement number.
     pub tcp_ack: u32,
+    /// TCP flags; the SYN bit is what opens a stream.
     pub tcp_flags: u8,
 }
 
@@ -34,11 +47,17 @@ pub struct ParsedPacket {
 /// every 1448 bytes carried.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PacketHeader {
+    /// The packet’s source, as the stack saw it.
     pub src: SocketAddr,
+    /// Where the packet is going.
     pub dst: SocketAddr,
+    /// Stream or datagram, decided from the IP protocol.
     pub network: NetworkType,
+    /// TCP sequence number, for stream bookkeeping.
     pub tcp_seq: u32,
+    /// TCP acknowledgement number.
     pub tcp_ack: u32,
+    /// TCP flags; the SYN bit is what opens a stream.
     pub tcp_flags: u8,
     /// Byte range of the L4 payload within the packet that was peeked at.
     pub payload: std::ops::Range<usize>,
@@ -1834,6 +1853,7 @@ pub const MIN_MTU: usize = 576;
 /// Largest IP packet a TUN device can carry.
 pub const MAX_MTU: usize = 65535;
 
+/// /// A TUN device with a userspace TCP/IP stack behind it.
 pub struct TunInbound {
     tag: String,
     interface_name: String,
@@ -1846,6 +1866,7 @@ pub struct TunInbound {
 }
 
 impl TunInbound {
+    /// Opens the device and starts the stack.
     pub fn new(
         tag: impl Into<String>,
         interface_name: impl Into<String>,

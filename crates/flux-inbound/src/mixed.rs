@@ -14,6 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
+/// /// One port that speaks SOCKS5 and HTTP, decided by the first byte.
 pub struct MixedInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -27,6 +28,7 @@ pub struct MixedInbound {
 }
 
 impl MixedInbound {
+    /// A listener named `tag` on `listen_addr`.
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
@@ -40,11 +42,13 @@ impl MixedInbound {
         }
     }
 
+    /// Requires credentials for both protocols.
     pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
         self.users = users;
         self
     }
 
+    /// Rejects connections above the limiter before any per-connection work.
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self

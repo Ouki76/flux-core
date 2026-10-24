@@ -15,6 +15,7 @@ const IP_RECVORIGDSTADDR: libc::c_int = 20;
 const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
 
 #[cfg(target_os = "linux")]
+/// /// Marks a socket transparent and able to receive foreign addresses.
 pub fn enable_tproxy_socket(socket: &Socket, is_v6: bool) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let fd = socket.as_raw_fd();
@@ -61,6 +62,7 @@ pub fn enable_tproxy_socket(_socket: &Socket, _is_v6: bool) -> std::io::Result<(
 }
 
 #[cfg(target_os = "linux")]
+/// /// Receives one datagram together with its original destination.
 pub fn recv_tproxy_udp(
     fd: std::os::fd::RawFd,
     buf: &mut [u8],
@@ -149,6 +151,7 @@ fn create_transparent_reply_socket(dst: SocketAddr) -> std::io::Result<UdpSocket
     UdpSocket::from_std(std_udp)
 }
 
+/// /// A TPROXY interceptor, for traffic redirected with the tproxy target.
 pub struct TproxyInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -160,6 +163,7 @@ pub struct TproxyInbound {
 }
 
 impl TproxyInbound {
+    /// An interceptor named `tag` on `listen_addr`.
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {

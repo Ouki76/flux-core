@@ -37,6 +37,7 @@ const MAX_INFLIGHT_QUERIES: usize = 256;
 const DNS_QUERIES_PER_SEC_PER_IP: u32 = 200;
 const DNS_BURST_PER_IP: u32 = 400;
 
+/// /// Answers DNS queries itself or forwards them upstream.
 pub struct DnsInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -52,6 +53,7 @@ pub struct DnsInbound {
 }
 
 impl DnsInbound {
+    /// A listener named `tag` on `listen_addr`, answering from `resolver`.
     pub fn new(
         tag: impl Into<String>,
         listen_addr: SocketAddr,

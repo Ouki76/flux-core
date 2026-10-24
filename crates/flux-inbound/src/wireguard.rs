@@ -39,7 +39,9 @@ const REAPER_INTERVAL: Duration = Duration::from_secs(30);
 /// An authorized peer of this WireGuard inbound.
 #[derive(Clone, Debug)]
 pub struct WireGuardInboundPeer {
+    /// The peer’s static public key.
     pub public_key: [u8; 32],
+    /// Optional pre-shared key, if the peer uses one.
     pub preshared_key: Option<[u8; 32]>,
     /// Allowed source IPs for inner tunnel traffic. Empty = allow any source IP.
     pub allowed_ips: Vec<ipnet::IpNet>,
@@ -54,6 +56,7 @@ struct PeerSessionState {
     allowed_ips: Vec<ipnet::IpNet>,
 }
 
+/// /// A WireGuard server: UDP, Noise handshakes, and a userspace stack.
 pub struct WireGuardInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -69,6 +72,7 @@ pub struct WireGuardInbound {
 }
 
 impl WireGuardInbound {
+    /// A listener named `tag` on `listen_addr` for these peers.
     pub fn new(
         tag: impl Into<String>,
         listen_addr: SocketAddr,

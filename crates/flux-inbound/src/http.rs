@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
+/// /// Accepts HTTP CONNECT and absolute-form requests.
 pub struct HttpInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -20,6 +21,7 @@ pub struct HttpInbound {
 }
 
 impl HttpInbound {
+    /// A listener named `tag` on `listen_addr`.
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {
@@ -34,16 +36,19 @@ impl HttpInbound {
         }
     }
 
+    /// Rejects connections above the limiter before any per-connection work.
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self
     }
 
+    /// Requires basic authentication with one of these pairs.
     pub fn with_users(mut self, users: Vec<(String, String)>) -> Self {
         self.users = users;
         self
     }
 
+    /// Applies a transport pipeline to accepted connections (TLS and friends).
     pub fn with_pipeline(
         mut self,
         pipe: flux_transport::pipeline::ServerTransportPipeline,

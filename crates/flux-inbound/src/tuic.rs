@@ -422,6 +422,7 @@ pub struct TuicInbound {
 }
 
 impl TuicInbound {
+    /// A listener named `tag` on `listen_addr` with these credentials.
     pub fn new(
         tag: impl Into<String>,
         listen_addr: SocketAddr,
@@ -446,11 +447,13 @@ impl TuicInbound {
         }
     }
 
+    /// Rejects sessions above the limiter.
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self
     }
 
+    /// A listener whose QUIC transport is pre-built from configuration.
     pub fn new_with_pipeline(
         tag: impl Into<String>,
         listen_addr: SocketAddr,

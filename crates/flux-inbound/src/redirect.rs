@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
 #[cfg(target_os = "linux")]
+/// /// The destination the client originally aimed at, from the kernel.
 pub fn get_original_destination(socket: &tokio::net::TcpStream) -> std::io::Result<SocketAddr> {
     use std::os::fd::AsRawFd;
     let fd = socket.as_raw_fd();
@@ -48,10 +49,12 @@ pub fn get_original_destination(socket: &tokio::net::TcpStream) -> std::io::Resu
 }
 
 #[cfg(not(target_os = "linux"))]
+/// /// The destination the client originally aimed at, from the kernel.
 pub fn get_original_destination(socket: &tokio::net::TcpStream) -> std::io::Result<SocketAddr> {
     socket.local_addr()
 }
 
+/// /// A REDIRECT (nat table) interceptor using `SO_ORIGINAL_DST`.
 pub struct RedirectInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -63,6 +66,7 @@ pub struct RedirectInbound {
 }
 
 impl RedirectInbound {
+    /// A listener named `tag` on `listen_addr`.
     pub fn new(tag: impl Into<String>, listen_addr: SocketAddr) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
         Self {

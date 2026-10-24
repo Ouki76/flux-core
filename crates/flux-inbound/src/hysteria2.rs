@@ -271,6 +271,7 @@ pub(crate) fn parse_client_cc_rx(value: Option<&str>) -> u64 {
         .unwrap_or(0)
 }
 
+/// /// A Hysteria 2 server over QUIC.
 pub struct Hysteria2Inbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -288,6 +289,7 @@ pub struct Hysteria2Inbound {
 }
 
 impl Hysteria2Inbound {
+    /// A listener named `tag` on `listen_addr` with these passwords.
     pub fn new(
         tag: impl Into<String>,
         listen_addr: SocketAddr,
@@ -311,6 +313,7 @@ impl Hysteria2Inbound {
         }
     }
 
+    /// Rejects sessions above the limiter.
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self
@@ -322,6 +325,7 @@ impl Hysteria2Inbound {
         self
     }
 
+    /// A listener whose QUIC transport is pre-built from configuration.
     pub fn new_with_pipeline(
         tag: impl Into<String>,
         listen_addr: SocketAddr,

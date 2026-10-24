@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 
+/// /// A Trojan listener: a password, then a request header, over TLS.
 pub struct TrojanInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -23,6 +24,7 @@ pub struct TrojanInbound {
 }
 
 impl TrojanInbound {
+    /// A listener named `tag` on `listen_addr` with these passwords.
     pub fn new(
         tag: impl Into<String>,
         listen_addr: SocketAddr,
@@ -47,6 +49,7 @@ impl TrojanInbound {
         }
     }
 
+    /// Rejects connections above the limiter before any per-connection work.
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self

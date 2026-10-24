@@ -1,16 +1,40 @@
+#![warn(missing_docs)]
+
+//! Inbounds: everything that accepts connections.
+//!
+//! Each module is one way in — a client-facing protocol (SOCKS5, HTTP, mixed), a
+//! server-side proxy protocol (VLESS, VMess, Trojan, Shadowsocks, TUIC, Hysteria 2,
+//! WireGuard) or a transparent interceptor (REDIRECT, TPROXY, TUN). They all implement
+//! the same [`Inbound`](flux_types::traits::Inbound) trait, and the contract that matters
+//! is on `stop`: it releases the listening socket before it resolves.
+
+/// The DNS listener: UDP and TCP answers.
 pub mod dns;
+/// Plain HTTP proxying.
 pub mod http;
+/// Hysteria 2 over QUIC.
 pub mod hysteria2;
+/// A port that accepts SOCKS5 and HTTP on the same socket.
 pub mod mixed;
+/// The REDIRECT (nat) transparent interceptor.
 pub mod redirect;
+/// Shadowsocks.
 pub mod shadowsocks;
+/// SOCKS5.
 pub mod socks;
+/// The TPROXY transparent interceptor.
 pub mod tproxy;
+/// Trojan.
 pub mod trojan;
+/// TUIC v5 over QUIC.
 pub mod tuic;
+/// The TUN device: a userspace IP stack.
 pub mod tun;
+/// VLESS.
 pub mod vless;
+/// VMess.
 pub mod vmess;
+/// WireGuard and AmneziaWG.
 pub mod wireguard;
 
 pub use dns::*;
@@ -52,6 +76,7 @@ pub struct InboundTasks {
 }
 
 impl InboundTasks {
+    /// An empty set; `stop` on it is a no-op.
     pub fn new() -> Self {
         Self::default()
     }

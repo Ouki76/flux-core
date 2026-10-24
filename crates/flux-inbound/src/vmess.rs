@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+/// /// A VMess listener.
 pub struct VmessInbound {
     tag: String,
     listen_addr: SocketAddr,
@@ -24,6 +25,7 @@ pub struct VmessInbound {
 }
 
 impl VmessInbound {
+    /// A listener named `tag` on `listen_addr` accepting these UUIDs.
     pub fn new(
         tag: impl Into<String>,
         listen_addr: SocketAddr,
@@ -44,6 +46,7 @@ impl VmessInbound {
         }
     }
 
+    /// Rejects connections above the limiter before any per-connection work.
     pub fn with_rate_limiter(mut self, rl: Arc<flux_common::RateLimiter>) -> Self {
         self.rate_limiter = Some(rl);
         self
