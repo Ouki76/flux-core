@@ -2872,3 +2872,27 @@ through a real Xray node and compares every byte.
 | nested config-key typo detection | ✅ |
 | browser-grade ClientHello | partial — rustls cannot emit one; the cipher table is Chrome's, GREED is absent, and tests pin what is actually sent |
 | mKCP server side | open — needs every inbound to accept an injected stream |
+
+---
+
+## Cycle 60 — 2026-10-24
+
+### XHTTP measured: 147 MB/s against xray's 119
+
+The transport now has a row in the matrix and a number that defends it:
+
+| path | flux-core | sing-box | xray | vs xray | CPU vs xray |
+|---|---|---|---|---|---|
+| VLESS / XHTTP | **147.4** | — (no such transport) | 118.8 | **+24.0 %** | **−55.5 %** |
+
+Wiring it in took three parts — the xray builders (`network: splithttp`, `mode:
+stream-one`), a matrix scenario, and a `MATRIX` row — and the coverage test that compares
+that list against what the harness actually runs caught the missing row immediately.
+
+### A number that matters for gRPC
+
+XHTTP moves **147 MB/s over the same HTTP/2 machinery that gRPC reaches 96 with**. That
+settles what six failed gRPC experiments could not: the h2 layer is not the ceiling, and
+the loss is entirely in our gRPC framing above it. If someone picks that row up, the
+target is XHTTP's 147, not h2's 114 — the difference between them is what a thin framing
+layer costs, and gRPC is currently paying three times that.
