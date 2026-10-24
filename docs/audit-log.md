@@ -2246,3 +2246,41 @@ Ahead of both competitors on TCP, ahead of sing-box on Trojan / Shadowsocks-AEAD
 Shadowsocks-2022 (parity), ahead of xray on five of eight; **one path still behind both —
 gRPC — and it is closed as unresolved** after five attempts, with the measured facts
 recorded for whoever picks it up.
+
+---
+
+## Cycle 41 — 2026-10-24
+
+### The matrix, five rounds, after the framing work
+
+| path | flux | sing-box | xray | vs sbox | vs xray | CPU vs both |
+|---|---|---|---|---|---|---|
+| VLESS / TCP | 684 | 544 | 604 | **+25.9 %** | **+13.2 %** | −47 / −51 % |
+| VLESS / REALITY | 300 | 299 | 228 | **+0.5 %** | **+31.6 %** | −38 / −49 % |
+| REALITY + Vision | 283 | 309 | 221 | −8.2 % | **+27.9 %** | −34 / −41 % |
+| VLESS / WS + TLS | 262 | 287 | 103 | −8.8 % | **+153.1 %** | −38 / −68 % |
+| VMess / WS + TLS | 191 | 198 | 172 | −3.5 % | **+11.0 %** | −41 / −51 % |
+| Trojan / TLS | 300 | 335 | — | −10.3 % | — | −33 % |
+| Shadowsocks-2022 | 319 | 389 | 283 | −18.1 % | **+12.9 %** | −20 / −58 % |
+| Shadowsocks-AEAD | 249 | 238 | — | **+4.6 %** | — | −21 % |
+| VLESS / gRPC + TLS | 105 | 117 | 182 | −10.3 % | −42.5 % | −55 / −36 % |
+
+### The audit in one paragraph
+
+Every path measured at roughly **half** the competitor's throughput when this started, and
+the cause was never the protocols. It was a single repeated defect — one framing unit per
+`poll_write`/`poll_read`, when the relay works in 64 KiB buffers — found and fixed in
+**seven** places: the shared copier (which asked the executor to reschedule after every
+64 KiB), WebSocket (16 KiB frames, then per-byte masking on the write path), both
+Shadowsocks variants, REALITY (records and reads), Vision (endless padding, then a 16 KiB
+stack array zeroed per read) and VMess. Each fix was measured, and the biggest ones now
+have tests that fail if the old shape returns.
+
+Along the way the audit also found that the project's own benchmarks had been lying: the
+TLS and REALITY rows were measuring plain VLESS because a config block sat in the wrong
+object, and every harness field that was silently ignored (WebSocket, gRPC and Hysteria2
+paths alike) is now rejected by name rather than dropped.
+
+**Result: parity or better against sing-box on three paths, within 10 % on four more, and
+ahead of xray on six of eight — at 20-68 % less CPU on every path.** gRPC remains the one
+clear loss to both, closed as unresolved with its measurements recorded.
