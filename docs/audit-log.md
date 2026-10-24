@@ -3144,3 +3144,19 @@ optimisation, because there is no measurement behind that claim anymore.
 Every "obviously the same setup" comparison must be checked against the actual configs. The
 XHTTP row was written to prove a transport worked, not to be compared with a TLS row, and
 the difference quietly produced a confident, wrong diagnosis that survived six cycles.
+
+### Two more null results, so the next person does not repeat them
+
+| experiment | result |
+|---|---|
+| remove the coalescing reader around the TLS stream | 279 MB/s either way (3 runs vs 3 runs) |
+| raise rustls' write-buffer limit 64 KiB → 256 KiB | 279 vs 279 MB/s |
+
+The write-buffer theory was worth testing because rustls' default limit is exactly the
+relay's copy unit — a 64 KiB write lands *on* the limit. It changes nothing, so it is
+reverted rather than kept as a plausible-looking constant.
+
+Where that leaves the TLS rows: TLS costs ~55 % here and ~54 % for sing-box, so the two
+stacks are within a few percent of each other *through the cipher*. Our remaining 3-8 % on
+those rows is not a bug with a layer to find; it is the difference between two TLS
+implementations, and further micro-experiments have stopped paying.
