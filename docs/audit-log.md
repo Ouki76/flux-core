@@ -2401,3 +2401,29 @@ control. What is measured and known:
 Six null attempts is enough. It stays the single path where both competitors beat us, it is
 written down here and in `docs/HANDOFF.md` with these facts, and the next person should
 start by instrumenting the h2 driver's wake and capacity events rather than the framing.
+
+---
+
+## Cycle 46 — 2026-10-24
+
+### Documentation: from "cargo doc is clean" to actually documented
+
+`cargo doc` passing only meant nothing was broken. Measured with `-W missing_docs`, the
+foundation crate alone had **63 undocumented public items**: every error variant, every
+field of `SessionMeta` and `UdpPacket`, most trait methods the workspace implements against
+each other, and the module tree.
+
+All are documented now, aimed at the reader who has a log line and no stack trace — that
+`Blocked` is a routing policy outcome rather than a fault, that `Internal` always means a
+bug here, that `Inbound::start` returns when the listener is *up*, not when it stops.
+
+`#![warn(missing_docs)]` is enabled for `flux-types` so the next public item cannot land
+silently undocumented. The other crates follow in their own cycles rather than in one
+sweeping commit, because a 300-item diff is not reviewable and this audit has to stay
+reviewable.
+
+### gRPC closed
+
+Six hypotheses, six nulls (message size, write batching, read batching, syscall batching,
+flow control at 8 MiB/16 MiB, syscall profiling). The path stays the one place both
+competitors beat us, with its measurements written down for whoever picks it up.
