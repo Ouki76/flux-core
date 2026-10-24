@@ -502,6 +502,8 @@ impl Drop for Setup {
 #[derive(Clone, Copy)]
 enum Kind {
     VlessTcp,
+    /// gRPC without TLS, to separate the framing cost from the cipher's.
+    VlessGrpcPlain,
     /// VLESS over XHTTP in stream-one mode.
     VlessXhttp,
     VlessWsTls,
@@ -538,6 +540,12 @@ const SCENARIOS: &[Scenario] = &[
         name: "VLESS / WS + TLS",
         kind: Kind::VlessWsTls,
         needs_cert: true,
+        needs_decoy: false,
+    },
+    Scenario {
+        name: "VLESS / gRPC (no TLS)",
+        kind: Kind::VlessGrpcPlain,
+        needs_cert: false,
         needs_decoy: false,
     },
     Scenario {
@@ -751,6 +759,7 @@ impl Scenario {
         match self.kind {
             Kind::VlessTcp => flux_in(port, &[], &flux_vless(false)),
             Kind::VlessXhttp => flux_in(port, &[flux_xhttp_server()], &flux_vless(false)),
+            Kind::VlessGrpcPlain => flux_in(port, &[flux_grpc_server()], &flux_vless(false)),
             Kind::VlessWsTls => flux_in(
                 port,
                 &[flux_tls_server(s), flux_ws_server()],
@@ -794,6 +803,9 @@ impl Scenario {
         match self.kind {
             Kind::VlessTcp => flux_out(socks, port, &[], &flux_vless(false)),
             Kind::VlessXhttp => flux_out(socks, port, &[flux_xhttp_client()], &flux_vless(false)),
+            Kind::VlessGrpcPlain => {
+                flux_out(socks, port, &[flux_grpc_client()], &flux_vless(false))
+            }
             Kind::VlessWsTls => flux_out(
                 socks,
                 port,
@@ -845,8 +857,8 @@ impl Scenario {
 
     fn sbox_server(&self, s: &Setup, port: u16) -> String {
         let inbound = match self.kind {
-            Kind::VlessXhttp => {
-                unreachable!("sing-box has no XHTTP transport; the column is skipped")
+            Kind::VlessXhttp | Kind::VlessGrpcPlain => {
+                unreachable!("sing-box cannot run this scenario; the column is skipped")
             }
             Kind::VlessTcp => format!(
                 r#"{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}]}}"#
@@ -893,8 +905,8 @@ impl Scenario {
 
     fn sbox_client(&self, s: &Setup, socks: u16, port: u16) -> String {
         let outbound = match self.kind {
-            Kind::VlessXhttp => {
-                unreachable!("sing-box has no XHTTP transport; the column is skipped")
+            Kind::VlessXhttp | Kind::VlessGrpcPlain => {
+                unreachable!("sing-box cannot run this scenario; the column is skipped")
             }
             Kind::VlessTcp => format!(
                 r#"{{"type":"vless","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}"}}"#
@@ -944,7 +956,18 @@ impl Scenario {
     /// Whether sing-box can run this scenario at all.
     fn sbox_capable(&self) -> bool {
         // sing-box has no XHTTP transport.
-        !matches!(self.kind, Kind::VlessXhttp)
+        matches!(
+            self.kind,
+            Kind::VlessTcp
+                | Kind::VlessWsTls
+                | Kind::VlessGrpcTls
+                | Kind::VlessReality
+                | Kind::VlessRealityVision
+                | Kind::VmessWsTls
+                | Kind::Ss2022
+                | Kind::SsAead
+                | Kind::TrojanTls
+        )
     }
 
     fn xray_protocol(&self) -> Option<xray_matrix_configs::Protocol> {
@@ -954,6 +977,7 @@ impl Scenario {
             Kind::VlessWsTls => P::VlessWs,
             Kind::VlessGrpcTls => P::VlessGrpc,
             Kind::VlessXhttp => P::VlessXhttp,
+            Kind::VlessGrpcPlain => P::VlessGrpc,
             Kind::VlessReality => P::Reality,
             Kind::VlessRealityVision => P::RealityVision,
             Kind::VmessWsTls => P::VmessWs,
