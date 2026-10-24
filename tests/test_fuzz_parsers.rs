@@ -136,6 +136,27 @@ fn fuzz_wireguard_initiation() {
     }
 }
 
+/// The **response** is what a client parses from a server it may not trust, and it is a
+/// different state machine from the initiation above: it reads a message type, indices,
+/// an ephemeral key, an empty-mac and a mac. Every slice conversion on that path is an
+/// `unwrap` over a range, so a missing length check is a panic rather than an error —
+/// and a panic in a proxy is a dead connection.
+#[test]
+fn fuzz_wireguard_response() {
+    use flux_protocol::wireguard::WireGuardHandshake;
+
+    let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let awg = AwgConfig::default();
+    let peer_secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let peer_public = x25519_dalek::PublicKey::from(&peer_secret);
+    // A real handshake state, so the fuzzer attacks the *response* parser rather than
+    // stopping at "this is not a valid initiation".
+    let (_, state) = WireGuardHandshake::create_initiation(&secret, &peer_public, 7, &awg, None);
+    for input in corpus(&[&[0u8; 92]]) {
+        let _ = WireGuardHandshake::consume_response(state.clone(), &input);
+    }
+}
+
 #[test]
 fn fuzz_proxy_uri_parsing() {
     let mut rng = Rng(0x1234_5678_9abc_def0);
