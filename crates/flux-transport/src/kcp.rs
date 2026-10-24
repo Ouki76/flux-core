@@ -1696,6 +1696,24 @@ pub async fn connect(peer: SocketAddr, cfg: KcpConfig) -> FluxResult<KcpStream> 
 /// receive buffer can hold. A socket whose kernel refuses the increase still
 /// works, it just retransmits more.
 pub async fn accept(socket: Arc<UdpSocket>, cfg: KcpConfig) -> FluxResult<KcpStream> {
+    accept_with_limit(socket, cfg, MAX_CONVERSATIONS).await
+}
+
+/// How many conversations one listening socket will carry at once.
+///
+/// A conversation is one task plus a route, and a peer that never completes a handshake
+/// holds both until the 30-second timeout. The socket takes unauthenticated datagrams, so
+/// without a ceiling a single sender could create conversations until memory ran out.
+/// 256 is far more than a real node carries (each tunnel is one conversation) and small
+/// enough that the worst case is bounded.
+pub const MAX_CONVERSATIONS: usize = 256;
+
+/// [`accept`], with an explicit ceiling. Tests use a small one.
+pub async fn accept_with_limit(
+    socket: Arc<UdpSocket>,
+    cfg: KcpConfig,
+    limit: usize,
+) -> FluxResult<KcpStream> {
     cfg.validate()?;
     tune_socket(&socket);
     let (hub, key) = hub_for(&socket, cfg.obfs);
@@ -1709,6 +1727,16 @@ pub async fn accept(socket: Arc<UdpSocket>, cfg: KcpConfig) -> FluxResult<KcpStr
         match result {
             Ok((addr, segment)) => {
                 let conv = conversation_of(&segment)?;
+                if hub.routes.len() >= limit {
+                    drop(hub);
+                    return Err(FluxError::Protocol {
+                        protocol: "mkcp",
+                        message: format!(
+                            "refusing conversation {conv:#06x}: {limit} already live on this \
+                             socket (a peer that never handshakes holds a slot until timeout)"
+                        ),
+                    });
+                }
                 hub.routes.insert(conv, inbox.clone());
                 (conv, (addr, segment))
             }
@@ -1719,6 +1747,18 @@ pub async fn accept(socket: Arc<UdpSocket>, cfg: KcpConfig) -> FluxResult<KcpStr
         }
     } else {
         let wanted = cfg.conversation()?;
+        {
+            let hub = hub.lock();
+            if hub.routes.len() >= limit && !hub.routes.contains_key(&wanted) {
+                drop(hub);
+                return Err(FluxError::Protocol {
+                    protocol: "mkcp",
+                    message: format!(
+                        "refusing conversation {wanted:#06x}: {limit} already live on this socket"
+                    ),
+                });
+            }
+        }
         if hub.lock().routes.insert(wanted, inbox.clone()).is_some() {
             return Err(FluxError::Config(format!(
                 "mKCP conversation {wanted:#06x} is already accepted on this socket"
@@ -1923,6 +1963,57 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UdpSocket as TokioUdp;
+
+    /// The listener takes unauthenticated datagrams, so an unbounded number of
+    /// conversations is a memory-exhaustion path: each live one is a task plus a route,
+    /// held until the handshake timeout. This fails if the ceiling is removed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_peer_cannot_open_more_conversations_than_the_ceiling() {
+        let socket = server_socket().await;
+        let addr = socket.local_addr().unwrap();
+
+        // One live conversation fills the single slot the limit allows.
+        let server = {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                accept_with_limit(
+                    socket,
+                    KcpConfig {
+                        conv: 0,
+                        ..KcpConfig::default()
+                    },
+                    1,
+                )
+                .await
+            })
+        };
+        let client = connect(addr, KcpConfig::default()).await.expect("connect");
+        let occupied = tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the first conversation must be accepted")
+            .expect("task")
+            .expect("first conversation");
+        assert_eq!(occupied.conv(), client.conv());
+
+        // A second one must be refused immediately rather than grow the table. The check
+        // happens before the acceptor waits for a datagram, which is why this resolves
+        // instead of hanging.
+        let cfg = KcpConfig {
+            conv: 0x1234,
+            ..KcpConfig::default()
+        };
+        let err = match accept_with_limit(socket, cfg, 1).await {
+            Ok(stream) => panic!(
+                "a second conversation must be refused, got {:#06x}",
+                stream.conv()
+            ),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            err.contains("already live"),
+            "the error must say why: {err}"
+        );
+    }
 
     /// Deterministic xorshift, so a "20 % loss" run is reproducible.
     struct Rng(u32);
