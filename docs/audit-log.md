@@ -2751,3 +2751,46 @@ generator's placeholder text had to be replaced by hand again — a reminder tha
 
 types 63, common 14, router 78, dns 108, transport 149, protocol 215, inbound 83.
 Remaining: outbound (81), app (352).
+
+---
+
+## Cycle 57 — 2026-10-24
+
+### The workspace is documented
+
+Ninth and last crate: `flux-app`, 352 public items — the configuration schema, the instance,
+the management API and the URI parser. **Every crate in the workspace now has
+`#![warn(missing_docs)]`**, and strict `cargo doc -D warnings` passes.
+
+| crate | public items |
+|---|---|
+| flux-types | 63 |
+| flux-common | 14 |
+| flux-router | 78 |
+| flux-dns | 108 |
+| flux-transport | 149 |
+| flux-protocol | 215 |
+| flux-inbound | 83 |
+| flux-outbound | 81 |
+| flux-app | 352 |
+| **total** | **1143** |
+
+### Three mechanical traps, each caught by a tool
+
+1. Doc comments inserted into struct **literals** — 19 of them, where a comment between a
+   field name and its value is a syntax error. Removed by iterating on the compiler's own
+   list until it was empty, not by trusting the generator.
+2. Docs placed **after** `#[serde(...)]` attributes, which rustc does not attach to the
+   variant — 186 moved above the attribute.
+3. Two variants with named fields needing per-field docs rather than a variant doc.
+
+Strict `cargo doc -D warnings` then found an unresolved intra-doc link to `FakeIpPool`
+written from a *different* crate's documentation — nothing a test would ever have caught.
+
+### What the configuration docs now say
+
+The crate root states the property this audit earned the hard way: validation is strict and
+an unknown key is an error naming the key, "because a silently ignored option is a
+configuration that lies about what the proxy does". These benchmarks spent months measuring
+TLS rows that were really plain VLESS because a block sat in the wrong object and was
+dropped in silence.
