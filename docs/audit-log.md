@@ -3011,3 +3011,15 @@ Nine hypotheses for this row have now been tested and rejected. What the numbers
 narrow and worth writing down: XHTTP moves 152 MB/s over the same HTTP/2 machinery gRPC
 reaches 91 with, so the loss is in per-message behaviour, not in bytes moved — and it is
 not copies, not buffer sizes, not flow control, not the framing format.
+
+### Quality pass on the new transport
+
+Three refusal cases now have tests, because each one is a way a client could be left
+waiting rather than told no: a GET (that is `stream-down`, which this does not speak), a
+path outside the base, and — the one that matters for real clients — a *deep* path under
+the base, which must be accepted because Xray appends to it.
+
+Also confirmed on this cycle: `cargo audit` (1352 advisories, 271 dependencies) and
+`cargo deny` (advisories, bans, licenses, sources) both clean, and `docs/HANDOFF.md`
+section 0 rewritten so a human picking this up reads the current state rather than cycle
+41's.
