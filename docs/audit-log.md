@@ -2794,3 +2794,29 @@ an unknown key is an error naming the key, "because a silently ignored option is
 configuration that lies about what the proxy does". These benchmarks spent months measuring
 TLS rows that were really plain VLESS because a block sat in the wrong object and was
 dropped in silence.
+
+---
+
+## Cycle 58 — 2026-10-24
+
+### gRPC: seventh attempt, and a useful number found on the way
+
+Two experiments, both reverted:
+
+**Message size.** 256 KiB messages instead of 64 KiB: **no change** (96 vs 95 MB/s). So the
+path is not per-message-overhead-bound either, which rules out the last cheap theory.
+
+**A zero-copy fast path.** When a whole uncompressed message arrives on its own, serve it
+straight out of the h2 buffer instead of copying it into `read_buf` first. That broke four
+hardening tests — empty messages must be *skipped*, compressed ones refused, and the
+framing state has to stay identical through every path. Two attempts at constraining it
+(only non-empty frames, only exact-size buffers) still failed, so it is reverted rather
+than patched until it happens to pass: a framing path that diverges per case is how silent
+corruption starts.
+
+**The number worth keeping:** our own h2 framing layer measures **114 MB/s** in the same
+harness, and sing-box's gRPC measures **113**. So gRPC's real ceiling here is ~114, our loss
+is 96/114 = 18 %, and the entire remaining gap to sing-box on this row is our own gRPC
+framing above h2 — not TLS, not the transport, not flow control. That is the most precise
+statement this audit can make about the row, and it is written here rather than chased
+further.
