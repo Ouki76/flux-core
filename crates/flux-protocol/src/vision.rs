@@ -165,6 +165,10 @@ pub struct VisionStream<S> {
     direct: bool,
     /// Scratch buffer reused for every encoded frame.
     enc_buf: Vec<u8>,
+    /// Scratch buffer for transport reads. This used to be a `[0u8; 16 * 1024]`
+    /// stack array, zero-initialised on **every** loop iteration and capping a read
+    /// at 16 KiB even when the caller had 64 KiB to fill.
+    read_tmp: Vec<u8>,
     pending: Vec<u8>,
     pending_pos: usize,
     /// Bytes of the caller's buffer the pending frame accounts for.
@@ -190,6 +194,7 @@ impl<S> VisionStream<S> {
             padding_phase: true,
             direct: false,
             enc_buf: Vec::new(),
+            read_tmp: vec![0u8; 16 * 1024],
             pending: Vec::new(),
             pending_pos: 0,
             plain_len: 0,
@@ -447,11 +452,18 @@ impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> {
                 UnpadState::Raw => {
                     if this.in_avail() > 0 {
                         let n = this.in_avail().min(buf.remaining());
-                        let chunk = this.in_slice()[..n].to_vec();
+                        // Copy straight into the caller: `to_vec()` here allocated and
+                        // copied twice for every byte Vision passed through.
+                        let src = &this.in_slice()[..n];
+                        buf.put_slice(src);
                         this.in_advance(n);
-                        buf.put_slice(&chunk);
                         return Poll::Ready(Ok(()));
                     }
+                    // Nothing buffered and nothing to parse: this is a plain
+                    // pass-through, so let the transport read into the caller's
+                    // buffer directly. Going through the scratch buffer capped every
+                    // read at 16 KiB and cost two extra copies.
+                    return Pin::new(&mut this.inner).poll_read(cx, buf);
                 }
             }
 
@@ -462,8 +474,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> {
             frames_this_call += 1;
 
             // 3. Need more bytes from the transport.
-            let mut tmp = [0u8; 16 * 1024];
-            let mut read_buf = ReadBuf::new(&mut tmp);
+            if this.read_tmp.len() < 16 * 1024 {
+                this.read_tmp.resize(16 * 1024, 0);
+            }
+            let mut read_buf = ReadBuf::new(&mut this.read_tmp);
             match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
                 Poll::Ready(Ok(())) => {
                     let n = read_buf.filled().len();
@@ -502,7 +516,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> {
                             }
                         };
                     }
-                    this.inbuf.extend_from_slice(&tmp[..n]);
+                    this.inbuf.extend_from_slice(&this.read_tmp[..n]);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
