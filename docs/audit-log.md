@@ -2204,3 +2204,45 @@ mode reaches 18 MB/s and streaming 103; throughput barely scales with message si
 is a *bandwidth* cap rather than per-message latency; `strace` shows 3 584 futexes for 64
 messages, but most of those are idle runtime workers rather than the data path. It is the
 one row where both competitors beat us.
+
+---
+
+## Cycle 40 — 2026-10-24
+
+### REALITY: −19 % → −1.7 %, and a latent bug the fix exposed
+
+REALITY sealed one 16 KiB record per `poll_write` — the same "one framing unit per call"
+defect, in the third place it hid. Doing it properly surfaced something worse:
+`seal_into` computed the record length as `out.len() - 5`, correct only when the caller
+has just cleared the buffer. With two records in one buffer the second carried a length
+covering both, the AEAD authenticated the wrong header, and the peer failed with
+`tls13 aead decrypt failed`. The function's own doc comment had always claimed the offsets
+were per-record.
+
+| path | before | after |
+|---|---|---|
+| VLESS / REALITY | −19.4 % (237) | **−1.7 % (305)** |
+| CPU vs sing-box | −25 % | **−36 %** |
+
+### Vision: 62 % behind → 7 % behind
+
+With the transport fixed, Vision still lost a quarter of REALITY's throughput on its own.
+Two causes, both in the pass-through state that Vision spends its whole life in:
+
+- the raw state copied into a fresh `Vec` and then copied again into the caller;
+- the transport read used a `[0u8; 16 * 1024]` **stack array zero-initialised on every
+  loop iteration**, capping each read at 16 KiB when the caller had 64 KiB.
+
+| path | before | after |
+|---|---|---|
+| REALITY + Vision | 118 (cycle 32) → 228 → **296** | vs sing-box: −62 % → −26 % → **−7.4 %** |
+| CPU vs sing-box | +72 % (worse) → −19.6 % → **−33.4 %** |
+
+Vision now costs about what REALITY costs, which is what a pass-through should cost.
+
+### Where the matrix stands
+
+Ahead of both competitors on TCP, ahead of sing-box on Trojan / Shadowsocks-AEAD /
+Shadowsocks-2022 (parity), ahead of xray on five of eight; **one path still behind both —
+gRPC — and it is closed as unresolved** after five attempts, with the measured facts
+recorded for whoever picks it up.
