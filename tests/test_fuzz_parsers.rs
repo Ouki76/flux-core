@@ -695,3 +695,77 @@ fn fuzz_dns_names_and_ptr_helpers() {
         let _ = ptr_name_to_ip(&Name::from_str(&labels.join(".")).unwrap_or_default());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Transport frame parsers: reachable from an unauthenticated peer
+// ---------------------------------------------------------------------------
+
+/// A WebSocket peer can send arbitrary bytes before any handshake completes. The frame
+/// reader must consume them without panicking, without hanging and without unbounded
+/// memory growth.
+#[tokio::test]
+async fn fuzz_websocket_frame_reader() {
+    use flux_transport::websocket::WebSocketStream;
+    use tokio::io::AsyncReadExt;
+
+    let mut rng = Rng(0xfeed_face_dead_0004);
+
+    for role_is_client in [true, false] {
+        for _ in 0..250 {
+            let len = (rng.next() % 512) as usize;
+            let data = rng.bytes(len);
+
+            let (mut peer, ours) = tokio::io::duplex(64 * 1024);
+            let mut stream = WebSocketStream::new(ours, Vec::new(), role_is_client);
+            let payload = data.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let _ = peer.write_all(&payload).await;
+                let _ = peer.shutdown().await;
+            });
+
+            let mut out = Vec::new();
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut out),
+            )
+            .await;
+            assert!(
+                res.is_ok(),
+                "websocket reader hung on {} bytes: {data:02x?}",
+                data.len()
+            );
+            assert!(
+                out.len() < 1024 * 1024,
+                "websocket reader produced {} bytes from {} input bytes",
+                out.len(),
+                data.len()
+            );
+        }
+    }
+}
+
+/// mKCP segments arrive as unauthenticated UDP datagrams, in every obfuscation mode.
+#[test]
+fn fuzz_kcp_segment_parser() {
+    use flux_transport::kcp::{KcpObfs, debug_parse};
+
+    let mut rng = Rng(0xfeed_face_dead_0005);
+    let modes = [
+        KcpObfs::Srtp,
+        KcpObfs::Utp,
+        KcpObfs::WechatVideo,
+        KcpObfs::Dtls,
+        KcpObfs::Wireguard,
+        KcpObfs::None,
+    ];
+    for mode in modes {
+        for _ in 0..2000 {
+            let len = (rng.next() % 96) as usize;
+            let data = rng.bytes(len);
+            // `debug_parse` returns a description rather than a value, so reaching the
+            // end of the call without a panic is the property under test.
+            let _ = debug_parse(mode, &data);
+        }
+    }
+}
