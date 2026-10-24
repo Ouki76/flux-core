@@ -3188,3 +3188,22 @@ The full-matrix run of cycle 64 had SS-2022 fail once with `handshake failed: I/
 early eof` while every other round of that path passed. Ten consecutive isolated runs of the
 same scenario: **0 failures**. Recorded as a single occurrence with no reproduction rather
 than filed as fixed — if it returns, the tunnel log now actually contains something.
+
+### Fourth null result this cycle: the TLS cipher order
+
+TLS 1.3 lets the **server** choose, and rustls' default order puts AES-256-GCM first —
+fourteen AES rounds per block against ten for AES-128. Reordering to AES-128 first is what
+browsers do and what our own client half already prefers, so it looked like free money.
+
+| variant | MB/s | CPU s/GiB |
+|---|---|---|
+| default (AES-256 first) | 284.5 | 6.64 |
+| AES-128 only (a first attempt that also dropped the TLS 1.2 suites) | 289.3 | 6.42 |
+| reorder, TLS 1.2 suites kept | 278.6 / 286.2 | 6.84 / 6.60 |
+
+The first row of gains was noise; the safe version shows nothing. Reverted — and note what
+the middle row nearly cost: replacing the suite list instead of reordering it would have
+silently broken every TLS 1.2 client while looking like a 2 % win.
+
+GHASH dominates AES-GCM here, which is why the round count barely matters. That closes the
+cipher micro-optimisation line: four experiments, all null, all reverted.
