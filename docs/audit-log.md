@@ -3160,3 +3160,31 @@ Where that leaves the TLS rows: TLS costs ~55 % here and ~54 % for sing-box, so 
 stacks are within a few percent of each other *through the cipher*. Our remaining 3-8 % on
 those rows is not a bug with a layer to find; it is the difference between two TLS
 implementations, and further micro-experiments have stopped paying.
+
+---
+
+## Cycle 66 — 2026-10-25
+
+### The panic surface, audited rather than assumed
+
+Asked directly whether any stubs remained, the honest answer needed checking, not assertion:
+
+| check | result |
+|---|---|
+| `todo!`, `unimplemented!`, `FIXME`, `XXX` in `crates/` | **0** |
+| `unwrap`/`expect` outside test modules | 62, across eight files |
+| of those, unsafe by inspection | **0** — each is a fixed-size slice conversion behind a preceding length check, a constant-length key, or an invariant the types enforce |
+
+The one gap worth closing was coverage, not code: the WireGuard **initiation** parser was
+fuzzed and the **response** parser — the half a client parses from a peer it may not trust —
+was not. Both are the same kind of hand-written parser with `try_into().unwrap()` on ranges,
+so a missing length check there is a panic in a live connection rather than a clean refusal.
+`fuzz_wireguard_response` now builds a real handshake state first, so the corpus attacks the
+response state machine instead of stopping at "that is not a valid initiation".
+
+### And a flake that did not reproduce
+
+The full-matrix run of cycle 64 had SS-2022 fail once with `handshake failed: I/O error:
+early eof` while every other round of that path passed. Ten consecutive isolated runs of the
+same scenario: **0 failures**. Recorded as a single occurrence with no reproduction rather
+than filed as fixed — if it returns, the tunnel log now actually contains something.
