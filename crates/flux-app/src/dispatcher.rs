@@ -10,6 +10,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
+/// How long establishing a stream may take before the session is abandoned.
+///
+/// Deliberately larger than the transport's own 10 s dial timeout so that the specific
+/// error still wins when the dial is what is slow.
+const ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct ActiveConnectionGuard {
     conn_id: Option<String>,
     meter: Option<Arc<TrafficMeter>>,
@@ -578,7 +584,27 @@ impl Dispatcher for DefaultDispatcher {
     }
 
     async fn dispatch_stream(&self, meta: SessionMeta, inbound_stream: BoxedStream) {
-        match self.dial_outbound(&meta).await {
+        // A session must not sit in establishment forever.
+        //
+        // The dial itself is bounded inside the pipeline (10 s), but that only covers the
+        // transport handshake: routing, the effective-address resolution and the
+        // outbound lookup sit *before* it and had no bound at all. A tunnel that stalls
+        // there holds the client's socket open with no error, which is what an
+        // intermittent warm-up hang looked like when it was measured (both processes
+        // asleep, 0.07 s of CPU across a 120 s attempt).
+        let dial = tokio::time::timeout(ESTABLISH_TIMEOUT, self.dial_outbound(&meta)).await;
+        let dial = match dial {
+            Ok(res) => res,
+            Err(_) => {
+                warn!(
+                    "[{}] establishing a stream to {} from {} did not finish within {:?}; \
+                     giving up so the client sees an error instead of a hang",
+                    meta.inbound_tag, meta.destination, meta.source, ESTABLISH_TIMEOUT
+                );
+                return;
+            }
+        };
+        match dial {
             Ok(outbound_stream) => {
                 self.bridge_streams(meta, inbound_stream, outbound_stream)
                     .await;
