@@ -2627,3 +2627,33 @@ crate until the remaining 42 items were done — which is how a lint should beha
 `flux-types` (63 items), `flux-common` (14) and `flux-router` (78) are documented and
 enforced. Remaining: `flux-dns` (271), `flux-protocol`, `flux-transport`, `flux-inbound`,
 `flux-outbound`, `flux-app` — the largest crates, in their own cycles.
+
+---
+
+## Cycle 53 — 2026-10-24
+
+### DNS documented: the crate a resolver must be honest about
+
+Fourth crate in the pass: `flux-dns` had 108 undocumented public items including the entire
+wire format, and is now documented and enforced with `#![warn(missing_docs)]`.
+
+The documentation that matters here is behavioural, not structural:
+
+- the crate root states the parser's posture — every length, pointer and record count from
+  a peer is validated before use, because a resolver is reachable by whatever the network
+  sends it;
+- `Answer::Alias` means "re-query this name", not "here is an address", and `Negative`
+  carries the SOA-derived TTL worth caching;
+- `QueryError` separates the three cases a caller must treat differently: a clean negative
+  (cacheable), a malformed response (protocol error) and a transport failure (never
+  cached).
+
+Two things this taught about the lint itself: `missing_docs` also covers **named fields of
+enum variants**, which is where the last thirty items were hiding, and clippy requires a
+blank line between a doc list and the summary sentence that follows it.
+
+### Documentation progress
+
+`flux-types` (63), `flux-common` (14), `flux-router` (78), `flux-dns` (108) — four crates
+closed and enforced, 263 public items. Remaining: `flux-protocol`, `flux-transport`,
+`flux-inbound`, `flux-outbound`, `flux-app`, in their own cycles.
