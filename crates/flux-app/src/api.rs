@@ -73,6 +73,13 @@ impl TrafficMeter {
         let handle = tokio::spawn(async move {
             let mut last_up = 0u64;
             let mut last_down = 0u64;
+            // Per-connection stall detection, on the sampler's existing 1 s tick: a
+            // connection whose counters stop moving for ten ticks is either deadlocked
+            // or waiting on something that will never wake it. This lives here rather
+            // than as a timer per connection because a timer per connection is exactly
+            // the kind of resource cost a proxy should not pay to diagnose itself.
+            let mut quiet: std::collections::HashMap<String, (u64, u64, u8)> =
+                std::collections::HashMap::new();
             loop {
                 tokio::select! {
                     _ = stop.cancelled() => break,
@@ -93,6 +100,33 @@ impl TrafficMeter {
 
                 last_up = cur_up;
                 last_down = cur_down;
+
+                let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for entry in meter.connections.iter() {
+                    let id = entry.key().clone();
+                    seen.insert(id.clone());
+                    let up = entry.upload.load(Ordering::Relaxed);
+                    let down = entry.download.load(Ordering::Relaxed);
+                    let slot = quiet.entry(id.clone()).or_insert((up, down, 0));
+                    if (slot.0, slot.1) == (up, down) {
+                        slot.2 = slot.2.saturating_add(1);
+                        if slot.2 == 10 {
+                            tracing::warn!(
+                                "relay stalled: [{}] {} -> {} from {} has moved no byte \
+                                 in 10 s (upload {} B, download {} B)",
+                                entry.meta.inbound_tag,
+                                entry.meta.source,
+                                entry.meta.destination,
+                                entry.meta.destination,
+                                up,
+                                down
+                            );
+                        }
+                    } else {
+                        *slot = (up, down, 0);
+                    }
+                }
+                quiet.retain(|id, _| seen.contains(id));
             }
         });
         *slot = Some(Sampler { cancel, handle });
