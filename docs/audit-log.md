@@ -2324,3 +2324,25 @@ which is exactly what a guard is for.
 ### Still open
 
 gRPC (documented, five attempts), mKCP server side, XHTTP, browser-grade ClientHello.
+
+---
+
+## Cycle 43 — 2026-10-24
+
+### What it costs, which was never measured
+
+Every claim in this audit so far was throughput and CPU. Memory and binary size — the other
+half of "lighter" — had never been compared against the competitors.
+
+Carrying the same 200 MiB Shadowsocks-2022 transfer, two processes each:
+
+| | flux-core | sing-box | xray |
+|---|---|---|---|
+| RSS, server + client | **17-18 MiB** | 57-58 MiB | 76-82 MiB |
+| RSS, one process at rest | 7.7-7.8 MiB | — | — |
+| binary size | **10.5 MiB** | 32.0 MiB | 34.9 MiB |
+
+**3x less memory than sing-box, 4x less than xray, one third of the binary** — on top of
+20-68 % less CPU on every path. That is now stated in the README next to the throughput
+table, because a proxy that is fast and cheap is the actual goal, not a fast one that
+pins a core and a hundred megabytes.
