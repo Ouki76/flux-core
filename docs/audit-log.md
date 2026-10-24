@@ -3427,3 +3427,34 @@ Both defects lived in the same twenty lines, and neither was found by review —
 by a backstop log, the other by a CPU figure in a timeout message. A relay loop that
 distinguishes "moved bytes" from "called a method that succeeded" needs that distinction
 tested, not reasoned about.
+
+### Verification: 48 rounds, no stalls and no spins
+
+Full matrix, 4 rounds x 12 rows, daemon log at `warn` from the start:
+
+```
+timeouts: 0        backstop "parked" messages: 0
+```
+
+Against cycle 64's run (one park) and cycle 70's (one spin), this is the first full matrix
+with neither. The relay now distinguishes "moved bytes" from "called something that
+returned successfully", which was the whole defect in both cases.
+
+The same run's best-of-4, for the record — note how much the leaders move between runs
+(SS-2022 was −5.0 % in the previous matrix and −15.6 % here; sing-box's TCP was 674 then
+519), which is why the README quotes the fastest round and states the variance beside it:
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | **728** | 519 | 700 | **+40.2 %** | **+4.0 %** |
+| VLESS / TLS | **301** | 290 | 242 | **+3.6 %** | **+24.4 %** |
+| VLESS / XHTTP | **160** | — | 145 | — | **+10.4 %** |
+| VLESS / WS + TLS | 281 | 292 | 106 | −3.9 % | **+165 %** |
+| VLESS / gRPC (no TLS) | 147 | — | 188 | — | −21.7 % |
+| VLESS / gRPC + TLS | 98 | 118 | 188 | −17.0 % | −48.0 % |
+| VLESS / REALITY | 306 | 333 | 270 | −8.3 % | **+13.2 %** |
+| REALITY + Vision | **355** | 329 | 245 | **+7.9 %** | **+44.8 %** |
+| VMess / WS + TLS | **193** | 192 | 178 | **+0.7 %** | **+8.6 %** |
+| Trojan / TLS | 297 | 331 | — | −10.2 % | — |
+| Shadowsocks-2022 | 308 | 365 | 305 | −15.6 % | **+1.1 %** |
+| Shadowsocks-AEAD | **260** | 259 | — | **+0.2 %** | — |
