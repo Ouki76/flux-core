@@ -504,6 +504,8 @@ enum Kind {
     VlessTcp,
     /// gRPC without TLS, to separate the framing cost from the cipher's.
     VlessGrpcPlain,
+    /// Plain VLESS over TLS: no framing above the cipher, so this row is the cipher.
+    VlessTls,
     /// VLESS over XHTTP in stream-one mode.
     VlessXhttp,
     VlessWsTls,
@@ -528,6 +530,12 @@ const SCENARIOS: &[Scenario] = &[
         name: "VLESS / TCP",
         kind: Kind::VlessTcp,
         needs_cert: false,
+        needs_decoy: false,
+    },
+    Scenario {
+        name: "VLESS / TLS",
+        kind: Kind::VlessTls,
+        needs_cert: true,
         needs_decoy: false,
     },
     Scenario {
@@ -760,6 +768,7 @@ impl Scenario {
             Kind::VlessTcp => flux_in(port, &[], &flux_vless(false)),
             Kind::VlessXhttp => flux_in(port, &[flux_xhttp_server()], &flux_vless(false)),
             Kind::VlessGrpcPlain => flux_in(port, &[flux_grpc_server()], &flux_vless(false)),
+            Kind::VlessTls => flux_in(port, &[flux_tls_server(s)], &flux_vless(false)),
             Kind::VlessWsTls => flux_in(
                 port,
                 &[flux_tls_server(s), flux_ws_server()],
@@ -806,6 +815,7 @@ impl Scenario {
             Kind::VlessGrpcPlain => {
                 flux_out(socks, port, &[flux_grpc_client()], &flux_vless(false))
             }
+            Kind::VlessTls => flux_out(socks, port, &[flux_tls_client(false)], &flux_vless(false)),
             Kind::VlessWsTls => flux_out(
                 socks,
                 port,
@@ -860,6 +870,10 @@ impl Scenario {
             Kind::VlessXhttp | Kind::VlessGrpcPlain => {
                 unreachable!("sing-box cannot run this scenario; the column is skipped")
             }
+            Kind::VlessTls => format!(
+                r#"{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}],{}}}"#,
+                sbox_tls_server(s)
+            ),
             Kind::VlessTcp => format!(
                 r#"{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}]}}"#
             ),
@@ -908,6 +922,10 @@ impl Scenario {
             Kind::VlessXhttp | Kind::VlessGrpcPlain => {
                 unreachable!("sing-box cannot run this scenario; the column is skipped")
             }
+            Kind::VlessTls => format!(
+                r#"{{"type":"vless","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}",{}}}"#,
+                sbox_tls_client()
+            ),
             Kind::VlessTcp => format!(
                 r#"{{"type":"vless","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}"}}"#
             ),
@@ -959,6 +977,7 @@ impl Scenario {
         matches!(
             self.kind,
             Kind::VlessTcp
+                | Kind::VlessTls
                 | Kind::VlessWsTls
                 | Kind::VlessGrpcTls
                 | Kind::VlessReality
@@ -978,6 +997,7 @@ impl Scenario {
             Kind::VlessGrpcTls => P::VlessGrpc,
             Kind::VlessXhttp => P::VlessXhttp,
             Kind::VlessGrpcPlain => P::VlessGrpc,
+            Kind::VlessTls => P::VlessTls,
             Kind::VlessReality => P::Reality,
             Kind::VlessRealityVision => P::RealityVision,
             Kind::VmessWsTls => P::VmessWs,
