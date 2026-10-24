@@ -2573,3 +2573,29 @@ broken links for anyone reading the generated docs.
 single largest performance win of this audit, and therefore the one most likely to be
 "optimised" back into a regression by someone who did not know why it looks that way. It
 now says so. `#![warn(missing_docs)]` is on for the crate.
+
+---
+
+## Cycle 51 — 2026-10-24
+
+### A stall detector that cannot lie, placed where it costs nothing
+
+The copier's liveness ticker only fires for a *parked* copier, and the stall shows both
+processed idle with the ticker silent — so the diagnostics were aimed at the wrong place.
+
+The new detector watches the per-connection byte counters in the connection table: ten
+consecutive one-second samples with both counters unchanged logs the session — inbound tag,
+source, destination, exact byte counts. That distinguishes "stuck after N bytes on the WS
+path" from "never started", which is the difference between two entirely different bugs.
+
+It lives inside the existing sampler rather than as a timer per connection. One task and
+one wakeup per active session purely to diagnose the proxy is exactly the kind of cost this
+audit keeps removing elsewhere; the sampler already ticks a second and already walks the
+table. Per-connection state is three machine words, pruned when the connection goes.
+
+### Status of the stall itself
+
+Six consecutive full-matrix runs since the establishment bound landed have been clean,
+where three of the previous five failed. That is encouraging and it is **not** proof: the
+failure rate was never high enough for six runs to settle it, and the detector has not
+caught a recurrence yet. Recorded as "not seen in six runs", not as "fixed".
