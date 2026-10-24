@@ -1480,12 +1480,14 @@ impl Drop for WgTcpStream {
     }
 }
 
+/// /// A WireGuard client: UDP, Noise handshakes, a userspace stack.
 pub struct WireGuardOutbound {
     tag: String,
     tunnel: Arc<WgTunnel>,
 }
 
 impl WireGuardOutbound {
+    /// An outbound for `config`.
     pub fn new(
         tag: impl Into<String>,
         config: WireGuardConfig,
@@ -1545,6 +1547,7 @@ impl Outbound for WireGuardOutbound {
     }
 }
 
+/// /// A datagram endpoint backed by the WireGuard tunnel.
 pub struct WireGuardPacketEndpoint {
     tunnel: Arc<WgTunnel>,
     /// Local tunnel address (ip:port) used as inner source.

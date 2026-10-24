@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// /// A VMess client.
 pub struct VmessOutbound {
     tag: String,
     uuid: Uuid,
@@ -22,6 +23,7 @@ pub struct VmessOutbound {
 }
 
 impl VmessOutbound {
+    /// A client named `tag` for this UUID and security type.
     pub fn new(
         tag: impl Into<String>,
         uuid: Uuid,
@@ -159,6 +161,7 @@ impl Outbound for VmessOutbound {
     }
 }
 
+/// /// A UDP association over VMess.
 pub struct VmessPacketEndpoint {
     reader: Arc<Mutex<tokio::io::ReadHalf<BoxedStream>>>,
     writer: Arc<Mutex<tokio::io::WriteHalf<BoxedStream>>>,

@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, mpsc};
 
 type UdpDemuxMap = Arc<dashmap::DashMap<u32, tokio::sync::mpsc::Sender<UdpPacket>>>;
 
+/// /// Hysteria 2 over QUIC, with its own pacing.
 pub struct Hysteria2Outbound {
     tag: String,
     config: Hysteria2Config,
@@ -34,6 +35,7 @@ pub struct Hysteria2Outbound {
 }
 
 impl Hysteria2Outbound {
+    /// An outbound for `config`, dialling through `dialer`.
     pub fn new(
         tag: impl Into<String>,
         config: Hysteria2Config,
@@ -57,6 +59,7 @@ impl Hysteria2Outbound {
         }
     }
 
+    /// An outbound whose QUIC connection is pre-built.
     pub fn new_with_dialer(
         tag: impl Into<String>,
         config: Hysteria2Config,
@@ -81,6 +84,7 @@ impl Hysteria2Outbound {
         }
     }
 
+    /// The bandwidth pacer, for tuning from configuration.
     pub fn pacer(&self) -> &Arc<Mutex<BrutalPacer>> {
         &self.pacer
     }

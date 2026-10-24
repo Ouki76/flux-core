@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use flux_types::{BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta};
 
+/// /// Refuses every connection, at once and without dialling.
 pub struct BlockOutbound {
     tag: String,
 }
 
 impl BlockOutbound {
+    /// A blocked outbound named `tag`.
     pub fn new(tag: impl Into<String>) -> Self {
         Self { tag: tag.into() }
     }

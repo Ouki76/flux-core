@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing::warn;
 
+/// /// One member of a group, chosen by hand or through the API.
 pub struct SelectorOutbound {
     tag: String,
     outbounds: Vec<String>,
@@ -14,6 +15,7 @@ pub struct SelectorOutbound {
 }
 
 impl SelectorOutbound {
+    /// A selector named `tag` over `members`, starting on `initial`.
     pub fn new(
         tag: impl Into<String>,
         outbounds: Vec<String>,
@@ -33,6 +35,7 @@ impl SelectorOutbound {
         }
     }
 
+    /// The member currently selected.
     pub fn current(&self) -> String {
         self.selected.read().clone()
     }

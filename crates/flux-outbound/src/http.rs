@@ -5,6 +5,7 @@ use flux_types::{
 };
 use std::sync::Arc;
 
+/// /// An HTTP CONNECT client.
 pub struct HttpOutbound {
     tag: String,
     auth: Option<(String, String)>,
@@ -12,6 +13,7 @@ pub struct HttpOutbound {
 }
 
 impl HttpOutbound {
+    /// A client named `tag` dialling through `dialer`.
     pub fn new(tag: impl Into<String>, dialer: Arc<dyn StreamDialer>) -> Self {
         Self {
             tag: tag.into(),
@@ -20,6 +22,7 @@ impl HttpOutbound {
         }
     }
 
+    /// Authenticates with basic credentials.
     pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.auth = Some((username.into(), password.into()));
         self

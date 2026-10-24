@@ -7,13 +7,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::warn;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+/// /// How connections are spread across the members.
 pub enum BalanceStrategy {
     #[default]
+    /// Each connection to the next member in turn.
     RoundRobin,
+    /// The same destination to the same member, so caches stay warm.
     ConsistentHashing,
 }
 
 impl BalanceStrategy {
+    /// Parses a strategy name, defaulting to round robin.
     pub fn parse_str(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "consistent-hashing" | "hash" | "sticky" => Self::ConsistentHashing,
@@ -22,6 +26,7 @@ impl BalanceStrategy {
     }
 }
 
+/// /// Spreads connections across several outbounds.
 pub struct LoadBalanceOutbound {
     tag: String,
     outbounds: Vec<String>,
@@ -31,6 +36,7 @@ pub struct LoadBalanceOutbound {
 }
 
 impl LoadBalanceOutbound {
+    /// A group named `tag` over `members` with `strategy`.
     pub fn new(
         tag: impl Into<String>,
         outbounds: Vec<String>,

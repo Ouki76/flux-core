@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+/// /// A Trojan client.
 pub struct TrojanOutbound {
     tag: String,
     password_hash: String,
@@ -20,6 +21,7 @@ pub struct TrojanOutbound {
 }
 
 impl TrojanOutbound {
+    /// A client named `tag` with this password.
     pub fn new(
         tag: impl Into<String>,
         password: impl Into<String>,
@@ -118,6 +120,7 @@ impl Outbound for TrojanOutbound {
     }
 }
 
+/// /// A UDP association over Trojan.
 pub struct TrojanPacketEndpoint {
     reader: Arc<Mutex<tokio::io::ReadHalf<BoxedStream>>>,
     writer: Arc<Mutex<tokio::io::WriteHalf<BoxedStream>>>,

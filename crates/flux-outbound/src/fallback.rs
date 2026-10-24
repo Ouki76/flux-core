@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, warn};
 
+/// /// Uses the first candidate that works, and remembers a failing one.
 pub struct FallbackOutbound {
     tag: String,
     outbounds: Vec<String>,
@@ -22,6 +23,7 @@ pub struct FallbackOutbound {
 }
 
 impl FallbackOutbound {
+    /// A fallback group over `candidates`, in preference order.
     pub fn new(
         tag: impl Into<String>,
         outbounds: Vec<String>,
@@ -44,6 +46,7 @@ impl FallbackOutbound {
         }
     }
 
+    /// The candidate currently in use.
     pub fn current(&self) -> String {
         self.current_active.read().clone()
     }
@@ -128,6 +131,7 @@ impl FallbackOutbound {
         }
     }
 
+    /// Re-tests candidates after the active one failed.
     pub async fn probe_candidates(&self) {
         let Some(ref test_url) = self.url else {
             return;

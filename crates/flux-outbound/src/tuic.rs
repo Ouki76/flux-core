@@ -18,6 +18,7 @@ struct DatagramDemux {
     sessions: DashMap<u16, mpsc::Sender<UdpPacket>>,
 }
 
+/// /// A TUIC v5 client.
 pub struct TuicOutbound {
     tag: String,
     config: TuicV5Config,
@@ -30,6 +31,7 @@ pub struct TuicOutbound {
 }
 
 impl TuicOutbound {
+    /// A client for `config`.
     pub fn new(
         tag: impl Into<String>,
         config: TuicV5Config,

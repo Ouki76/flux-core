@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 
+/// /// A Shadowsocks client.
 pub struct ShadowsocksOutbound {
     tag: String,
     password: String,
@@ -28,6 +29,7 @@ pub struct ShadowsocksOutbound {
 }
 
 impl ShadowsocksOutbound {
+    /// A client named `tag` with this password and method.
     pub fn new(
         tag: impl Into<String>,
         server_address: TargetAddress,
@@ -49,6 +51,7 @@ impl ShadowsocksOutbound {
         }
     }
 
+    /// The same client, used for datagrams.
     pub fn new_datagram(
         tag: impl Into<String>,
         server_address: TargetAddress,
@@ -69,6 +72,7 @@ impl ShadowsocksOutbound {
         }
     }
 
+    /// Uses this cipher instead of the default.
     pub fn with_cipher_kind(mut self, kind: CipherKind) -> Self {
         self.cipher_kind = kind;
         self.master_key = derive_master_key_for_kind(&self.password, kind);
@@ -265,6 +269,7 @@ enum ShadowsocksPacketEndpointInner {
     Ss2022(Arc<flux_protocol::shadowsocks2022::Ss2022UdpPacketCipher>),
 }
 
+/// /// A UDP association over Shadowsocks.
 pub struct ShadowsocksPacketEndpoint {
     udp_socket: Arc<UdpSocket>,
     server_addr: SocketAddr,

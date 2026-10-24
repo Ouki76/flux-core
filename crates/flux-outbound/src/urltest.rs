@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, info};
 
+/// /// Measures each member against a URL and uses the fastest.
 pub struct UrlTestOutbound {
     tag: String,
     outbounds: Vec<String>,
@@ -30,6 +31,7 @@ pub struct UrlTestOutbound {
 }
 
 impl UrlTestOutbound {
+    /// A group named `tag` over `members`, probing `url`.
     pub fn new(
         tag: impl Into<String>,
         outbounds: Vec<String>,
@@ -105,6 +107,7 @@ impl UrlTestOutbound {
         });
     }
 
+    /// Probes every member once and updates the choice.
     pub async fn probe_all(&self) {
         use futures_util::future::join_all;
         let futures: Vec<_> = self
@@ -182,10 +185,12 @@ impl UrlTestOutbound {
         }
     }
 
+    /// The fastest member from the last probe, if any succeeded.
     pub fn current_best_tag(&self) -> Option<String> {
         self.current_best.read().clone()
     }
 
+    /// The URL being probed.
     pub fn url(&self) -> &str {
         &self.url
     }

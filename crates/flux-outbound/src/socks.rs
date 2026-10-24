@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
+/// /// A SOCKS5 client.
 pub struct SocksOutbound {
     tag: String,
     server_address: TargetAddress,
@@ -25,6 +26,7 @@ pub struct SocksOutbound {
 }
 
 impl SocksOutbound {
+    /// A client named `tag` dialling through `dialer`.
     pub fn new(
         tag: impl Into<String>,
         server_address: TargetAddress,
@@ -41,6 +43,7 @@ impl SocksOutbound {
         }
     }
 
+    /// Authenticates with username and password.
     pub fn with_auth(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
         self.auth = Some((username.into(), password.into()));
         self
@@ -118,6 +121,7 @@ impl Outbound for SocksOutbound {
     }
 }
 
+/// /// A SOCKS5 UDP association.
 pub struct SocksPacketEndpoint {
     // Keeps the UDP-associate control connection alive for the lifetime of the
     // endpoint; dropping it tells the server to tear the association down.

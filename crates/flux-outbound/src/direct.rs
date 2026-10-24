@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
+/// /// Connects to the destination itself, optionally fragmenting the ClientHello.
 pub struct DirectOutbound {
     tag: String,
     resolver: Arc<DnsResolver>,
@@ -17,6 +18,7 @@ pub struct DirectOutbound {
 }
 
 impl DirectOutbound {
+    /// A direct outbound named `tag`.
     pub fn new(tag: impl Into<String>, resolver: Arc<DnsResolver>) -> Self {
         Self {
             tag: tag.into(),
@@ -26,6 +28,7 @@ impl DirectOutbound {
         }
     }
 
+    /// Splits the TLS ClientHello when the destination is HTTPS.
     pub fn with_fragmentation(
         mut self,
         cfg: flux_transport::fragment::FragmentationConfig,
@@ -83,6 +86,7 @@ impl Outbound for DirectOutbound {
     }
 }
 
+/// /// A UDP association that sends datagrams straight from a local socket.
 pub struct DirectPacketEndpoint {
     socket: Arc<UdpSocket>,
     resolver: Arc<DnsResolver>,

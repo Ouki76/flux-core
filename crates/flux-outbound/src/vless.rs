@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+/// /// A VLESS client.
 pub struct VlessOutbound {
     tag: String,
     uuid: Uuid,
@@ -21,6 +22,7 @@ pub struct VlessOutbound {
 }
 
 impl VlessOutbound {
+    /// A client named `tag` for this UUID, optionally using Vision.
     pub fn new(
         tag: impl Into<String>,
         uuid: Uuid,
@@ -145,6 +147,7 @@ impl Outbound for VlessOutbound {
     }
 }
 
+/// /// A UDP association over VLESS packet-address mode.
 pub struct VlessPacketEndpoint {
     reader: Arc<Mutex<tokio::io::ReadHalf<BoxedStream>>>,
     writer: Arc<Mutex<tokio::io::WriteHalf<BoxedStream>>>,
