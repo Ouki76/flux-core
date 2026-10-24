@@ -3285,3 +3285,40 @@ better, because xray's own numbers barely move (+22 to +28 % on the TLS rows eve
 So the 25 % that WebSocket costs over an HttpUpgrade layer (769 against 993) is not in the
 masking and not in the frame loop width. It is somewhere this cycle did not find, and the
 two experiments above are recorded so the next attempt starts past them.
+
+---
+
+## Cycle 69 — 2026-10-25
+
+### Profiling the WebSocket layer: the right tool, pointed at the wrong caller
+
+The harness had no way to profile one layer, so callgrind profiled all five and the h2 path
+— orders of magnitude more instructions per byte — dominated whatever the question was.
+`--only ws` fixes that, and the isolated profile was unambiguous:
+
+| function | share of instructions |
+|---|---|
+| `__memcpy_avx_unaligned_erms` | **68.4 %** |
+| `encode_frame_into` | 9.7 % |
+| `mask_in_place` | 9.6 % |
+| `memset` | 1.5 % |
+
+The obvious suspect: `mask_in_place` writes each eight-byte word with
+`word.copy_from_slice(&v.to_ne_bytes())`, which LLVM does not fold into a store — it emits a
+`memcpy` call per word. Rewritten with `read_unaligned`/`write_unaligned`, those calls do
+disappear (`mask_in_place` falls to 4.6 %, `ptr::mod` leaves the profile entirely).
+
+**It does not make the layer faster, and total instructions rise 15 %.** Measured in release
+builds, three runs each: 1132 median with the rewrite against 1206 without — inside the
+noise, on a box whose load average moved from 8 to 1.6 during the session. The memcpy was
+coming from the harness's own `tokio::io::duplex` pipes, not from the mask. Reverted: it
+added `unsafe` and bought nothing.
+
+### Two lessons, both about instruments rather than code
+
+1. **callgrind counts instructions, not cycles.** A function at the top of its list is not
+   necessarily where the time goes; memory ops retire from the store buffer far faster than
+   their instruction count suggests.
+2. **The load average of this host moved between 8.3 and 1.6 during one session**, which is
+   ±20 % on every absolute throughput number. Nothing under ~15 % can be attributed to a code
+   change here, and the README's tables are only meaningful within one run.
