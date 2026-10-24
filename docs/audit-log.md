@@ -2679,3 +2679,23 @@ and `pipeline` composes them, which is why no transport has its own connection t
 
 Five crates done: types (63), common (14), router (78), dns (108), transport (149) — **412
 public items**. Remaining: protocol, inbound, outbound, app.
+
+### The tokio upgrade did not cost throughput
+
+A dependency upgrade that fixes a security advisory can still cost performance, so it was
+measured rather than assumed. Full matrix, 3 rounds x 200 MiB, on tokio 1.54.1:
+
+| path | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | 688 | 566 | 580 | **+21.5 %** | **+18.5 %** |
+| REALITY | 270 | 287 | 225 | −5.9 % | **+20.2 %** |
+| REALITY + Vision | 270 | 297 | 254 | −9.1 % | **+6.6 %** |
+| VMess / WS | 173 | 192 | 160 | −10.0 % | **+7.8 %** |
+| Trojan / TLS | 272 | 290 | — | −6.1 % | — |
+| Shadowsocks-2022 | 311 | 329 | 270 | −5.5 % | **+15.4 %** |
+| Shadowsocks-AEAD | 244 | 241 | — | **+1.2 %** | — |
+| VLESS / WS + TLS | 258 | 293 | 104 | −11.9 % | **+147.9 %** |
+| gRPC | 95 | 113 | 181 | −16.1 % | −47.3 % |
+
+Same corridor as before the upgrade, and **every row completed** — no stall in this run.
+CPU is 28-68 % below sing-box and 34-68 % below xray throughout.
