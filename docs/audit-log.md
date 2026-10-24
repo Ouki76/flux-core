@@ -2498,3 +2498,47 @@ one that hung:
 
 Ahead of xray on six of eight, within 11 % of sing-box on everything but gRPC and
 Shadowsocks-2022, and 14-58 % cheaper on CPU everywhere.
+
+---
+
+## Cycle 49 — 2026-10-24
+
+### The stall: narrowed further, bounded, still open
+
+Three measurements moved it forward and none of them fixed it.
+
+**It is not the TLS read adapter.** A/B with the coalescing removed: same 3 failures, only
+the CPU figure changed (0.084 s → 1.196 s). Reverted the experiment, kept the adapter (it
+carries Trojan −10.3 % → −1.1 %).
+
+**It is not the outbound handshake.** `LayeredTransportPipeline` already wraps the whole
+dial in a 10 s timeout; a stuck handshake would surface as an error at 10 s, not a hang at
+120 s.
+
+**It is not establishment.** Added a 30 s bound around `dispatch_stream`'s route + dial
+(the one unbounded stretch between accepting a connection and starting the relay). It never
+fired in the failure that followed — the session was established.
+
+What the failure looks like now:
+
+```
+round 1: timeout: no completion within 120s (120 MiB attempted);
+         the tunnel used 1.193 s CPU during the attempt
+```
+
+So: TLS-carrying paths only, needs three stacks for load, ~1 run in 3, session established,
+some data moved, then both processes go quiet — **neither spinning nor parked in the
+copier's poll** (its 500 ms liveness backstop stays silent, and it logs when it fires).
+
+That last point is the new lead and it is a narrow one: a task waiting *outside* a
+`poll_fn`, on a channel or notify inside one of our layered streams, would look exactly
+like this. The next step is to enumerate the awaits between `poll_write`/`poll_read` and
+the socket in the VMess/WS/TLS stack — there are few.
+
+### Also this cycle
+
+The benchmark harness binary was **stale** for several runs: `cargo build --example` had
+not been re-run after the mKCP scenario was reverted, so the matrix kept reporting a row
+that no longer exists in the source. Rebuilt; the row is gone. Worth stating plainly
+because every number quoted since then was produced by the current source, and the earlier
+ones by a binary that also carried a failing scenario as extra load.
