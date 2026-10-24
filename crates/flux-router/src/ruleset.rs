@@ -8,10 +8,15 @@ use std::sync::Arc;
 /// Lives behind an RwLock so remote (URL-fetched) rule sets can be hot-swapped
 /// without touching the running router.
 #[derive(Clone, Debug, Default)]
+/// A rule set in the shape matching wants: sorted ranges and hash sets.
 pub struct CompiledRuleSet {
+    /// CIDR entries, merged into intervals.
     pub ip_range_set: crate::ip_range::IpRangeSet,
+    /// Exact domain entries.
     pub exact_set: HashSet<String>,
+    /// Domain-suffix entries.
     pub suffix_set: HashSet<String>,
+    /// Domain-keyword entries; a list because they are matched by substring.
     pub keyword_list: Vec<String>,
 }
 
@@ -68,32 +73,43 @@ impl CompiledRuleSet {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// One external rule set, as configured.
 pub struct RuleSet {
+    /// The tag rules refer to this set by.
     pub tag: String,
     #[serde(default)]
+    /// Local file to load, if any.
     pub path: Option<String>,
     #[serde(default)]
+    /// Inline CIDR entries.
     pub ip_cidr: Vec<String>,
     #[serde(default)]
+    /// Inline exact domains.
     pub domain: Vec<String>,
     #[serde(default)]
+    /// Inline domain suffixes.
     pub domain_suffix: Vec<String>,
     #[serde(default)]
+    /// Inline domain keywords.
     pub domain_keyword: Vec<String>,
 
     /// Remote URL (http:// or https://) fetched asynchronously in the background.
     /// The rule set matches nothing until the first successful fetch completes.
     #[serde(skip)]
+    /// Where to fetch the set from, for the refreshing loader.
     pub remote_url: Option<String>,
     /// Optional periodic refresh interval for remote rule sets.
     #[serde(skip)]
+    /// How often to re-fetch `remote_url`.
     pub update_interval: Option<std::time::Duration>,
     /// Hot-swappable compiled matcher state.
     #[doc(hidden)]
     #[serde(skip)]
+    /// The compiled form, swapped wholesale when the set is reloaded.
     pub compiled: Arc<parking_lot::RwLock<CompiledRuleSet>>,
     #[serde(skip)]
     #[doc(hidden)]
+    /// Whether the file behind this set has been read.
     pub file_loaded: bool,
     /// Mutable parse statistics (interior mutability: remote rule sets are
     /// refreshed through a shared `&RuleSet`).
@@ -262,6 +278,7 @@ impl RuleSet {
         })
     }
 
+    /// Loads plain-text entries from a file, one rule line at a time.
     pub fn load_from_file(&mut self, path: &str) -> std::io::Result<()> {
         let content = std::fs::read_to_string(path)?;
         for line in content.lines() {
@@ -371,6 +388,7 @@ impl RuleSet {
         Ok(())
     }
 
+    /// Whether this set contains the session's destination.
     pub fn matches(&self, meta: &SessionMeta) -> bool {
         let compiled = self.compiled.read();
         match &meta.destination {
@@ -417,12 +435,14 @@ impl RuleSet {
     }
 }
 
+/// Every rule set by tag, shared with the router.
 #[derive(Clone, Debug, Default)]
 pub struct RuleSetRegistry {
     rule_sets: HashMap<String, Arc<RuleSet>>,
 }
 
 impl RuleSetRegistry {
+    /// An empty registry.
     pub fn new() -> Self {
         Self {
             rule_sets: HashMap::new(),
@@ -438,6 +458,7 @@ impl RuleSetRegistry {
         Ok(())
     }
 
+    /// The set with this tag, if it was inserted.
     pub fn get(&self, tag: &str) -> Option<Arc<RuleSet>> {
         self.rule_sets.get(tag).cloned()
     }

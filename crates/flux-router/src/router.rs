@@ -6,6 +6,7 @@ use flux_types::SessionMeta;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Evaluates rules in order and returns the first outbound tag that matches.
 #[derive(Clone)]
 pub struct Router {
     rules: Vec<Rule>,
@@ -31,6 +32,7 @@ impl Default for Router {
 }
 
 impl Router {
+    /// A router over `rules`, falling back to `default_outbound` when none match.
     pub fn new(rules: Vec<Rule>, default_outbound: impl Into<String>) -> Self {
         let mut exact_domains: HashMap<String, Vec<usize>> = HashMap::new();
         let mut suffix_domains: HashMap<String, Vec<usize>> = HashMap::new();
@@ -105,21 +107,25 @@ impl Router {
         }
     }
 
+    /// Supplies rule sets; without this a rule naming one never matches.
     pub fn with_rule_sets(mut self, registry: RuleSetRegistry) -> Self {
         self.rule_sets = registry;
         self
     }
 
+    /// Supplies the GeoIP database; without this a `geoip` rule never matches.
     pub fn with_geoip(mut self, geo: Arc<GeoIpRegistry>) -> Self {
         self.geoip_registry = geo;
         self
     }
 
+    /// Supplies the process resolver; without this a `process_name` rule never matches.
     pub fn with_process_resolver(mut self, pr: Arc<ProcessResolver>) -> Self {
         self.process_resolver = pr;
         self
     }
 
+    /// The outbound tag for `meta`: the first matching rule, else the default.
     pub fn route(&self, meta: &SessionMeta) -> &str {
         match &meta.destination {
             flux_types::TargetAddress::Domain(domain, _) => {
@@ -270,6 +276,8 @@ impl Router {
     /// router deliberately does not resolve on its own, because it is synchronous
     /// and has no resolver. The dispatcher asks this question and resolves when the
     /// answer is yes, which keeps the decision where the async I/O lives.
+    /// Whether any rule looks at the destination IP, so the caller knows it must resolve
+    /// a domain before routing instead of connecting first.
     pub fn needs_resolved_destination(&self) -> bool {
         self.ip_rules.iter().any(|&idx| {
             let rule = &self.rules[idx];
@@ -277,10 +285,12 @@ impl Router {
         })
     }
 
+    /// The outbound used when no rule matches.
     pub fn default_outbound(&self) -> &str {
         &self.default_outbound
     }
 
+    /// The rules, in the order they are evaluated.
     pub fn rules(&self) -> &[Rule] {
         &self.rules
     }

@@ -3,16 +3,19 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// A set of IP ranges stored as sorted, merged intervals.
 pub struct IpRangeSet {
     v4_ranges: Vec<(u32, u32)>,
     v6_ranges: Vec<(u128, u128)>,
 }
 
 impl IpRangeSet {
+    /// An empty set.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Builds the set from CIDRs, merging overlaps so lookups stay logarithmic.
     pub fn from_cidrs(cidrs: &[IpNet]) -> Self {
         let mut v4_raw = Vec::new();
         let mut v6_raw = Vec::new();
@@ -45,6 +48,7 @@ impl IpRangeSet {
     }
 
     #[inline]
+    /// Whether the set contains no range at all.
     pub fn is_empty(&self) -> bool {
         self.v4_ranges.is_empty() && self.v6_ranges.is_empty()
     }
@@ -61,6 +65,7 @@ impl IpRangeSet {
     /// An explicit v6 rule still wins: the address is checked against the v6
     /// ranges first, so `IP-CIDR6,::ffff:0:0/96` keeps working.
     #[inline]
+    /// Whether `ip` falls in any range in the set.
     pub fn contains(&self, ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => self.contains_v4(*v4),
@@ -77,6 +82,7 @@ impl IpRangeSet {
     }
 
     #[inline]
+    /// Whether an IPv4 address falls in any range in the set.
     pub fn contains_v4(&self, ip: Ipv4Addr) -> bool {
         if self.v4_ranges.is_empty() {
             return false;
@@ -96,6 +102,7 @@ impl IpRangeSet {
     }
 
     #[inline]
+    /// Whether an IPv6 address falls in any range in the set.
     pub fn contains_v6(&self, ip: Ipv6Addr) -> bool {
         if self.v6_ranges.is_empty() {
             return false;
@@ -117,6 +124,7 @@ impl IpRangeSet {
 
 /// CIDR-list membership with the same semantics as [`IpRangeSet`], for rules
 /// whose ranges were never compiled (`compile_cidrs` is optional).
+/// Linear scan over a CIDR list. For a repeatedly searched list use [`IpRangeSet`].
 pub fn cidr_list_contains(cidrs: &[IpNet], ip: IpAddr) -> bool {
     if cidrs.iter().any(|cidr| cidr.contains(&ip)) {
         return true;

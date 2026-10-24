@@ -12,6 +12,7 @@ use std::borrow::Cow;
 /// meant the rule dropped the session and it fell through to `final`: traffic
 /// meant for the proxy went direct.
 #[inline]
+/// Lowercases a host and strips a trailing dot, borrowing when it is already normal.
 pub fn normalize_host(host: &str) -> Cow<'_, str> {
     let trimmed = host.trim().trim_end_matches('.');
     // A non-ASCII name must be compared in its ASCII form: a rule written as
@@ -34,6 +35,7 @@ pub fn normalize_host(host: &str) -> Cow<'_, str> {
 /// used to compile to `""`, and `str::contains("")` is true for every string,
 /// so one broken line turned its rule set into "match every domain".
 #[inline]
+/// Substring match used by keyword rules, case-insensitive on ASCII.
 pub fn contains_keyword(haystack: &str, needle: &str) -> bool {
     let needle = needle.trim();
     if needle.is_empty() {
@@ -63,22 +65,29 @@ pub(crate) fn canonical_suffix(pattern: &str) -> String {
     p.trim_start_matches('.').to_ascii_lowercase()
 }
 
+/// How a domain pattern is compared.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DomainMatch {
+    /// One specific name.
     Exact(String),
+    /// A domain and everything under it.
     Suffix(String),
+    /// Any name containing this substring.
     Keyword(String),
 }
 
 impl DomainMatch {
+    /// Matches one specific name and nothing else.
     pub fn exact(pattern: impl Into<String>) -> Self {
         Self::Exact(canonical_exact(&pattern.into()))
     }
 
+    /// Matches a domain and every subdomain of it.
     pub fn suffix(suffix: impl Into<String>) -> Self {
         Self::Suffix(canonical_suffix(&suffix.into()))
     }
 
+    /// Matches any name containing the keyword.
     pub fn keyword(kw: impl Into<String>) -> Self {
         Self::Keyword(kw.into().trim().to_ascii_lowercase())
     }
@@ -90,6 +99,7 @@ impl DomainMatch {
     /// arrive with uppercase or a trailing dot and the matcher must still agree
     /// with the index the router builds from the same pattern.
     #[inline]
+    /// Whether this pattern matches `domain`, after normalising it.
     pub fn matches(&self, domain: &str) -> bool {
         let domain = normalize_host(domain);
         let domain = domain.as_ref();
@@ -124,13 +134,17 @@ impl DomainMatch {
     }
 }
 
+/// An inclusive range of destination ports.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortRange {
+    /// First port of the range.
     pub start: u16,
+    /// Last port of the range, inclusive.
     pub end: u16,
 }
 
 impl PortRange {
+    /// A range containing exactly one port.
     pub fn single(port: u16) -> Self {
         Self {
             start: port,
@@ -138,44 +152,65 @@ impl PortRange {
         }
     }
 
+    /// A range from `start` to `end`, both inclusive.
     pub fn range(start: u16, end: u16) -> Self {
         Self { start, end }
     }
 
+    /// Whether `port` falls inside the range.
     pub fn contains(&self, port: u16) -> bool {
         port >= self.start && port <= self.end
     }
 }
 
+/// One routing rule: a conjunction of conditions plus the outbound it selects.
+///
+/// Every populated condition must hold (they are ANDed); empty vectors are ignored, so
+/// a rule with only `domains` set matches on domains alone. `matches` is the entry point
+/// and evaluates in a fixed order, cheapest condition first.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Rule {
+    /// Inbound tags this rule applies to; empty means any.
     pub inbound_tags: Vec<String>,
+    /// Stream or datagram; empty means both.
     pub networks: Vec<NetworkType>,
+    /// Domain patterns; any one matching is enough.
     pub domains: Vec<DomainMatch>,
+    /// Destination CIDRs; any one containing the destination is enough.
     pub ip_cidrs: Vec<IpNet>,
+    /// Destination port ranges; any one containing the port is enough.
     pub ports: Vec<PortRange>,
+    /// Names of external rule sets to consult.
     #[serde(default)]
     pub rule_set: Vec<String>,
+    /// ISO country codes matched against the GeoIP database.
     #[serde(default)]
     pub geoip: Vec<String>,
+    /// Process names, when the platform can attribute a connection to one.
     #[serde(default)]
     pub process_name: Vec<String>,
+    /// Inverts the whole rule: it matches when its conditions do not.
     #[serde(default)]
     pub invert: bool,
+    /// Compiled form of `ip_cidrs`; not deserialised, built by `compile_cidrs`.
     #[serde(skip)]
     pub ip_range_set: crate::ip_range::IpRangeSet,
+    /// The outbound tag this rule selects when it matches.
     pub outbound: String,
 }
 
 impl Rule {
+    /// Pre-parses the CIDR list. Called once after loading; matching does not parse.
     pub fn compile_cidrs(&mut self) {
         self.ip_range_set = crate::ip_range::IpRangeSet::from_cidrs(&self.ip_cidrs);
     }
 
+    /// Matches without a rule-set or GeoIP database; those conditions fail closed.
     pub fn matches(&self, meta: &SessionMeta) -> bool {
         self.matches_with_context(meta, None, None, None)
     }
 
+    /// Matches with rule sets available but no GeoIP database.
     pub fn matches_with_registry(
         &self,
         meta: &SessionMeta,
@@ -184,6 +219,8 @@ impl Rule {
         self.matches_with_context(meta, registry, None, None)
     }
 
+    /// Matches with every registry available. A condition whose registry is absent
+    /// fails, so a rule never matches by accident when its data is missing.
     pub fn matches_with_context(
         &self,
         meta: &SessionMeta,

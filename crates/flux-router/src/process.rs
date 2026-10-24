@@ -23,6 +23,7 @@ const MAX_PENDING_SCANS: usize = 256;
 /// never blocks a Tokio worker. On a cache miss the scan is queued and `None`
 /// is returned; subsequent queries pick up the populated cache entry.
 #[derive(Clone)]
+/// Resolves the process that owns a source port, where the platform exposes it.
 pub struct ProcessResolver {
     cache: Arc<Mutex<HashMap<SocketAddr, CacheEntry>>>,
     inner: Arc<ResolverShared>,
@@ -40,6 +41,7 @@ impl Default for ProcessResolver {
 }
 
 impl ProcessResolver {
+    /// A resolver with an empty cache.
     pub fn new() -> Self {
         let cache: Arc<Mutex<HashMap<SocketAddr, CacheEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -90,6 +92,7 @@ impl ProcessResolver {
     ///
     /// Non-blocking: returns `None` on a cache miss and queues an asynchronous
     /// background scan instead of performing blocking `/proc` I/O inline.
+    /// The process name behind `src`, or `None` when it cannot be attributed.
     pub fn resolve_process_name(&self, src: SocketAddr) -> Option<String> {
         let now = Instant::now();
         {
