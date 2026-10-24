@@ -152,6 +152,21 @@ interleaved rounds — the only comparison that says anything about competitiven
 | Shadowsocks-AEAD | 249 | 238 | — | **+4.6 %** | — | −21 % |
 | VLESS / gRPC + TLS | 105 | 117 | 182 | −10.3 % | −42.5 % | −55 / −36 % |
 
+### Resource use
+
+Same three stacks, measured while carrying the same 200 MiB Shadowsocks-2022 transfer,
+two processes each (a server and a client):
+
+| | flux-core | sing-box | xray |
+|---|---|---|---|
+| RSS, server + client | **17-18 MiB** | 57-58 MiB | 76-82 MiB |
+| RSS, one process at rest | **7.7-7.8 MiB** | — | — |
+| binary size | **10.5 MiB** | 32.0 MiB | 34.9 MiB |
+
+Three times less memory than sing-box and four times less than xray under load, and a
+binary a third of their size. Combined with the CPU column above — 20-68 % less than both
+on every path — that is what "flies and costs nothing" looks like in numbers.
+
 **Absolutes are machine-specific — never compare these numbers across machines, only
 within one run.** This table is the homelab server (24 cores, Void Linux, 5 interleaved
 rounds x 200 MiB); an earlier edition came from a desktop where every absolute was about
