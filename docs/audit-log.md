@@ -2158,3 +2158,49 @@ attack. gRPC is separate: four attempts at its framing all returned null.
 
 README's performance table replaced with this one, with the machine-specificity of the
 absolutes stated in the table itself.
+
+---
+
+## Cycle 39 — 2026-10-24
+
+### WebSocket: masking one byte at a time cost two thirds of the throughput
+
+Every byte a WebSocket client sends went through
+`payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4])` — a modulo and a per-byte push
+through the iterator protocol. The read path had been optimised to mask four bytes at a
+time long ago; the write path never was.
+
+| layer (echo, 64 KiB) | before | after |
+|---|---|---|
+| raw, no framing | 989 | 1093 |
+| **WebSocket** | **345** | **742** |
+| HTTPUpgrade | 970 | 1051 |
+
+Through the proxy against sing-box, 4 rounds x 200 MiB:
+
+| path | before | after |
+|---|---|---|
+| VLESS / WS + TLS | −19.5 % | **−3.5 %** |
+| VMess / WS + TLS | −21.4 % | **−3.0 %** |
+
+CPU 36-39 % below sing-box on both, and both rows went from "clearly behind" to "level".
+
+### Why this one hid for so long
+
+Three things pointed away from it. The framing cap was already 64 KiB, so the "one framing
+unit per call" defect that explained the other paths looked fixed here. Removing the two
+copies per read changed nothing (345 → 356), which made the layer look cheap. And the
+proxy-level comparison was close enough to look like a TLS difference.
+
+What found it: measuring the transport **in isolation against a raw stream**. 345 versus
+989 means the layer itself is the cost, not the stack under it. That is the same lesson as
+`bench_tls` in cycle 24 — a layer cannot be judged from the composite number.
+
+### gRPC: closed as unresolved, with what is known
+
+Five attempts (frame size, write batching, read batching, syscall batching, and finally the
+syscall profile) all returned null. Measured facts recorded for whoever picks it up: echo
+mode reaches 18 MB/s and streaming 103; throughput barely scales with message size, so it
+is a *bandwidth* cap rather than per-message latency; `strace` shows 3 584 futexes for 64
+messages, but most of those are idle runtime workers rather than the data path. It is the
+one row where both competitors beat us.
