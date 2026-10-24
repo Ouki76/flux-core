@@ -2427,3 +2427,28 @@ reviewable.
 Six hypotheses, six nulls (message size, write batching, read batching, syscall batching,
 flow control at 8 MiB/16 MiB, syscall profiling). The path stays the one place both
 competitors beat us, with its measurements written down for whoever picks it up.
+
+---
+
+## Cycle 47 — 2026-10-24
+
+### The last "one unit per call" was inside a dependency
+
+REALITY — our own TLS — had reached parity while every rustls path (Trojan, WS, VMess,
+gRPC) was still 5-10 % behind. The common factor is rustls returning **one TLS record per
+`poll_read`** against a relay that reads 64 KiB, which is the same defect found in five of
+our own transports, except this one cannot be fixed inside the code that has it.
+
+`CoalesceReader` does it at the boundary: keep polling the inner stream while the caller's
+buffer has room; return when the inner stream is Pending *and* something was delivered.
+Applied to both sides of the TLS layer.
+
+| path | before | after |
+|---|---|---|
+| Trojan / TLS | −10.3 % | **−2.2 %** (288 vs 295) |
+| VLESS / WS + TLS | −8.8 % | **−5.6 %** (278 vs 295) |
+| VMess / WS + TLS | −3.5 % | −4.6 % (within noise) |
+| CPU vs sing-box, Trojan | −33 % | −37.5 % |
+
+Two tests pin the adapter's contract, including the case that matters — a short inner
+stream must still end cleanly rather than look like a hang.
