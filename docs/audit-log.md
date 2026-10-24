@@ -3052,3 +3052,53 @@ conversation fills the only slot, and the second is refused by name.
 Every transport that accepts unsolicited traffic needs an explicit ceiling on the state one
 peer can create. The TCP listeners had one (`rate_limit`); the UDP one had none, and the
 reason was simply that it did not exist before this week.
+
+---
+
+## Cycle 64 — 2026-10-25
+
+### The stall: a missing `poll_flush`. Found, fixed, proven.
+
+The defect that has been open since cycle 30 and survived every earlier theory is this: the
+copier wrote bytes and, when nothing else could move, parked — but a writer above a socket
+accepts bytes and **holds them until flushed**. WebSocket assembles frames, TLS assembles
+records; the tail of a transfer sat in those buffers, the peer waited for bytes that were
+already "written", and both directions parked forever.
+
+What finally named it was instrumenting the backstop that was already there to poke a stalled
+relay. It now logs the copier's state:
+
+```
+relay copier parked for 501.8ms (poke #237): both reads parked, nothing pending;
+moved up=4194304 down=4158464 — re-polling
+```
+
+`up` equal to the whole payload, `down` short by 35 840 bytes, both reads idle. The missing
+bytes were not in flight and not lost — they were in a buffer nobody had flushed.
+
+Two diagnostics had to be repaired before that line could exist:
+
+1. The benchmark captured only the tunnels' **stderr**; the daemons log to **stdout**, so
+   every "tunnel log" printed `(empty)`. Both streams now go to the same file.
+2. The backstop's warning was filtered out, because the generated configs asked for
+   `error`.
+
+Two earlier theories died on that same line: mutual write deadlock (it would have shown
+`both writes stuck`), and a lost wakeup (the backstop's poke would have produced data).
+
+### Proof, in the form this audit demands
+
+`buffered_bytes_reach_the_peer_without_a_close`: a writer that only releases its bytes on
+flush, a transfer that never sees EOF, and 5000 bytes that must arrive anyway. With the fix
+reverted it fails with `only 0 of 5000 bytes reached the peer: the writer was never flushed`.
+
+Hunting: 25 rounds x 64 MiB of the WebSocket path that stalled most often — **0 stalls, 0
+parked messages**, against roughly one stall every 20 rounds before.
+
+### Tried and reverted: `aws-lc-rs`
+
+Its AES-GCM suggested the encrypted paths might close their gaps. With both providers
+compiled in (ring arrives via quinn), rustls panics: it cannot choose a default. Forcing one
+provider broke REALITY interop with Xray — the handshake stopped matching. A modest,
+unproven gain was not worth a second crypto stack and a broken interop path, so it is out,
+and this note is the reason nobody should try it again without solving the provider choice.
