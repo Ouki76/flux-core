@@ -487,6 +487,8 @@ impl Drop for Setup {
 #[derive(Clone, Copy)]
 enum Kind {
     VlessTcp,
+    /// VLESS over XHTTP in stream-one mode.
+    VlessXhttp,
     VlessWsTls,
     VlessGrpcTls,
     VlessReality,
@@ -508,6 +510,12 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "VLESS / TCP",
         kind: Kind::VlessTcp,
+        needs_cert: false,
+        needs_decoy: false,
+    },
+    Scenario {
+        name: "VLESS / XHTTP",
+        kind: Kind::VlessXhttp,
         needs_cert: false,
         needs_decoy: false,
     },
@@ -589,6 +597,16 @@ fn flux_tls_client(alpn_h2: bool) -> String {
     } else {
         format!(r#""security":{{"type":"tls","insecure":true,"sni":"{TLS_SNI}"}}"#)
     }
+}
+
+/// XHTTP framing on the server side.
+fn flux_xhttp_server() -> String {
+    r#""framing":{"type":"xhttp","path":"/tunnel"}"#.to_string()
+}
+
+/// XHTTP framing on the client side.
+fn flux_xhttp_client() -> String {
+    r#""framing":{"type":"xhttp","path":"/tunnel"}"#.to_string()
 }
 
 fn flux_ws_server() -> String {
@@ -717,6 +735,7 @@ impl Scenario {
     fn flux_server(&self, s: &Setup, port: u16) -> String {
         match self.kind {
             Kind::VlessTcp => flux_in(port, &[], &flux_vless(false)),
+            Kind::VlessXhttp => flux_in(port, &[flux_xhttp_server()], &flux_vless(false)),
             Kind::VlessWsTls => flux_in(
                 port,
                 &[flux_tls_server(s), flux_ws_server()],
@@ -759,6 +778,7 @@ impl Scenario {
     fn flux_client(&self, s: &Setup, socks: u16, port: u16) -> String {
         match self.kind {
             Kind::VlessTcp => flux_out(socks, port, &[], &flux_vless(false)),
+            Kind::VlessXhttp => flux_out(socks, port, &[flux_xhttp_client()], &flux_vless(false)),
             Kind::VlessWsTls => flux_out(
                 socks,
                 port,
@@ -810,6 +830,9 @@ impl Scenario {
 
     fn sbox_server(&self, s: &Setup, port: u16) -> String {
         let inbound = match self.kind {
+            Kind::VlessXhttp => {
+                unreachable!("sing-box has no XHTTP transport; the column is skipped")
+            }
             Kind::VlessTcp => format!(
                 r#"{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}]}}"#
             ),
@@ -855,6 +878,9 @@ impl Scenario {
 
     fn sbox_client(&self, s: &Setup, socks: u16, port: u16) -> String {
         let outbound = match self.kind {
+            Kind::VlessXhttp => {
+                unreachable!("sing-box has no XHTTP transport; the column is skipped")
+            }
             Kind::VlessTcp => format!(
                 r#"{{"type":"vless","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}"}}"#
             ),
@@ -900,12 +926,19 @@ impl Scenario {
 
     /// The scenario as the xray builders name it, or `None` where xray has no
     /// equivalent (REALITY + Vision is an xray-only flow, and it is present).
+    /// Whether sing-box can run this scenario at all.
+    fn sbox_capable(&self) -> bool {
+        // sing-box has no XHTTP transport.
+        !matches!(self.kind, Kind::VlessXhttp)
+    }
+
     fn xray_protocol(&self) -> Option<xray_matrix_configs::Protocol> {
         use xray_matrix_configs::Protocol as P;
         Some(match self.kind {
             Kind::VlessTcp => P::VlessTcp,
             Kind::VlessWsTls => P::VlessWs,
             Kind::VlessGrpcTls => P::VlessGrpc,
+            Kind::VlessXhttp => P::VlessXhttp,
             Kind::VlessReality => P::Reality,
             Kind::VlessRealityVision => P::RealityVision,
             Kind::VmessWsTls => P::VmessWs,
@@ -1360,7 +1393,12 @@ async fn run_scenario(
     };
 
     let mut sbox = None;
-    if args.with_singbox {
+    if args.with_singbox && !scenario.sbox_capable() {
+        results.push((
+            Stack::Singbox,
+            Outcome::Skipped("sing-box has no such transport".into()),
+        ));
+    } else if args.with_singbox {
         match sbox_bin {
             None => results.push((
                 Stack::Singbox,

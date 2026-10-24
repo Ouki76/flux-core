@@ -174,6 +174,14 @@ pub const MATRIX: &[MatrixRow] = &[
         note: "VLESS over gRPC: `network: grpc` plus a matching `grpcSettings.serviceName`",
     },
     MatrixRow {
+        protocol: "vless-xhttp",
+        xray_server: Support::Yes,
+        xray_client: Support::Yes,
+        note: "VLESS over XHTTP (`network: splithttp`) in `stream-one` mode: one POST \
+               carries both directions, and the absence of a session id in the path is \
+               what selects the mode",
+    },
+    MatrixRow {
         protocol: "vless-tls",
         xray_server: Support::Yes,
         xray_client: Support::YesWithCaveat(
@@ -357,6 +365,54 @@ pub fn vless_ws_server_config(port: u16, uuid: &str, path: &str) -> String {
             "wsSettings": { "path": path }
         }
     }))
+}
+
+/// Xray server: VLESS over XHTTP in `stream-one` mode.
+///
+/// `stream-one` is the mode Xray itself selects for XHTTP under REALITY, and the only one
+/// that needs no sequence numbers: a single POST keeps both directions open.
+pub fn vless_xhttp_server_config(port: u16, uuid: &str, path: &str) -> String {
+    server_doc(json!({
+        "listen": LOOPBACK,
+        "port": port,
+        "protocol": "vless",
+        "settings": {
+            "clients": [{ "id": uuid }],
+            "decryption": "none"
+        },
+        "streamSettings": {
+            "network": "splithttp",
+            "security": "none",
+            "splithttpSettings": { "path": path, "mode": "stream-one" }
+        }
+    }))
+}
+
+/// Xray client: SOCKS5 in, VLESS over XHTTP out.
+pub fn vless_xhttp_client_config(
+    socks_port: u16,
+    server_port: u16,
+    uuid: &str,
+    path: &str,
+) -> String {
+    client_doc(
+        socks_port,
+        json!({
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": LOOPBACK,
+                    "port": server_port,
+                    "users": [{ "id": uuid, "encryption": "none" }]
+                }]
+            },
+            "streamSettings": {
+                "network": "splithttp",
+                "security": "none",
+                "splithttpSettings": { "path": path, "mode": "stream-one" }
+            }
+        }),
+    )
 }
 
 /// Xray client: SOCKS5 in, VLESS over WebSocket out.
@@ -828,6 +884,8 @@ pub enum Protocol {
     VlessTcp,
     VlessWs,
     VlessGrpc,
+    /// XHTTP (`splithttp`) in stream-one mode.
+    VlessXhttp,
     VlessTls,
     Reality,
     RealityVision,
@@ -838,10 +896,11 @@ pub enum Protocol {
 
 impl Protocol {
     /// Every protocol, in report order.
-    pub const ALL: [Protocol; 9] = [
+    pub const ALL: [Protocol; 10] = [
         Protocol::VlessTcp,
         Protocol::VlessWs,
         Protocol::VlessGrpc,
+        Protocol::VlessXhttp,
         Protocol::VlessTls,
         Protocol::Reality,
         Protocol::RealityVision,
@@ -856,6 +915,7 @@ impl Protocol {
             Protocol::VlessTcp => "vless-tcp",
             Protocol::VlessWs => "vless-ws",
             Protocol::VlessGrpc => "vless-grpc",
+            Protocol::VlessXhttp => "vless-xhttp",
             Protocol::VlessTls => "vless-tls",
             Protocol::Reality => "vless-reality",
             Protocol::RealityVision => "vless-reality-vision",
@@ -871,6 +931,7 @@ impl Protocol {
             Protocol::VlessTcp => vless_tcp_server_config(p.server_port, p.uuid),
             Protocol::VlessWs => vless_ws_server_config(p.server_port, p.uuid, WS_PATH),
             Protocol::VlessGrpc => vless_grpc_server_config(p.server_port, p.uuid, GRPC_SERVICE),
+            Protocol::VlessXhttp => vless_xhttp_server_config(p.server_port, p.uuid, WS_PATH),
             Protocol::VlessTls => {
                 vless_tls_server_config(p.server_port, p.uuid, p.cert_path, p.key_path)
             }
@@ -904,6 +965,9 @@ impl Protocol {
             Protocol::VlessTcp => vless_tcp_client_config(p.socks_port, p.server_port, p.uuid),
             Protocol::VlessWs => {
                 vless_ws_client_config(p.socks_port, p.server_port, p.uuid, WS_PATH)
+            }
+            Protocol::VlessXhttp => {
+                vless_xhttp_client_config(p.socks_port, p.server_port, p.uuid, WS_PATH)
             }
             Protocol::VlessGrpc => {
                 vless_grpc_client_config(p.socks_port, p.server_port, p.uuid, GRPC_SERVICE)
