@@ -1095,6 +1095,9 @@ fn compile_client_framings(
 
     for frame in frames.into_vec() {
         match frame {
+            FramingConfig::Xhttp { path, headers } => {
+                list.push(flux_transport::pipeline::FramingLayer::Xhttp { path, headers });
+            }
             FramingConfig::WebSocket { path, headers } => {
                 list.push(flux_transport::pipeline::FramingLayer::WebSocket { path, headers });
             }
@@ -1614,6 +1617,9 @@ fn compile_server_framings(
 
     for frame in frames.into_vec() {
         match frame {
+            InboundFramingConfig::Xhttp { path } => {
+                list.push(flux_transport::pipeline::ServerFramingLayer::Xhttp { path });
+            }
             InboundFramingConfig::WebSocket { path } => {
                 list.push(flux_transport::pipeline::ServerFramingLayer::WebSocket { path });
             }

@@ -39,6 +39,8 @@ pub mod tcp;
 pub mod tls;
 /// WebSocket framing.
 pub mod websocket;
+/// XHTTP (`splithttp`), stream-one mode.
+pub mod xhttp;
 
 pub use fingerprint::*;
 pub use fragment::*;

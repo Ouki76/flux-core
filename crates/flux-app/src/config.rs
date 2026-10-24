@@ -635,6 +635,16 @@ pub enum InboundSecurityConfig {
 /// The framing layer over an outbound's security layer.
 #[serde(tag = "type")]
 pub enum FramingConfig {
+    /// XHTTP (`splithttp`), stream-one mode: one request carries both directions.
+    #[serde(rename = "xhttp", alias = "splithttp")]
+    Xhttp {
+        /// Base path; a per-connection suffix is appended to it.
+        #[serde(default = "default_ws_path")]
+        path: String,
+        /// Extra headers sent with the request.
+        #[serde(default)]
+        headers: HashMap<String, String>,
+    },
     /// WebSocket framing, RFC 6455.
     #[serde(rename = "ws", alias = "websocket")]
     WebSocket {
@@ -692,6 +702,13 @@ fn default_hy2_mbps() -> u64 {
 /// The framing layer an inbound expects under its security.
 #[serde(tag = "type")]
 pub enum InboundFramingConfig {
+    /// XHTTP (`splithttp`), stream-one mode.
+    #[serde(rename = "xhttp", alias = "splithttp")]
+    Xhttp {
+        /// Base path; the client appends a per-connection suffix.
+        #[serde(default)]
+        path: Option<String>,
+    },
     /// WebSocket framing, RFC 6455.
     #[serde(rename = "ws", alias = "websocket")]
     WebSocket {

@@ -50,6 +50,14 @@ pub enum FramingLayer {
         headers: HashMap<String, String>,
     },
     ///  framing over HTTP/2.
+    /// XHTTP (`splithttp`), stream-one mode.
+    Xhttp {
+        /// Base path; a per-connection suffix is appended to it.
+        path: String,
+        /// Extra headers.
+        headers: HashMap<String, String>,
+    },
+    /// gRPC framing over HTTP/2.
     Grpc {
         /// gRPC service name used in the request path.
         service_name: String,
@@ -183,6 +191,11 @@ impl StreamDialer for LayeredTransportPipeline {
             for framing in &self.framings {
                 stream = match framing {
                     FramingLayer::Raw => stream,
+                    FramingLayer::Xhttp { path, headers } => {
+                        let st =
+                            crate::xhttp::connect(stream, &self.host_header, path, headers).await?;
+                        Box::new(st)
+                    }
                     FramingLayer::WebSocket { path, headers } => {
                         let ws = crate::websocket::client_handshake(
                             stream,
@@ -263,6 +276,11 @@ pub enum ServerFramingLayer {
     /// WebSocket framing, RFC 6455.
     WebSocket {
         /// Request path; the transport default when `None`.
+        path: Option<String>,
+    },
+    /// XHTTP (`splithttp`), stream-one mode.
+    Xhttp {
+        /// Base path; the client appends a per-connection suffix.
         path: Option<String>,
     },
     /// Upgrade framing.
@@ -352,6 +370,14 @@ impl ServerTransportPipeline {
             for framing in &self.framings {
                 stream = match framing {
                     ServerFramingLayer::Raw => stream,
+                    ServerFramingLayer::Xhttp { path } => {
+                        let st = crate::xhttp::accept(
+                            stream,
+                            path.as_deref().unwrap_or(crate::xhttp::DEFAULT_XHTTP_PATH),
+                        )
+                        .await?;
+                        Box::new(st)
+                    }
                     ServerFramingLayer::WebSocket { path } => {
                         let ws =
                             crate::websocket::server_handshake(stream, path.as_deref()).await?;
