@@ -3102,3 +3102,45 @@ compiled in (ring arrives via quinn), rustls panics: it cannot choose a default.
 provider broke REALITY interop with Xray — the handshake stopped matching. A modest,
 unproven gain was not worth a second crypto stack and a broken interop path, so it is out,
 and this note is the reason nobody should try it again without solving the provider choice.
+
+---
+
+## Cycle 65 — 2026-10-25
+
+### A wrong conclusion, found by adding the row that tests it
+
+Since cycle 59 this log has said: "XHTTP moves 152 MB/s over the same HTTP/2 machinery gRPC
+reaches 91 with, so the loss is in our gRPC framing." That was **wrong**, and the reason is
+embarrassing in a useful way: the XHTTP row carries no TLS while the gRPC row does. The
+comparison was between a plaintext path and an encrypted one.
+
+The row that settles it:
+
+| row | flux-core |
+|---|---|
+| VLESS / gRPC (no TLS) | **149.7** |
+| VLESS / XHTTP (no TLS) | 139 |
+| VLESS / gRPC + TLS | 96.7 |
+
+gRPC's framing costs almost nothing — without TLS it is the *fastest* HTTP-shaped path in
+the matrix. **The entire gap is the cipher.** Nine experiments on framing (frame size, write
+batching, read batching, syscall batching, syscall profiling, zero-copy reads, envelope
+parsing) were all chasing a layer that was never responsible, and each returned a null
+result for the same reason.
+
+### What that relocates
+
+`bench_tls` measures the cipher directly: 630 MB/s for plain VLESS against 280 with TLS, so
+**TLS costs ~55 %** on this host. sing-box pays almost the same (581 → 269). Our TLS rows
+are not competitive because of a TLS advantage — they are close because our plain-TCP path is
+18 % faster than its, and the cipher drags both down to about the same place.
+
+Re-measured the coalescing reader around the TLS stream, with and without: **279 MB/s either
+way**. It stays (it is harmless and load-bearing by design) but it is no longer claimed as an
+optimisation, because there is no measurement behind that claim anymore.
+
+### The habit worth keeping
+
+Every "obviously the same setup" comparison must be checked against the actual configs. The
+XHTTP row was written to prove a transport worked, not to be compared with a TLS row, and
+the difference quietly produced a confident, wrong diagnosis that survived six cycles.
