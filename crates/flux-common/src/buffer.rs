@@ -3,7 +3,9 @@ use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
 
+/// Per-buffer size of the default pool, in bytes.
 pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024; // 16 KB
+/// Per-buffer size of the datagram pool: one maximum-size UDP payload.
 pub const PACKET_BUFFER_SIZE: usize = 65536; // 64 KB for UDP datagrams
 
 /// Hard ceiling on a pool's per-buffer size. A pooled buffer is allocated
@@ -76,11 +78,13 @@ impl BufferPool {
         }
     }
 
+    /// The process-wide pool for stream buffers.
     pub fn default_pool() -> &'static Self {
         static INSTANCE: OnceLock<BufferPool> = OnceLock::new();
         INSTANCE.get_or_init(|| BufferPool::new(DEFAULT_BUFFER_SIZE, 256))
     }
 
+    /// The process-wide pool for datagram buffers.
     pub fn packet_pool() -> &'static Self {
         static PACKET_INSTANCE: OnceLock<BufferPool> = OnceLock::new();
         PACKET_INSTANCE.get_or_init(|| BufferPool::new(PACKET_BUFFER_SIZE, 64))
@@ -145,6 +149,7 @@ impl BufferPool {
     }
 }
 
+/// A pooled buffer borrowed from a [`BufferPool`], returned on drop.
 pub struct BufferGuard {
     buf: Option<Vec<u8>>,
     pool: &'static BufferPool,

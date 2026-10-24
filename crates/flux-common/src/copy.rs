@@ -14,6 +14,7 @@ pub struct MeteredStream<S> {
 }
 
 impl<S> MeteredStream<S> {
+    /// Counts bytes on `inner` into the given per-connection counters.
     pub fn new(inner: S, read_bytes: Arc<AtomicU64>, written_bytes: Arc<AtomicU64>) -> Self {
         Self {
             inner,
@@ -24,6 +25,7 @@ impl<S> MeteredStream<S> {
         }
     }
 
+    /// Also adds every byte to process-wide counters.
     pub fn with_global(
         mut self,
         global_read: Arc<AtomicU64>,
@@ -100,6 +102,7 @@ pub struct PrefixedStream<S> {
 }
 
 impl<S> PrefixedStream<S> {
+    /// Writes `prefix` before any of `inner`'s bytes and then passes everything through.
     pub fn new(inner: S, prefix: Vec<u8>) -> Self {
         Self {
             inner,
@@ -243,6 +246,12 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Relays in both directions with a single task and a caller-sized buffer each way.
+///
+/// One task rather than two: two would need the halves behind a lock, and that lock was
+/// the reason a relay could not saturate a link (see the audit log for the measurement).
+/// The cost of one task is that a full write in one direction delays a read in the other,
+/// which is why the buffer is sized to the relay's copy unit rather than to a page.
 pub async fn copy_bidirectional_buffered<A, B>(
     a: &mut A,
     b: &mut B,
