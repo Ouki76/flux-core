@@ -225,6 +225,55 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     }
 
+    #[test]
+    fn base64url_matches_the_standard_vectors() {
+        // RFC 4648 section 10 with the URL-safe alphabet and no padding. If any of these
+        // is wrong, Xray decodes garbage out of `x_padding` and refuses the request.
+        let cases: &[(&[u8], &str)] = &[
+            (b"", ""),
+            (b"f", "Zg"),
+            (b"fo", "Zm8"),
+            (b"foo", "Zm9v"),
+            (b"foob", "Zm9vYg"),
+            (b"fooba", "Zm9vYmE"),
+            (b"foobar", "Zm9vYmFy"),
+            (&[0xfb, 0xff, 0xfe], "-__-"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&base64url(input), expected, "encoding {input:?}");
+        }
+    }
+
+    #[test]
+    fn the_padding_stays_inside_the_range_xray_accepts() {
+        // The server checks the length of the *encoded* value against its configured
+        // range, 100-1000 by default. A value outside it is refused with the length
+        // quoted back, which is how this was found the first time.
+        for _ in 0..500 {
+            let value = padding_param();
+            assert!(
+                (100..=1000).contains(&value.len()),
+                "padding length {} is outside 100-1000",
+                value.len()
+            );
+            assert!(!value.contains('='), "padding must be unpadded: {value}");
+            assert!(
+                !value.contains('+') && !value.contains('/'),
+                "must be URL-safe"
+            );
+        }
+    }
+
+    #[test]
+    fn paths_are_normalised_the_way_xray_compares_them() {
+        assert_eq!(normalize_path(""), "/");
+        assert_eq!(normalize_path("/"), "/");
+        assert_eq!(normalize_path("tunnel"), "/tunnel/");
+        assert_eq!(normalize_path("/tunnel"), "/tunnel/");
+        assert_eq!(normalize_path("/tunnel/"), "/tunnel/");
+        assert_eq!(normalize_path("//tunnel//"), "/tunnel/");
+    }
+
     #[tokio::test]
     async fn a_get_is_refused() {
         // `stream-one` is the POST branch; a GET belongs to `stream-down`, which this
