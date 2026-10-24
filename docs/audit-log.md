@@ -3458,3 +3458,44 @@ The same run's best-of-4, for the record — note how much the leaders move betw
 | Trojan / TLS | 297 | 331 | — | −10.2 % | — |
 | Shadowsocks-2022 | 308 | 365 | 305 | −15.6 % | **+1.1 %** |
 | Shadowsocks-AEAD | **260** | 259 | — | **+0.2 %** | — |
+
+---
+
+## Cycle 72 — 2026-10-25
+
+### Stop guessing: a working profiler, and what it says about UDP
+
+Every earlier attempt to profile ended in a hypothesis because the profiler never attached.
+The reason: the benchmark spawns `flux-core`, and with `ptrace_scope=1` (no sudo on this
+host) an external tool cannot attach to a non-child. The fix is to invert the arrangement —
+run the daemon **under** callgrind and drive it with a standalone load generator — plus
+`callgrind_control -d`, which forces a dump while the process is still alive.
+
+Two traps found while doing it, both recorded because both waste an afternoon:
+
+1. **Inclusive cost lies here.** callgrind attributed 58 % to the `TrafficMeter` sampler,
+   which runs once a second, because tokio's worker loop was the outer frame and everything
+   on that thread inherited its name. Only **self** cost is trustworthy.
+2. Killing the traced process with SIGTERM produces a **zero-byte** profile. Use
+   `callgrind_control -d`.
+
+### The numbers, and what they rule out
+
+| measurement | result |
+|---|---|
+| instructions in `malloc`/`free` under UDP load | **33 %** (`free` 15.5, `malloc` 11.0) |
+| heap allocations per relayed datagram | **7.00** → **5.00** after reusing the reply buffer |
+| syscalls per datagram, flux-core | **4** (2 × `recvfrom`, 2 × `sendto`) |
+| syscalls per datagram, sing-box | **4** (3 019 `sendto` + 4 114 `recvmsg` per 2 000) |
+| `epoll_wait` per 2 000 datagrams | flux 276, sing-box 1 783 |
+| throughput | flux 55k pps, sing-box 69k, xray 8k |
+
+So the 25 % UDP gap is **not** syscalls, **not** batching (sing-box does not batch either),
+and **not** wakeups (sing-box wakes six times more often). It is user-space work per
+datagram — and the allocations I removed did not move throughput, because instructions are
+not cycles. The remaining candidate is the dispatcher's channel hops, which is where the
+next cycle starts, with `alloc_count` and the profiler workflow now in place to check the
+result rather than argue about it.
+
+The workflow itself is the deliverable: `examples/alloc_count` counts allocations around a
+live instance, and the valgrind recipe is in this log. Neither existed this morning.
