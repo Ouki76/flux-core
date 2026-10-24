@@ -3023,3 +3023,32 @@ Also confirmed on this cycle: `cargo audit` (1352 advisories, 271 dependencies) 
 `cargo deny` (advisories, bans, licenses, sources) both clean, and `docs/HANDOFF.md`
 section 0 rewritten so a human picking this up reads the current state rather than cycle
 41's.
+
+---
+
+## Cycle 63 — 2026-10-24
+
+### A denial of service I introduced, found by reviewing my own change
+
+Enabling the mKCP server introduced a hole worth stating plainly: the listener takes
+unauthenticated datagrams, `accept` registered a route per conversation and spawned a task
+per conversation, and a peer that opened conversations **without ever completing a
+handshake** held both until the 30-second timeout. Nothing capped how many could be open,
+and routes are only removed when a stream is dropped — which a conversation that never
+started never does.
+
+A single sender could therefore create tasks and routes until memory ran out, with no
+credentials. The ceiling is now `MAX_CONVERSATIONS = 256` per socket: far more than a real
+node carries (one tunnel is one conversation), small enough that the worst case is bounded,
+and reached *before* the acceptor waits for a datagram so a full listener does not park.
+
+Getting a test that actually proves it took two rewrites. Raw datagrams never reach the
+acceptor — it registers its catch-all route on the first poll, and `Conn` needs a real
+segment sequence — so the test drives `connect()` like the rest of the suite: one live
+conversation fills the only slot, and the second is refused by name.
+
+### The lesson, since it repeats
+
+Every transport that accepts unsolicited traffic needs an explicit ceiling on the state one
+peer can create. The TCP listeners had one (`rate_limit`); the UDP one had none, and the
+reason was simply that it did not exist before this week.
