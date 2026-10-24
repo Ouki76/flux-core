@@ -56,7 +56,7 @@
 //! * Command set. ikcp has PUSH/ACK/WASK/WINS only; Xray adds `PING` and
 //!   `TERMINATE`. A stream here has no close, so a peer that stops without
 //!   closing looks like silence, which is why liveness falls back to probing
-//!   (see [`PEER_SILENCE_LIMIT`]).
+//!   (see `PEER_SILENCE_LIMIT`).
 //! * Payload encryption. Xray's `seed` option replaces the "original" mask with
 //!   an AES-GCM AEAD keyed from the seed (`NewAEADAESGCMBasedOnSeed`, now
 //!   `finalmask/mkcp/aes128gcm`). [`KcpObfs`] has no such mode, and a peer
@@ -68,7 +68,7 @@
 //!
 //! # Behaviour
 //!
-//! * One task drives [`flush`](Conn) on `interval_ms`; there is no task per
+//! * One task drives `flush` on `Conn` on `interval_ms`; there is no task per
 //!   segment. Reads and writes only ever take a short lock and hand work to the
 //!   driver.
 //! * The send buffer is bounded by `snd_wnd` segments: a writer that outruns the
