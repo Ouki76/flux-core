@@ -2726,3 +2726,28 @@ before use, naming the fuzz harness that keeps it true.
 
 types 63, common 14, router 78, dns 108, transport 149, protocol 215. Remaining: inbound
 (83), outbound (81), app (352).
+
+---
+
+## Cycle 56 — 2026-10-24
+
+### Inbounds documented
+
+Seventh crate: 83 public items across SOCKS5, HTTP, mixed, VLESS, VMess, Trojan,
+Shadowsocks, TUIC, Hysteria 2, WireGuard and the three transparent interceptors (REDIRECT,
+TPROXY, TUN), plus the crate root, which states the contract the rest of the system depends
+on: `Inbound::stop` releases the listening socket *before* it resolves, so a caller can
+rebind immediately.
+
+The TUN fields are documented by what the datapath does with them ("the SYN bit is what
+opens a stream"), not by their type.
+
+Two self-inflicted problems, both caught by the tools rather than by luck: my insertion
+produced `/// ///` on three module lines (visible immediately in the file), and the doc
+generator's placeholder text had to be replaced by hand again — a reminder that a generated
+`missing_docs` pass is only worth having if the text is then read.
+
+### Seven crates, 710 public items
+
+types 63, common 14, router 78, dns 108, transport 149, protocol 215, inbound 83.
+Remaining: outbound (81), app (352).
