@@ -3378,3 +3378,52 @@ earlier "fixed" claim needs that qualification.
 Nine isolated Trojan rounds afterwards: clean, 257-292 MB/s. So it is rare, and it is not
 reproducing on demand — the next cycle hunts it with the daemon log at `warn` from the
 start, since the CPU signature says the log will have something to say.
+
+---
+
+## Cycle 71 — 2026-10-25
+
+### The 335 s spin was mine, from two cycles ago
+
+Cycle 70 recorded a tunnel that burned **335 s of CPU inside a 120 s window** while moving
+nothing, and noted it was a different defect from the parked stall. It was — and it was
+introduced by the fix in cycle 64.
+
+That fix flushed the writers before parking, and marked a **successful flush as progress**:
+
+```rust
+if pend_ab.is_none() && matches!(b.poll_flush(cx), Ready(Ok(()))) && pend_ba.is_none() {
+    progressed = true;   // <- a flush on a quiet tunnel moves nothing
+}
+```
+
+`progressed` then re-entered the loop, which flushed again, which "progressed" again — at a
+full core per direction, for as long as the connection had nothing to do. On a busy transfer
+the branch is rarely reached, which is why it survived the soak and the benchmark: **it only
+costs anything when the tunnel is idle, and that is exactly when nobody measures throughput.**
+
+### A test that fails deterministically, so it cannot come back
+
+`an_idle_relay_does_not_spin` wraps both ends in a poll counter, lets the copier sit with
+nothing to do for 250 ms, and asserts the count. Reverting the fix:
+
+```
+an idle relay was polled 499584 times in 250 ms: it is spinning, not parked
+```
+
+With it: under 100. Both copier bugs now have a test that was verified by reverting its fix:
+
+| test | without the fix |
+|---|---|
+| `buffered_bytes_reach_the_peer_without_a_close` | `only 0 of 5000 bytes reached the peer: the writer was never flushed` |
+| `an_idle_relay_does_not_spin` | `an idle relay was polled 499584 times in 250 ms: it is spinning, not parked` |
+
+Throughput is unchanged (WS+TLS 281.7 MB/s, 6.475 CPU s/GiB against 7.1 before), which is
+what a fix for an idle-path bug should look like.
+
+### The lesson, since this is the second time this audit has produced its own bug
+
+Both defects lived in the same twenty lines, and neither was found by review — one was found
+by a backstop log, the other by a CPU figure in a timeout message. A relay loop that
+distinguishes "moved bytes" from "called a method that succeeded" needs that distinction
+tested, not reasoned about.
