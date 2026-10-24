@@ -2542,3 +2542,34 @@ not been re-run after the mKCP scenario was reverted, so the matrix kept reporti
 that no longer exists in the source. Rebuilt; the row is gone. Worth stating plainly
 because every number quoted since then was produced by the current source, and the earlier
 ones by a binary that also carried a failing scenario as extra load.
+
+---
+
+## Cycle 50 — 2026-10-24
+
+### Every gate in the objective now runs and passes
+
+The objective names five gates. Two of them — `cargo audit` and `cargo deny` — had never
+been installed on this host, and `cargo doc -D warnings` had never been run strictly (only
+plain `cargo doc`). All five run now:
+
+| gate | result |
+|---|---|
+| `cargo fmt --check` | ok |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ok |
+| `cargo test --workspace` | **1071 passed, 0 failed** |
+| `cargo audit` | no findings |
+| `cargo deny check` | advisories ok, bans ok, licenses ok, sources ok |
+| `cargo doc --workspace --no-deps` with `-D warnings` | ok |
+
+Strict doc checking immediately found three real defects that plain `cargo doc` tolerated:
+two intra-doc links in the mKCP module pointing at **private** items, which render as
+broken links for anyone reading the generated docs.
+
+### Documentation pass, second crate
+
+`flux-common` had 14 undocumented public items including the crate root and
+`copy_bidirectional_buffered` itself — the function whose one-task, no-lock design was the
+single largest performance win of this audit, and therefore the one most likely to be
+"optimised" back into a regression by someone who did not know why it looks that way. It
+now says so. `#![warn(missing_docs)]` is on for the crate.
