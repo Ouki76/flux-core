@@ -7,15 +7,21 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 pub use crate::fingerprint::TlsFingerprint;
 
+/// Installs the process-wide rustls provider exactly once.
 pub fn init_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 #[derive(Clone, Debug)]
+/// Client-side TLS settings.
 pub struct TlsClientConfig {
+    /// SNI to present.
     pub server_name: String,
+    /// ALPN protocols to offer.
     pub alpn: Vec<Vec<u8>>,
+    /// Skip certificate verification. Only for tests and pinned self-signed setups.
     pub insecure: bool,
+    /// Which browser profile to imitate, when any.
     pub fingerprint: Option<TlsFingerprint>,
     /// PEM files of extra trust anchors, appended to the built-in roots.
     ///
@@ -27,6 +33,7 @@ pub struct TlsClientConfig {
 }
 
 impl TlsClientConfig {
+    /// Defaults for `server_name`: verification on, no ALPN, no fingerprint.
     pub fn new(server_name: impl Into<String>) -> Self {
         Self {
             server_name: server_name.into(),
@@ -37,16 +44,19 @@ impl TlsClientConfig {
         }
     }
 
+    /// Turns certificate verification off.
     pub fn with_insecure(mut self, insecure: bool) -> Self {
         self.insecure = insecure;
         self
     }
 
+    /// Offers these ALPN protocols.
     pub fn with_alpn(mut self, alpn: Vec<String>) -> Self {
         self.alpn = alpn.into_iter().map(|s| s.into_bytes()).collect();
         self
     }
 
+    /// Imitates this browser's cipher and group ordering.
     pub fn with_fingerprint(mut self, fp: TlsFingerprint) -> Self {
         self.fingerprint = Some(fp);
         self
@@ -147,6 +157,7 @@ pub fn add_ca_certs(store: &mut RootCertStore, paths: &[std::path::PathBuf]) -> 
     Ok(())
 }
 
+/// TLS over a carrier, with a configurable fingerprint.
 pub struct TlsTransport;
 
 impl TlsTransport {
@@ -224,6 +235,7 @@ impl TlsTransport {
         Ok(connector)
     }
 
+    /// Builds an acceptor from a certificate chain and key.
     pub fn create_server_acceptor(
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
@@ -245,6 +257,7 @@ impl TlsTransport {
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
+    /// Reads a PEM certificate chain and key from disk.
     pub fn load_certs_and_key(
         cert_path: &str,
         key_path: &str,
@@ -278,6 +291,7 @@ impl TlsTransport {
         Ok((certs, key))
     }
 
+    /// Runs the handshake over `stream` and returns the encrypted stream.
     pub async fn connect<S>(stream: S, cfg: &TlsClientConfig) -> FluxResult<BoxedStream>
     where
         S: AsyncStream + 'static,

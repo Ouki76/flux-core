@@ -6,13 +6,18 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// How to split the TLS ClientHello.
 pub struct FragmentationConfig {
+    /// Whether fragmentation is active at all.
     pub enabled: bool,
     #[serde(default = "default_length_min")]
+    /// Smallest fragment, in bytes.
     pub length_min: usize,
     #[serde(default = "default_length_max")]
+    /// Largest fragment, in bytes.
     pub length_max: usize,
     #[serde(default = "default_interval_ms")]
+    /// Delay between fragments; the point is to defeat reassembly.
     pub interval_ms: u64,
 }
 
@@ -37,6 +42,7 @@ impl Default for FragmentationConfig {
     }
 }
 
+/// A stream that writes its first payload in fragments.
 pub struct FragmentedStream<S> {
     inner: S,
     config: FragmentationConfig,
@@ -54,6 +60,7 @@ pub struct FragmentedStream<S> {
 }
 
 impl<S> FragmentedStream<S> {
+    /// Wraps `inner` with `config`.
     pub fn new(inner: S, config: FragmentationConfig) -> Self {
         let direct_mode = !config.enabled;
         Self {
@@ -70,6 +77,7 @@ impl<S> FragmentedStream<S> {
         }
     }
 
+    /// Returns the wrapped stream.
     pub fn into_inner(self) -> S {
         self.inner
     }

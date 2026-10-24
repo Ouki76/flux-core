@@ -5,15 +5,21 @@ use tokio_rustls::rustls::crypto::ring::kx_group::*;
 use tokio_rustls::rustls::crypto::{CryptoProvider, SupportedKxGroup};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+/// Which browser's cipher and key-exchange ordering to present.
 pub enum TlsFingerprint {
     #[default]
+    /// Chrome's ordering: fewest surprises, the default.
     Chrome,
+    /// Firefox's ordering.
     Firefox,
+    /// Safari's ordering.
     Safari,
+    /// Resolves to one of the concrete profiles per connection.
     Random,
 }
 
 impl TlsFingerprint {
+    /// Parses a configuration value, accepting the documented aliases.
     pub fn parse_str(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "chrome" | "chrome_120" | "chrome_auto" => Some(Self::Chrome),
@@ -24,6 +30,7 @@ impl TlsFingerprint {
         }
     }
 
+    /// The canonical name, as used in logs and configuration.
     pub fn to_str(&self) -> &'static str {
         match self {
             Self::Chrome => "chrome",

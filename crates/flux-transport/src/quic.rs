@@ -14,6 +14,7 @@ pub struct QuicBiStream {
 }
 
 impl QuicBiStream {
+    /// Wraps one QUIC stream pair as a byte stream.
     pub fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
         Self { send, recv }
     }
@@ -51,6 +52,7 @@ impl AsyncWrite for QuicBiStream {
     }
 }
 
+/// The QUIC carrier used by Hysteria 2 and TUIC.
 pub struct QuicTransport;
 
 impl QuicTransport {

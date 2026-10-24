@@ -4,9 +4,11 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
+/// The TCP carrier.
 pub struct TcpTransport;
 
 impl TcpTransport {
+    /// Connects with the socket options the relay expects already applied.
     pub async fn connect(addr: SocketAddr, connect_timeout: Duration) -> FluxResult<TcpStream> {
         let stream = match timeout(connect_timeout, TcpStream::connect(addr)).await {
             Ok(Ok(s)) => s,

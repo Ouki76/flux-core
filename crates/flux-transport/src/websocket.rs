@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+/// The fixed GUID from RFC 6455 that the `Sec-WebSocket-Accept` hash is built from.
 pub const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Largest single frame payload this endpoint accepts. RFC 6455 sets no
@@ -557,6 +558,7 @@ fn close_code_valid(code: u16) -> bool {
     matches!(code, 1000..=1003 | 1007..=1014 | 3000..=4999)
 }
 
+/// A stream carrying WebSocket frames over `S`.
 pub struct WebSocketStream<S> {
     inner: S,
     is_client: bool,
@@ -592,6 +594,7 @@ pub struct WebSocketStream<S> {
 }
 
 impl<S> WebSocketStream<S> {
+    /// Wraps `inner`, replaying any bytes already read past the handshake.
     pub fn new(inner: S, excess: Vec<u8>, is_client: bool) -> Self {
         Self {
             inner,

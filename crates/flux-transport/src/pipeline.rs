@@ -8,40 +8,62 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
+/// A client-side security layer to apply, outermost last.
 pub enum SecurityLayer {
+    /// No layer at all.
     None,
+    /// TLS, client side.
     Tls(TlsClientConfig),
+    /// REALITY, client side.
     Reality(RealityClientConfig),
+    /// ShadowTLS, client side.
     ShadowTls(ShadowTlsClientConfig),
+    /// Split the TLS ClientHello into fragments.
     Fragment(crate::fragment::FragmentationConfig),
 }
 
 #[derive(Clone, Debug, Default)]
+/// A client-side framing layer to apply, innermost first.
 pub enum FramingLayer {
     #[default]
+    /// No framing: the bytes pass through untouched.
     Raw,
+    /// WebSocket framing, RFC 6455.
     WebSocket {
+        /// Request path from the configuration.
         path: String,
+        /// Extra HTTP headers to send with the upgrade request.
         headers: HashMap<String, String>,
     },
+    /// Upgrade framing.
     HttpUpgrade {
+        /// Request path from the configuration.
         path: String,
+        /// Extra HTTP headers to send with the upgrade request.
         headers: HashMap<String, String>,
     },
+    /// HTTP/2 framing.
     Http2 {
+        /// Request path from the configuration.
         path: String,
+        /// Extra HTTP headers to send with the upgrade request.
         headers: HashMap<String, String>,
     },
+    ///  framing over HTTP/2.
     Grpc {
+        /// gRPC service name used in the request path.
         service_name: String,
+        /// Extra HTTP headers to send with the upgrade request.
         headers: HashMap<String, String>,
     },
 }
 
 /// Dynamic, composable layered transport pipeline:
 /// [L4 Carrier] ──► [L5 Security Layer] ──► [L6 Framing Layer]
+/// A dial plan: how to reach one server and what to wrap the connection in.
 pub struct LayeredTransportPipeline {
     /// Set when the node's carrier is mKCP instead of TCP.
+    /// Set when the carrier is mKCP rather than TCP.
     pub kcp: Option<crate::kcp::KcpConfig>,
     server_address: TargetAddress,
     resolved_addr: std::net::SocketAddr,
@@ -52,6 +74,7 @@ pub struct LayeredTransportPipeline {
 }
 
 impl LayeredTransportPipeline {
+    /// A plan for `server_address`, already resolved to `resolved_addr`.
     pub fn new(server_address: TargetAddress, resolved_addr: std::net::SocketAddr) -> Self {
         let host = server_address.host();
         Self {
@@ -66,41 +89,49 @@ impl LayeredTransportPipeline {
     }
 
     /// Selects mKCP as the carrier instead of TCP.
+    /// Carries the connection over mKCP instead of TCP.
     pub fn with_kcp(mut self, kcp: crate::kcp::KcpConfig) -> Self {
         self.kcp = Some(kcp);
         self
     }
 
+    /// How long the whole dial may take; the transport's own timeout still applies.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
+    /// Appends one security layer.
     pub fn with_security(mut self, sec: SecurityLayer) -> Self {
         self.securities.push(sec);
         self
     }
 
+    /// Replaces the security layers wholesale.
     pub fn with_securities(mut self, secs: Vec<SecurityLayer>) -> Self {
         self.securities = secs;
         self
     }
 
+    /// Appends one framing layer.
     pub fn with_framing(mut self, framing: FramingLayer) -> Self {
         self.framings.push(framing);
         self
     }
 
+    /// Replaces the framing layers wholesale.
     pub fn with_framings(mut self, framings: Vec<FramingLayer>) -> Self {
         self.framings = framings;
         self
     }
 
+    /// Host header for the HTTP-shaped framings; defaults to the server address.
     pub fn with_host_header(mut self, host: impl Into<String>) -> Self {
         self.host_header = host.into();
         self
     }
 
+    /// The address this plan dials, as the peer knows it (before resolution).
     pub fn server_address(&self) -> &TargetAddress {
         &self.server_address
     }
@@ -211,39 +242,58 @@ impl StreamDialer for LayeredTransportPipeline {
 }
 
 #[derive(Clone)]
+/// A server-side security layer, built from configuration.
 pub enum ServerSecurityLayer {
+    /// No layer at all.
     None,
+    /// TLS, server side.
     Tls(tokio_rustls::TlsAcceptor),
+    /// REALITY, server side.
     Reality(RealityServerConfig),
+    /// ShadowTLS, server side.
     ShadowTls(ShadowTlsServerConfig),
 }
 
 #[derive(Clone, Debug, Default)]
+/// A server-side framing layer, built from configuration.
 pub enum ServerFramingLayer {
     #[default]
+    /// No framing: the bytes pass through untouched.
     Raw,
+    /// WebSocket framing, RFC 6455.
     WebSocket {
+        /// Request path; the transport default when `None`.
         path: Option<String>,
     },
+    /// Upgrade framing.
     HttpUpgrade {
+        /// Request path; the transport default when `None`.
         path: Option<String>,
     },
+    /// Raw HTTP/2 framing.
     Http2,
+    /// gRPC framing over HTTP/2.
     Grpc,
 }
 
+/// Namespace for the server-side handshake helpers.
 pub struct ServerLayeredTransportPipeline;
 
 impl ServerLayeredTransportPipeline {}
 
 #[derive(Clone)]
+/// What a server accepts: the layers in configuration order and the handshake timeout.
 pub struct ServerTransportPipeline {
+    /// Security layers, applied outermost last.
     pub securities: Vec<ServerSecurityLayer>,
+    /// Framing layers, applied innermost first.
     pub framings: Vec<ServerFramingLayer>,
+    /// How long a peer has to complete the handshake.
     pub timeout: Duration,
 }
 
 impl ServerTransportPipeline {
+    /// A pipeline over the given layers, with the default timeout.
     pub fn new(securities: Vec<ServerSecurityLayer>, framings: Vec<ServerFramingLayer>) -> Self {
         Self {
             securities,
@@ -252,6 +302,7 @@ impl ServerTransportPipeline {
         }
     }
 
+    /// The common case: exactly one security and one framing layer.
     pub fn single(security: ServerSecurityLayer, framing: ServerFramingLayer) -> Self {
         Self {
             securities: vec![security],
@@ -260,10 +311,12 @@ impl ServerTransportPipeline {
         }
     }
 
+    /// A pipeline with no layers, for a plain listener.
     pub fn raw() -> Self {
         Self::new(vec![], vec![])
     }
 
+    /// Applies this pipeline's layers to a freshly connected stream.
     pub async fn unwrap<
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
     >(

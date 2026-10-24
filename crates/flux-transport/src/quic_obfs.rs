@@ -25,6 +25,7 @@ pub struct SalamanderRuntime {
 }
 
 impl SalamanderRuntime {
+    /// A deobfuscator for the given password.
     pub fn new(password: &str) -> Arc<Self> {
         // Fall back to a random PSK rather than silently disabling
         // obfuscation: a too-short configured password is a configuration

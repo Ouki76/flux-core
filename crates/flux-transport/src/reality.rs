@@ -119,13 +119,17 @@ fn aes256gcm_open(
 // ClientHello parsing (record + handshake message level)
 // ===========================================================================
 
+/// The parts of a ClientHello REALITY needs to make its decision.
 pub struct ParsedClientHello {
     /// Full handshake message bytes (4-byte header + body).
     pub raw: Vec<u8>,
     /// Full first TLS record bytes (5-byte record header + raw).
     pub record: Vec<u8>,
+    /// The 32-byte client random that carries the authentication material.
     pub random: [u8; 32],
+    /// Session id carried in the TLS handshake.
     pub session_id: [u8; 32],
+    /// SNI, when the client sent one.
     pub server_name: Option<String>,
     /// X25519 public key from the key_share extension (plain X25519 preferred,
     /// X25519MLKEM768 hybrid accepted — its last 32 bytes are the X25519 part).
@@ -151,6 +155,7 @@ pub async fn read_client_hello<S: AsyncRead + Unpin>(stream: &mut S) -> FluxResu
     Ok(record)
 }
 
+/// Extracts what REALITY needs from a raw ClientHello record, or `None` if malformed.
 pub fn parse_client_hello(record: &[u8]) -> Option<ParsedClientHello> {
     if record.len() < 5 + 4 + 2 + 32 + 1 {
         return None;
@@ -264,15 +269,21 @@ pub fn parse_client_hello(record: &[u8]) -> Option<ParsedClientHello> {
 // ===========================================================================
 
 #[derive(Clone, Debug)]
+/// Client-side REALITY settings.
 pub struct RealityClientConfig {
+    /// SNI to present; must be one the server accepts.
     pub server_name: String,
+    /// The server's x25519 public key.
     pub public_key: [u8; 32],
+    /// Short id, which authenticates the client inside the handshake.
     pub short_id: Vec<u8>,
 }
 
 /// Server-side REALITY configuration.
 pub struct RealityServerConfig {
+    /// Names this server will answer for.
     pub server_names: Vec<String>,
+    /// The server's x25519 private key.
     pub private_key: [u8; 32],
     /// Up to 8 bytes each (zero-padded).
     pub short_ids: Vec<Vec<u8>>,
@@ -315,6 +326,7 @@ impl Default for RealityServerConfig {
 }
 
 impl RealityServerConfig {
+    /// Builds a client config for one server.
     pub fn new(
         server_names: Vec<String>,
         private_key: [u8; 32],
@@ -402,6 +414,7 @@ impl RealityCertMaterial {
 // REALITY server
 // ===========================================================================
 
+/// Namespace for the REALITY handshake, both sides.
 pub struct RealityHandshake;
 
 impl RealityHandshake {

@@ -24,6 +24,7 @@ pub struct H2Stream {
 }
 
 impl H2Stream {
+    /// Wraps one h2 stream pair as a byte stream.
     pub fn new(send: SendStream<Bytes>, recv: RecvStream) -> Self {
         Self {
             send,
@@ -33,6 +34,7 @@ impl H2Stream {
         }
     }
 
+    /// Builds a client stream whose request completes later.
     pub fn new_client_pending(
         send: SendStream<Bytes>,
         response_fut: h2::client::ResponseFuture,
@@ -45,6 +47,7 @@ impl H2Stream {
         }
     }
 
+    /// Ends the stream with a gRPC status trailer.
     pub fn send_grpc_trailers(&mut self) {
         let mut trailers = http::HeaderMap::new();
         trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
@@ -185,6 +188,7 @@ impl AsyncWrite for H2Stream {
     }
 }
 
+/// Raw HTTP/2 framing.
 pub struct H2Transport;
 
 impl H2Transport {
@@ -202,6 +206,7 @@ impl H2Transport {
         Self::create_client_stream(&mut client, host, path, headers).await
     }
 
+    /// Opens an h2 stream to the server named in the pipeline.
     pub async fn create_client_stream(
         client: &mut SendRequest<Bytes>,
         host: &str,

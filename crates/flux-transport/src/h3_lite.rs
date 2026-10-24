@@ -22,6 +22,7 @@ fn err(msg: impl Into<String>) -> FluxError {
 // QUIC varints (RFC 9000 §16)
 // ---------------------------------------------------------------------------
 
+/// Appends a QUIC variable-length integer.
 pub fn write_varint(buf: &mut Vec<u8>, val: u64) {
     if val < 64 {
         buf.push(val as u8);
@@ -34,6 +35,7 @@ pub fn write_varint(buf: &mut Vec<u8>, val: u64) {
     }
 }
 
+/// Reads a QUIC variable-length integer, rejecting a malformed or truncated one.
 pub async fn read_varint<R: AsyncRead + Unpin>(r: &mut R) -> FluxResult<u64> {
     // Read the whole varint with a single call: the previous version issued one
     // `read_exact` per byte (up to 8 awaits, i.e. 8 wake-ups on a slow stream).
@@ -292,12 +294,17 @@ pub fn qpack_encode_field_section(fields: &[(String, String)]) -> Vec<u8> {
 // H3 frames
 // ---------------------------------------------------------------------------
 
+/// HTTP/3 DATA frame type.
 pub const H3_FRAME_DATA: u64 = 0x00;
+/// HTTP/3 HEADERS frame type.
 pub const H3_FRAME_HEADERS: u64 = 0x01;
+/// HTTP/3 SETTINGS frame type.
 pub const H3_FRAME_SETTINGS: u64 = 0x04;
 
+/// Unidirectional stream type for the control stream.
 pub const H3_STREAM_CONTROL: u8 = 0x00;
 
+/// A complete HTTP/3 frame with its type and length prefix.
 pub fn h3_frame(frame_type: u64, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload.len());
     write_varint(&mut out, frame_type);
@@ -310,28 +317,37 @@ pub fn h3_frame(frame_type: u64, payload: &[u8]) -> Vec<u8> {
 // Minimal H3 server connection
 // ---------------------------------------------------------------------------
 
+/// What a peer sent on an HTTP/3 request stream.
 pub enum H3Event {
     /// A proper H3 request: parsed headers, plus the request stream halves
     /// (response goes to `send`; request body, if any, on `recv`).
     Request {
+        /// Request headers as received.
         headers: Vec<(String, String)>,
+        /// Stream to write the response on.
         send: quinn::SendStream,
+        /// Stream the request body, if any, arrives on.
         recv: quinn::RecvStream,
     },
     /// A bidirectional stream whose first frame type is not HEADERS — the raw
     /// stream after consuming just the frame-type varint (Hysteria 2 TCP).
     RawStream {
+        /// The frame type that opened the stream.
         frame_type: u64,
+        /// Stream to write on.
         send: quinn::SendStream,
+        /// Stream to read the rest of the payload from.
         recv: quinn::RecvStream,
     },
 }
 
+/// Accepts HTTP/3 requests on a QUIC connection.
 pub struct H3LiteServer {
     conn: quinn::Connection,
 }
 
 impl H3LiteServer {
+    /// Wraps an established QUIC connection.
     pub fn new(conn: quinn::Connection) -> Self {
         // Server control stream: stream type 0x00 + empty SETTINGS frame.
         // The stream MUST stay open — its closure initiates connection shutdown.
@@ -368,6 +384,7 @@ impl H3LiteServer {
         Self { conn }
     }
 
+    /// The peer address.
     pub fn remote_address(&self) -> std::net::SocketAddr {
         self.conn.remote_address()
     }

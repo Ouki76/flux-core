@@ -59,6 +59,7 @@ thread_local! {
     static CT_COMPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// A stream that disguises itself as a TLS session to a real site.
 pub struct ShadowTlsStream<S> {
     inner: S,
     write_hmac: HmacSha1,
@@ -85,6 +86,7 @@ pub struct ShadowTlsStream<S> {
 }
 
 impl<S> ShadowTlsStream<S> {
+    /// Client half of an established ShadowTLS tunnel.
     pub fn new_client(inner: S, password: &str, server_random: &[u8]) -> Self {
         let mut write_hmac = <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).unwrap();
         write_hmac.update(server_random);
@@ -146,6 +148,7 @@ impl<S> ShadowTlsStream<S> {
         }
     }
 
+    /// Server half of an established ShadowTLS tunnel.
     pub fn new_server(inner: S, password: &str, server_random: &[u8]) -> Self {
         let mut write_hmac = <HmacSha1 as hmac::Mac>::new_from_slice(password.as_bytes()).unwrap();
         write_hmac.update(server_random);
@@ -504,14 +507,18 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowTlsStream<S> {
     }
 }
 
+/// The bytes a v3 server sends to take the connection over.
 pub const SHADOWTLS_V3_TAKEOVER: &[u8] = b"SHADOWTLS_V3_PROXY_HANDSHAKE_READY";
 const TLS_RECORD_HANDSHAKE: u8 = 0x16;
 const _TLS_RECORD_APP_DATA: u8 = 0x17;
 const TLS_CLIENT_HELLO: u8 = 0x01;
 
 #[derive(Clone, Debug)]
+/// Client-side ShadowTLS settings.
 pub struct ShadowTlsClientConfig {
+    /// SNI of the site being imitated.
     pub server_name: String,
+    /// Shared secret.
     pub password: String,
     // NOTE: there is deliberately no `insecure` flag. ShadowTLS v3 aborts the
     // handshake right after ServerHello and never validates the decoy's
@@ -520,15 +527,22 @@ pub struct ShadowTlsClientConfig {
 }
 
 #[derive(Clone, Debug)]
+/// Server-side ShadowTLS settings.
 pub struct ShadowTlsServerConfig {
+    /// Names this server will answer for.
     pub server_names: Vec<String>,
+    /// Shared secret.
     pub password: String,
+    /// Where unauthenticated peers are sent.
     pub fallback_address: TargetFallback,
 }
 
 #[derive(Clone, Debug)]
+/// Where to send a peer that fails to authenticate.
 pub enum TargetFallback {
+    /// A literal address to forward to.
     Address(SocketAddr),
+    /// A name and port to forward to.
     Domain(String, u16),
 }
 
@@ -646,6 +660,7 @@ fn sni_is_allowed(sni: Option<&str>, allowed: &[String]) -> bool {
     sni.is_some_and(|name| allowed.iter().any(|a| a.eq_ignore_ascii_case(name)))
 }
 
+/// Namespace for the ShadowTLS handshake, both sides.
 pub struct ShadowTlsHandshake;
 
 impl ShadowTlsHandshake {

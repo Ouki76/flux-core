@@ -762,6 +762,7 @@ fn validate_request(request: &Request<RecvStream>) -> Result<(), String> {
     Ok(())
 }
 
+/// gRPC framing over HTTP/2.
 pub struct GrpcTransport;
 
 impl GrpcTransport {
