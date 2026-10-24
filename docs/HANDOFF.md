@@ -7,6 +7,57 @@ where that is not true, it says so.
 
 ---
 
+## 0. Where things stand right now (2026-10-24, after cycle 41)
+
+**1066 tests, 0 failed.** fmt, `clippy -D warnings` and `cargo doc` clean. Three-column
+matrix, 5 interleaved rounds x 200 MiB on the homelab server:
+
+| path | flux | sing-box | xray | vs sbox | vs xray | CPU vs both |
+|---|---|---|---|---|---|---|
+| VLESS / TCP | 684 | 544 | 604 | **+25.9 %** | **+13.2 %** | −47 / −51 % |
+| VLESS / REALITY | 300 | 299 | 228 | **+0.5 %** | **+31.6 %** | −38 / −49 % |
+| REALITY + Vision | 283 | 309 | 221 | −8.2 % | **+27.9 %** | −34 / −41 % |
+| VLESS / WS + TLS | 262 | 287 | 103 | −8.8 % | **+153.1 %** | −38 / −68 % |
+| VMess / WS + TLS | 191 | 198 | 172 | −3.5 % | **+11.0 %** | −41 / −51 % |
+| Trojan / TLS | 300 | 335 | — | −10.3 % | — | −33 % |
+| Shadowsocks-2022 | 319 | 389 | 283 | −18.1 % | **+12.9 %** | −20 / −58 % |
+| Shadowsocks-AEAD | 249 | 238 | — | **+4.6 %** | — | −21 % |
+| VLESS / gRPC + TLS | 105 | 117 | 182 | −10.3 % | −42.5 % | −55 / −36 % |
+
+**The single defect behind almost all of it:** every path framed *one unit per call*
+(one 16 KiB chunk, one TLS record, one WebSocket frame, one gRPC message) while the relay
+works in 64 KiB buffers. Found and fixed in the shared copier, WebSocket, both Shadowsocks
+variants, REALITY (writes and reads), Vision and VMess — seven places, one bug. If a path
+is slower than its competitor, check that first, then check whether it is spending *more
+CPU* (wasted work, e.g. Vision's endless padding) or *less* (round trips per buffer).
+
+**What is genuinely open:**
+- **gRPC** — the one clear loss to both. Five attempts, all null: frame size, write
+  batching, read batching, syscall batching, syscall profiling. Facts: echo mode 18 MB/s,
+  streaming 103; throughput barely scales with message size, so it is a bandwidth cap, not
+  per-message latency. Start by instrumenting the h2 driver's wake and capacity events.
+- **Shadowsocks-2022** — ~14 % behind sing-box on 7 rounds while 23 % cheaper on CPU: the
+  same signature as the framing bugs, so look for a remaining per-unit cycle in its read
+  path (the write path is batched and guarded by tests).
+- **mKCP server side** — `carrier: kcp` on an *inbound* is refused with an explanation.
+  Serving it needs every `Inbound::start` to accept an already-established stream instead
+  of binding its own TCP listener. Client side works and interoperates with Xray.
+- **XHTTP** — not implemented.
+- **Browser-grade ClientHello** — not achievable through rustls; the cipher table is
+  Chrome's, the extension set and order are rustls', and there is no GREASE. Two tests pin
+  what is actually emitted so the claim cannot drift.
+
+**Tooling truth:** `perf` cannot sample on this host at all (zero events, kernel has
+PERF_EVENTS, no seccomp — looks like a VM with no PMU). `valgrind --tool=callgrind` works,
+and `strace -c` plus per-syscall read-size histograms are what found every real bug here.
+
+**Guards that must not be weakened:** `shadowsocks2022::batching_guard_tests`,
+`vmess::framing_guard_tests`, `vision::padding_phase_guard` and
+`websocket::mask_equivalence_tests` all fail if their fix is reverted — each was verified
+by actually reverting it.
+
+---
+
 ## 1. The objective
 
 Bring `flux-core` to competitive parity and beyond on every measured dimension,
