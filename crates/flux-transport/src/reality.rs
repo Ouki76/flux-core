@@ -812,22 +812,28 @@ impl TrafficState {
         Ok(record)
     }
 
-    /// Seals one record into `out` (which the caller has cleared): header ‖
-    /// ciphertext ‖ tag. Zero allocation when `out` already has the capacity.
+    /// Seals one record appended to `out`: header ‖ ciphertext ‖ tag.
+    ///
+    /// Every offset is relative to `start`, not to the start of `out` — the original
+    /// version assumed the caller had cleared the buffer (`out.len() - 5`), which made
+    /// the second record of a multi-record write carry a length covering both. The AEAD
+    /// then authenticated the wrong header and the peer rejected it with "aead decrypt
+    /// failed", which is exactly how this surfaced.
     fn seal_into(&mut self, content_type: u8, data: &[u8], out: &mut Vec<u8>) -> FluxResult<()> {
         out.reserve(5 + data.len() + 1 + 16);
+        let start = out.len();
         out.extend_from_slice(&[0u8; 5]); // header, patched below
         out.extend_from_slice(data);
         out.push(content_type);
-        let ct_len = out.len() - 5 + 16;
+        let ct_len = out.len() - start - 5 + 16;
         let header = [TLS_APPDATA, 0x03, 0x03, (ct_len >> 8) as u8, ct_len as u8];
         let nonce = self.nonce();
         self.seq += 1;
         let tag = self
             .suite
-            .seal(&self.cipher, &nonce, &header, &mut out[5..])?;
+            .seal(&self.cipher, &nonce, &header, &mut out[start + 5..])?;
         out.extend_from_slice(&tag);
-        out[..5].copy_from_slice(&header);
+        out[start..start + 5].copy_from_slice(&header);
         Ok(())
     }
 
@@ -1684,13 +1690,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
 
         // 2. Encrypt one record worth of plaintext into the reusable staging
         //    buffer (no allocation in steady state) and hand it to the transport.
-        let n = buf.len().min(MAX_TLS_RECORD);
+        // Seal as many records as the caller's buffer provides, up to the relay's copy
+        // buffer, and hand them to the transport in one write. One record per call made
+        // a 64 KiB write four records and four syscalls — the defect found in the
+        // WebSocket, Shadowsocks, REALITY-read and VMess paths.
+        let cap = buf.len().min(64 * 1024);
+        let mut n = 0usize;
         this.tx_buf.clear();
-        if let Err(e) = this.write_state.seal_into(23, &buf[..n], &mut this.tx_buf) {
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                e.to_string(),
-            )));
+        while n < cap {
+            let step = (cap - n).min(MAX_TLS_RECORD);
+            if let Err(e) = this
+                .write_state
+                .seal_into(23, &buf[n..n + step], &mut this.tx_buf)
+            {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )));
+            }
+            n += step;
         }
 
         let Self {
