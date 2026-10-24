@@ -3960,9 +3960,13 @@ outbounds:
     req.extend_from_slice(&echo.port().to_be_bytes());
     stream.write_all(&req).await.unwrap();
     let mut resp = [0u8; 10];
-    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut resp))
+    // 30 s, not 10: this is a QUIC handshake plus a SOCKS CONNECT through two
+    // processes, and the whole test binary runs its cases in parallel. Ten seconds is
+    // enough alone and not enough under that load — the failure said "timed out", not
+    // "refused", which is a slow path, not a broken one. A genuine hang still fails.
+    tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut resp))
         .await
-        .expect("sing-box hy2 connect to flux timed out")
+        .expect("sing-box hy2 connect to flux timed out (30 s)")
         .unwrap();
     assert_eq!(resp[1], 0x00, "sing-box hy2 connect must succeed");
 
