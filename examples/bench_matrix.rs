@@ -269,12 +269,15 @@ struct ProxyProc {
 impl ProxyProc {
     fn spawn(bin: &Path, log_path: &Path, argv: &[&str]) -> Result<Self, String> {
         let mut cmd = Command::new(bin);
+        // Both streams into the same file: the daemons log to stdout, and capturing
+        // only stderr made every "see the log" diagnostic print "(empty)" — which cost
+        // a whole hunt for the stall below.
+        let log = std::fs::File::create(log_path).map_err(|e| format!("log file: {e}"))?;
+        let log_err = log.try_clone().map_err(|e| format!("log file: {e}"))?;
         cmd.args(argv)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(
-                std::fs::File::create(log_path).map_err(|e| format!("log file: {e}"))?,
-            ));
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err));
         let child = cmd.spawn().map_err(|e| {
             format!(
                 "failed to spawn {}: {e} (build it first, e.g. `cargo build --release -p flux-core`)",
@@ -381,6 +384,18 @@ struct Tunnel {
 impl Tunnel {
     fn cpu_secs(&self) -> Option<f64> {
         Some(self.server.cpu_secs()? + self.client.cpu_secs()?)
+    }
+
+    /// The two tunnels' stderr, which is where a parked relay says so.
+    fn log_tail(&self) -> String {
+        let mut out = String::new();
+        for (name, proc) in [("server", &self.server), ("client", &self.client)] {
+            let tail = proc.log_tail();
+            if !tail.is_empty() {
+                out.push_str(&format!("  -- {name} --\n{tail}\n"));
+            }
+        }
+        out
     }
 
     fn why(&self, ctx: &str) -> String {
@@ -1259,12 +1274,20 @@ async fn measure_round(
                 (Some(b), Some(a)) => format!("{:.3} s CPU", (a - b).max(0.0)),
                 _ => "CPU unknown".to_string(),
             };
+            // The tunnel's own stderr names what it thinks happened: the copier's
+            // backstop logs every time it has to re-poll a parked relay.
+            let notes = tunnel.log_tail();
             return Err(format!(
                 "timeout: no completion within {}s ({} MiB attempted); the tunnel used {} \
-                 during the attempt",
+                 during the attempt. Tunnel log:\n{}",
                 timeout.as_secs(),
                 total_bytes / (1024 * 1024),
-                burned
+                burned,
+                if notes.is_empty() {
+                    "  (empty)".to_string()
+                } else {
+                    notes
+                }
             ));
         }
         Ok(Err(e)) => return Err(e),

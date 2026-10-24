@@ -288,10 +288,21 @@ where
     struct Backstop {
         waker: Option<std::task::Waker>,
         last_poll: std::time::Instant,
+        /// What the copier was doing on its last pass. Without this a park says only
+        /// "nothing happened", which cannot distinguish "waiting for the peer" from
+        /// "both directions are blocked on each other".
+        state: &'static str,
+        up: u64,
+        down: u64,
+        pokes: u64,
     }
     let backstop = std::sync::Arc::new(std::sync::Mutex::new(Backstop {
         waker: None,
         last_poll: std::time::Instant::now(),
+        state: "start",
+        up: 0,
+        down: 0,
+        pokes: 0,
     }));
     let ticker_state = backstop.clone();
     let ticker = tokio::spawn(async move {
@@ -306,13 +317,16 @@ where
             if idle_for >= std::time::Duration::from_millis(500)
                 && let Some(w) = waker
             {
-                {
-                    tracing::warn!(
-                        "relay copier was parked for {:?} with no wakeup — re-polling",
-                        idle_for
-                    );
-                    w.wake();
-                }
+                let (state, up, down, pokes) = {
+                    let mut st = ticker_state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.pokes += 1;
+                    (st.state, st.up, st.down, st.pokes)
+                };
+                tracing::warn!(
+                    "relay copier parked for {:?} (poke #{pokes}): {state}; moved up={up}                      down={down} — re-polling",
+                    idle_for
+                );
+                w.wake();
             }
         }
     });
@@ -322,6 +336,11 @@ where
         {
             let mut st = backstop.lock().unwrap_or_else(|e| e.into_inner());
             st.last_poll = std::time::Instant::now();
+            // Enough to tell the two shapes of stall apart: which writes are stuck,
+            // which reads are still open, and how much has moved in total.
+            st.state = describe_state(pend_ab, pend_ba, eof_ab, eof_ba);
+            st.up = up;
+            st.down = down;
             match &st.waker {
                 Some(existing) if existing.will_wake(cx.waker()) => {}
                 _ => st.waker = Some(cx.waker().clone()),
@@ -425,6 +444,26 @@ where
             if eof_ab && eof_ba && pend_ab.is_none() && pend_ba.is_none() {
                 return Poll::Ready(Ok((up, down)));
             }
+
+            // Nothing moved this pass, so this is the last chance before parking: a
+            // writer may have accepted every byte and still be holding it in its own
+            // buffer. WebSocket assembles frames and TLS assembles records above the
+            // socket, so without a flush the final bytes of a transfer never leave and
+            // both directions park forever — measured as a relay that moves exactly its
+            // payload (`up=down=4194304`) and then hangs, with the backstop re-polling
+            // into a void.
+            if !progressed {
+                if pend_ab.is_none()
+                    && matches!(Pin::new(&mut *b).poll_flush(cx), Poll::Ready(Ok(())))
+                    && pend_ba.is_none()
+                {
+                    // A successful flush pushes buffered bytes out; give the loop one
+                    // more pass so a writer that freed its buffer can accept more.
+                    progressed = true;
+                } else if pend_ba.is_none() {
+                    let _ = Pin::new(&mut *a).poll_flush(cx);
+                }
+            }
             if progressed {
                 spins += 1;
                 if spins < 64 {
@@ -442,6 +481,28 @@ where
     Ok(total)
 }
 
+/// A one-line summary of the copier's pending state, for the backstop's log.
+fn describe_state(
+    pend_ab: Option<(usize, usize)>,
+    pend_ba: Option<(usize, usize)>,
+    eof_ab: bool,
+    eof_ba: bool,
+) -> &'static str {
+    match (pend_ab.is_some(), pend_ba.is_some(), eof_ab, eof_ba) {
+        (true, true, _, _) => "both writes stuck: a->b and b->a cannot drain",
+        (true, false, true, false) => "a->b write stuck; a at EOF",
+        (true, false, false, false) => "a->b write stuck, b->a read still open",
+        (false, true, false, true) => "b->a write stuck; b at EOF",
+        (false, true, false, false) => "b->a write stuck, a->b read still open",
+        (false, false, true, true) => "both at EOF",
+        (false, false, true, false) => "a at EOF, b quiet",
+        (false, false, false, true) => "b at EOF, a quiet",
+        (false, false, false, false) => "both reads parked, nothing pending",
+        (true, false, _, _) => "a->b write stuck",
+        (false, true, _, _) => "b->a write stuck",
+    }
+}
+
 fn zero_write() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::WriteZero,
@@ -453,6 +514,106 @@ fn zero_write() -> std::io::Error {
 mod buffered_copy_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A writer that accepts bytes but only releases them on flush, like a TLS record
+    /// or a WebSocket frame being assembled above the socket. Without the copier's
+    /// pre-park flush the payload stays in `pending` forever and this test times out —
+    /// which is exactly the shape of the production stall: a relay that moved exactly
+    /// its payload and then parked with `up == down`.
+    struct FlushGated {
+        pending: Vec<u8>,
+        shared: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl FlushGated {
+        fn new() -> (Self, Arc<std::sync::Mutex<Vec<u8>>>) {
+            let shared = Arc::new(std::sync::Mutex::new(Vec::new()));
+            (
+                Self {
+                    pending: Vec::new(),
+                    shared: shared.clone(),
+                },
+                shared,
+            )
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FlushGated {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.pending.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let pending = std::mem::take(&mut this.pending);
+            let shared = this.shared.clone();
+            shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(&pending);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            tokio::io::AsyncWrite::poll_flush(self, cx)
+        }
+    }
+
+    /// `FlushGated` is write-only; reads are always empty (it never sends anything).
+    impl tokio::io::AsyncRead for FlushGated {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn buffered_bytes_reach_the_peer_without_a_close() {
+        let (mut a_client, mut a_proxy) = tokio::io::duplex(64 * 1024);
+        let (mut sink, seen) = FlushGated::new();
+
+        let copier = tokio::spawn(async move {
+            // The transfer never sees EOF: it must still deliver what it accepted.
+            let _ = copy_bidirectional_buffered(&mut a_proxy, &mut sink, 8 * 1024).await;
+        });
+
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+        a_client.write_all(&payload).await.unwrap();
+
+        // The reader on the far side is the assertion: it sees the bytes only if the
+        // copier flushed before parking.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let got = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if got.len() >= payload.len() {
+                assert_eq!(got, payload, "the copier corrupted the payload");
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {} of {} bytes reached the peer: the writer was never flushed",
+                got.len(),
+                payload.len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        copier.abort();
+    }
 
     /// Byte-exact in both directions, across many buffers worth of data.
     #[tokio::test]
