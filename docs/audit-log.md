@@ -4366,3 +4366,43 @@ which function burned instructions, and I read it as "this is the floor". What b
 assumption was a *ratio* — our row degrading 66 % against our own TLS when the competitor's
 degraded 12 %. Comparing two implementations' profiles against each other, rather than one
 profile against my expectations, is what found it.
+
+---
+
+## Cycle 90 — 2026-10-25
+
+### Shadowsocks-2022: a real gap, and it is not the cipher
+
+After the gRPC window fix, SS-2022 is the only row where sing-box is ahead by more than noise.
+Six rounds, interleaved:
+
+| round | flux | sing-box |
+|---|---|---|
+| 1 | 336.4 | 384.2 |
+| 2 | 350.8 | 361.2 |
+| 3 | 317.3 | 300.8 |
+| 4 | 277.1 | 338.3 |
+| 5 | 310.3 | 342.0 |
+| 6 | 291.1 | 404.0 |
+| **best** | **350.8** | **404.0** |
+| **median** | 314.0 | 352.1 |
+
+Our **best** round is below their **median**, so unlike the WS row this is not two tails of one
+distribution — it is a real ~11 % deficit.
+
+**And we spend 5.3-6.6 CPU s/GiB doing it against their 7.3-8.1.** Less compute, less
+throughput: the path is waiting, not working. That rules out the obvious candidates — the
+cipher, the chunk framing, the blake3 key derivation — because all of those would show up as
+CPU, and ours is a quarter lower.
+
+What is left is wakeup or syscall structure: the reader loops to fill the caller's buffer and
+the writer batches four chunks into one write, both verified by reading the code, so the
+remaining suspects are on the relay side or in how often the encryptor is polled. Not chased
+further this cycle — the profile refused to resolve symbols twice (once because a stale
+`callgrind-amd64` held the port and once because the binary had been rebuilt without debug
+info), and a third guess is worth less than a clean measurement next time.
+
+### Same-cycle context
+
+The h2 window fix landed this cycle and moved gRPC from 106 to 182 MB/s and XHTTP from 185 to
+334, which is why the matrix ordering changed so much between two runs an hour apart.
