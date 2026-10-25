@@ -4614,3 +4614,47 @@ the same binary leading on three axes that a user actually feels: bulk throughpu
 protocol rows, xray beaten on all), exchanges per second under concurrent short connections
 (+37 % over sing-box), and memory per connection (2-4x smaller). Each was found by asking
 "what is not measured", not by tuning what already was.
+
+---
+
+## Cycle 97 — 2026-10-25
+
+### The window sweep: bigger was better, up to a point, and the point is measurable
+
+Last cycle's fix set the h2 client window to 1 MiB / 2 MiB and gRPC jumped from 106 to 182.
+The obvious next thought is "then set it larger still". Swept instead:
+
+| stream / connection window | gRPC (no TLS) | gRPC + TLS |
+|---|---|---|
+| unset (h2 default, 64 KiB) | 168.5 | 106.4 |
+| 128 KiB / 256 KiB | 410.7 | 166.5 |
+| **256 KiB / 512 KiB** | **445-538** | **203-265** |
+| 1 MiB / 2 MiB | 344.8 | 182.1 |
+
+The curve turns. 256/512 is the peak of what was tested, and it is worth **2.4x** over the
+value the previous cycle shipped. Three runs: 499.1 / 445.4 / 537.7 without TLS, 203.4 /
+240.0 / 264.7 with it.
+
+| row | before | after |
+|---|---|---|
+| gRPC + TLS vs sing-box | +53.7 % | **+104 to +124 %** |
+| gRPC + TLS vs xray | **+2.0 %** | **+25 to +40 %** |
+| gRPC (no TLS) vs xray | +84.6 % | **+138 to +188 %** |
+
+The margin against xray on this row went from 2 % — a number I described as "level" — to a
+quarter. And it came from sweeping a parameter I had already "fixed" once.
+
+### An honest note on h2's cost
+
+Measured with the footprint mode of `bench_rps`: **203-214 KB per connection** through the
+gRPC framing against **20 KB** through plain TCP. The window setting does not change it
+(128/256 and 1024/2048 measured the same), so it is h2's own per-connection allocation. That
+is a real cost of the transport and it belongs in the documentation rather than in a surprise
+during a capacity plan.
+
+### And a flaky run, correctly attributed
+
+The first full-suite run after the change reported `test_mux_vless_flux_to_singbox` failing;
+it passed alone, and a second full run passed 1089 of 1089. The machine had been running
+benchmarks moments before. Recorded because the instinct to "fix" a test that fails once is
+how a real signal gets buried.
