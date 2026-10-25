@@ -1023,7 +1023,11 @@ impl Conn {
             window_update: false,
             peer_closed: false,
             closing: false,
-            next_ping: now,
+            // `now` would make the first flush send a PING immediately, and an Xray
+            // *server* closes a session whose first datagram is anything but DATA — our own
+            // capture settled that. Start the idle timer instead, so the first probe happens
+            // after three seconds of quiet, as a real peer does.
+            next_ping: now + PING_IDLE,
             last_recv: now,
             last_send: now,
             read_waker: None,
