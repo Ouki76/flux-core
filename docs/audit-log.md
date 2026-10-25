@@ -6374,3 +6374,44 @@ That is the shape a fix should take: reproduce the failing condition, not the pa
 While saturating the host, the benchmark's own per-round lines were still sensible —
 flux 323.6 MB/s against sing-box 262.8 and xray 220.1 in the same round — which is the property
 the `--assert` gate relies on: absolute numbers sag under load, the ratios do not.
+
+---
+
+## Cycle 140 — 2026-10-25
+
+### The interop test did not cover the defect it was written for
+
+Applied the revert test to the address-follow fix — and the interop test passed **without it**.
+
+Two explanations, and the experiment distinguishes them: disabling the fix and running the same
+scenario by hand produces `ConnectionResetError`, so the fix is necessary; therefore the test
+never triggers the socket switch. On a short loopback transfer Xray answers from the port it
+received on, and the whole guard is bypassed.
+
+So a test was written for a defect and did not cover it, and nothing would have revealed that
+except reverting the fix — which is the same lesson as cycles 125 and 138, arriving from a
+different direction.
+
+`the_dialler_follows_a_peer_that_changes_its_address` replaces the coverage: a second socket
+sends a valid segment from a port the client never talked to, and the assertion is that the
+receive counter advances.
+
+```
+disabled:  assertion failed: a segment from the peer's new address must be accepted (rcv_nxt=0)
+enabled:   rcv_nxt=1
+```
+
+The interop test stays, because real traffic through a real binary is worth having. It just no
+longer claims to cover this defect, and its comment now says so.
+
+### A tally of the guards found hollow this session
+
+| guard | problem | outcome |
+|---|---|---|
+| cumulative ACK "fix" | test passed with and without it | fix deleted as dead code |
+| opening PING test | cannot see the driver path | relabelled a guard |
+| h2 window wire test | captured zero bytes | deleted; value-level test ships |
+| AES interop test | passes without the fix | superseded by a deterministic unit test |
+
+Four out of four guards written this session were initially weaker than they looked. That the
+reversions found them is the only reason the number is four rather than zero and unnoticed.
