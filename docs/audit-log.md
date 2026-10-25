@@ -5927,3 +5927,42 @@ Nothing structural — this run is a little slower on several rows (TLS 361 → 
 274 → 225, SS-AEAD 285 → 304) because the box was busier. Both competitors moved the same way,
 and the ratios held, which is the property the `--assert` gate exists to check. The absolute
 numbers in this audit have never been stable to better than ±15%; the ratios have.
+
+---
+
+## Cycle 129 — 2026-10-25
+
+### The second axis gets the same gate
+
+`bench_rps --assert [TOLERANCE]` now exits non-zero when flux-core is behind any competitor on
+connection rate, exactly as `bench_matrix --assert` does for throughput.
+
+```
+plain:  flux 12 920/s   sing-box 9 990/s   xray 1 166/s    ASSERT PASSED
+TLS:    flux  8 456/s   sing-box 4 234/s   xray   899/s    ASSERT PASSED
+```
+
+and the failure branch, exercised the only way it can be when flux is ahead — by demanding a
+margin larger than the measured one:
+
+```
+--assert -1.0   ASSERT FAILED (tolerance -100%):
+                  exchanges/s vs sing-box: 9798 < 7892 (+24.1%, tolerance -100%)    exit 1
+```
+
+Two of the objective's measured dimensions are now commands that can fail. The remaining two —
+memory per connection and UDP datagrams — are single numbers produced by `bench_rps --idle` and
+the UDP bench, and a gate for them would be the same three lines. That is worth doing, but it is
+worth doing when someone is going to run them, not to make a table look complete.
+
+### The shape of the objective now
+
+| clause | command | can it fail? |
+|---|---|---|
+| ahead on every matrix row | `bench_matrix --assert 0.10` | yes |
+| ahead on connection rate | `bench_rps --assert 0.10` | yes |
+| transport and protocol interop | `cargo test` (1099 tests) | yes |
+| gates green | fmt / clippy / audit / deny / doc | yes |
+
+Four clauses, four commands, each of which has been seen to fail at least once — three of them
+by deliberately breaking the thing they check.
