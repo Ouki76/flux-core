@@ -1896,6 +1896,54 @@ mod connect_tests {
         assert_eq!(&buf, b"okay");
     }
 
+    /// A server may rotate its traffic keys mid-connection (RFC 8446 §7.2); the client has to
+    /// derive the next read keys from the transcript, or every byte after the update fails to
+    /// decrypt. Nothing tested this, and the derivation is exactly the kind of thing that works
+    /// for the first message and then does not.
+    #[tokio::test]
+    async fn a_key_update_mid_stream_is_followed() {
+        crate::tls::init_crypto_provider();
+        let (acceptor, ca_pem) = server_and_ca();
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut srv = acceptor.accept(server_raw).await.expect("server handshake");
+            let mut buf = [0u8; 4];
+            srv.read_exact(&mut buf).await.expect("first read");
+            srv.write_all(b"one!").await.expect("first write");
+            srv.flush().await.expect("flush");
+            // Rotate the server's send keys, then continue in the clear-text sense.
+            let (_, conn) = srv.get_mut();
+            conn.refresh_traffic_keys().expect("refresh keys");
+            srv.write_all(b"two!").await.expect("write after update");
+            srv.flush().await.expect("flush");
+        });
+
+        let mut trust = verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = ClientHelloConfig {
+            server_name: "localhost",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut client = connect(client_raw, &cfg).await.expect("handshake");
+        client.write_all(b"ping").await.expect("write");
+        let mut first = [0u8; 4];
+        client
+            .read_exact(&mut first)
+            .await
+            .expect("read before update");
+        assert_eq!(&first, b"one!");
+        let mut second = [0u8; 4];
+        client
+            .read_exact(&mut second)
+            .await
+            .expect("read after the server rotated its keys");
+        assert_eq!(&second, b"two!");
+        server.await.expect("server task");
+    }
+
     /// The name in the certificate is checked against SNI, not taken on trust.
     #[tokio::test]
     async fn a_certificate_for_another_name_is_refused() {
