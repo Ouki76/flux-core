@@ -145,21 +145,21 @@ medians are in `docs/audit-log.md`):
 
 | Path | flux-core | sing-box | xray | vs sing-box | vs xray |
 |---|---|---|---|---|---|
-| **Hysteria2** | **101** | 52 | — | **+93.1 %** | — |
-| **TUIC v5** | **102** | 55 | — | **+83.2 %** | — |
-| **WireGuard** | **73** | 45 | — | **+63.6 %** | — |
-| VLESS / TCP | **812** | 665 | 613 | **+22.0 %** | **+32.5 %** |
-| VLESS / gRPC (no TLS) | **345** | — | 187 | — | **+84.6 %** |
-| VLESS / XHTTP | **334** | — (unsupported) | 164 | — | **+103 %** |
-| VLESS / REALITY + Vision | 334 | 336 | 238 | −0.5 % | **+40.7 %** |
-| VLESS / TLS | **331** | 322 | 255 | **+3.0 %** | **+29.9 %** |
-| VLESS / REALITY | 329 | 345 | 239 | −4.8 % | **+37.6 %** |
-| Trojan / TLS | 302 | 319 | — | −5.6 % | — |
-| VLESS / WS + TLS | 298 | 301 | 107 | −0.9 % | **+179 %** |
-| Shadowsocks-2022 | 300 | 378 | 271 | −20.8 % | **+10.4 %** |
-| Shadowsocks-AEAD | 277 | 292 | — | −5.1 % | — |
-| VMess / WS + TLS | 213 | 217 | 169 | −2.0 % | **+26.4 %** |
-| VLESS / gRPC + TLS | **182** | 119 | 178 | **+53.7 %** | **+2.0 %** |
+| **Hysteria2** | **101** | 53 | — | **+91.2 %** | — |
+| **TUIC v5** | **100** | 56 | — | **+80.8 %** | — |
+| **WireGuard** | **71** | 45 | — | **+59.2 %** | — |
+| VLESS / TCP | **817** | 586 | 657 | **+39.5 %** | **+24.5 %** |
+| VLESS / gRPC (no TLS) | **451** | — | 191 | — | **+136.6 %** |
+| VLESS / XHTTP | **373** | — (unsupported) | 134 | — | **+179.5 %** |
+| VLESS / TLS | **346** | 311 | 237 | **+11.3 %** | **+46.0 %** |
+| VLESS / REALITY + Vision | **335** | 323 | 263 | **+3.7 %** | **+27.2 %** |
+| VLESS / REALITY | 291 | 300 | 230 | −3.0 % | **+26.8 %** |
+| Trojan / TLS | 296 | 313 | — | −5.5 % | — |
+| VLESS / WS + TLS | 287 | 290 | 111 | −0.8 % | **+158.8 %** |
+| Shadowsocks-AEAD | **259** | 241 | — | **+7.5 %** | — |
+| Shadowsocks-2022 | 347 | 392 | 283 | −11.6 % | **+22.6 %** |
+| VMess / WS + TLS | 200 | 203 | 174 | −1.7 % | **+14.9 %** |
+| VLESS / gRPC + TLS | **232** | 118 | 192 | **+96.5 %** | **+21.2 %** |
 
 **Absolutes are machine-specific — never compare these numbers across machines, only
 within one run.** This table is the homelab server (24 cores, Void Linux, 4 interleaved
@@ -168,14 +168,15 @@ round of each stack is the number quoted here; an earlier edition came from a de
 1.6x higher and the deltas told a different story.
 
 What the table says, as a fifteen-row best-of-four with no failures: flux-core **beats xray on
-every path xray can run** — all ten of them — and **beats sing-box on six**, with three more
-inside 2 % (WS at −0.9 %, Vision at −0.5 %, VMess at −2.0 %). The widest margins are the three
-UDP-carried protocols, where sing-box runs at roughly half our rate.
+every path xray can run** — all ten of them — and **beats sing-box on ten of fifteen**, with
+three more inside 3 % (WS −0.8 %, VMess −1.7 %, REALITY −3.0 %). The widest margins are the
+three UDP-carried protocols, where sing-box runs at half our rate, and the two h2 paths, where
+xray does.
 
-The four sing-box gaps left are REALITY (−4.8 %), Trojan (−5.6 %), Shadowsocks-AEAD (−5.1 %)
-and Shadowsocks-2022 (−20.8 %, which has read −2.8 %, −10.7 % and −20.8 % across three runs of
-the same binary). Single rows swing up to ±15 % on this host, so treat any gap under about 10 %
-as unresolved rather than as a ranking; the per-round spreads are in `docs/audit-log.md`.
+Two sing-box gaps remain: Trojan (−5.5 %) and Shadowsocks-2022 (−11.6 %, which has read
+−2.8 %, −10.7 %, −20.8 % and −11.6 % across four runs of the same binary). Single rows swing up
+to ±15 % on this host, so treat any gap under about 10 % as unresolved rather than as a
+ranking; the per-round spreads are in `docs/audit-log.md`.
 
 All of that while spending **19-68 % less CPU than both on every TCP path** and using a third
 of the memory. Single rows swing up to ±15 % between runs on this host, so treat any gap under
