@@ -951,8 +951,10 @@ pub(crate) mod verify {
         transcript_hash: &[u8],
         signature: &[u8],
     ) -> FluxResult<()> {
-        let mut signed = Vec::with_capacity(64 + 1 + transcript_hash.len());
-        signed.extend_from_slice(b"                                    ");
+        let mut signed = Vec::with_capacity(64 + 33 + 1 + transcript_hash.len());
+        // 64 bytes of 0x20, not "some spaces": a miscount here is a signature that never
+        // verifies, and the only symptom is `InvalidSignatureForPublicKey`.
+        signed.extend_from_slice(&[0x20u8; 64]);
         signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
         signed.push(0);
         signed.extend_from_slice(transcript_hash);
@@ -1295,13 +1297,18 @@ pub(crate) fn build_client_hello(
     // serves HTTP/2. The REALITY server ignores the contents (it authenticates
     // the session id), so this only affects what an on-path observer sees.
 
-    let alpn_list_len: usize = alpn.iter().map(|p| 1 + p.len()).sum();
-    ext.extend_from_slice(&0x0010u16.to_be_bytes()); // extension_type
-    ext.extend_from_slice(&((2 + alpn_list_len) as u16).to_be_bytes()); // ext length
-    ext.extend_from_slice(&(alpn_list_len as u16).to_be_bytes()); // protocol list
-    for proto in alpn {
-        ext.push(proto.len() as u8);
-        ext.extend_from_slice(proto);
+    // An ALPN extension with an empty protocol list is illegal — rustls rejects the whole
+    // connection with `IllegalEmptyList(ProtocolNames)`, and any strict server does the
+    // same. A caller that wants no ALPN must get no extension at all.
+    if !alpn.is_empty() {
+        let alpn_list_len: usize = alpn.iter().map(|p| 1 + p.len()).sum();
+        ext.extend_from_slice(&0x0010u16.to_be_bytes()); // extension_type
+        ext.extend_from_slice(&((2 + alpn_list_len) as u16).to_be_bytes()); // ext length
+        ext.extend_from_slice(&(alpn_list_len as u16).to_be_bytes()); // protocol list
+        for proto in alpn {
+            ext.push(proto.len() as u8);
+            ext.extend_from_slice(proto);
+        }
     }
     // supported_versions: TLS 1.3
     ext.extend_from_slice(&0x002bu16.to_be_bytes());
@@ -1354,4 +1361,494 @@ pub(crate) fn build_client_hello(
     hello[2] = hs_len_bytes[2];
     hello[3] = hs_len_bytes[3];
     hello
+}
+
+/// Everything a general TLS 1.3 connection needs to know about who it is talking to.
+#[allow(dead_code)] // wired into `tls.rs` in the next step
+pub(crate) struct ClientHelloConfig<'a> {
+    /// The name to put in SNI and to check the certificate against.
+    pub(crate) server_name: &'a str,
+    /// ALPN protocols to offer; the server's answer must be one of these.
+    pub(crate) alpn: &'a [&'a [u8]],
+    /// Trust anchors, ignored when `insecure` is set.
+    pub(crate) trust: &'a verify::TrustStore,
+    /// Accept any certificate. Named the way it behaves, not the way it sounds.
+    pub(crate) insecure: bool,
+}
+
+/// Runs a full TLS 1.3 client handshake and returns a stream carrying application data.
+///
+/// The shape of this handshake — cipher list, extension list, GREASE — is ours, which is the
+/// whole point: rustls will not let a caller control it. What is *not* ours is certificate
+/// validation, which is delegated to `verify` and therefore to `rustls-webpki`.
+#[allow(dead_code)] // wired into `tls.rs` in the next step
+pub(crate) async fn connect<S>(
+    mut stream: S,
+    cfg: &ClientHelloConfig<'_>,
+) -> FluxResult<Tls13Stream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use rand::RngCore;
+    use tokio::io::AsyncWriteExt;
+    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+    // ---- 1. Greeting.
+    let eph = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let eph_pub = X25519PublicKey::from(&eph);
+    let mut random = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut random);
+    let hello = build_client_hello(cfg.server_name, cfg.alpn, &random, eph_pub.as_bytes());
+
+    let mut transcript: Vec<u8> = Vec::with_capacity(1024);
+    transcript.extend_from_slice(&hello);
+
+    // The record, then a compatibility change_cipher_spec: middleboxes expect both, and some
+    // servers ignore a client that omits the second.
+    let mut record = Vec::with_capacity(5 + hello.len());
+    record.push(TLS_HANDSHAKE);
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+    record.extend_from_slice(&hello);
+    record.extend_from_slice(&[TLS_CCS, 0x03, 0x03, 0x00, 0x01, 0x01]);
+    stream
+        .write_all(&record)
+        .await
+        .map_err(flux_types::FluxError::Io)?;
+    stream.flush().await.map_err(flux_types::FluxError::Io)?;
+
+    // ---- 2. ServerHello.
+    let sh_record = read_record_typed(&mut stream, TLS_HANDSHAKE).await?;
+    if sh_record.len() < 4 || sh_record[0] != HS_SERVER_HELLO {
+        return Err(crypto_err("expected a TLS ServerHello"));
+    }
+    let sh_len = u32::from_be_bytes([0, sh_record[1], sh_record[2], sh_record[3]]) as usize;
+    if sh_record.len() < 4 + sh_len {
+        return Err(crypto_err("truncated ServerHello"));
+    }
+    let sh = &sh_record[..4 + sh_len];
+    transcript.extend_from_slice(sh);
+
+    let mut pos = 4 + 2;
+    if sh.len() < pos + 32 + 1 {
+        return Err(crypto_err("short ServerHello"));
+    }
+    let server_random: [u8; 32] = sh[pos..pos + 32].try_into().expect("32 bytes");
+    pos += 32;
+    /// The fixed ServerHello.random that marks a HelloRetryRequest (RFC 8446 §4.1.3).
+    const HRR_RANDOM: [u8; 32] = [
+        0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
+        0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
+        0x33, 0x9c,
+    ];
+    if server_random == HRR_RANDOM {
+        return Err(crypto_err(
+            "server asked for a HelloRetryRequest; this client always offers an x25519 key share",
+        ));
+    }
+    let sid_echo_len = sh[pos] as usize;
+    pos += 1 + sid_echo_len;
+    if pos + 3 > sh.len() {
+        return Err(crypto_err("short ServerHello (cipher suite)"));
+    }
+    let suite_id = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+    pos += 2;
+    pos += 1; // legacy compression method
+    let suite = Tls13Suite::from_id(suite_id)
+        .ok_or_else(|| crypto_err(format!("server chose cipher suite {suite_id:#06x}")))?;
+
+    if pos + 2 > sh.len() {
+        return Err(crypto_err("short ServerHello (extensions)"));
+    }
+    let ext_total = u16::from_be_bytes([sh[pos], sh[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = (pos + ext_total).min(sh.len());
+    let mut server_keyshare: Option<[u8; 32]> = None;
+    while pos + 4 <= ext_end {
+        let etype = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+        let elen = u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]) as usize;
+        pos += 4;
+        if pos + elen > ext_end {
+            return Err(crypto_err("ServerHello extension overruns the message"));
+        }
+        if etype == 0x0033 {
+            if elen < 36 {
+                return Err(crypto_err("short key_share in ServerHello"));
+            }
+            let group = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+            if group != GROUP_X25519 {
+                return Err(crypto_err(format!(
+                    "server chose key share group {group:#06x}, which this client did not offer"
+                )));
+            }
+            server_keyshare = Some(
+                sh[pos + 4..pos + 36]
+                    .try_into()
+                    .map_err(|_| crypto_err("bad key_share length"))?,
+            );
+        }
+        pos += elen;
+    }
+    let server_keyshare =
+        server_keyshare.ok_or_else(|| crypto_err("ServerHello carried no x25519 key share"))?;
+
+    // ---- 3. Handshake key schedule (RFC 8446 §7.1).
+    let shared = eph.diffie_hellman(&X25519PublicKey::from(server_keyshare));
+    let zeros = vec![0u8; suite.hash_len()];
+    let empty_hash = suite.hash(&[]);
+    let early_secret = suite.hkdf_extract(&zeros, &zeros);
+    let derived = suite.derive_secret(&early_secret, "derived", &empty_hash)?;
+    let handshake_secret = suite.hkdf_extract(&derived, shared.as_bytes());
+    let ch_sh_hash = suite.hash(&transcript);
+    let c_hs_secret = suite.derive_secret(&handshake_secret, "c hs traffic", &ch_sh_hash)?;
+    let s_hs_secret = suite.derive_secret(&handshake_secret, "s hs traffic", &ch_sh_hash)?;
+    let mut server_hs = TrafficState::new(suite, s_hs_secret.clone())?;
+    let mut client_hs = TrafficState::new(suite, c_hs_secret.clone())?;
+
+    // ---- 4. The encrypted server flight.
+    let mut hs_buf: Vec<u8> = Vec::new();
+    let mut chain: Vec<rustls_pki_types::CertificateDer<'static>> = Vec::new();
+    let mut alpn: Option<Vec<u8>> = None;
+    let mut got_finished = false;
+    while !got_finished {
+        let hdr = read_record_header(&mut stream).await?;
+        let body = read_record_body(&mut stream, &hdr).await?;
+        match hdr[0] {
+            TLS_CCS => continue,
+            TLS_APPDATA => {
+                let (ctype, plain) = server_hs.decrypt_record(&hdr, &body)?;
+                if ctype != TLS_HANDSHAKE {
+                    return Err(crypto_err(format!(
+                        "encrypted record of type {ctype} during the handshake"
+                    )));
+                }
+                hs_buf.extend_from_slice(&plain);
+            }
+            TLS_ALERT => {
+                return Err(crypto_err(format!(
+                    "TLS alert during handshake: {body:02x?}"
+                )));
+            }
+            other => {
+                return Err(crypto_err(format!(
+                    "record type {other} during the handshake"
+                )));
+            }
+        }
+        loop {
+            if hs_buf.len() < 4 {
+                break;
+            }
+            let mtype = hs_buf[0];
+            let mlen = u32::from_be_bytes([0, hs_buf[1], hs_buf[2], hs_buf[3]]) as usize;
+            if hs_buf.len() < 4 + mlen {
+                break;
+            }
+            let msg = hs_buf[..4 + mlen].to_vec();
+            hs_buf.drain(..4 + mlen);
+            match mtype {
+                HS_ENCRYPTED_EXTENSIONS => {
+                    let parsed = parse_encrypted_extensions(&msg, cfg.alpn)?;
+                    alpn = parsed.alpn;
+                    transcript.extend_from_slice(&msg);
+                }
+                HS_CERTIFICATE => {
+                    chain = parse_certificate_chain(&msg)?;
+                    transcript.extend_from_slice(&msg);
+                }
+                HS_CERTIFICATE_VERIFY => {
+                    if msg.len() < 8 {
+                        return Err(crypto_err("short CertificateVerify"));
+                    }
+                    let scheme = u16::from_be_bytes([msg[4], msg[5]]);
+                    let sig_len = u16::from_be_bytes([msg[6], msg[7]]) as usize;
+                    if msg.len() < 8 + sig_len {
+                        return Err(crypto_err("truncated CertificateVerify signature"));
+                    }
+                    let sig = &msg[8..8 + sig_len];
+                    // The signature covers the transcript *up to this message*, so the
+                    // verification below must use the hash taken before adding it.
+                    let transcript_hash = suite.hash(&transcript);
+                    if !cfg.insecure {
+                        let leaf = chain
+                            .first()
+                            .ok_or_else(|| crypto_err("CertificateVerify before Certificate"))?;
+                        verify::verify_certificate_verify(leaf, scheme, &transcript_hash, sig)?;
+                    }
+                    transcript.extend_from_slice(&msg);
+                }
+                HS_FINISHED => {
+                    let transcript_hash = suite.hash(&transcript);
+                    let finished_key =
+                        suite.hkdf_expand_label(&s_hs_secret, "finished", &[], suite.hash_len())?;
+                    let expect = suite.hmac(&finished_key, &transcript_hash);
+                    if msg.len() < 4 + expect.len() || msg[4..] != expect[..] {
+                        return Err(crypto_err("the server's Finished message does not verify"));
+                    }
+                    transcript.extend_from_slice(&msg);
+                    got_finished = true;
+                }
+                _ => {
+                    return Err(crypto_err(format!(
+                        "unexpected handshake message type {mtype} in the server flight"
+                    )));
+                }
+            }
+        }
+    }
+
+    // ---- 5. Chain validation, once the whole flight is in hand.
+    if !cfg.insecure {
+        let now = {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| crypto_err("the system clock is before the Unix epoch"))?
+                .as_secs();
+            rustls_pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(secs))
+        };
+        verify::verify_server_chain(cfg.trust, &chain, cfg.server_name, now)?;
+    }
+
+    // ---- 6. Application traffic secrets and the client's Finished.
+    let derived2 = suite.derive_secret(&handshake_secret, "derived", &empty_hash)?;
+    let master_secret = suite.hkdf_extract(&derived2, &vec![0u8; suite.hash_len()]);
+    let ap_hash = suite.hash(&transcript);
+    let c_ap = suite.derive_secret(&master_secret, "c ap traffic", &ap_hash)?;
+    let s_ap = suite.derive_secret(&master_secret, "s ap traffic", &ap_hash)?;
+
+    let fin_key = suite.hkdf_expand_label(&c_hs_secret, "finished", &[], suite.hash_len())?;
+    let fin_hash = suite.hash(&transcript);
+    let verify_data = suite.hmac(&fin_key, &fin_hash);
+    let mut fin_msg = Vec::with_capacity(4 + verify_data.len());
+    fin_msg.push(HS_FINISHED);
+    fin_msg.extend_from_slice(&(verify_data.len() as u32).to_be_bytes()[1..]);
+    fin_msg.extend_from_slice(&verify_data);
+    let fin_record = client_hs.encrypt_record(TLS_HANDSHAKE, &fin_msg)?;
+    stream
+        .write_all(&fin_record)
+        .await
+        .map_err(flux_types::FluxError::Io)?;
+    stream.flush().await.map_err(flux_types::FluxError::Io)?;
+
+    let _ = alpn;
+    Ok(Tls13Stream {
+        inner: stream,
+        suite,
+        read_state: TrafficState::new(suite, s_ap)?,
+        write_state: TrafficState::new(suite, c_ap)?,
+        read_pos: 0,
+        read_len: 0,
+        hdr_buf: [0u8; 5],
+        hdr_len: 0,
+        body_buf: Vec::new(),
+        body_len: 0,
+        tx_buf: Vec::new(),
+        pending_write: Vec::new(),
+        pending_write_pos: 0,
+        pending_unacked: 0,
+        closed: false,
+    })
+}
+
+/// Extracts every certificate from a TLS 1.3 Certificate message, leaf first.
+fn parse_certificate_chain(
+    msg: &[u8],
+) -> FluxResult<Vec<rustls_pki_types::CertificateDer<'static>>> {
+    use rustls_pki_types::CertificateDer;
+    if msg.len() < 9 {
+        return Err(crypto_err("short Certificate message"));
+    }
+    let ctx_len = msg[4] as usize;
+    let mut pos = 5 + ctx_len;
+    if pos + 3 > msg.len() {
+        return Err(crypto_err("short Certificate list"));
+    }
+    let list_len = u32::from_be_bytes([0, msg[pos], msg[pos + 1], msg[pos + 2]]) as usize;
+    pos += 3;
+    if pos + list_len > msg.len() {
+        return Err(crypto_err("truncated Certificate list"));
+    }
+    let end = pos + list_len;
+    let mut out = Vec::new();
+    while pos + 3 <= end {
+        let cert_len = u32::from_be_bytes([0, msg[pos], msg[pos + 1], msg[pos + 2]]) as usize;
+        pos += 3;
+        if pos + cert_len > end {
+            return Err(crypto_err("certificate entry overruns the list"));
+        }
+        out.push(CertificateDer::from(msg[pos..pos + cert_len].to_vec()));
+        pos += cert_len;
+        if pos + 2 > end {
+            break;
+        }
+        let ext_len = u16::from_be_bytes([msg[pos], msg[pos + 1]]) as usize;
+        pos += 2 + ext_len;
+    }
+    if out.is_empty() {
+        return Err(crypto_err("the server sent an empty certificate list"));
+    }
+    Ok(out)
+}
+
+async fn read_record_header<S: AsyncRead + Unpin>(stream: &mut S) -> FluxResult<[u8; 5]> {
+    use tokio::io::AsyncReadExt;
+    let mut hdr = [0u8; 5];
+    stream
+        .read_exact(&mut hdr)
+        .await
+        .map_err(flux_types::FluxError::Io)?;
+    Ok(hdr)
+}
+
+async fn read_record_body<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    hdr: &[u8; 5],
+) -> FluxResult<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+    if len > MAX_TLS_RECORD + 256 {
+        return Err(crypto_err("TLS record exceeds the maximum size"));
+    }
+    let mut body = vec![0u8; len];
+    stream
+        .read_exact(&mut body)
+        .await
+        .map_err(flux_types::FluxError::Io)?;
+    Ok(body)
+}
+
+async fn read_record_typed<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    expect: u8,
+) -> FluxResult<Vec<u8>> {
+    loop {
+        let hdr = read_record_header(stream).await?;
+        if hdr[0] == expect {
+            return read_record_body(stream, &hdr).await;
+        }
+        if hdr[0] == TLS_CCS {
+            let _ = read_record_body(stream, &hdr).await?;
+            continue;
+        }
+        if hdr[0] == TLS_ALERT {
+            let body = read_record_body(stream, &hdr).await?;
+            let level = body.first().copied().unwrap_or(0);
+            let desc = body.get(1).copied().unwrap_or(0);
+            return Err(crypto_err(format!(
+                "the server sent a TLS alert before {expect} (level {level}, description {desc})"
+            )));
+        }
+        return Err(crypto_err(format!(
+            "expected record type {expect}, got {}",
+            hdr[0]
+        )));
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+    use crate::tls::TlsTransport;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A CA and a leaf it signed for `localhost`, as a rustls server acceptor plus the PEM the
+    /// client will trust.
+    fn server_and_ca() -> (tokio_rustls::TlsAcceptor, String) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).expect("leaf");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf");
+        let acceptor = TlsTransport::create_server_acceptor(
+            vec![rustls_pki_types::CertificateDer::from(leaf.der().to_vec())],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            vec![],
+        )
+        .expect("acceptor");
+        (acceptor, ca.pem())
+    }
+
+    /// The whole point of B3: our handshake, no rustls, against a real TLS 1.3 server.
+    #[tokio::test]
+    async fn our_client_handshakes_with_a_real_tls_server() {
+        crate::tls::init_crypto_provider();
+        let (acceptor, ca_pem) = server_and_ca();
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut srv = acceptor.accept(server_raw).await.expect("server handshake");
+            let mut buf = [0u8; 5];
+            srv.read_exact(&mut buf).await.expect("server read");
+            assert_eq!(&buf, b"ping!");
+            srv.write_all(b"pong!").await.expect("server write");
+            srv.shutdown().await.expect("shutdown");
+        });
+
+        let mut trust = verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("trust the CA");
+        let cfg = ClientHelloConfig {
+            server_name: "localhost",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut client = connect(client_raw, &cfg).await.expect("our handshake");
+        client.write_all(b"ping!").await.expect("write");
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"pong!");
+        server.await.expect("server task");
+    }
+
+    /// Without the CA the same handshake must be refused — the check is real, not decorative.
+    #[tokio::test]
+    async fn an_untrusted_server_is_refused() {
+        crate::tls::init_crypto_provider();
+        let (acceptor, _ca_pem) = server_and_ca();
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = acceptor.accept(server_raw).await;
+        });
+        let trust = verify::TrustStore::empty();
+        let cfg = ClientHelloConfig {
+            server_name: "localhost",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let err = match connect(client_raw, &cfg).await {
+            Ok(_) => panic!("an unknown CA must not be trusted"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("trust anchors"), "{err}");
+    }
+
+    /// The name in the certificate is checked against SNI, not taken on trust.
+    #[tokio::test]
+    async fn a_certificate_for_another_name_is_refused() {
+        crate::tls::init_crypto_provider();
+        let (acceptor, ca_pem) = server_and_ca();
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = acceptor.accept(server_raw).await;
+        });
+        let mut trust = verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = ClientHelloConfig {
+            server_name: "not-localhost.test",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let err = match connect(client_raw, &cfg).await {
+            Ok(_) => panic!("the name must be checked"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("not valid for"), "{err}");
+    }
 }
