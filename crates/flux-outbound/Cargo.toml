@@ -30,3 +30,6 @@ tokio-util = { workspace = true }
 smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "auto-icmp-echo-reply"] }
 futures-channel = "0.3"
 libc = { workspace = true }
+
+[lints]
+workspace = true

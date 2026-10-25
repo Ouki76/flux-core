@@ -96,6 +96,7 @@ async fn test_sighup_hot_reload_swaps_listeners() {
     // Rewrite config to a different port and send SIGHUP.
     write_config(&cfg_path, port_b, "in-b");
     let pid = child.0.id() as i32;
+    // SAFETY: `kill` takes a pid and a signal number; the pid is a live child this test spawned.
     let ret = unsafe { libc::kill(pid, libc::SIGHUP) };
     assert_eq!(ret, 0, "failed to send SIGHUP");
 
@@ -118,6 +119,7 @@ async fn test_sighup_hot_reload_swaps_listeners() {
 
     // Second reload back to A must also work (no state leakage).
     write_config(&cfg_path, port_a, "in-a2");
+    // SAFETY: `kill` takes a pid and a signal number; the pid is a live child this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
     assert!(
         wait_port_open(port_a, Duration::from_secs(5)).await,
@@ -153,6 +155,7 @@ async fn test_sighup_invalid_config_keeps_old_instance() {
     // Corrupt the config and reload: process must survive, listener stays.
     std::fs::write(&cfg_path, b"{ this is not valid json ").unwrap();
     let pid = child.0.id() as i32;
+    // SAFETY: `kill` takes a pid and a signal number; the pid is a live child this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
     // Give the reload path a generous window (it re-reads and validates the whole
     // config) before asserting survival, so a loaded machine cannot make this
@@ -236,6 +239,7 @@ async fn test_sighup_reload_with_dns_inbound() {
     // up and answers SOCKS5 after the reload.
     write("dns-in-b");
     let pid = child.0.id() as i32;
+    // SAFETY: `kill` takes a pid and a signal number; the pid is a live child this test spawned.
     let ret = unsafe { libc::kill(pid, libc::SIGHUP) };
     assert_eq!(ret, 0, "failed to send SIGHUP");
 
@@ -333,6 +337,7 @@ async fn test_sighup_burst_keeps_the_last_configuration() {
     // First reload, brought to completion so the burst starts from a known state.
     write_cfg(port_b, "in-b");
     let pid = child.0.id() as i32;
+    // SAFETY: `kill` takes a pid and a signal number; the pid is a live child this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
     assert!(
         wait_port_open(port_b, Duration::from_secs(5)).await,
@@ -342,7 +347,9 @@ async fn test_sighup_burst_keeps_the_last_configuration() {
     // Write C, then send two SIGHUPs back to back: the second arrives either
     // during the reload or immediately after it.
     write_cfg(port_c, "in-c");
+    // SAFETY: `kill` takes a pid and a signal number; the pid is a live child this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    // SAFETY: `kill` takes a pid and a signal number; the pid is a live child this test spawned.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
 
     assert!(

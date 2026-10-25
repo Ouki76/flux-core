@@ -26,3 +26,6 @@ dashmap = { workspace = true }
 # Local DoT/DoQ servers for the transport tests: a throwaway CA + server cert,
 # so certificate verification and the happy path are both exercisable offline.
 rcgen = { workspace = true }
+
+[lints]
+workspace = true

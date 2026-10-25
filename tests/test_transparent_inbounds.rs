@@ -81,6 +81,7 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(180);
 // ---------------------------------------------------------------------------
 
 fn is_root() -> bool {
+    // SAFETY: `geteuid` takes no arguments and touches no memory.
     unsafe { libc::geteuid() == 0 }
 }
 

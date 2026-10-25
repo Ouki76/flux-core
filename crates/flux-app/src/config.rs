@@ -2564,6 +2564,8 @@ route:
 
     #[test]
     fn test_expand_env_vars() {
+        // SAFETY: a single-threaded test that is the only accessor of these names for the
+        // duration; edition 2024 marks `set_var` unsafe for that reason.
         unsafe {
             std::env::set_var("TEST_PORT_FLUX", "10809");
             std::env::set_var("TEST_HOST_FLUX", "example.com");

@@ -94,6 +94,8 @@ route:
 
 #[test]
 fn test_config_env_var_substitution() {
+    // SAFETY: a single-threaded test that is the only accessor of these names while it runs;
+    // edition 2024 marks `set_var` unsafe for exactly that reason.
     unsafe {
         std::env::set_var("FLUX_TEST_INBOUND_PORT", "19999");
         std::env::set_var("FLUX_TEST_SECRET", "supersecret123");

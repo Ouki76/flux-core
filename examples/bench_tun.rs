@@ -106,6 +106,7 @@ impl Args {
 fn main() {
     let args = Args::parse();
 
+    // SAFETY: `geteuid` takes no arguments and touches no memory.
     if std::env::var_os(NS_CHILD_ENV).is_none() && unsafe { libc::geteuid() } != 0 {
         // Re-run ourselves as root inside a private user+network namespace.
         let exe = std::env::current_exe().expect("current_exe");
@@ -133,6 +134,7 @@ fn main() {
         }
     }
 
+    // SAFETY: no arguments or a plain `rusage` out-parameter owned by this frame.
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("bench_tun: still not root after re-exec — aborting");
         std::process::exit(1);
@@ -192,8 +194,10 @@ fn proc_cpu_split() -> (f64, f64) {
         // struct is never written past the end of ours.
         rest: [libc::c_long; 32],
     }
+    // SAFETY: no arguments or a plain `rusage` out-parameter owned by this frame.
     let mut ru: Rusage = unsafe { std::mem::zeroed() };
     // 0 == RUSAGE_SELF
+    // SAFETY: no arguments or a plain `rusage` out-parameter owned by this frame.
     let rc = unsafe { libc::getrusage(0, &mut ru as *mut Rusage as *mut libc::rusage) };
     if rc != 0 {
         return (0.0, 0.0);

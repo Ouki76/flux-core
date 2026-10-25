@@ -17,3 +17,6 @@ dashmap = { workspace = true }
 blake2 = "0.10"
 rand = { workspace = true }
 subtle = "2.6"
+
+[lints]
+workspace = true

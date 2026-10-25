@@ -12,16 +12,24 @@ static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
 
+// SAFETY: every method forwards to `System` with the same arguments it was given, so the
+// allocator contract — non-null distinct regions for live allocations, matching layouts on
+// dealloc and realloc — is exactly the system allocator's own.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract; this forwards it.
         unsafe { System.alloc(layout) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the pointer and layout are the ones a previous `alloc` or `realloc`
+        // returned, as the caller guarantees.
         unsafe { System.dealloc(ptr, layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCS.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the pointer is a live allocation made with `layout`, which the caller
+        // guarantees; `new_size` is the requested size.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }

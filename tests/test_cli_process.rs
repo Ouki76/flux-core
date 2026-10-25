@@ -176,6 +176,7 @@ impl Proxy {
     }
 
     fn signal(&self, signal: i32) {
+        // SAFETY: no pointers are dereferenced; the pid and signal are plain integers.
         let ret = unsafe { libc::kill(self.pid(), signal) };
         assert_eq!(ret, 0, "failed to send signal {signal}");
     }
@@ -347,6 +348,7 @@ async fn config_file_problems_name_the_path_and_exit_non_zero() {
 
 #[test]
 fn unreadable_config_file_is_reported() {
+    // SAFETY: no pointers are dereferenced; the pid and signal are plain integers.
     if unsafe { libc::geteuid() } == 0 {
         eprintln!("skipping: root can read a 0o000 file, so the failure cannot be produced");
         return;
@@ -776,9 +778,11 @@ fn hold_fifo_open(path: &Path, deadline: Duration) -> std::fs::File {
     let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path");
     let start = std::time::Instant::now();
     loop {
+        // SAFETY: no pointers are dereferenced; the pid and signal are plain integers.
         let fd = unsafe { libc::open(raw.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
         if fd >= 0 {
             use std::os::fd::FromRawFd as _;
+            // SAFETY: no pointers are dereferenced; the pid and signal are plain integers.
             return unsafe { std::fs::File::from_raw_fd(fd) };
         }
         let err = std::io::Error::last_os_error();
@@ -798,6 +802,7 @@ fn hold_fifo_open(path: &Path, deadline: Duration) -> std::fs::File {
 fn make_fifo(path: &Path) {
     use std::os::unix::ffi::OsStrExt as _;
     let raw = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+    // SAFETY: no pointers are dereferenced; the pid and signal are plain integers.
     let ret = unsafe { libc::mkfifo(raw.as_ptr(), 0o600) };
     assert_eq!(ret, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
 }

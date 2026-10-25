@@ -172,3 +172,9 @@ targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
 best_effort_targets = ["aarch64-unknown-linux-gnu"]
 checksums = "SHA256SUMS"
 signed = false
+
+# Every `unsafe` block must state the invariant it depends on. The workspace was verified
+# clean in cycle 145; this section is what keeps it that way, because a lint that is only
+# ever run by hand is a lint that stops being run.
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"

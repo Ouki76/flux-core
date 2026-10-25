@@ -73,6 +73,8 @@ const EXIT_FORCED_SHUTDOWN: i32 = 1;
 
 fn main() -> std::process::ExitCode {
     #[cfg(target_os = "linux")]
+    // SAFETY: `mallopt` only adjusts an allocator tunable; it holds no pointers and is
+    // called once before any thread exists.
     unsafe {
         // Restrict glibc heap arenas to eliminate multi-megabyte arena fragmentation
         libc::mallopt(libc::M_ARENA_MAX, 2);

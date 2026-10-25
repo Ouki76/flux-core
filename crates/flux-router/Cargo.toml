@@ -12,3 +12,6 @@ serde = { workspace = true }
 tracing = { workspace = true }
 maxminddb = { workspace = true }
 parking_lot = { workspace = true }
+
+[lints]
+workspace = true
