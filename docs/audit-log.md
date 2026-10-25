@@ -4323,3 +4323,46 @@ gRPC is the only row whose deficit survives every run, and its profile explains 
 plus one framing copy that h2's `send_data` API makes unavoidable. Everything else on that list
 is this host, not this code, and the honest statement of the objective is that **the matrix is
 at parity or better everywhere the machine can resolve, with one structural exception**.
+
+---
+
+## Cycle 89 — 2026-10-25
+
+### The last structural gap was a missing setting, not a copy
+
+For three cycles this log described gRPC as "TLS plus one framing copy that h2's API makes
+unavoidable". That was wrong, and the tell was in the numbers: our gRPC lost **66 %** against
+our own TLS row (311 → 106 MB/s) while xray's lost **12 %**. A structural copy cannot cost two
+thirds of a path; a flow-control limit can.
+
+`h2::server::Builder` has had `initial_window_size(1 MiB)` and
+`initial_connection_window_size(2 MiB)` from the beginning. **`h2::client::Builder` had
+neither**, so our client advertised h2's default of 65 535 bytes — and the client is the
+*receiver* of a download, so its window was what capped the server's send rate. The tunnel was
+moving 64 KiB per round trip by design and blaming a memcpy.
+
+| row | before | after | delta |
+|---|---|---|---|
+| VLESS / gRPC (no TLS) | 168.5 | **344.8** | **+105 %** |
+| VLESS / gRPC + TLS | 106.4 | **182.1** | **+71 %** |
+| VLESS / XHTTP | 185.2 | **333.6** | **+80 %** |
+
+Against the competitors both rows flip outright:
+
+| row | before | after |
+|---|---|---|
+| gRPC + TLS vs xray | −44.4 % | **+2.0 %** |
+| gRPC + TLS vs sing-box | −7.6 % | **+53.7 %** |
+| gRPC (no TLS) vs xray | −7.9 % | **+84.6 %** |
+| XHTTP vs xray | +39.5 % | **+103 %** |
+
+### Where that leaves the matrix
+
+**xray is now beaten on every path it can run — all ten.** Against sing-box: six ahead, three
+inside 2 %, four behind (REALITY −4.8 %, Trojan −5.6 %, SS-AEAD −5.1 %, SS-2022 −20.8 %).
+
+The lesson is worth more than the numbers: a profile showing "the copies dominate" told me
+which function burned instructions, and I read it as "this is the floor". What broke the
+assumption was a *ratio* — our row degrading 66 % against our own TLS when the competitor's
+degraded 12 %. Comparing two implementations' profiles against each other, rather than one
+profile against my expectations, is what found it.
