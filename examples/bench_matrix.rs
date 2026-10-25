@@ -109,6 +109,8 @@ struct Args {
     with_singbox: bool,
     with_xray: bool,
     flux_bin: PathBuf,
+    /// Route TLS through this project's own TLS 1.3 client instead of rustls.
+    native_tls: bool,
     singbox_bin: Option<PathBuf>,
     /// When set, exit non-zero if any row is behind a competitor by more than this fraction.
     ///
@@ -129,6 +131,7 @@ impl Args {
             with_singbox: true,
             with_xray: true,
             flux_bin: PathBuf::from("./target/release/flux-core"),
+            native_tls: false,
             singbox_bin: find_in_path("sing-box"),
             assert_tolerance: None,
         };
@@ -151,6 +154,7 @@ impl Args {
                 }
                 "--no-singbox" => args.with_singbox = false,
                 "--no-xray" => args.with_xray = false,
+                "--native-tls" => args.native_tls = true,
                 "--assert" => {
                     args.assert_tolerance = Some(match argv.get(i + 1) {
                         Some(v) if !v.starts_with("--") => {
@@ -182,6 +186,9 @@ impl Args {
          [--assert [TOLERANCE]]  exit 1 if any row is behind by more than TOLERANCE (default 0.10)"
     }
 }
+
+/// Set once from the command line; the scenario builders are free functions.
+static NATIVE_TLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
@@ -689,11 +696,14 @@ fn flux_tls_client_h3() -> String {
     format!(r#""security":{{"type":"tls","insecure":true,"sni":"{TLS_SNI}","alpn":["h3"]}}"#)
 }
 
-fn flux_tls_client(alpn_h2: bool) -> String {
+fn flux_tls_client(alpn_h2: bool, native: bool) -> String {
+    let native = if native { r#","native_tls":true"# } else { "" };
     if alpn_h2 {
-        format!(r#""security":{{"type":"tls","insecure":true,"sni":"{TLS_SNI}","alpn":["h2"]}}"#)
+        format!(
+            r#""security":{{"type":"tls","insecure":true,"sni":"{TLS_SNI}","alpn":["h2"]{native}}}"#
+        )
     } else {
-        format!(r#""security":{{"type":"tls","insecure":true,"sni":"{TLS_SNI}"}}"#)
+        format!(r#""security":{{"type":"tls","insecure":true,"sni":"{TLS_SNI}"{native}}}"#)
     }
 }
 
@@ -910,23 +920,37 @@ impl Scenario {
             Kind::Hysteria2 => format!(
                 r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"socks-in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"udp","address":"127.0.0.1:{port}"}},{tls},"protocol":{{"type":"hysteria2","password":"{pass}"}}}}],"route":{{"final":"node"}}}}"#,
                 level = log_level(),
-                tls = flux_tls_client(false),
+                tls = flux_tls_client(false, NATIVE_TLS.load(std::sync::atomic::Ordering::Relaxed)),
                 pass = HY2_PASSWORD
             ),
             Kind::VlessGrpcPlain => {
                 flux_out(socks, port, &[flux_grpc_client()], &flux_vless(false))
             }
-            Kind::VlessTls => flux_out(socks, port, &[flux_tls_client(false)], &flux_vless(false)),
+            Kind::VlessTls => flux_out(
+                socks,
+                port,
+                &[flux_tls_client(
+                    false,
+                    NATIVE_TLS.load(std::sync::atomic::Ordering::Relaxed),
+                )],
+                &flux_vless(false),
+            ),
             Kind::VlessWsTls => flux_out(
                 socks,
                 port,
-                &[flux_tls_client(false), flux_ws_client()],
+                &[
+                    flux_tls_client(false, NATIVE_TLS.load(std::sync::atomic::Ordering::Relaxed)),
+                    flux_ws_client(),
+                ],
                 &flux_vless(false),
             ),
             Kind::VlessGrpcTls => flux_out(
                 socks,
                 port,
-                &[flux_tls_client(true), flux_grpc_client()],
+                &[
+                    flux_tls_client(true, NATIVE_TLS.load(std::sync::atomic::Ordering::Relaxed)),
+                    flux_grpc_client(),
+                ],
                 &flux_vless(false),
             ),
             Kind::VlessReality => {
@@ -938,13 +962,19 @@ impl Scenario {
             Kind::VmessWsTls => flux_out(
                 socks,
                 port,
-                &[flux_tls_client(false), flux_ws_client()],
+                &[
+                    flux_tls_client(false, NATIVE_TLS.load(std::sync::atomic::Ordering::Relaxed)),
+                    flux_ws_client(),
+                ],
                 &format!(r#""protocol":{{"type":"vmess","uuid":"{UUID}"}}"#),
             ),
             Kind::TrojanTls => flux_out(
                 socks,
                 port,
-                &[flux_tls_client(false)],
+                &[flux_tls_client(
+                    false,
+                    NATIVE_TLS.load(std::sync::atomic::Ordering::Relaxed),
+                )],
                 &format!(r#""protocol":{{"type":"trojan","password":"{TROJAN_PASSWORD}"}}"#),
             ),
             Kind::Ss2022 => flux_out(
@@ -1937,6 +1967,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    NATIVE_TLS.store(args.native_tls, std::sync::atomic::Ordering::Relaxed);
     let mut scenarios: Vec<&Scenario> = SCENARIOS
         .iter()
         .filter(|s| match &args.only {

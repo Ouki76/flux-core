@@ -128,6 +128,12 @@ fn flux_server_tls(port: u16, cert: &str, key: &str) -> String {
     )
 }
 
+fn flux_client_tls_native(socks: u16, port: u16) -> String {
+    format!(
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"tcp","address":"127.0.0.1:{port}"}},"security":{{"type":"tls","sni":"localhost","insecure":true,"native_tls":true}},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"route":{{"final":"node"}}}}"#
+    )
+}
+
 fn flux_client_tls(socks: u16, port: u16) -> String {
     format!(
         r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"tcp","address":"127.0.0.1:{port}"}},"security":{{"type":"tls","sni":"localhost","insecure":true}},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"route":{{"final":"node"}}}}"#
@@ -296,6 +302,8 @@ fn main() -> Result<()> {
     // Exits non-zero when flux is behind a competitor by more than this fraction — the same
     // gate `bench_matrix --assert` provides for throughput, for the connection-rate axis.
     let mut assert_tolerance: Option<f64> = None;
+    // Compare our own TLS 1.3 client against rustls on the identical workload.
+    let mut native_tls = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--exchanges" => exchanges = args.next().unwrap_or_default().parse()?,
@@ -303,6 +311,7 @@ fn main() -> Result<()> {
             "--idle" => idle = args.next().unwrap_or_default().parse()?,
             "--framing" => framing = args.next().unwrap_or_else(|| "none".into()),
             "--tls" => use_tls = true,
+            "--native-tls" => native_tls = true,
             "--assert" => {
                 assert_tolerance = Some(match args.next() {
                     Some(v) if !v.starts_with("--") => v.parse()?,
@@ -372,7 +381,11 @@ fn main() -> Result<()> {
         let (srv, cli) = match stack {
             Stack::Flux if use_tls => (
                 flux_server_tls(sport, &cert, &key),
-                flux_client_tls(socks, sport),
+                if native_tls {
+                    flux_client_tls_native(socks, sport)
+                } else {
+                    flux_client_tls(socks, sport)
+                },
             ),
             Stack::Flux => (
                 flux_server_framed(sport, &framing),
