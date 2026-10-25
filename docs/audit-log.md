@@ -5203,3 +5203,32 @@ which turned out to have real fixes behind them and the third a wrong-file inves
 
 The difference now is that the question is answered in one run instead of six: dump the rounds,
 compare medians and ranges, and only then believe the summary line.
+
+---
+
+## Cycle 110 — 2026-10-25
+
+### The handoff document was lying, and that is a defect
+
+`docs/HANDOFF.md` is the first thing the next person (or agent) reads. Its "what is genuinely
+open" list still said gRPC was behind both competitors, Shadowsocks-2022 behind sing-box, the
+mKCP server side unimplemented, and XHTTP not implemented. Every one of those has been false
+for twenty cycles. Its "open work, in priority order" began with "Shadowsocks is the largest
+measured gap (−48 %)" — a row that now runs **+5.3 % ahead** of the same competitor.
+
+A stale document is not a lesser defect than stale code. It costs exactly what it cost this
+audit five times over: an agent reading it would have spent cycles re-fixing what was fixed,
+and — worse — would have trusted its numbers over the code's behaviour.
+
+Rewritten against evidence:
+
+- Section 0 now carries the current fifteen-row table, the soak, the other three measured
+  dimensions, and the seven files whose caps were the last real defect.
+- The open list is down to three items, all functional, each with the reason it is open.
+- Sections 4–5 are marked as the historical snapshots they are, and the "read this first"
+  path is now "run the matrix, then read the audit log from cycle 89".
+
+The lesson generalises beyond this file: **a document that says what was true is
+indistinguishable from one that says what is true until someone acts on it.** The audit keeps
+its numbers honest by re-deriving them; the handoff now points at that derivation instead of
+duplicating it.
