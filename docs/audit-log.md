@@ -6293,3 +6293,28 @@ Static gates alongside: fmt clean, clippy 0, doc 0, deny ok, 1100 tests 0 failed
 
 The one non-green row is a capability the dependency does not have. Everything else is defended
 by a command whose failure has been observed at least once.
+
+---
+
+## Cycle 137 — 2026-10-25
+
+### A fresh soak, and the leak that was not one
+
+The last soak predates the kcp work, so it was re-run over a seeded mKCP tunnel — the path whose
+code changed most.
+
+| run | requests | errors | client RSS | server RSS |
+|---|---|---|---|---|
+| 1 | 8 000 | **0** | 23 448 K | 11 184 K |
+| 2 | 8 000 | **0** | 29 992 K | 11 184 K |
+| 3 | 8 000 | **0** | 29 992 K | 10 948 K |
+
+**24 000 requests, zero errors**, zero error lines in either process's log, payload compared
+byte-for-byte on every exchange.
+
+The client's RSS rose 6.5 MB between the first and second run and then stopped — flat across the
+third, while the server's actually fell. That is allocator retention settling, not a leak: a leak
+would keep climbing with the workload, and the third run added 8 000 more connections and 0 KB.
+
+Worth recording because the first two readings look alarming and the third is what distinguishes
+the two explanations. A single measurement of "memory went up" is not evidence of anything.
