@@ -6582,3 +6582,26 @@ which is not.
 
 This is the least exciting work in the audit and it is the kind that pays off exactly once, when
 someone changes a length or an offset and a comment tells them what they just broke.
+
+### Cycle 145 wrap-up — zero undocumented unsafe, and a lint to keep it
+
+Every `unsafe` block in the workspace now states its invariant: 61 in library code, 27 in tests
+and examples.
+
+| crate | blocks |
+|---|---|
+| `flux-common` (splice fast path) | 10 |
+| `flux-inbound` (tun, wireguard, tproxy, redirect) | 29 |
+| `flux-outbound` (wireguard socket path) | 12 |
+| `flux-app`, `src/main.rs` | 2 |
+| tests and examples | 27 |
+
+`clippy::undocumented_unsafe_blocks` is now `warn` in `[workspace.lints.clippy]` with
+`[lints] workspace = true` in every crate, so a new block without a comment fails
+`clippy -D warnings`. **A lint that is only ever run by hand is a lint that stops being run** —
+which is exactly how 61 blocks reached 9 comments in the first place.
+
+One process note: the commit message for this change lost two config snippets to shell command
+substitution and went out describing the wiring inaccurately. Repaired with an explicit
+follow-up commit rather than left standing, because a message that misdescribes a change is a
+small lie with a long life.
