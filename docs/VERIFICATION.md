@@ -19,33 +19,31 @@ Exits **0** with `ASSERT PASSED` when every row is at or above both competitors 
 tolerance, **1** with a list of the rows that are not. The tolerance defaults to 10%, which is
 this host's own run-to-run spread; a row inside it is at parity.
 
-Last full run (four rounds, 200 MiB): **ASSERT PASSED** — fourteen of fifteen rows ahead of
-sing-box, ten of ten ahead of xray. The table itself is in `docs/audit-log.md`.
-
-The rows that look close in a four-round run need eight: on a shared host, one slow round and
-one fast competitor round can decide a best-of-four. Re-run with `--rounds 8`:
-
-| row | flux | sing-box | xray |
-|---|---|---|---|
-| Shadowsocks-2022 | 358.4 (+5.6%) | 339.4 | 254.1 (+41.0%) |
-| VLESS / REALITY | 360.2 (+11.5%) | 323.0 | 242.6 (+48.5%) |
-| VLESS / REALITY + Vision | 347.2 (+9.0%) | 318.4 | 228.6 (+51.9%) |
-| VMess / WS + TLS | 229.4 (+17.0%) | 196.0 | 160.3 (+43.1%) |
-
-With that sampling, **fifteen of fifteen rows are ahead of sing-box** and ten of ten ahead of
-xray.
-
-Some individual rows (this host, best of four):
+Last full run — **eight rounds, 200 MiB, `ASSERT PASSED`**:
 
 | protocol | flux | sing-box | xray |
 |---|---|---|---|
-| VLESS / TCP | 735 | 566 | 575 |
-| VLESS / XHTTP | 466 | — | 108 |
-| VLESS / gRPC + TLS | 225 | 101 | 161 |
-| VLESS / WS + TLS | 329 | 263 | 102 |
-| VLESS / REALITY + Vision | 334 | 297 | 229 |
-| Hysteria2 | 103 | 45 | — |
-| Shadowsocks-2022 | 336 | 350 | 265 |
+| VLESS / TCP | **905.1** | 564.9 | 587.2 |
+| VLESS / XHTTP | **469.8** | — | 133.2 |
+| VLESS / gRPC (no TLS) | **482.8** | — | 168.7 |
+| VLESS / gRPC + TLS | **221.5** | 100.8 | 173.4 |
+| VLESS / WS + TLS | **334.2** | 280.8 | 100.7 |
+| VLESS / REALITY | **343.1** | 316.9 | 228.8 |
+| VLESS / REALITY + Vision | **351.2** | 327.0 | 222.3 |
+| VLESS / TLS | **313.2** | 306.6 | 230.1 |
+| VMess / WS + TLS | **220.9** | 198.3 | 158.8 |
+| Trojan / TLS | **358.2** | 312.7 | — |
+| Shadowsocks-2022 | **367.0** | 343.6 | 281.1 |
+| Shadowsocks-AEAD | **286.5** | 274.0 | — |
+| Hysteria2 | **100.8** | 45.6 | — |
+| TUIC v5 | **97.7** | 49.2 | — |
+| WireGuard | **65.7** | 40.5 | — |
+
+**Fifteen of fifteen ahead of sing-box, ten of ten ahead of xray.**
+
+Four rounds is enough for most rows but not for the close ones: the same row can read −8.6% in a
+four-round run and +6.8% in an eight-round run, because a single slow round decides a best-of-four
+on a shared host. Use `--rounds 8` when a row matters.
 
 ## 2. Speed — connection rate
 
