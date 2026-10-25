@@ -31,12 +31,14 @@ pub mod quic;
 pub mod quic_obfs;
 /// REALITY: TLS that cannot be attributed to this server.
 pub mod reality;
+
 /// ShadowTLS: a TLS handshake forwarded to a real site, then hijacked.
 pub mod shadowtls;
 /// The TCP carrier.
 pub mod tcp;
 /// TLS with configurable fingerprints and an optional private CA.
 pub mod tls;
+mod tls13;
 /// WebSocket framing.
 pub mod websocket;
 /// XHTTP (`splithttp`), stream-one mode.
