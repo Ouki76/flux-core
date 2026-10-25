@@ -4442,3 +4442,33 @@ once.
 
 That is where the next cycle starts, and it is a much better question than "why is the cipher
 slow" — which the CPU column had already ruled out.
+
+### SS-2022, cycle 91: three hypotheses, all falsified by measurement
+
+| hypothesis | test | result |
+|---|---|---|
+| one of the halves is slow | cross-pair the implementations | our client → their server 428-484; their client → our server 369-445 — no slow half |
+| per-round-trip latency | 2 000 echo exchanges of 1 KiB | ours **0.183 ms**, theirs 0.195 ms — we are faster |
+| the copier starves on 16 KiB reads | read the SS reader | it already loops to fill the caller's buffer |
+
+So every isolated measurement favours this implementation:
+
+| measurement | flux | sing-box |
+|---|---|---|
+| one-way download, 50 MiB (median of 3) | **482** | 422 |
+| one-way upload, 50 MiB (median of 3) | **555** | 542 |
+| round-trip latency, 1 KiB | **0.183 ms** | 0.195 ms |
+| **simultaneous echo, 200 MiB (the matrix)** | 314 | **352** |
+
+The deficit exists **only** in the last row, and only there is the traffic symmetric and
+sustained. Three explanations have now been tested and failed, which is worth more than a
+fourth guess: the cipher (ruled out by CPU), the chunking (ruled out by reading the reader),
+and the halves (ruled out by cross-pairing).
+
+What remains is that our relay serialises the two directions in one task — a write that only
+partly drains keeps the next read from starting — while sing-box runs a goroutine per
+direction. With 64 KiB reads that interference is invisible; SS-2022's 16 KiB chunks quadruple
+the number of alternations and make it visible.
+
+That is a real architectural difference and a real piece of work, not a tuning knob. It is
+left open, stated plainly, rather than closed with a number that would not survive review.
