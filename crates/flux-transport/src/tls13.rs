@@ -1944,6 +1944,59 @@ mod connect_tests {
         server.await.expect("server task");
     }
 
+    /// An expired certificate must be refused even when its chain is trusted.
+    ///
+    /// The validity window is checked by `rustls-webpki` against the wall clock, so this also
+    /// proves the client passes a real time rather than a constant.
+    #[tokio::test]
+    async fn an_expired_certificate_is_refused() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        crate::tls::init_crypto_provider();
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let mut leaf_params = CertificateParams::new(vec!["localhost".to_string()]).expect("leaf");
+        // A window that closed in 2020, long before this runs.
+        leaf_params.not_before = rcgen::date_time_ymd(2019, 1, 1);
+        leaf_params.not_after = rcgen::date_time_ymd(2020, 1, 1);
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf");
+
+        let acceptor = crate::tls::TlsTransport::create_server_acceptor(
+            vec![rustls_pki_types::CertificateDer::from(leaf.der().to_vec())],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            vec![],
+        )
+        .expect("acceptor");
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = acceptor.accept(server_raw).await;
+        });
+
+        let mut trust = verify::TrustStore::empty();
+        trust.add_pem(ca.pem().as_bytes()).expect("ca");
+        let cfg = ClientHelloConfig {
+            server_name: "localhost",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let err = match connect(client_raw, &cfg).await {
+            Ok(_) => panic!("an expired certificate must be refused"),
+            Err(e) => e,
+        };
+        // rustls-webpki reports this as `CertExpired`; the wrapper keeps the text.
+        let text = err.to_string().to_ascii_lowercase();
+        assert!(
+            text.contains("expired") || text.contains("chain rejected"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// The name in the certificate is checked against SNI, not taken on trust.
     #[tokio::test]
     async fn a_certificate_for_another_name_is_refused() {
