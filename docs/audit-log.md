@@ -3721,3 +3721,41 @@ gRPC, and a 64 KiB `memset` per datagram.
 
 The two rows still behind: gRPC over TLS (−7.3 %, and the only row behind xray) and Trojan
 (−9.9 %).
+
+---
+
+## Cycle 78 — 2026-10-25
+
+### Trojan: the profile says TLS and stops
+
+Same method — our client under callgrind, our Trojan+TLS server as the peer, a plain SOCKS
+driver:
+
+| function | instructions | calls | per call |
+|---|---|---|---|
+| `_aesni_ctr32_ghash_6x` (AES-GCM) | 111.2 M (53.0 %) | — | — |
+| `CoalesceReader<TlsStream>::poll_read` | 25.1 M (11.9 %) | 1 532 | 16 KB |
+| rustls `OutboundChunks::copy_to_vec` | 25.0 M | 1 533 | 16 KB |
+| rustls `take_received_plaintext` | 25.0 M | 1 532 | 16 KB |
+
+Three copies of the payload per pass — two on the read side (rustls decrypts into its own
+buffer, then hands a copy to the reader) and one on the write side (plaintext into the record
+buffer). Those are rustls' structure, not ours, and every TLS row pays them: the VLESS/TLS row
+is +1.5 % against sing-box with exactly the same copies.
+
+Repeating the Trojan row three times gives −7.1 %, −4.1 %, −5.7 % — so the −9.9 % in the
+matrix was the bad tail of a noisy row, and the typical gap is about 5 %, inside this host's
+noise band. There is no layer to fix here, and the honest entry says so rather than inventing
+one.
+
+### What five cycles of profiling have produced
+
+| found by the profiler | effect |
+|---|---|
+| 64 KiB `memset` per datagram (buffer pool) | UDP **+70 %**; now +37-55 % over sing-box |
+| quadratic copy per gRPC frame | gRPC **45× fewer instructions** |
+| h2's 16 KiB DATA frames | gRPC+TLS **+14 %**, −18 % → −7 % vs sing-box |
+| TLS copies in every row | nothing to fix: rustls' structure, shared with the competitors |
+
+The pattern worth keeping: a profile that names a *library* is as valuable as one that names
+a bug, because it tells the next cycle where to stop looking.
