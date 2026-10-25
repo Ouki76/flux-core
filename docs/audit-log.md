@@ -4406,3 +4406,39 @@ info), and a third guess is worth less than a clean measurement next time.
 
 The h2 window fix landed this cycle and moved gRPC from 106 to 182 MB/s and XHTTP from 185 to
 334, which is why the matrix ordering changed so much between two runs an hour apart.
+
+### SS-2022: the deficit is in concurrency, not in the protocol
+
+The profile refused to resolve symbols twice more (the parsing of callgrind's cumulative
+position lines gave nonsense when I tried to work around it), so the question was answered by
+direct experiment instead — measuring each direction separately and each half against the
+competitor's half.
+
+**One-way download, 50 MiB:**
+
+| pairing | rate |
+|---|---|
+| flux client → sing-box server | 427.6, 483.7 |
+| sing-box client → flux server | 444.7, 368.6 |
+| **flux pair** | **593.3, 420.0, 482.4** (median 482) |
+| **sing-box pair** | 492.2, 393.5, 421.8 (median 422) |
+
+**One-way upload, 50 MiB:**
+
+| pairing | rate |
+|---|---|
+| **flux pair** | **601.7, 525.5, 554.9** (median 555) |
+| sing-box pair | 550.6, 541.7, 410.2 (median 542) |
+
+So in *both* directions we are ahead, and neither half of the path is slow: our client against
+their server and their client against our server both run at 370-484 MiB/s.
+
+What the matrix measures is different — a 200 MiB transfer that writes and reads at the same
+time. There we are 314 against their 352. **The deficit exists only when both directions run
+concurrently**, which points at the relay's handling of simultaneous traffic rather than at
+Shadowsocks at all: SS-2022 is the only protocol in the matrix whose reads arrive in 16 KiB
+chunks, so it is the only row that stresses the copier's small-read path in both directions at
+once.
+
+That is where the next cycle starts, and it is a much better question than "why is the cipher
+slow" — which the CPU column had already ruled out.
