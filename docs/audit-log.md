@@ -5783,3 +5783,44 @@ is the difference between a test suite and a ritual.
 
 Ninety-nine cycles of claims in this file, and the useful thing about this one is that it
 removes a claim instead of adding one.
+
+---
+
+## Cycle 125 — 2026-10-25
+
+### Auditing the guards, not just the code
+
+The audit's central claim is that a 64 → 256 KiB relay buffer plus a matching cap in seven files
+produced most of the wins. That claim rests on a test, so the test was checked the same way
+every fix was: by reverting and watching.
+
+Reverting `FRAME_CAP` to 65536:
+
+```
+the WebSocket frame cap must equal the relay buffer, or a write is split into several frames
+left: 65536
+right: 262144
+```
+
+**It catches the regression**, with the failure mode named. The guard is real.
+
+### And one guard that is not
+
+The h2 stream window had no guard at all. I tried to build one that captures the client's SETTINGS
+frame on the wire — and it cannot be done this way: h2 writes its preface from the connection
+task, which stalls until the peer answers, so the capture reads zero bytes and the test proves
+nothing. Deleted rather than left as decoration.
+
+What ships instead is `the_h2_windows_track_the_relay_buffer`, which fails if `STREAM_WINDOW`
+stops tracking `RELAY_BUFFER_BYTES`. That is a weaker statement than "the client advertises it",
+and the test's own comment says which statement it is making. The application of the window to
+both builders remains backed by measurement alone (gRPC 106 → 235 MB/s), which is honest but is
+not the same thing as a guard.
+
+### The rule this produced
+
+> A test that cannot fail is worse than no test, and a test that claims more than it checks is
+> worse than both.
+
+Two of the three things I set out to pin this cycle fell in the second category — one deleted,
+one relabelled. That is a useful ratio to know.
