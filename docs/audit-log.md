@@ -3831,3 +3831,54 @@ OK: bounded memory (tail/head median delta 1.9 MB, 13%)
 5.8 million requests, not one error, memory plateaued, descriptors and threads flat. The
 scrub change does not leak the buffers it no longer zeroes, which is the property the soak
 was run to check.
+
+---
+
+## Cycle 79 — 2026-10-25
+
+### The XHTTP path rule, made testable — and the gap that found
+
+The server's only unauthenticated decision ("is this path mine?") lived inline inside
+`accept`, unexported and untested. Extracted as `xhttp::is_under_base` and given a fuzz test
+that states the rule, which immediately failed on a case the old code accepted:
+
+```
+assertion failed: !is_under_base("/tunnel", "/tunnel/%2e%2e/etc")
+```
+
+Percent-encoded traversal passed the literal `..` check. It is inert here — this proxy serves
+no filesystem behind a path — and it is refused anyway, because a rule that says "not ours"
+to anything shaped like an escape cannot become wrong when something else is later put behind
+the path.
+
+The first version of that test asserted a constant and passed. Rewriting it against the real
+matcher is what found the hole; a test that cannot fail is the thing this audit keeps
+deleting from other people's projects.
+
+### Two six/four-round matrices, read together
+
+Six rounds this time, four in cycle 77, no failures in either:
+
+| row | vs sing-box (6 rounds) | vs sing-box (4 rounds) | vs xray (6 rounds) |
+|---|---|---|---|
+| VLESS / TCP | **+5.5 %** | **+14.1 %** | **+17.4 %** |
+| VLESS / TLS | −3.3 % | **+1.5 %** | **+26.1 %** |
+| VLESS / XHTTP | — | — | **+28.4 %** |
+| VLESS / WS + TLS | −11.0 % | −4.7 % | **+136 %** |
+| VLESS / gRPC (no TLS) | — | — | −6.6 % |
+| VLESS / gRPC + TLS | −3.4 % | −7.3 % | −46.2 % |
+| VLESS / REALITY | **+2.2 %** | −0.3 % | **+32.7 %** |
+| REALITY + Vision | −10.4 % | −2.4 % | **+8.0 %** |
+| VMess / WS + TLS | −0.8 % | −2.3 % | **+10.6 %** |
+| Trojan / TLS | −6.5 % | −9.9 % | — |
+| Shadowsocks-2022 | −9.5 % | −2.8 % | **+18.7 %** |
+| Shadowsocks-AEAD | −0.7 % | **+5.5 %** | — |
+
+Read honestly: **against xray, ahead on eleven of twelve rows** and behind only on gRPC.
+Against sing-box every row lands between −11 % and +6 %, and which rows are positive moves
+between runs — WS was −4.7 % then −11.0 %, Vision −2.4 % then −10.4 %, SS-2022 −2.8 % then
+−9.5 %. Those reorderings are this host's noise, not changes in the code, and no single run
+can say otherwise.
+
+What is stable across both runs: gRPC over TLS improved from −7.3 % to −3.4 % after the
+64 KiB frame change, and REALITY is now ahead.
