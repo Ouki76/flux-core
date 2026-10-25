@@ -449,6 +449,10 @@ impl CarrierConfig {
             resend: *resend,
             no_congestion: true,
             obfs,
+            // The AES-GCM mask primitive is implemented and unit-tested in
+            // `flux_transport::kcp::seed_mask`; exposing it as a configuration option is
+            // not wired yet, so a node always uses the "original" envelope mask.
+            seed_key: None,
         }))
     }
 }

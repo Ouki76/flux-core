@@ -245,15 +245,19 @@ struct ObfsState {
     counter: u16,
     seq: u32,
     dtls_len: u16,
+    /// When set, the payload is sealed with Xray's AES-GCM mask instead of the
+    /// "original" envelope mask.
+    key: Option<[u8; 16]>,
 }
 
 impl ObfsState {
-    fn new(mode: KcpObfs) -> Self {
+    fn new(mode: KcpObfs, key: Option<[u8; 16]>) -> Self {
         Self {
             mode,
             counter: rand::random(),
             seq: rand::random(),
             dtls_len: 17,
+            key,
         }
     }
 
@@ -303,6 +307,63 @@ impl ObfsState {
             out.extend_from_slice(&header[..len]);
         }
         envelope::seal(segment, out);
+    }
+}
+
+/// Xray's `mkcp-aes128gcm` mask: AES-128-GCM keyed from SHA-256(seed)[..16].
+///
+/// See the module documentation for the upstream source. The wire form is
+/// `nonce (12) ‖ ciphertext ‖ tag (16)`, which is what
+/// `finalmask/mkcp/aes128gcm/conn.go` reads and writes.
+pub mod seed_mask {
+    use ring::aead;
+
+    /// Nonce length, fixed by AES-GCM.
+    pub const NONCE_LEN: usize = 12;
+    /// Authentication tag length.
+    pub const TAG_LEN: usize = 16;
+    /// Bytes this mask adds to a payload.
+    pub const OVERHEAD: usize = NONCE_LEN + TAG_LEN;
+
+    /// Derives the key exactly as `NewAEADAESGCMBasedOnSeed` does.
+    pub fn key_from_seed(seed: &str) -> [u8; 16] {
+        let digest = ring::digest::digest(&ring::digest::SHA256, seed.as_bytes());
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&digest.as_ref()[..16]);
+        key
+    }
+
+    fn aead(key: &[u8; 16]) -> aead::LessSafeKey {
+        let unbound = aead::UnboundKey::new(&aead::AES_128_GCM, key)
+            .expect("AES-128-GCM accepts exactly 16 bytes");
+        aead::LessSafeKey::new(unbound)
+    }
+
+    /// `nonce ‖ ciphertext ‖ tag`.
+    pub fn seal(key: &[u8; 16], plain: &[u8], out: &mut Vec<u8>) {
+        let nonce_bytes: [u8; NONCE_LEN] = rand::random();
+        let mut body = plain.to_vec();
+        aead(key)
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce_bytes),
+                aead::Aad::empty(),
+                &mut body,
+            )
+            .expect("sealing cannot fail with a valid key and nonce");
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&body);
+    }
+
+    /// Inverse of [`seal`]. `None` means "not ours, or corrupted in flight".
+    pub fn open(key: &[u8; 16], wire: &[u8]) -> Option<Vec<u8>> {
+        if wire.len() < OVERHEAD {
+            return None;
+        }
+        let (nonce_bytes, rest) = wire.split_at(NONCE_LEN);
+        let nonce = aead::Nonce::try_assume_unique_for_key(nonce_bytes).ok()?;
+        let mut body = rest.to_vec();
+        let plain = aead(key).open_in_place(nonce, aead::Aad::empty(), &mut body).ok()?;
+        Some(plain.to_vec())
     }
 }
 
@@ -656,11 +717,14 @@ fn decode_datagram(conv: u16, buf: &[u8]) -> Vec<Segment> {
 }
 
 /// Strips the obfuscation layer. `None` means the datagram must be dropped.
-fn unwrap_datagram(obfs: KcpObfs, datagram: &[u8]) -> Option<Vec<u8>> {
+fn unwrap_datagram(obfs: KcpObfs, key: Option<&[u8; 16]>, datagram: &[u8]) -> Option<Vec<u8>> {
     if datagram.len() <= obfs.header_len() {
         return None;
     }
-    envelope::open(&datagram[obfs.header_len()..])
+    match key {
+        Some(k) => seed_mask::open(k, &datagram[obfs.header_len()..]),
+        None => envelope::open(&datagram[obfs.header_len()..]),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +757,11 @@ pub struct KcpConfig {
     pub no_congestion: bool,
     /// Datagram camouflage.
     pub obfs: KcpObfs,
+    /// Key for Xray's AES-GCM payload mask, derived from the `seed` option.
+    ///
+    /// Fixed-size rather than a `String` so this struct stays `Copy`: it is
+    /// passed by value into every accept and connect path.
+    pub seed_key: Option<[u8; 16]>,
 }
 
 impl Default for KcpConfig {
@@ -706,6 +775,7 @@ impl Default for KcpConfig {
             resend: 2,
             no_congestion: true,
             obfs: KcpObfs::Srtp,
+            seed_key: None,
         }
     }
 }
@@ -713,8 +783,12 @@ impl Default for KcpConfig {
 impl KcpConfig {
     /// Largest segment payload for these settings.
     pub fn mss(&self) -> usize {
+        let mask_overhead = match self.seed_key {
+            Some(_) => seed_mask::OVERHEAD,
+            None => envelope::OVERHEAD,
+        };
         self.mtu
-            .saturating_sub(DATA_OVERHEAD + self.obfs.header_len() + envelope::OVERHEAD)
+            .saturating_sub(DATA_OVERHEAD + self.obfs.header_len() + mask_overhead)
     }
 
     /// Bytes the obfuscation layer adds to every datagram.
@@ -906,7 +980,7 @@ impl Conn {
         // window is the whole point of `no_congestion`.
         let initial_cwnd = if cfg.no_congestion { wnd } else { wnd.min(4) };
         Self {
-            obfs: ObfsState::new(cfg.obfs),
+            obfs: ObfsState::new(cfg.obfs, cfg.seed_key),
             cfg,
             conv,
             socket,
@@ -1501,6 +1575,8 @@ impl Inbox {
 struct Hub {
     socket: Arc<UdpSocket>,
     obfs: KcpObfs,
+    /// AES-GCM mask key, when the peer uses Xray's `mkcp-aes128gcm` mask.
+    seed_key: Option<[u8; 16]>,
     routes: HashMap<u16, Arc<Inbox>>,
     /// Route used by an `accept` that has not learned its conversation id yet.
     any: Option<Arc<Inbox>>,
@@ -1526,7 +1602,11 @@ fn socket_key(socket: &Arc<UdpSocket>) -> usize {
 }
 
 /// Returns (and if needed creates) the demultiplexer for `socket`.
-fn hub_for(socket: &Arc<UdpSocket>, obfs: KcpObfs) -> (Arc<Mutex<Hub>>, usize) {
+fn hub_for(
+    socket: &Arc<UdpSocket>,
+    obfs: KcpObfs,
+    seed_key: Option<[u8; 16]>,
+) -> (Arc<Mutex<Hub>>, usize) {
     let key = socket_key(socket);
     let mut map = hubs().lock();
     if let Some(hub) = map.get(&key) {
@@ -1535,6 +1615,7 @@ fn hub_for(socket: &Arc<UdpSocket>, obfs: KcpObfs) -> (Arc<Mutex<Hub>>, usize) {
     let hub = Arc::new(Mutex::new(Hub {
         socket: socket.clone(),
         obfs,
+        seed_key,
         routes: HashMap::new(),
         any: None,
         closed: false,
@@ -1549,9 +1630,14 @@ fn hub_for(socket: &Arc<UdpSocket>, obfs: KcpObfs) -> (Arc<Mutex<Hub>>, usize) {
 /// id. Unknown conversations are dropped here, which is the first line of
 /// defence against stray or hostile traffic.
 async fn dispatch(hub: Arc<Mutex<Hub>>) {
-    let (socket, obfs) = {
+    let (socket, obfs, seed_key) = {
         let hub = hub.lock();
-        (hub.socket.clone(), hub.obfs)
+        (hub.socket.clone(), hub.obfs, hub.seed_key)
+    };
+    // Bytes the mask adds; the minimum-size check below depends on it.
+    let mask_overhead = match seed_key {
+        Some(_) => seed_mask::OVERHEAD,
+        None => envelope::OVERHEAD,
     };
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
@@ -1571,10 +1657,15 @@ async fn dispatch(hub: Arc<Mutex<Hub>>) {
         };
         // Header-only segments (ACK, WASK, WINS) are exactly the minimum size,
         // so this must be a strict comparison.
-        if n < obfs.header_len() + envelope::OVERHEAD + CMD_ONLY_LEN {
+        if n < obfs.header_len() + mask_overhead + CMD_ONLY_LEN {
             continue;
         }
-        let Some(segment) = unwrap_datagram(obfs, &buf[..n]) else {
+        let Some(segment) = unwrap_datagram(obfs, seed_key.as_ref(), &buf[..n]) else {
+            tracing::trace!(
+                "kcp: dropped a {} byte datagram (mask={})",
+                n,
+                if seed_key.is_some() { "aes-gcm" } else { "envelope" }
+            );
             continue;
         };
         if segment.len() < SEGMENT_PREFIX_LEN {
@@ -1686,7 +1777,7 @@ pub async fn connect(peer: SocketAddr, cfg: KcpConfig) -> FluxResult<KcpStream> 
         })?);
     tune_socket(&socket);
     let conv = cfg.conversation()?;
-    let (hub, key) = hub_for(&socket, cfg.obfs);
+    let (hub, key) = hub_for(&socket, cfg.obfs, cfg.seed_key);
     let inbox = Inbox::new();
     hub.lock().routes.insert(conv, inbox.clone());
 
@@ -1733,7 +1824,7 @@ pub async fn accept_with_limit(
 ) -> FluxResult<KcpStream> {
     cfg.validate()?;
     tune_socket(&socket);
-    let (hub, key) = hub_for(&socket, cfg.obfs);
+    let (hub, key) = hub_for(&socket, cfg.obfs, cfg.seed_key);
     let inbox = Inbox::new();
 
     let (conv, first) = if cfg.conv == 0 {
@@ -2229,7 +2320,7 @@ mod tests {
     #[test]
     fn obfs_headers_have_the_expected_shape() {
         // SRTP: constant prefix, counter that advances.
-        let mut state = ObfsState::new(KcpObfs::Srtp);
+        let mut state = ObfsState::new(KcpObfs::Srtp, None);
         let mut first = Vec::new();
         state.wrap(b"segment", &mut first);
         let mut second = Vec::new();
@@ -2239,7 +2330,7 @@ mod tests {
         assert_ne!(&first[2..4], &second[2..4], "counter must advance");
         // Round trip through the reader.
         assert_eq!(
-            unwrap_datagram(KcpObfs::Srtp, &first).as_deref(),
+            unwrap_datagram(KcpObfs::Srtp, None, &first).as_deref(),
             Some(b"segment".as_slice())
         );
 
@@ -2252,26 +2343,26 @@ mod tests {
             (KcpObfs::Dtls, 13),
             (KcpObfs::Wireguard, 4),
         ] {
-            let mut state = ObfsState::new(mode);
+            let mut state = ObfsState::new(mode, None);
             let mut framed = Vec::new();
             state.wrap(b"payload!", &mut framed);
             assert_eq!(mode.header_len(), len, "{mode:?}");
             assert_eq!(
-                unwrap_datagram(mode, &framed).as_deref(),
+                unwrap_datagram(mode, None, &framed).as_deref(),
                 Some(b"payload!".as_slice()),
                 "{mode:?} must round trip"
             );
             // A datagram that is only a header must be dropped, not panic.
-            assert!(unwrap_datagram(mode, &framed[..len]).is_none());
-            assert!(unwrap_datagram(mode, &[]).is_none());
+            assert!(unwrap_datagram(mode, None, &framed[..len]).is_none());
+            assert!(unwrap_datagram(mode, None, &[]).is_none());
         }
 
         // WireGuard is a constant, WeChat carries a monotonically increasing sn.
-        let mut wg = ObfsState::new(KcpObfs::Wireguard);
+        let mut wg = ObfsState::new(KcpObfs::Wireguard, None);
         let mut a = Vec::new();
         wg.wrap(b"x", &mut a);
         assert_eq!(&a[0..4], &[0x04, 0x00, 0x00, 0x00]);
-        let mut wc = ObfsState::new(KcpObfs::WechatVideo);
+        let mut wc = ObfsState::new(KcpObfs::WechatVideo, None);
         let mut b1 = Vec::new();
         let mut b2 = Vec::new();
         wc.wrap(b"x", &mut b1);
@@ -2296,7 +2387,7 @@ mod tests {
         };
         assert_eq!(plain.mss(), 1350 - DATA_OVERHEAD - 6);
         // A datagram built at the MTU must not exceed it.
-        let mut state = ObfsState::new(KcpObfs::Srtp);
+        let mut state = ObfsState::new(KcpObfs::Srtp, None);
         let mut framed = Vec::new();
         state.wrap(&vec![0u8; cfg.mss()], &mut framed);
         assert!(framed.len() <= 1350);
@@ -2562,14 +2653,14 @@ mod tests {
             out.push(vec![0xAA; 7]);
             out.push(datagram[..datagram.len() / 2].to_vec());
 
-            let Some(plain) = unwrap_datagram(self.obfs, datagram) else {
+            let Some(plain) = unwrap_datagram(self.obfs, None, datagram) else {
                 return out;
             };
             if plain.len() < DATA_OVERHEAD {
                 return out;
             }
             let wrap = |plain: &[u8]| {
-                let mut state = ObfsState::new(self.obfs);
+                let mut state = ObfsState::new(self.obfs, None);
                 let mut framed = Vec::new();
                 state.wrap(plain, &mut framed);
                 framed
@@ -2755,7 +2846,7 @@ mod tests {
                         continue;
                     }
                     client_addr = Some(from);
-                    if let Some(plain) = unwrap_datagram(cfg.obfs, &buf[..n]) {
+                    if let Some(plain) = unwrap_datagram(cfg.obfs, cfg.seed_key.as_ref(), &buf[..n]) {
                         for seg in decode_datagram(cfg.conv as u16, &plain) {
                             if seg.cmd == CMD_DATA && !seg.data.is_empty() {
                                 seen.lock().push(seg.sn);
@@ -3553,5 +3644,67 @@ mod interop {
         println!("xray client -> our server: {} bytes echoed", echoed.len());
         drop(door);
         let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    }
+}
+
+#[cfg(test)]
+mod seed_mask_tests {
+    use super::seed_mask;
+
+    /// The key derivation has to match Xray's byte for byte, and the detail that
+    /// matters is the half everyone gets wrong: `hashedSeed[:16]`, not the whole
+    /// SHA-256. Commit `2b82366` upstream changed exactly this.
+    #[test]
+    fn the_key_is_the_first_half_of_the_seed_hash() {
+        let seed = "a-seed";
+        let digest = ring::digest::digest(&ring::digest::SHA256, seed.as_bytes());
+        assert_eq!(seed_mask::key_from_seed(seed), digest.as_ref()[..16]);
+        // And it is *not* the full 32-byte digest truncated differently or the
+        // second half — the two halves differ, so a wrong half cannot pass.
+        assert_ne!(seed_mask::key_from_seed(seed), &digest.as_ref()[16..]);
+    }
+
+    /// A payload sealed with a seed round-trips, and the wire form is
+    /// `nonce ‖ ciphertext ‖ tag` — 12 bytes of nonce in front, a 16-byte tag at
+    /// the back, and the plaintext not visible in between.
+    #[test]
+    fn a_seeded_payload_round_trips_and_hides_its_contents() {
+        let key = seed_mask::key_from_seed("hunter2");
+        let plain = b"mkcp segment bytes that must not appear on the wire";
+        let mut wire = Vec::new();
+        seed_mask::seal(&key, plain, &mut wire);
+
+        assert_eq!(wire.len(), plain.len() + seed_mask::OVERHEAD);
+        assert!(
+            !wire.windows(plain.len()).any(|w| w == plain),
+            "the plaintext is visible in the sealed datagram"
+        );
+        assert_eq!(
+            seed_mask::open(&key, &wire).as_deref(),
+            Some(plain.as_slice())
+        );
+    }
+
+    /// A different seed must not open the payload, and a corrupted byte must not
+    /// either — otherwise the mask would authenticate nothing.
+    #[test]
+    fn the_wrong_key_or_a_flipped_byte_is_refused() {
+        let key = seed_mask::key_from_seed("hunter2");
+        let other = seed_mask::key_from_seed("hunter3");
+        let mut wire = Vec::new();
+        seed_mask::seal(&key, b"payload", &mut wire);
+
+        assert!(seed_mask::open(&other, &wire).is_none(), "wrong key accepted");
+        let mut corrupted = wire.clone();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0x01;
+        assert!(
+            seed_mask::open(&key, &corrupted).is_none(),
+            "a flipped bit was accepted"
+        );
+        assert!(
+            seed_mask::open(&key, &wire[..seed_mask::OVERHEAD - 1]).is_none(),
+            "a short datagram was accepted"
+        );
     }
 }
