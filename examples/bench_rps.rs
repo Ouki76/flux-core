@@ -75,15 +75,26 @@ fn wait_listen(addr: SocketAddr, timeout: Duration) -> bool {
     false
 }
 
-fn flux_server(port: u16) -> String {
+/// Server config for the chosen framing; `grpc` exercises the h2 layer end to end.
+fn flux_server_framed(port: u16, framing: &str) -> String {
+    // An inbound gRPC framing takes no `service_name`: it accepts whatever `:path` the
+    // client sends, and a server-side value is rejected rather than ignored.
+    let f = match framing {
+        "grpc" => r#","framing":{"type":"grpc"}"#,
+        _ => "",
+    };
     format!(
-        r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{port}}},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"route":{{"final":"direct"}}}}"#
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{port}}}{f},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"route":{{"final":"direct"}}}}"#
     )
 }
 
-fn flux_client(socks: u16, port: u16) -> String {
+fn flux_client_framed(socks: u16, port: u16, framing: &str) -> String {
+    let f = match framing {
+        "grpc" => r#","framing":{"type":"grpc","service_name":"svc"}"#,
+        _ => "",
+    };
     format!(
-        r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"tcp","address":"127.0.0.1:{port}"}},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"route":{{"final":"node"}}}}"#
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"tcp","address":"127.0.0.1:{port}"}}{f},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"route":{{"final":"node"}}}}"#
     )
 }
 
@@ -220,11 +231,13 @@ fn main() -> Result<()> {
     let mut exchanges: u64 = 4000;
     let mut conns: usize = 32;
     let mut idle: usize = 0;
+    let mut framing = String::from("none");
     while let Some(a) = args.next() {
         match a.as_str() {
             "--exchanges" => exchanges = args.next().unwrap_or_default().parse()?,
             "--conns" => conns = args.next().unwrap_or_default().parse()?,
             "--idle" => idle = args.next().unwrap_or_default().parse()?,
+            "--framing" => framing = args.next().unwrap_or_else(|| "none".into()),
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -275,7 +288,10 @@ fn main() -> Result<()> {
         let sport = free_port();
         let socks = free_port();
         let (srv, cli) = match stack {
-            Stack::Flux => (flux_server(sport), flux_client(socks, sport)),
+            Stack::Flux => (
+                flux_server_framed(sport, &framing),
+                flux_client_framed(socks, sport, &framing),
+            ),
             Stack::Singbox => (sbox_server(sport), sbox_client(socks, sport)),
             Stack::Xray => (xray_server(sport), xray_client(socks, sport)),
         };

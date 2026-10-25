@@ -297,7 +297,7 @@ pub(crate) mod shared {
     use flux_types::AsyncStream;
 
     /// `SETTINGS_INITIAL_WINDOW_SIZE` advertised to the peer, in bytes.
-    const INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
+    const INITIAL_STREAM_WINDOW: u32 = 256 * 1024;
     /// Largest DATA frame either side will send, negotiated in SETTINGS.
     ///
     /// The relay moves 64 KiB at a time, so a 64 KiB frame is the size that stops one
@@ -305,7 +305,7 @@ pub(crate) mod shared {
     /// advertised limit is its own business: SETTINGS is symmetric and h2 respects it.
     const MAX_FRAME_SIZE: u32 = 64 * 1024;
     /// Connection-level window advertised to the peer, in bytes.
-    const INITIAL_CONNECTION_WINDOW: u32 = 2 * 1024 * 1024;
+    const INITIAL_CONNECTION_WINDOW: u32 = 512 * 1024;
     /// Consecutive non-I/O `accept()` failures tolerated before the driver gives
     /// up on a connection that is otherwise still open.
     const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 8;
