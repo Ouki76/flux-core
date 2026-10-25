@@ -50,6 +50,12 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **Soak / leak detection**: `scripts/soak.sh [duration_secs]` (default 24h) — sustained load with RSS/FD/thread sampling and leak assertion.
 - 41 sing-box interop tests plus 17 mux interop tests run against the real `sing-box` binary (graceful skip when absent), including Salamander-obfuscated Hysteria 2 **in both directions**.
 - 4 Xray interop tests run against the real `xray` binary: REALITY plain and REALITY + XTLS Vision, both directions.
+- **Optional native TLS 1.3 client.** `"native_tls": true` on a `tls` security layer routes the
+  handshake through this project's own client instead of rustls, which is the only way to get a
+  browser-shaped ClientHello with GREASE (RFC 8701). Off by default: rustls speaks TLS 1.2 as
+  well as 1.3 and the native path is TLS 1.3 only. Interop is tested against the real `sing-box`
+  and `xray` binaries including gRPC/h2, and throughput and connection rate are at parity with
+  the rustls path.
 - 7 mKCP interop tests against the real `xray` binary: VLESS over mKCP both directions, the
   AES-GCM mask (`finalmask.udp` → `mkcp-aes128gcm`) both directions, and an Xray client reaching
   our server through it.

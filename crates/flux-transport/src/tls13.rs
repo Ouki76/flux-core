@@ -1828,6 +1828,74 @@ mod connect_tests {
         assert!(err.to_string().contains("trust anchors"), "{err}");
     }
 
+    /// A real server sends its leaf **and** the intermediates; only the root is trusted.
+    ///
+    /// Without chain building this fails — the leaf alone does not chain to the root, and a
+    /// client that only looked at `chain[0]` would reject every real deployment while passing
+    /// every self-signed test.
+    #[tokio::test]
+    async fn an_intermediate_chain_is_built_from_the_servers_flight() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        crate::tls::init_crypto_provider();
+
+        // root -> intermediate -> leaf
+        let root_key = KeyPair::generate().expect("root key");
+        let mut root_params = CertificateParams::new(vec![]).expect("root params");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let root = root_params.self_signed(&root_key).expect("root");
+
+        let int_key = KeyPair::generate().expect("int key");
+        let mut int_params = CertificateParams::new(vec![]).expect("int params");
+        int_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        let intermediate = int_params
+            .signed_by(&int_key, &root, &root_key)
+            .expect("int");
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).expect("leaf");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &intermediate, &int_key)
+            .expect("leaf");
+
+        // The server sends leaf + intermediate; the root is not in the flight.
+        let acceptor = crate::tls::TlsTransport::create_server_acceptor(
+            vec![
+                rustls_pki_types::CertificateDer::from(leaf.der().to_vec()),
+                rustls_pki_types::CertificateDer::from(intermediate.der().to_vec()),
+            ],
+            rustls_pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            vec![],
+        )
+        .expect("acceptor");
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acceptor.accept(server_raw).await {
+                let mut b = [0u8; 4];
+                if srv.read_exact(&mut b).await.is_ok() {
+                    let _ = srv.write_all(&b).await;
+                }
+            }
+        });
+
+        let mut trust = verify::TrustStore::empty();
+        trust
+            .add_pem(root.pem().as_bytes())
+            .expect("trust root only");
+        let cfg = ClientHelloConfig {
+            server_name: "localhost",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut client = connect(client_raw, &cfg)
+            .await
+            .expect("a chain through an intermediate must verify");
+        client.write_all(b"okay").await.expect("write");
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"okay");
+    }
+
     /// The name in the certificate is checked against SNI, not taken on trust.
     #[tokio::test]
     async fn a_certificate_for_another_name_is_refused() {
