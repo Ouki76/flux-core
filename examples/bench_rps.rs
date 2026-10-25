@@ -75,6 +75,30 @@ fn wait_listen(addr: SocketAddr, timeout: Duration) -> bool {
     false
 }
 
+/// A self-signed certificate for the TLS rows; written next to the configs.
+/// Returns the certificate path, key path, and the certificate's SHA-256 as base64url.
+///
+/// Xray 26 removed `allowInsecure` and pins a peer certificate instead, so the TLS row needs
+/// the pin even for a self-signed certificate generated seconds earlier.
+fn make_cert(dir: &std::path::Path) -> Result<(String, String, String)> {
+    use sha2::Digest;
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .map_err(|e| anyhow::anyhow!("rcgen: {e}"))?;
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    std::fs::write(&cert_path, cert.cert.pem())?;
+    std::fs::write(&key_path, cert.key_pair.serialize_pem())?;
+    // Xray expects the pin as lowercase hex, not base64 — its parser says so:
+    // `encoding/hex: invalid byte`. Learned by trying the base64 form first.
+    let digest = sha2::Sha256::digest(cert.cert.der());
+    let pin: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    Ok((
+        cert_path.to_string_lossy().into_owned(),
+        key_path.to_string_lossy().into_owned(),
+        pin,
+    ))
+}
+
 /// Server config for the chosen framing; `grpc` exercises the h2 layer end to end.
 fn flux_server_framed(port: u16, framing: &str) -> String {
     // An inbound gRPC framing takes no `service_name`: it accepts whatever `:path` the
@@ -95,6 +119,42 @@ fn flux_client_framed(socks: u16, port: u16, framing: &str) -> String {
     };
     format!(
         r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"tcp","address":"127.0.0.1:{port}"}}{f},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"route":{{"final":"node"}}}}"#
+    )
+}
+
+fn flux_server_tls(port: u16, cert: &str, key: &str) -> String {
+    format!(
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{port}}},"security":{{"type":"tls","certificate_path":"{cert}","key_path":"{key}"}},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"route":{{"final":"direct"}}}}"#
+    )
+}
+
+fn flux_client_tls(socks: u16, port: u16) -> String {
+    format!(
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"tag":"in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"tcp","address":"127.0.0.1:{port}"}},"security":{{"type":"tls","sni":"localhost","insecure":true}},"protocol":{{"type":"vless","uuid":"{UUID}"}}}}],"route":{{"final":"node"}}}}"#
+    )
+}
+
+fn sbox_server_tls(port: u16, cert: &str, key: &str) -> String {
+    format!(
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}],"tls":{{"enabled":true,"certificate_path":"{cert}","key_path":"{key}"}}}}],"outbounds":[{{"type":"direct","tag":"d"}}]}}"#
+    )
+}
+
+fn sbox_client_tls(socks: u16, port: u16) -> String {
+    format!(
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"type":"socks","tag":"in","listen":"127.0.0.1","listen_port":{socks}}}],"outbounds":[{{"type":"vless","tag":"n","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}","tls":{{"enabled":true,"insecure":true,"server_name":"localhost"}}}}]}}"#
+    )
+}
+
+fn xray_server_tls(port: u16, cert: &str, key: &str) -> String {
+    format!(
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"port":{port},"listen":"127.0.0.1","protocol":"vless","settings":{{"clients":[{{"id":"{UUID}"}}],"decryption":"none"}},"streamSettings":{{"security":"tls","tlsSettings":{{"certificates":[{{"certificateFile":"{cert}","keyFile":"{key}"}}]}}}}}}],"outbounds":[{{"protocol":"freedom"}}]}}"#
+    )
+}
+
+fn xray_client_tls(socks: u16, port: u16, pin: &str) -> String {
+    format!(
+        r#"{{"log":{{"level":"error"}},"inbounds":[{{"port":{socks},"listen":"127.0.0.1","protocol":"socks","settings":{{"auth":"noauth","udp":false}}}}],"outbounds":[{{"protocol":"vless","settings":{{"vnext":[{{"address":"127.0.0.1","port":{port},"users":[{{"id":"{UUID}","encryption":"none"}}]}}]}},"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"localhost","pinnedPeerCertSha256":"{pin}"}}}}}}]}}"#
     )
 }
 
@@ -232,12 +292,14 @@ fn main() -> Result<()> {
     let mut conns: usize = 32;
     let mut idle: usize = 0;
     let mut framing = String::from("none");
+    let mut use_tls = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--exchanges" => exchanges = args.next().unwrap_or_default().parse()?,
             "--conns" => conns = args.next().unwrap_or_default().parse()?,
             "--idle" => idle = args.next().unwrap_or_default().parse()?,
             "--framing" => framing = args.next().unwrap_or_else(|| "none".into()),
+            "--tls" => use_tls = true,
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -258,9 +320,17 @@ fn main() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("flux-rps-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let echo = start_echo();
+    let (cert, key, pin) = if use_tls {
+        make_cert(&dir)?
+    } else {
+        (String::new(), String::new(), String::new())
+    };
 
     if idle == 0 {
-        println!("requests per second — {exchanges} exchanges over {conns} concurrent connections");
+        let label = if use_tls { " (TLS)" } else { "" };
+        println!(
+            "requests per second{label} — {exchanges} exchanges over {conns} concurrent connections"
+        );
         println!("{}", "-".repeat(78));
         println!(
             "{:<12} {:>13} {:>12} {:>12}",
@@ -288,11 +358,23 @@ fn main() -> Result<()> {
         let sport = free_port();
         let socks = free_port();
         let (srv, cli) = match stack {
+            Stack::Flux if use_tls => (
+                flux_server_tls(sport, &cert, &key),
+                flux_client_tls(socks, sport),
+            ),
             Stack::Flux => (
                 flux_server_framed(sport, &framing),
                 flux_client_framed(socks, sport, &framing),
             ),
+            Stack::Singbox if use_tls => (
+                sbox_server_tls(sport, &cert, &key),
+                sbox_client_tls(socks, sport),
+            ),
             Stack::Singbox => (sbox_server(sport), sbox_client(socks, sport)),
+            Stack::Xray if use_tls => (
+                xray_server_tls(sport, &cert, &key),
+                xray_client_tls(socks, sport, &pin),
+            ),
             Stack::Xray => (xray_server(sport), xray_client(socks, sport)),
         };
         let sp = dir.join(format!("{}-srv.json", stack.name()));
