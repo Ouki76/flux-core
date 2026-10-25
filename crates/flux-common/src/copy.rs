@@ -4,6 +4,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// How much payload the relay moves per read/write, in bytes.
+///
+/// Every layer above the socket — the TLS record buffer, the WebSocket frame cap, the h2
+/// flow-control window — has to be able to hold one of these plus its own overhead, or it
+/// splits the relay's write and the split costs a copy and a syscall per piece.
+///
+/// This constant exists because that agreement kept being violated by accident. The relay
+/// buffer was 64 KiB and the WebSocket frame cap was 16 KiB, so every write became four
+/// frames; the cap was raised to 64 KiB, then the relay buffer moved to 256 KiB and the same
+/// defect came back at the new size. Three constants in three crates, each correct for the
+/// buffer size of the day it was written. They are derived from this one now, and
+/// `pipeline_stages_agree_on_the_relay_buffer` fails if they drift apart.
+pub const RELAY_BUFFER_BYTES: usize = 256 * 1024;
+
 /// An AsyncRead + AsyncWrite stream wrapper that updates atomic counters in real time.
 pub struct MeteredStream<S> {
     inner: S,

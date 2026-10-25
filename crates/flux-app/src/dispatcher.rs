@@ -557,7 +557,7 @@ impl Dispatcher for DefaultDispatcher {
             let copy_fut = flux_common::copy::copy_bidirectional_buffered(
                 &mut inbound_stream,
                 &mut outbound_stream,
-                256 * 1024,
+                flux_common::copy::RELAY_BUFFER_BYTES,
             );
             let _ = if let (Some(c), Some(rx)) = (&conn, &mut cancel_rx) {
                 tokio::select! {

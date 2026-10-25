@@ -518,6 +518,13 @@ fn mask_in_place(key: [u8; 4], offset: usize, data: &mut [u8]) {
 ///
 /// Split out from [`encode_frame_into`] so an unmasked writer can send the header and the
 /// payload as one vectored write instead of copying the payload into a frame buffer.
+/// The largest payload a single frame carries.
+///
+/// Equal to the relay buffer by construction, and asserted by
+/// `pipeline::stage_agreement_tests`: a frame smaller than the relay's write makes one write
+/// several frames, which is the defect that was fixed twice at two different sizes.
+pub const FRAME_CAP: usize = flux_common::copy::RELAY_BUFFER_BYTES;
+
 fn write_frame_header(out: &mut [u8; 10], fin: bool, opcode: u8, len: usize) -> usize {
     out[0] = if fin { 0x80 } else { 0x00 } | opcode;
     if len <= 125 {
@@ -1159,7 +1166,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
         // write became four frames — four copies, four masks and four syscalls — on
         // the single hottest path of this transport. 64 KiB matches the relay's copy
         // buffer, so a normal write is framed once.
-        let chunk_len = buf.len().min(256 * 1024);
+        // One frame per relay write: see `flux_common::copy::RELAY_BUFFER_BYTES` for why
+        // this must match the buffer above it.
+        let chunk_len = buf.len().min(FRAME_CAP);
 
         // Fast path for the unmasked side — a server never masks (RFC 6455 §5.1), so the
         // header can be written straight from the stack with the payload as a second
@@ -2774,7 +2783,7 @@ mod short_write_tests {
             };
             assert_eq!(
                 body,
-                payload.len().min(256 * 1024),
+                payload.len().min(FRAME_CAP),
                 "limit {limit}: wrong frame length"
             );
             assert_eq!(

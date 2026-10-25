@@ -11,7 +11,7 @@ use std::time::Duration;
 ///
 /// One relay buffer plus a framing header has to fit, or a vectored write of a whole frame
 /// is always short and the layer above falls back to copying.
-pub(crate) const TLS_WRITE_BUFFER: usize = 256 * 1024;
+pub(crate) const TLS_WRITE_BUFFER: usize = flux_common::copy::RELAY_BUFFER_BYTES + 16 * 1024;
 
 #[derive(Clone, Debug)]
 /// A client-side security layer to apply, outermost last.
@@ -603,5 +603,48 @@ mod tests {
         let p = client("127.0.0.1:443".parse().unwrap());
         assert_eq!(p.server_address().host(), "example.com");
         assert_eq!(p.server_address().port(), 443);
+    }
+}
+
+#[cfg(test)]
+mod stage_agreement_tests {
+    /// Every stage above the socket must hold one relay buffer plus its own overhead.
+    ///
+    /// This is the invariant that broke three times: a frame capped at 16 KiB under a relay
+    /// buffer of 64 KiB, then a frame capped at 64 KiB under a relay buffer of 256 KiB. Each
+    /// constant was correct when written and wrong afterwards, and no test compared them.
+    #[test]
+    fn pipeline_stages_agree_on_the_relay_buffer() {
+        use flux_common::copy::RELAY_BUFFER_BYTES as RELAY;
+
+        // The TLS record buffer holds a whole relay buffer plus a frame header and the
+        // record's own overhead, so one relay write never has to be split. Const-evaluated
+        // rather than asserted at runtime: both sides are compile-time constants.
+        const _: () = assert!(super::TLS_WRITE_BUFFER >= RELAY + 8 * 1024);
+
+        // A WebSocket frame carries exactly one relay write; the writer caps at this value
+        // and the reader's test asserts the same number.
+        assert_eq!(
+            crate::websocket::FRAME_CAP,
+            RELAY,
+            "the WebSocket frame cap must equal the relay buffer, or a write is split into several frames"
+        );
+
+        // An h2 stream window holds at least one relay write, and the connection window at
+        // least two, so a single stream is never throttled by the connection.
+        let stream = crate::h2::shared::STREAM_WINDOW as usize;
+        let connection = crate::h2::shared::CONNECTION_WINDOW as usize;
+        assert!(
+            stream >= RELAY,
+            "h2 stream window {} is below the relay buffer {}",
+            stream,
+            RELAY
+        );
+        assert!(
+            connection >= 2 * stream,
+            "h2 connection window {} is below twice the stream window {}",
+            connection,
+            stream
+        );
     }
 }
