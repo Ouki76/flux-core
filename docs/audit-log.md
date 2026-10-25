@@ -6201,3 +6201,47 @@ instrumentation was right (`rcv_free=0`, `snd_buf=0` is unambiguous) and it took
 
 Both directions now interoperate with the real binary and are pinned by tests, which is the
 state the objective asked for.
+
+---
+
+## Cycle 135 — 2026-10-25
+
+### The fingerprint item, settled in rustls' own source
+
+The one objective item that has never been green is "browser-grade TLS fingerprint
+(uTLS-style)". Its status has been explained in this log from memory several times; this cycle
+it was checked against the dependency.
+
+```
+$ grep -rc "0x0a0a\|0x1A0A\|0x2A0A" rustls-0.23.46/src/
+(no matches anywhere in the crate)
+
+$ grep -rn "EchMode::Grease" rustls-0.23.46/src/client/hs.rs
+409:  EchMode::Grease(cfg) => Some(cfg.grease_ext(
+```
+
+Two facts, both from the source:
+
+1. **rustls has no GREASE values** (RFC 8701) — not as cipher suites, not as extension ids. The
+   crate does not contain the constants.
+2. The only GREASE it emits is the ECH outer extension, which requires `EchMode::Grease` and
+   therefore an HPKE provider. The only Rust HPKE implementation usable here is aws-lc-rs's, and
+   swapping the crypto provider to it breaks REALITY interop — a working, measured protocol
+   traded for cosmetic similarity in one field of one handshake.
+
+So the item is not "unfinished work"; it is **a capability the dependency does not have**. What
+this project can claim, and tests pin, is a per-profile cipher order, a per-profile extension
+set and a shuffled extension order in the emitted ClientHello.
+
+### What a browser fingerprint would actually cost
+
+If someone later wants the full thing, the honest options are:
+
+| option | cost |
+|---|---|
+| fork rustls or emit ClientHello by hand | full control, plus maintaining a TLS stack |
+| swap the provider to aws-lc-rs | REALITY interop breaks — measured, not assumed |
+| accept no GREASE | what ships |
+
+That is the trade written down so the next person does not have to rediscover it, and so nobody
+mistakes the current state for an oversight.

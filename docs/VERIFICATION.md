@@ -116,8 +116,10 @@ or `FIXME` markers outside test code.
 
 - **Browser-grade TLS fingerprint.** The emitted ClientHello carries a per-profile cipher order,
   a per-profile extension set and a shuffled extension order, and three tests parse the bytes.
-  It does **not** carry GREASE values: rustls emits GREASE only for ECH, and the HPKE provider
-  that would supply it breaks REALITY interop. Details in `docs/HANDOFF.md`.
+  It does **not** carry GREASE values, and cannot: rustls 0.23 contains no RFC 8701 constants —
+  verified by searching the crate — and its only GREASE output is the ECH outer extension, which
+  needs an HPKE provider whose available implementation breaks REALITY interop. Details in
+  `docs/HANDOFF.md`.
 - **Nothing on the AES-GCM mask any more.** Both directions interoperate with the real Xray
   binary and are covered by tests; the client carries 256 KiB through it at 18 MiB/s.
 - **Absolute throughput numbers.** They move ±15% with host load. The ratios in section 1 are
