@@ -4029,3 +4029,50 @@ The three behind are worth naming honestly:
 | functional gaps closed | all closed; ClientHello bounded by an HPKE-provider dependency |
 | gates green every cycle | 1085 tests, five gates, re-run repeatedly |
 | commits + audit log | 60+ commits, every cycle recorded including the wrong calls |
+
+---
+
+## Cycle 83 — 2026-10-25
+
+### WebSocket: the fourth copy, and the limit that hid it
+
+The WS row was the last consistently negative one — −4.7 %, −11.0 %, −11.5 % across three
+runs. Profiling the **server** side (the client masks, so its cost is unavoidable) named the
+passes over the payload:
+
+| copy | where |
+|---|---|
+| `take_received_plaintext` | rustls: decrypted out of the record |
+| `tokio_rustls` read into the caller | rustls: the only copy visible above |
+| `OutboundChunks::copy_to_vec` | rustls: plaintext into the record |
+| **`websocket::encode_frame_into`** | **ours: payload into the frame buffer** |
+
+A server never masks, so its header can be written from the stack with the payload as a
+second iovec, and `tokio_rustls` implements `poll_write_vectored` properly. Implemented — and
+**it changed nothing**, which is the part worth recording:
+
+> rustls' default write-buffer limit is **64 KiB**, and a frame is 64 KiB *plus a header*, so
+> the vectored write was short on every single call and fell straight back to the copy path.
+
+Raising the acceptor's limit to 256 KiB made the fast path reachable. Verified by profiling
+the server again: **four large copies became three**, `encode_frame_into` gone.
+
+| | before | after |
+|---|---|---|
+| WS + TLS, three runs | 264-295 MB/s | **323-341 MB/s** |
+| vs sing-box | −4.7 to −11.5 % | **+4.6 % median, +11.2 % best** |
+
+### Two profiling mistakes caught in the same cycle
+
+Both are recorded because both produced plausible-looking numbers:
+
+1. **A stale process held the port.** `pkill -x flux-core` does not match `callgrind-amd64`,
+   and `pkill -f callgrind-amd64` matches the shell running it — so two profiled clients were
+   alive and the traffic went to the one not writing a profile. A 19 MiB transfer reported
+   2.6 M instructions, which is startup-only; the tell was the size, not the share.
+2. **`callgrind_control -d` writes numbered parts.** The first WS profile analysed only part
+   `.1` (196 M) while part `.2` held another 210 M, so "90 % in memcpy" and the comparison that
+   followed were both computed on half a run.
+
+The check that catches both: sum the parts, and sanity-check the total against the workload
+(a TLS path cannot move 19 MiB in 2.6 M instructions).
