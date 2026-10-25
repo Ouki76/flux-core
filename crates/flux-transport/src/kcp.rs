@@ -306,7 +306,12 @@ impl ObfsState {
             }
             out.extend_from_slice(&header[..len]);
         }
-        envelope::seal(segment, out);
+        // Xray's AES-GCM mask, when one is configured, replaces the "original"
+        // envelope — the two are alternatives, not layers.
+        match &self.key {
+            Some(key) => seed_mask::seal(key, segment, out),
+            None => envelope::seal(segment, out),
+        }
     }
 }
 
@@ -362,7 +367,9 @@ pub mod seed_mask {
         let (nonce_bytes, rest) = wire.split_at(NONCE_LEN);
         let nonce = aead::Nonce::try_assume_unique_for_key(nonce_bytes).ok()?;
         let mut body = rest.to_vec();
-        let plain = aead(key).open_in_place(nonce, aead::Aad::empty(), &mut body).ok()?;
+        let plain = aead(key)
+            .open_in_place(nonce, aead::Aad::empty(), &mut body)
+            .ok()?;
         Some(plain.to_vec())
     }
 }
@@ -1661,10 +1668,14 @@ async fn dispatch(hub: Arc<Mutex<Hub>>) {
             continue;
         }
         let Some(segment) = unwrap_datagram(obfs, seed_key.as_ref(), &buf[..n]) else {
-            tracing::trace!(
-                "kcp: dropped a {} byte datagram (mask={})",
+            tracing::debug!(
+                "kcp: dropped a {} byte datagram (configured mask: {})",
                 n,
-                if seed_key.is_some() { "aes-gcm" } else { "envelope" }
+                if seed_key.is_some() {
+                    "aes-gcm"
+                } else {
+                    "envelope"
+                }
             );
             continue;
         };
@@ -2846,7 +2857,8 @@ mod tests {
                         continue;
                     }
                     client_addr = Some(from);
-                    if let Some(plain) = unwrap_datagram(cfg.obfs, cfg.seed_key.as_ref(), &buf[..n]) {
+                    if let Some(plain) = unwrap_datagram(cfg.obfs, cfg.seed_key.as_ref(), &buf[..n])
+                    {
                         for seg in decode_datagram(cfg.conv as u16, &plain) {
                             if seg.cmd == CMD_DATA && !seg.data.is_empty() {
                                 seen.lock().push(seg.sn);
@@ -3694,7 +3706,10 @@ mod seed_mask_tests {
         let mut wire = Vec::new();
         seed_mask::seal(&key, b"payload", &mut wire);
 
-        assert!(seed_mask::open(&other, &wire).is_none(), "wrong key accepted");
+        assert!(
+            seed_mask::open(&other, &wire).is_none(),
+            "wrong key accepted"
+        );
         let mut corrupted = wire.clone();
         let last = corrupted.len() - 1;
         corrupted[last] ^= 0x01;

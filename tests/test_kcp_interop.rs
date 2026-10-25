@@ -260,6 +260,128 @@ async fn a_node_configured_with_a_kcp_carrier_relays_through_xray() {
     let _ = instance.stop().await;
 }
 
+/// The AES-GCM mask (`seed`) has to work end to end, and a mismatched seed has to
+/// fail — otherwise the mask would be decoration rather than authentication.
+///
+/// This exists because the mask was once implemented but never exercised: the send
+/// path had lost its mask selection and silently used the envelope, so a seeded
+/// server dropped every datagram. Only an end-to-end test would have caught it.
+#[tokio::test]
+async fn a_seeded_kcp_pair_relays_and_a_wrong_seed_does_not() {
+    let echo_port = echo_server().await;
+    let server_port = get_free_tcp_port().await;
+    let socks_port = get_free_tcp_port().await;
+
+    let server_cfg = format!(
+        r#"{{
+  "log": {{"level": "warn"}},
+  "inbounds": [{{
+    "tag": "kcp-in",
+    "carrier": {{"type": "kcp", "listen": "127.0.0.1", "listen_port": {server_port},
+                 "header": "srtp", "seed": "correct-horse"}},
+    "protocol": {{"type": "vless", "uuid": "{UUID}"}}
+  }}],
+  "outbounds": [{{"type": "direct", "tag": "direct"}}],
+  "route": {{"final": "direct"}}
+}}"#
+    );
+    let server =
+        flux_app::Instance::new(flux_app::Config::from_json_str(&server_cfg).expect("config"))
+            .expect("server instance");
+    server.start().await.expect("start server");
+    wait_for_udp(format!("127.0.0.1:{server_port}").parse().unwrap()).await;
+
+    let client_cfg = |seed: &str, socks: u16| {
+        format!(
+            r#"{{
+  "log": {{"level": "warn"}},
+  "inbounds": [{{
+    "tag": "socks-in",
+    "carrier": {{"type": "tcp", "listen": "127.0.0.1", "listen_port": {socks}}},
+    "protocol": {{"type": "socks"}}
+  }}],
+  "outbounds": [{{
+    "tag": "kcp-out",
+    "carrier": {{"type": "kcp", "address": "127.0.0.1:{server_port}",
+                 "header": "srtp", "seed": "{seed}"}},
+    "protocol": {{"type": "vless", "uuid": "{UUID}"}}
+  }}],
+  "route": {{"final": "kcp-out"}}
+}}"#
+        )
+    };
+
+    // The matching seed must carry data.
+    let client = flux_app::Instance::new(
+        flux_app::Config::from_json_str(&client_cfg("correct-horse", socks_port)).expect("config"),
+    )
+    .expect("client instance");
+    client.start().await.expect("start client");
+    let payload: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    let got = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", socks_port))
+            .await
+            .ok()?;
+        s.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+        let mut m = [0u8; 2];
+        s.read_exact(&mut m).await.ok()?;
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&[127, 0, 0, 1]);
+        req.extend_from_slice(&echo_port.to_be_bytes());
+        s.write_all(&req).await.ok()?;
+        let mut head = [0u8; 10];
+        s.read_exact(&mut head).await.ok()?;
+        if head[1] != 0 {
+            return None;
+        }
+        s.write_all(&payload).await.ok()?;
+        let mut buf = vec![0u8; payload.len()];
+        s.read_exact(&mut buf).await.ok()?;
+        Some(buf)
+    })
+    .await
+    .expect("a seeded tunnel must answer")
+    .expect("socks request must succeed");
+    assert_eq!(got, payload, "the AES-GCM mask corrupted the payload");
+    let _ = client.stop().await;
+
+    // A different seed must not carry anything: the mask authenticates.
+    let wrong_socks = get_free_tcp_port().await;
+    let wrong_cfg = client_cfg("wrong-horse", wrong_socks);
+    let wrong =
+        flux_app::Instance::new(flux_app::Config::from_json_str(&wrong_cfg).expect("config"))
+            .expect("wrong-seed instance");
+    wrong.start().await.expect("start wrong-seed client");
+    let leaked = tokio::time::timeout(Duration::from_secs(6), async {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", wrong_socks))
+            .await
+            .ok()?;
+        s.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+        let mut m = [0u8; 2];
+        s.read_exact(&mut m).await.ok()?;
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&[127, 0, 0, 1]);
+        req.extend_from_slice(&echo_port.to_be_bytes());
+        s.write_all(&req).await.ok()?;
+        let mut head = [0u8; 10];
+        s.read_exact(&mut head).await.ok()?;
+        if head[1] != 0 {
+            return Some(false);
+        }
+        s.write_all(&payload).await.ok()?;
+        let mut buf = vec![0u8; payload.len()];
+        s.read_exact(&mut buf).await.ok()?;
+        Some(buf == payload)
+    })
+    .await;
+    assert!(
+        !matches!(leaked, Ok(Some(true))),
+        "a client with the wrong seed carried data through the tunnel"
+    );
+    let _ = wrong.stop().await;
+    let _ = server.stop().await;
+}
+
 /// A header name we do not implement must be a configuration error, not a silent
 /// fallback to a different camouflage.
 #[tokio::test]

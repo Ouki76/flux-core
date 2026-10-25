@@ -1770,7 +1770,10 @@ fn build_layered_inbound(
                 .map_err(|e| FluxError::Config(format!("invalid vless uuid {}: {}", uuid, e)))?;
             let mut ib = flux_inbound::VlessInbound::new(tag, addr, vec![parsed_uuid], pipeline);
             if is_kcp {
-                ib = ib.with_kcp(flux_transport::KcpConfig::default());
+                // Honour the carrier's fields: this used to pass `KcpConfig::default()`,
+                // so a server silently ignored `header` and `seed`.
+                let cfg = node.carrier.kcp_config()?.unwrap_or_default();
+                ib = ib.with_kcp(cfg);
             }
             if let Some(rl) = rate_limiter.clone() {
                 ib = ib.with_rate_limiter(rl);

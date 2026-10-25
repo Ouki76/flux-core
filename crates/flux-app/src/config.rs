@@ -391,6 +391,11 @@ pub enum CarrierConfig {
         /// mKCP obfuscation header type.
         #[serde(default = "default_kcp_header")]
         header: String,
+        /// Xray's `mkcp-aes128gcm` payload mask seed. When set, the segment is
+        /// sealed with AES-128-GCM keyed from `SHA-256(seed)[..16]` instead of
+        /// being wrapped in the "original" envelope mask.
+        #[serde(default)]
+        seed: Option<String>,
     },
 }
 
@@ -421,6 +426,7 @@ impl CarrierConfig {
             interval_ms,
             resend,
             header,
+            seed,
             ..
         } = self
         else {
@@ -449,10 +455,9 @@ impl CarrierConfig {
             resend: *resend,
             no_congestion: true,
             obfs,
-            // The AES-GCM mask primitive is implemented and unit-tested in
-            // `flux_transport::kcp::seed_mask`; exposing it as a configuration option is
-            // not wired yet, so a node always uses the "original" envelope mask.
-            seed_key: None,
+            seed_key: seed
+                .as_deref()
+                .map(flux_transport::kcp::seed_mask::key_from_seed),
         }))
     }
 }
@@ -503,7 +508,82 @@ pub enum InboundCarrierConfig {
         /// Address to connect to.
         #[serde(default)]
         address: Option<String>,
+        /// Obfuscation header, matching the client's. `srtp` when omitted.
+        #[serde(default = "default_kcp_header")]
+        header: String,
+        /// Xray's `mkcp-aes128gcm` payload mask seed, matching the client's.
+        #[serde(default)]
+        seed: Option<String>,
+        /// Largest packet the link may carry.
+        #[serde(default = "default_kcp_mtu")]
+        mtu: usize,
+        /// mKCP send window, in packets.
+        #[serde(default = "default_kcp_wnd")]
+        snd_wnd: u16,
+        /// mKCP receive window, in packets.
+        #[serde(default = "default_kcp_wnd")]
+        rcv_wnd: u16,
+        /// mKCP flush interval, in milliseconds.
+        #[serde(default = "default_kcp_interval")]
+        interval_ms: u32,
+        /// mKCP fast-resend threshold.
+        #[serde(default = "default_kcp_resend")]
+        resend: u32,
     },
+}
+
+/// Maps a user-facing header name onto the obfuscation mode.
+fn kcp_obfs_from_header(header: &str) -> FluxResult<flux_transport::KcpObfs> {
+    Ok(match header.to_ascii_lowercase().as_str() {
+        "none" => flux_transport::KcpObfs::None,
+        "srtp" => flux_transport::KcpObfs::Srtp,
+        "utp" => flux_transport::KcpObfs::Utp,
+        "wechat-video" | "wechatvideo" | "wechat" => flux_transport::KcpObfs::WechatVideo,
+        "dtls" => flux_transport::KcpObfs::Dtls,
+        "wireguard" | "wg" => flux_transport::KcpObfs::Wireguard,
+        other => {
+            return Err(FluxError::Config(format!(
+                "unknown kcp header '{other}'; expected none, srtp, utp, wechat-video, \
+                 dtls or wireguard"
+            )));
+        }
+    })
+}
+
+impl InboundCarrierConfig {
+    /// Builds the mKCP configuration for this inbound carrier, if it is one.
+    ///
+    /// The inbound used to ignore every mKCP field and run with `KcpConfig::default()`,
+    /// so `header` and `seed` were silently client-only and a server could not be
+    /// reached by a client configured with anything but the default header.
+    pub fn kcp_config(&self) -> FluxResult<Option<flux_transport::KcpConfig>> {
+        let InboundCarrierConfig::Kcp {
+            header,
+            seed,
+            mtu,
+            snd_wnd,
+            rcv_wnd,
+            interval_ms,
+            resend,
+            ..
+        } = self
+        else {
+            return Ok(None);
+        };
+        Ok(Some(flux_transport::KcpConfig {
+            conv: 0,
+            mtu: *mtu,
+            snd_wnd: *snd_wnd,
+            rcv_wnd: *rcv_wnd,
+            interval_ms: *interval_ms,
+            resend: *resend,
+            no_congestion: true,
+            obfs: kcp_obfs_from_header(header)?,
+            seed_key: seed
+                .as_deref()
+                .map(flux_transport::kcp::seed_mask::key_from_seed),
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
