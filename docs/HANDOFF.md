@@ -237,11 +237,11 @@ What is left is functional and bounded:
 
 1. **Browser-grade ClientHello.** See section 0: GREASE-ECH needs an HPKE provider, and the
    only one in rustls 0.23 breaks REALITY interop with Xray. Closing it is a REALITY project.
-2. **mKCP parity with xray's newer options** — our mKCP interoperates in both directions, but
-   does not implement xray's `seed`/AES-GCM mask, PING/TERMINATE liveness or
-   `tti`/`uplinkCapacity` pacing. A client can be rejected by a server configured with them.
-3. **GeoIP fixture in CI** — the routing tests use a fixture built at test time; an `.mmdb`
-   checked into the repo would let a CI box exercise the real lookup.
+2. **mKCP parity with xray's newer options** — our mKCP interoperates with Xray 26 in both
+   directions, but does not implement xray's `seed` (AES-GCM payload mask keyed from a seed),
+   so a server configured with `seed` cannot be read by this client. Documented at the top of
+   `crates/flux-transport/src/kcp.rs`. Xray also adds `PING`/`TERMINATE` commands the module
+   does not send.
 
 If you are picking this up cold: run the matrix first (`cargo run --release --example
 bench_matrix -- --rounds 4 --mb 200`), then read `docs/audit-log.md` from cycle 89 onwards.

@@ -5232,3 +5232,24 @@ The lesson generalises beyond this file: **a document that says what was true is
 indistinguishable from one that says what is true until someone acts on it.** The audit keeps
 its numbers honest by re-deriving them; the handoff now points at that derivation instead of
 duplicating it.
+
+### A false claim I wrote myself, caught one cycle later
+
+The rewritten handoff listed three open items. The third was "GeoIP fixture in CI — an
+`.mmdb` checked into the repo would let a CI box exercise the real lookup".
+
+**The repository already contains one.** `crates/flux-router/tests/data/GeoIP2-City-Test.mmdb`
+— MaxMind's published CC0 test database, 18 KB — with seven tests against it in
+`crates/flux-router/tests/geoip_mmdb.rs`, which check that `81.2.69.142` is GB,
+`216.160.83.56` is US and `89.160.20.128` is SE. The gap was closed before this audit began.
+
+I wrote that item from memory of an older note instead of checking, which is precisely the
+failure mode this cycle was meant to fix in the document. The item is removed and the remaining
+mKCP claim was then verified against the source before being kept — it is accurate:
+`crates/flux-transport/src/kcp.rs` documents that `seed` is unimplemented and that a server
+configured with it cannot be read.
+
+Three cycles, three false statements in the handoff — two inherited, one mine. The pattern is
+not carelessness about numbers; the matrix has never been wrong. It is that **prose is written
+from memory and numbers are derived from commands**. The handoff now says so at the top, and
+the two remaining open items are the only ones that survived being checked.
