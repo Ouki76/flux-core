@@ -5355,3 +5355,39 @@ Two cycles were spent on this, and the cost was not the code: it was trusting an
 whose silence had been calibrated nowhere. **A log line that never fires tells you nothing
 until you have seen it fire.** Every profiling conclusion in this audit has that rule behind
 it; this one did not, and cost two cycles.
+
+---
+
+## Cycle 114 — 2026-10-25
+
+### The mask matches Xray on the wire, and the session still does not complete
+
+Measured through a UDP relay between our client and a real Xray 26 node, configured the only
+way it accepts masks now:
+
+| direction | size | first bytes |
+|---|---|---|
+| us → xray | 76 | `b5e8 3c05 …` |
+| xray → us | 53 | `b5e8 c25f …` |
+| xray → us | 1382 | `b5e8 c260 …` |
+
+**Xray answers our datagram**, which it could not do if the key, the nonce placement or the
+tag placement were wrong. Both sides' datagrams begin with the SRTP magic and a counter, so
+the composition is header-*outside* — AES-GCM over the segment, wrapped by the camouflage
+header.
+
+Two facts that came from reading their source and nowhere else:
+
+- The setting is **`password`**, not `seed`. `NewConnClient` reads `c.Password`; a config
+  written with `seed` parses without error and silently uses an empty key. My first interop
+  attempt died on exactly that.
+- `aes128gcmConn.WriteTo` encrypts in place and never calls the underlying conn — the header
+  mask wraps the AES output, not the other way round. That settled the composition order and
+  explains the captured bytes.
+
+**What does not work**: the tunnel never carries a stream. Our side closes immediately after
+Xray's reply and nothing at `debug` level says why. So the mask is *spec-correct on the wire and
+not yet interoperable in a session*, and the log says both halves of that sentence.
+
+The self-pair test — matching seed relays 8 KiB intact, mismatched seed carries nothing —
+passes, so what is shipped is not broken; it is incomplete, and labelled.
