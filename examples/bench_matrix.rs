@@ -110,6 +110,13 @@ struct Args {
     with_xray: bool,
     flux_bin: PathBuf,
     singbox_bin: Option<PathBuf>,
+    /// When set, exit non-zero if any row is behind a competitor by more than this fraction.
+    ///
+    /// A benchmark cannot be a unit test, but it can still be a gate: this turns "we are
+    /// ahead on paper" into a command whose exit status says so. The tolerance exists
+    /// because the host moves rows by up to ~10% between runs — a row inside it is at
+    /// parity, not behind.
+    assert_tolerance: Option<f64>,
 }
 
 impl Args {
@@ -123,6 +130,7 @@ impl Args {
             with_xray: true,
             flux_bin: PathBuf::from("./target/release/flux-core"),
             singbox_bin: find_in_path("sing-box"),
+            assert_tolerance: None,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -143,6 +151,15 @@ impl Args {
                 }
                 "--no-singbox" => args.with_singbox = false,
                 "--no-xray" => args.with_xray = false,
+                "--assert" => {
+                    args.assert_tolerance = Some(match argv.get(i + 1) {
+                        Some(v) if !v.starts_with("--") => {
+                            i += 1;
+                            v.parse().map_err(|e| format!("{e}"))?
+                        }
+                        _ => 0.10,
+                    })
+                }
                 "--flux" => args.flux_bin = PathBuf::from(take(&mut i)?),
                 "--singbox" => args.singbox_bin = Some(PathBuf::from(take(&mut i)?)),
                 "--help" | "-h" => {
@@ -161,7 +178,8 @@ impl Args {
 
     fn usage() -> &'static str {
         "usage: bench_matrix [--rounds N] [--mb N] [--only SUBSTR] [--timeout SECS] \
-         [--no-singbox] [--flux PATH] [--singbox PATH]"
+         [--no-singbox] [--flux PATH] [--singbox PATH] \
+         [--assert [TOLERANCE]]  exit 1 if any row is behind by more than TOLERANCE (default 0.10)"
     }
 }
 
@@ -2163,6 +2181,49 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     println!("{}", "-".repeat(126));
+
+    // The gate. A row is a failure when flux is behind a competitor by more than the
+    // tolerance, which defaults to the host's own run-to-run spread.
+    let mut failures: Vec<String> = Vec::new();
+    if let Some(tolerance) = args.assert_tolerance {
+        for protocol in &protocols {
+            let best = |stack: Stack| -> Option<f64> {
+                rows.iter()
+                    .find(|r| &r.0 == protocol && r.1 == stack)
+                    .and_then(|r| r.2.as_ref())
+                    .map(|samples| samples.iter().map(|s| s.bulk_mbps).fold(f64::MIN, f64::max))
+            };
+            let flux = best(Stack::Flux);
+            for (name, other) in [
+                ("sing-box", best(Stack::Singbox)),
+                ("xray", best(Stack::Xray)),
+            ] {
+                if let (Some(f), Some(o)) = (flux, other)
+                    && o > 0.0
+                    && f < o * (1.0 - tolerance)
+                {
+                    failures.push(format!(
+                        "{protocol} vs {name}: {f:.1} < {o:.1} MB/s ({:+.1}%, tolerance {:.0}%)",
+                        (f / o - 1.0) * 100.0,
+                        tolerance * 100.0
+                    ));
+                }
+            }
+        }
+        if failures.is_empty() {
+            println!(
+                "\nASSERT PASSED: every row is at or above both competitors within {:.0}%",
+                tolerance * 100.0
+            );
+        } else {
+            println!("\nASSERT FAILED (tolerance {:.0}%):", tolerance * 100.0);
+            for f in &failures {
+                println!("  {f}");
+            }
+            // Exit non-zero so the gate can be used from a script or a CI job.
+            std::process::exit(1);
+        }
+    }
 
     println!(
         "MB/s = MiB/s (1048576 B) of payload. CPU s/GiB = CPU of both tunnel processes per GiB of\n\
