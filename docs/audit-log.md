@@ -5453,3 +5453,30 @@ all of which are now excluded by evidence.
 
 The demultiplexer keeps the log line, at `debug`: it names the conversation and the live set,
 which is exactly what was missing for four cycles of guessing.
+
+### Xray accepts the request; only the return path fails
+
+Xray's own log for the failing direction:
+
+```
+from 127.0.0.1:33606 accepted tcp:127.0.0.1:34809
+```
+
+**Xray accepted a destination.** That means our client's masked datagrams carried a complete
+VLESS request through Xray's kcp inbound — so the tunnel works *outbound*, the mask is right,
+the segment codec is right, and the VLESS framing is right. The failure is entirely on the
+return path: Xray dials the echo server, sends data back, and our side has already finished.
+
+Combined with the previous cycle's `live: []`, the picture is now narrow and consistent:
+
+1. our client's stream ends within ~130 ms of connecting,
+2. the route is removed with it,
+3. Xray's reply datagrams then arrive at a hub with no listener and are dropped.
+
+So the remaining question is one function — what ends our `KcpStream` before the peer's first
+data segment arrives — and not the mask, the composition, the key derivation, the segment codec
+or the protocol framing, each of which is now excluded by a captured packet or a log line from
+the peer.
+
+Three cycles ago this was "the mask does not work". It is now "our stream ends early", which is
+a different and much smaller thing to be wrong about.
