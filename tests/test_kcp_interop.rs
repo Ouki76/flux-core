@@ -382,6 +382,95 @@ async fn a_seeded_kcp_pair_relays_and_a_wrong_seed_does_not() {
     let _ = server.stop().await;
 }
 
+/// **A real Xray client through our server's AES-GCM mask.**
+///
+/// Xray 26 removed `kcpSettings.seed`; the mask now arrives as
+/// `finalmask.udp: [{"type":"header-srtp"},{"type":"mkcp-aes128gcm","settings":{"password":"…"}}]`.
+/// The setting is `password`, not `seed` — `NewConnClient` reads `c.Password`, and a config
+/// written with the other name parses cleanly and silently uses an empty key.
+///
+/// This direction is the one that works: our *server* accepts a real Xray client's masked
+/// traffic. The opposite direction (our client into an Xray server) gets as far as Xray
+/// answering our datagram and then fails to establish, which is recorded in
+/// `docs/audit-log.md` rather than asserted here.
+#[tokio::test]
+async fn a_real_xray_client_reaches_our_aes_masked_kcp_server() {
+    let Some(bin) = xray_bin() else {
+        panic!("the `xray` binary is required by this test but was not found");
+    };
+    let echo_port = echo_server().await;
+    let server_port = get_free_tcp_port().await;
+    let socks_port = get_free_tcp_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let server_cfg = format!(
+        r#"{{
+  "log": {{"level": "error"}},
+  "inbounds": [{{
+    "tag": "in",
+    "carrier": {{"type": "kcp", "listen": "127.0.0.1", "listen_port": {server_port},
+                 "header": "srtp", "seed": "interop-seed"}},
+    "protocol": {{"type": "vless", "uuid": "{UUID}"}}
+  }}],
+  "outbounds": [{{"type": "direct", "tag": "direct"}}],
+  "route": {{"final": "direct"}}
+}}"#
+    );
+    let instance = flux_app::Instance::new(
+        flux_app::Config::from_json_str(&server_cfg).expect("parse our server config"),
+    )
+    .expect("build our server");
+    instance.start().await.expect("start our server");
+
+    let client_cfg = format!(
+        r#"{{
+  "log": {{"loglevel": "warning"}},
+  "inbounds": [{{"port": {socks_port}, "listen": "127.0.0.1", "protocol": "socks",
+                 "settings": {{"udp": false}}}}],
+  "outbounds": [{{
+    "protocol": "vless",
+    "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {server_port},
+      "users": [{{"id": "{UUID}", "encryption": "none"}}]}}]}},
+    "streamSettings": {{
+      "network": "kcp", "kcpSettings": {{"mtu": 1350, "tti": 20}},
+      "finalmask": {{"udp": [{{"type": "header-srtp"}},
+        {{"type": "mkcp-aes128gcm", "settings": {{"password": "interop-seed"}}}}]}}
+    }}
+  }}]
+}}"#
+    );
+    let _xray = spawn_xray(&bin, &client_cfg, dir.path());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let mut sock = tokio::net::TcpStream::connect(format!("127.0.0.1:{socks_port}"))
+        .await
+        .expect("connect to the xray socks listener");
+    sock.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut hello = [0u8; 2];
+    sock.read_exact(&mut hello).await.unwrap();
+    let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+    req.extend_from_slice(&echo_port.to_be_bytes());
+    sock.write_all(&req).await.unwrap();
+    let mut rep = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(30), sock.read_exact(&mut rep))
+        .await
+        .expect("the SOCKS reply must arrive through the AES mask")
+        .unwrap();
+    assert_eq!(rep[1], 0x00, "the CONNECT must succeed");
+
+    let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    sock.write_all(&payload).await.expect("write payload");
+    sock.flush().await.expect("flush");
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(30), sock.read_exact(&mut got))
+        .await
+        .expect("the echo must come back through the AES mask")
+        .expect("read echo");
+    assert_eq!(got, payload, "the AES mask corrupted the payload");
+
+    instance.stop().await.expect("stop our server");
+}
+
 /// A header name we do not implement must be a configuration error, not a silent
 /// fallback to a different camouflage.
 #[tokio::test]
