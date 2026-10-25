@@ -516,7 +516,7 @@ fn mask_in_place(key: [u8; 4], offset: usize, data: &mut [u8]) {
 
 /// Writes the frame header into `out`, returning its length.
 ///
-/// Split out from [`encode_frame_into`] so an unmasked writer can send the header and the
+/// Split out from `encode_frame_into` so an unmasked writer can send the header and the
 /// payload as one vectored write instead of copying the payload into a frame buffer.
 /// The largest payload a single frame carries.
 ///

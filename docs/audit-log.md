@@ -4952,3 +4952,19 @@ but unproven on the metric is exactly what this log has spent fifty cycles refus
 
 What the profile buys is narrower and real: the next attempt at this row has a named target
 and a number to move — 28 M instructions in `poll_read` — instead of six failed guesses.
+
+### Full gate run, and the state it certifies
+
+| gate | result |
+|---|---|
+| `cargo fmt --all --check` | clean |
+| `cargo clippy --workspace --all-targets -D warnings` | clean |
+| `cargo test --workspace` | **1090 passed, 0 failed** |
+| `cargo doc --workspace -D warnings` | clean (one private-item link fixed) |
+| `cargo audit` | exit 0, 1352 advisories loaded, nothing reported |
+| `cargo deny check` | advisories, bans, licenses, sources ok |
+
+Two tests are new since the last full checkout of this list: the pipeline-agreement test that
+guards the relay-buffer invariant, and the WebSocket short-write test. The doc warning was the
+same class as an earlier one — a public constant linking to a private helper — and was fixed by
+naming the helper in backticks rather than as a link.
