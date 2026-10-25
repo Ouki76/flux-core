@@ -2655,3 +2655,138 @@ mod mask_equivalence_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod short_write_tests {
+    use super::*;
+    use std::io::IoSlice;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+    /// An inner stream that accepts at most `limit` bytes per write.
+    ///
+    /// This exists to exercise the server-side vectored fast path's short-write branch: the
+    /// fast path writes the frame header and payload as two iovecs and, when the inner
+    /// accepts only part of that, falls back to buffering with `write_pos` set to what the
+    /// peer already took. A bug there truncates or duplicates the frame, and no test with a
+    /// well-behaved inner stream would see it.
+    struct ShortWriter {
+        out: Vec<u8>,
+        limit: usize,
+    }
+
+    impl AsyncWrite for ShortWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let n = buf.len().min(self.limit);
+            self.out.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let mut budget = self.limit;
+            let mut wrote = 0usize;
+            for b in bufs {
+                if budget == 0 {
+                    break;
+                }
+                let n = b.len().min(budget);
+                self.out.extend_from_slice(&b[..n]);
+                wrote += n;
+                budget -= n;
+            }
+            Poll::Ready(Ok(wrote))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for ShortWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// Whatever the inner stream accepts at a time, the peer must receive exactly one
+    /// well-formed unmasked binary frame carrying exactly the payload.
+    ///
+    /// This drives the vectored fast path's short-write branch, which falls back to
+    /// buffering with `write_pos` set to what the peer already took. A bug there truncates
+    /// or duplicates the frame, and no test using a well-behaved inner stream would see it.
+    #[tokio::test]
+    async fn a_short_inner_write_still_produces_one_correct_frame() {
+        for limit in [1usize, 3, 7, 64, 4096, 65_536] {
+            let mut ws = WebSocketStream::new(
+                ShortWriter {
+                    out: Vec::new(),
+                    limit,
+                },
+                Vec::new(),
+                false, // server: the fast path, and no masking
+            );
+            // One frame exactly: the point is that a short inner write must not add,
+            // drop or duplicate a byte. A larger payload legitimately becomes several
+            // frames, so that case is covered separately below.
+            let payload: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+            let mut written = 0usize;
+            while written < payload.len() {
+                written += ws.write(&payload[written..]).await.unwrap();
+            }
+            ws.flush().await.unwrap();
+
+            let frame = ws.inner.out.clone();
+            assert!(
+                !frame.is_empty(),
+                "limit {limit}: the writer produced nothing"
+            );
+            assert_eq!(frame[0], 0x82, "limit {limit}: not a binary FIN frame");
+            assert_eq!(
+                frame[1] & 0x80,
+                0,
+                "limit {limit}: a server must not set the mask bit"
+            );
+            let (hdr, body) = if frame[1] == 126 {
+                let len = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+                (4, len)
+            } else if frame[1] == 127 {
+                let len = u64::from_be_bytes(frame[2..10].try_into().unwrap()) as usize;
+                (10, len)
+            } else {
+                (2, frame[1] as usize)
+            };
+            assert_eq!(
+                body,
+                payload.len().min(64 * 1024),
+                "limit {limit}: wrong frame length"
+            );
+            assert_eq!(
+                &frame[hdr..hdr + body],
+                &payload[..body],
+                "limit {limit}: payload corrupted by the short-write path"
+            );
+            assert_eq!(
+                frame.len(),
+                hdr + body,
+                "limit {limit}: the writer emitted extra bytes beyond one frame"
+            );
+        }
+    }
+}
