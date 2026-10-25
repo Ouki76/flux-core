@@ -53,6 +53,23 @@ pub(crate) const HS_KEY_UPDATE: u8 = 24;
 #[allow(dead_code)]
 pub(crate) const MAX_TLS_RECORD: usize = 16384;
 
+/// Largest handshake message this client will buffer.
+///
+/// A length field is 24 bits, so a peer can claim 16 MiB and make the client allocate it before
+/// a single byte of it has been validated. Real handshake messages are small — a certificate
+/// chain is a few kilobytes, ten at the outside — so the ceiling is generous and still bounded.
+pub(crate) const MAX_HANDSHAKE_MESSAGE: usize = 256 * 1024;
+
+/// Refuses a handshake message longer than the ceiling, before anything is allocated for it.
+pub(crate) fn check_handshake_len(mlen: usize) -> FluxResult<()> {
+    if mlen > MAX_HANDSHAKE_MESSAGE {
+        return Err(crypto_err(format!(
+            "handshake message claims {mlen} bytes, more than the {MAX_HANDSHAKE_MESSAGE} this client will buffer"
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Tls13Suite {
     Aes128GcmSha256,
@@ -1541,6 +1558,7 @@ where
             }
             let mtype = hs_buf[0];
             let mlen = u32::from_be_bytes([0, hs_buf[1], hs_buf[2], hs_buf[3]]) as usize;
+            check_handshake_len(mlen)?;
             if hs_buf.len() < 4 + mlen {
                 break;
             }
@@ -2019,5 +2037,31 @@ mod connect_tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("not valid for"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod size_limit_tests {
+    use super::*;
+
+    /// A 24-bit length field lets a peer ask for 16 MiB. The ceiling refuses it before the
+    /// buffer is grown, and stays out of the way of real handshakes.
+    #[test]
+    fn a_handshake_message_larger_than_the_ceiling_is_refused() {
+        assert!(
+            check_handshake_len(64 * 1024).is_ok(),
+            "a 64 KiB message must pass"
+        );
+        let err = check_handshake_len(16 * 1024 * 1024)
+            .expect_err("a 16 MiB handshake message must be refused");
+        assert!(err.to_string().contains("will buffer"), "unexpected: {err}");
+    }
+
+    /// The ceiling has to be above any real certificate chain, or this becomes a
+    /// compatibility bug rather than a hardening one.
+    #[test]
+    fn the_ceiling_is_above_a_realistic_certificate_chain() {
+        // Three 8 KiB certificates, a size no real chain exceeds by much.
+        assert!(check_handshake_len(3 * 8 * 1024).is_ok());
     }
 }
