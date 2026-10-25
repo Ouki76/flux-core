@@ -172,11 +172,22 @@ def machine_info():
 def load_baseline(path):
     try:
         with open(path) as fh:
-            return json.load(fh), None
+            data = json.load(fh)
     except FileNotFoundError:
         return None, f"baseline file not found: {path}"
     except json.JSONDecodeError as exc:
         return None, f"baseline file is not valid JSON ({path}): {exc}"
+    # Shape check, because a hand-edited baseline used to reach `.get` below and die with
+    # `AttributeError: 'float' object has no attribute 'get'` — an error that says nothing
+    # about the file, the field or what a correct one looks like.
+    throughput = data.get("throughput_mbps")
+    if not isinstance(throughput, dict) or "flux_core" not in throughput:
+        return None, (
+            f"baseline {path} has no throughput_mbps.flux_core number; expected an object like "
+            '{"flux_core": 1234.5, "direct_loopback": 1400.0, ...}. '
+            "Re-record it with --update-baseline rather than editing by hand."
+        )
+    return data, None
 
 
 def read_pairs(path):
