@@ -7149,3 +7149,35 @@ buried in a default value.
 It means implementing the TLS 1.2 handshake — CBC and GCM record layers, RSA and ECDHE key
 exchange, the signature algorithm list of an older era. Weeks of work with a security review, for
 a protocol version browsers are removing. Not worth starting without a user who needs it.
+
+### B3.7 — the case every other test would have missed
+
+Every native-TLS test until now used a single self-signed certificate. Real servers send their
+leaf **and** the intermediates, with only the root trusted — and a client that inspected
+`chain[0]` alone would pass every test written so far and fail against every real deployment.
+
+`an_intermediate_chain_is_built_from_the_servers_flight` builds root → intermediate → leaf, has
+the server send leaf + intermediate, trusts only the root, and carries data through. Proved by
+removing the intermediates from the verification call:
+
+```
+a chain through an intermediate must verify:
+certificate chain rejected: InvalidSignatureForPublicKey
+```
+
+That failure mode is worth noting: a missing intermediate is indistinguishable, from the error
+message, from a wrong key. `InvalidSignatureForPublicKey` is what path building produces when the
+path cannot be built.
+
+The README now carries the option and its trade-off in the place a user looks:
+
+> `"native_tls": true` … Off by default: rustls speaks TLS 1.2 as well as 1.3 and the native path
+> is TLS 1.3 only.
+
+| B3 state | |
+|---|---|
+| our TLS against sing-box, xray, and under gRPC/h2 | **works, tested** |
+| WebPKI, private CA, intermediates, name check, ALPN, GREASE | **works, tested** |
+| throughput and connection rate | **parity** |
+| default | **rustls**, deliberately — TLS 1.2 coverage |
+| remaining gap | TLS 1.2 on the native path (not started, not planned) |
