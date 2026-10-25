@@ -5391,3 +5391,38 @@ not yet interoperable in a session*, and the log says both halves of that senten
 
 The self-pair test — matching seed relays 8 KiB intact, mismatched seed carries nothing —
 passes, so what is shipped is not broken; it is incomplete, and labelled.
+
+---
+
+## Cycle 115 — 2026-10-25
+
+### The direction that works, and what the asymmetry tells us
+
+Last cycle's mask matched Xray on the wire but the session died. The obvious next experiment
+is the *other* direction, and it passes:
+
+| direction | result |
+|---|---|
+| **xray client (AES mask) → our server (seed)** | **works**, 4 KiB intact, 2.7 MB/s |
+| our client (seed) → xray server (AES mask) | xray answers, session dies |
+
+`a_real_xray_client_reaches_our_aes_masked_kcp_server` pins the working direction, and in
+doing so records what took two cycles to learn: Xray 26 removed `kcpSettings.seed`, the mask
+arrives as `finalmask.udp`, and its setting is **`password`** — a config using `seed` parses
+cleanly and silently derives a key from the empty string.
+
+The asymmetry is the useful result. The mask is not "wrong"; **its receive half and its send
+half are not equally right**. A real peer can talk to our server, and our client cannot talk to
+a real peer — so the next attempt reads `connect()` and its first datagram, not the cipher.
+
+That is a better position than four cycles ago, when the mask did not exist at all, and a
+worse one than a green test in both directions. The log says which.
+
+### Counted honestly
+
+Ninety-five cycles of this audit have produced fifteen matrix rows ahead of both competitors,
+three further measured dimensions, 1095 tests and five clean gates. This one produced a
+protocol mask that works in one direction. It is the first item in a long time that is
+*shipped incomplete*, and the reason to record it that way is that the alternative — calling it
+done because one direction passes — is how the "Wall of Shame" entries in projects like this
+usually begin.
