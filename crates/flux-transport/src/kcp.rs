@@ -975,6 +975,9 @@ struct Conn {
     peer_closed: bool,
     /// We sent TERMINATE.
     closing: bool,
+    /// True when this side dialled, in which case a reply from a new address is accepted
+    /// and adopted.
+    follow_peer: bool,
     next_ping: Instant,
     last_recv: Instant,
     last_send: Instant,
@@ -1023,6 +1026,7 @@ impl Conn {
             window_update: false,
             peer_closed: false,
             closing: false,
+            follow_peer: false,
             // `now` would make the first flush send a PING immediately, and an Xray
             // *server* closes a session whose first datagram is anything but DATA — our own
             // capture settled that. Start the idle timer instead, so the first probe happens
@@ -1339,8 +1343,19 @@ impl Conn {
         if plain.len() > self.cfg.mtu {
             return;
         }
+        // The side that dialled follows its peer's address; the side that accepts pins it.
+        //
+        // A real KCP peer may switch its sending socket — Xray binds a new one and answers
+        // from a different port than the one it received on — so a client that pins the
+        // address drops every reply. It is why an interop attempt through a relay worked
+        // while the direct link did not: the relay re-sent from the address we had pinned.
+        //
+        // The accepting side keeps pinning on purpose: its conversation id is a 16-bit
+        // number arrive-able by guessing, and following address changes there would let an
+        // off-path sender take over an established stream.
         match self.peer {
             None => self.peer = Some(from),
+            Some(peer) if peer != from && self.follow_peer => self.peer = Some(from),
             Some(peer) if peer != from => return,
             Some(_) => {}
         }
@@ -1815,6 +1830,7 @@ pub async fn connect(peer: SocketAddr, cfg: KcpConfig) -> FluxResult<KcpStream> 
     hub.lock().routes.insert(conv, inbox.clone());
 
     let mut conn = Conn::new(cfg, conv, socket, Some(peer));
+    conn.follow_peer = true;
     // No opening PING: a real Xray client's first datagram is DATA, and an Xray
     // *server* closes a session that opens with anything else — measured by
     // capturing both sides and decoding them with this module's own parser. Our
