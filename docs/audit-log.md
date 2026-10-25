@@ -7181,3 +7181,36 @@ The README now carries the option and its trade-off in the place a user looks:
 | throughput and connection rate | **parity** |
 | default | **rustls**, deliberately — TLS 1.2 coverage |
 | remaining gap | TLS 1.2 on the native path (not started, not planned) |
+
+### B3.8 — the code path that works for the first message and not the second
+
+RFC 8446 §7.2 lets a server rotate its send keys at any moment. The read path already derived
+the next keys when it saw a `KeyUpdate`, and **nothing tested it** — which is the shape of code
+that survives review and fails at 3 a.m. on a long-lived connection.
+
+`a_key_update_mid_stream_is_followed` has a rustls server refresh its traffic keys mid-connection
+and keep writing:
+
+```
+one!   ← before the update
+        refresh_traffic_keys()
+two!   ← after
+```
+
+Removing the derivation reproduces the real-world symptom:
+
+```
+read after the server rotated its keys: tls13 aead decrypt failed
+```
+
+An `aead decrypt failed` on a connection that was working a second ago is one of the least
+diagnosable failures in this layer; having a test that produces it on demand is worth more than
+the fix, because the fix was already there.
+
+### A note on a false alarm
+
+The full suite failed twice in this cycle with *"the `xray` binary is required by this test but
+was not found"* — because that invocation did not have `~/.local/bin` on `PATH`. Not a
+regression, and worth recording as such: the harness needs the competitor binaries on `PATH`, and
+a run without them fails loudly rather than skipping silently, which is the behaviour the tests
+were built to have.
