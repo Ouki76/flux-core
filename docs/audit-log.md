@@ -4737,3 +4737,28 @@ the middle of the hot path since the beginning.
 The two rows still behind sing-box are Trojan (−5.5 %, inside this host's noise) and
 Shadowsocks-2022 (−11.6 %, which has now been investigated four times without a surviving
 explanation and is documented as an open architectural question).
+
+### The sweep applied to Shadowsocks, and a fifth falsified hypothesis
+
+The relay buffer went to 256 KiB, so the Shadowsocks writer — which caps a batch at 64 KiB —
+now receives four times what it can process per call. Raising its cap to match is the obvious
+follow-up:
+
+| row | 64 KiB cap | 256 KiB cap |
+|---|---|---|
+| Shadowsocks-2022 | −11.6 % | **−14.0 %, −18.2 %** |
+| Shadowsocks-AEAD | +7.5 % | +39.3 %, +12.3 % |
+
+SS-2022 — the row all of this is about — got *worse*, twice. SS-AEAD improved in one pass and
+was inside noise in the other. Reverted to 64 KiB.
+
+That is five hypotheses for this row now: cipher (CPU), chunking (the reader coalesces),
+halves (cross-pairing), bidirectional serialisation (read-ahead, measured, no effect), and
+batch size (this). The row stays at −12 % in the matrix, and every individual measurement of
+the same code — one-way down, one-way up, round-trip latency, exchanges per second — is
+faster than the competitor's.
+
+At some point the honest thing is to stop: five measured negatives is a result, and the
+result is that this row is slower under a symmetric synthetic echo for a reason none of the
+obvious mechanisms explain. It is written down as the one open question rather than papered
+over with a change that does not help.
