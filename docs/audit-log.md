@@ -5426,3 +5426,30 @@ protocol mask that works in one direction. It is the first item in a long time t
 *shipped incomplete*, and the reason to record it that way is that the alternative — calling it
 done because one direction passes — is how the "Wall of Shame" entries in projects like this
 usually begin.
+
+### Where the failing direction actually stops
+
+The route table explains it. Instrumenting the demultiplexer with the conversation id of
+every dropped datagram:
+
+```
+kcp: no route for conversation 0xa289 (live: []) - datagram dropped
+kcp: no route for conversation 0xa289 (live: []) - datagram dropped
+...
+```
+
+**`live: []`** — the client's route was already gone when Xray's replies arrived. `connect()`
+does register it (`routes.insert(conv, inbox)`), so the route was *removed*, which happens when
+the stream is dropped. The transfer's own output agrees: `0 MiB in 0.13s` — the SOCKS
+connection was answered and then closed immediately, long before Xray's first reply.
+
+So the mask is not dropping anything and the conv is not mismatched: **our client's kcp stream
+ends by itself right after connecting**, and everything Xray sends afterwards arrives at a hub
+that no longer has a listener.
+
+That narrows the next attempt to one place — `connect()` and whatever ends the stream before
+the peer's first segment comes back — instead of the cipher, the composition, or the framing,
+all of which are now excluded by evidence.
+
+The demultiplexer keeps the log line, at `debug`: it names the conversation and the live set,
+which is exactly what was missing for four cycles of guessing.

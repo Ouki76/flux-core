@@ -1691,9 +1691,13 @@ async fn dispatch(hub: Arc<Mutex<Hub>>) {
         let conv = u16::from_be_bytes([segment[0], segment[1]]);
         let hub = hub.lock();
         let target = hub.routes.get(&conv).or(hub.any.as_ref()).cloned();
+        let known: Vec<u16> = hub.routes.keys().copied().collect();
         drop(hub);
-        if let Some(inbox) = target {
-            inbox.push((from, segment));
+        match target {
+            Some(inbox) => inbox.push((from, segment)),
+            None => tracing::debug!(
+                "kcp: no route for conversation {conv:#06x} (live: {known:?}) - datagram dropped"
+            ),
         }
     }
 }
