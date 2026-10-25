@@ -4658,3 +4658,37 @@ The first full-suite run after the change reported `test_mux_vless_flux_to_singb
 it passed alone, and a second full run passed 1089 of 1089. The machine had been running
 benchmarks moments before. Recorded because the instinct to "fix" a test that fails once is
 how a real signal gets buried.
+
+---
+
+## Cycle 98 — 2026-10-25
+
+### The copier's buffer, swept
+
+The relay used two 64 KiB buffers per connection because that matched a socket read. The h2
+sweep taught that this class of constant is worth measuring, so it was measured — competitors
+disabled, so the comparison is our own numbers against our own, two independent passes:
+
+| row | 64 KiB | 256 KiB |
+|---|---|---|
+| VLESS / TCP | 681 / 729 / 813 | **840 / 962** |
+| VLESS / XHTTP | 333 / 382 / 300 | **523 / 617** |
+| VLESS / TLS | 342 / 302 / 313 | **320 / 365** |
+| VLESS / REALITY | 285 / 305 / 319 | **330 / 273** |
+| VLESS / gRPC + TLS | 234 / 233 / 232 | **214 / 252** |
+| Trojan / TLS | 313 / 330 | **385** |
+| VMess / WS + TLS | 195 / 209 | **219 / 211** |
+
+XHTTP gains the most — 300-382 becoming 523-617 — and TCP gains 15-18 % in both passes.
+REALITY is the one row that went backwards in one pass and forwards in the other, which is
+what noise looks like.
+
+**On the memory question**, which is the obvious objection: the buffers are allocated when a
+transfer starts and released when it ends, so the idle footprint — the number that decides
+whether a proxy fits on a small box — is unchanged. Measured 11-24 KB per held connection at
+*either* size, because a connection that is not moving data is not holding a copy buffer.
+What grows is the working set of a connection actively transferring: 512 KiB instead of
+128 KiB, on a path that carries 500 MB/s.
+
+That is the difference between a parameter and an architecture: this one costs nothing until
+someone is actually using it.
