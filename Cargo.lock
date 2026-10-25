@@ -838,6 +838,8 @@ dependencies = [
  "rcgen",
  "ring",
  "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
  "serde",
  "sha1",
  "sha2",

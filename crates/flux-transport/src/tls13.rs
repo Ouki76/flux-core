@@ -779,3 +779,281 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
 }
 
 // ===========================================================================
+
+/// WebPKI verification for this client's server certificate.
+///
+/// The chain logic is `rustls-webpki`'s, not ours: path building, signature checks, validity
+/// windows, name constraints and SAN matching are exactly the rules the rest of this project
+/// already trusts through rustls. What this module adds is the glue — a trust store that can
+/// carry the system roots and the configured private CAs at once, the TLS 1.3
+/// `CertificateVerify` construction, and the mapping from a TLS signature scheme to a
+/// verification algorithm.
+// Wired into a handshake in the next step; until then only the tests exercise it, and the
+// dead-code lint would otherwise hide the moment it goes stale.
+#[allow(dead_code)]
+pub(crate) mod verify {
+    use super::{FluxResult, crypto_err};
+    use rustls_pki_types::{CertificateDer, ServerName, TrustAnchor, UnixTime};
+    use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert};
+
+    /// The anchors a connection will accept.
+    pub(crate) struct TrustStore {
+        /// Process-lifetime anchors from `webpki-roots`.
+        system: &'static [TrustAnchor<'static>],
+        /// Anchors loaded from configured PEM files, owned by the store.
+        owned: Vec<CertificateDer<'static>>,
+    }
+
+    impl TrustStore {
+        /// The Mozilla root program, as shipped by `webpki-roots`.
+        pub(crate) fn system() -> Self {
+            Self {
+                system: webpki_roots::TLS_SERVER_ROOTS,
+                owned: Vec::new(),
+            }
+        }
+
+        /// No anchors at all. Only useful with `insecure`, and it makes every verification
+        /// fail otherwise, which is the behaviour a caller asking for it should expect.
+        pub(crate) fn empty() -> Self {
+            Self {
+                system: &[],
+                owned: Vec::new(),
+            }
+        }
+
+        /// Adds every certificate in a PEM bundle as a trust anchor.
+        ///
+        /// This is the private-CA path: a homelab CA pinned here is trusted, and nothing else
+        /// changes about how the chain is validated.
+        pub(crate) fn add_pem(&mut self, pem_bytes: &[u8]) -> FluxResult<usize> {
+            let text = std::str::from_utf8(pem_bytes)
+                .map_err(|e| crypto_err(format!("CA file is not UTF-8: {e}")))?;
+            let mut added = 0;
+            for block in pem::parse_many(text)
+                .map_err(|e| crypto_err(format!("CA file is not valid PEM: {e}")))?
+            {
+                if block.tag() != "CERTIFICATE" {
+                    continue;
+                }
+                self.owned
+                    .push(CertificateDer::from(block.contents().to_vec()));
+                added += 1;
+            }
+            Ok(added)
+        }
+
+        pub(crate) fn is_empty(&self) -> bool {
+            self.system.is_empty() && self.owned.is_empty()
+        }
+
+        /// Every anchor, borrowed for the duration of one verification.
+        fn anchors(&self) -> FluxResult<Vec<TrustAnchor<'_>>> {
+            let mut out: Vec<TrustAnchor<'_>> = self.system.to_vec();
+            for der in &self.owned {
+                out.push(
+                    anchor_from_trusted_cert(der)
+                        .map_err(|e| crypto_err(format!("unusable trust anchor: {e}")))?,
+                );
+            }
+            Ok(out)
+        }
+    }
+
+    /// Signature algorithms accepted for *chain* signatures.
+    const CHAIN_SIG_ALGS: &[&dyn rustls_pki_types::SignatureVerificationAlgorithm] = &[
+        webpki::ring::ECDSA_P256_SHA256,
+        webpki::ring::ECDSA_P256_SHA384,
+        webpki::ring::ECDSA_P384_SHA256,
+        webpki::ring::ECDSA_P384_SHA384,
+        webpki::ring::ED25519,
+        webpki::ring::RSA_PKCS1_2048_8192_SHA256,
+        webpki::ring::RSA_PKCS1_2048_8192_SHA384,
+        webpki::ring::RSA_PKCS1_2048_8192_SHA512,
+        webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+        webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+    ];
+
+    /// Maps a TLS 1.3 `SignatureScheme` onto the algorithm that verifies it.
+    fn scheme_algorithm(
+        scheme: u16,
+    ) -> FluxResult<&'static dyn rustls_pki_types::SignatureVerificationAlgorithm> {
+        Ok(match scheme {
+            0x0403 => webpki::ring::ECDSA_P256_SHA256,
+            0x0503 => webpki::ring::ECDSA_P384_SHA256,
+            0x0603 => webpki::ring::ECDSA_P384_SHA384,
+            0x0804 => webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+            0x0805 => webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+            0x0806 => webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
+            0x0401 => webpki::ring::RSA_PKCS1_2048_8192_SHA256,
+            0x0501 => webpki::ring::RSA_PKCS1_2048_8192_SHA384,
+            0x0601 => webpki::ring::RSA_PKCS1_2048_8192_SHA512,
+            0x0807 => webpki::ring::ED25519,
+            other => {
+                return Err(crypto_err(format!(
+                    "server chose signature scheme {other:#06x}, which this client does not verify"
+                )));
+            }
+        })
+    }
+
+    /// Verifies the server's chain against `store` and that it is valid for `server_name`.
+    ///
+    /// `chain` is the certificate list exactly as the server sent it: leaf first, then the
+    /// intermediates. Roots are not expected in it — they come from the store.
+    pub(crate) fn verify_server_chain(
+        store: &TrustStore,
+        chain: &[CertificateDer<'_>],
+        server_name: &str,
+        now: UnixTime,
+    ) -> FluxResult<()> {
+        let (leaf, intermediates) = chain
+            .split_first()
+            .ok_or_else(|| crypto_err("the server sent no certificate"))?;
+        let name = ServerName::try_from(server_name.to_owned())
+            .map_err(|e| crypto_err(format!("'{server_name}' is not a usable server name: {e}")))?;
+        let anchors = store.anchors()?;
+        if anchors.is_empty() {
+            return Err(crypto_err(
+                "no trust anchors are configured, so no server certificate can be verified",
+            ));
+        }
+        let end_entity = EndEntityCert::try_from(leaf)
+            .map_err(|e| crypto_err(format!("the server certificate is unparseable: {e}")))?;
+        end_entity
+            .verify_for_usage(
+                CHAIN_SIG_ALGS,
+                &anchors,
+                intermediates,
+                now,
+                KeyUsage::server_auth(),
+                None,
+                None,
+            )
+            .map_err(|e| crypto_err(format!("certificate chain rejected: {e}")))?;
+        end_entity
+            .verify_is_valid_for_subject_name(&name)
+            .map_err(|e| {
+                crypto_err(format!("certificate is not valid for '{server_name}': {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Verifies the handshake signature over the TLS 1.3 `CertificateVerify` construction.
+    ///
+    /// The signed content is the fixed context string, a zero byte, and the transcript hash —
+    /// RFC 8446 §4.4.3. Getting this wrong would accept a signature that was never made for
+    /// this handshake, so it is spelled out rather than inlined.
+    pub(crate) fn verify_certificate_verify(
+        leaf: &CertificateDer<'_>,
+        scheme: u16,
+        transcript_hash: &[u8],
+        signature: &[u8],
+    ) -> FluxResult<()> {
+        let mut signed = Vec::with_capacity(64 + 1 + transcript_hash.len());
+        signed.extend_from_slice(b"                                    ");
+        signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        signed.push(0);
+        signed.extend_from_slice(transcript_hash);
+        let alg = scheme_algorithm(scheme)?;
+        let cert = EndEntityCert::try_from(leaf)
+            .map_err(|e| crypto_err(format!("the server certificate is unparseable: {e}")))?;
+        cert.verify_signature(alg, &signed, signature)
+            .map_err(|e| crypto_err(format!("CertificateVerify rejected: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::verify::*;
+    use rustls_pki_types::{CertificateDer, UnixTime};
+
+    /// A throwaway CA and a leaf it signed, as PEM bytes and DER chain.
+    fn ca_and_leaf(name: &str) -> (String, Vec<CertificateDer<'static>>) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "flux test CA");
+        let ca = ca_params.self_signed(&ca_key).expect("ca cert");
+
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params = CertificateParams::new(vec![name.to_string()]).expect("leaf params");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf cert");
+        (ca.pem(), vec![CertificateDer::from(leaf.der().to_vec())])
+    }
+
+    fn now() -> UnixTime {
+        UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_790_000_000))
+    }
+
+    /// A private CA configured by the caller is enough to verify a chain that no public root
+    /// would accept — this is the homelab case the private-CA knob exists for.
+    #[test]
+    fn a_configured_private_ca_verifies_its_leaf() {
+        let (ca_pem, chain) = ca_and_leaf("example.test");
+        let mut store = TrustStore::empty();
+        assert_eq!(store.add_pem(ca_pem.as_bytes()).expect("add ca"), 1);
+
+        verify_server_chain(&store, &chain, "example.test", now())
+            .expect("a leaf from the configured CA must verify");
+    }
+
+    /// Without the CA, the same chain must fail: nothing is trusted by default.
+    #[test]
+    fn the_same_chain_fails_without_its_ca() {
+        let (_ca_pem, chain) = ca_and_leaf("example.test");
+        let store = TrustStore::empty();
+        let err = verify_server_chain(&store, &chain, "example.test", now())
+            .expect_err("an empty trust store must reject everything");
+        assert!(
+            err.to_string().contains("no trust anchors"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A certificate for another name must not pass for this one. This is the check that
+    /// stops a valid certificate for attacker.test from being accepted for example.test.
+    #[test]
+    fn a_leaf_is_not_accepted_for_a_different_name() {
+        let (ca_pem, chain) = ca_and_leaf("example.test");
+        let mut store = TrustStore::empty();
+        store.add_pem(ca_pem.as_bytes()).expect("add ca");
+        let err = verify_server_chain(&store, &chain, "other.test", now())
+            .expect_err("the name must be checked");
+        assert!(
+            err.to_string().contains("not valid for"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A leaf signed by someone else's CA must not verify against our store.
+    #[test]
+    fn a_leaf_from_a_foreign_ca_is_rejected() {
+        let (ours_pem, _) = ca_and_leaf("example.test");
+        let (_theirs_pem, their_chain) = ca_and_leaf("example.test");
+        let mut store = TrustStore::empty();
+        store.add_pem(ours_pem.as_bytes()).expect("add ca");
+        let err = verify_server_chain(&store, &their_chain, "example.test", now())
+            .expect_err("a foreign CA must not verify");
+        assert!(
+            err.to_string().contains("chain rejected"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A malformed PEM must be reported as such, not silently produce an empty store.
+    #[test]
+    fn a_broken_pem_is_an_error() {
+        let mut store = TrustStore::empty();
+        let err = store
+            .add_pem(b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n")
+            .expect_err("a broken PEM must fail");
+        assert!(err.to_string().contains("PEM"), "unexpected: {err}");
+    }
+}
