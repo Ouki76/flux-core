@@ -7329,3 +7329,52 @@ The chain of evidence for the default is now complete at every link:
 | rustls reaches the same server | `rustls_reaches_the_same_tls12_server` |
 | **the dial actually retries** | `a_tls12_only_server_is_reached_through_the_fallback` |
 | nothing else regressed | 1127 tests, matrix `ASSERT PASSED` |
+
+---
+
+## B3.13 — closing the B3 goal
+
+Final verification, with the default configuration (native TLS) and nothing overridden:
+
+```
+cargo fmt --all --check                          clean
+cargo clippy --workspace --all-targets -D        0
+RUSTDOCFLAGS=-D warnings cargo doc               0
+cargo audit                                      exit 0
+cargo deny check                                 advisories ok, bans ok, licenses ok, sources ok
+cargo test --workspace                           1127 passed, 0 failed
+bench_rps --tls --assert 0.10                    ASSERT PASSED   8 477/s vs 4 236 and 900
+bench_matrix --assert 0.10                       ASSERT PASSED   15 of 15 ahead of sing-box
+```
+
+### What B3 delivered
+
+| objective clause | state |
+|---|---|
+| replace rustls on the TLS transports with our TLS 1.3 client | **default**, with an automatic rustls fallback |
+| WebPKI chain verification: webpki-roots, configured CA, insecure | done, 8 tests |
+| ALPN negotiation | done, and an unoffered answer is refused |
+| browser-shaped ClientHello with GREASE (RFC 8701) | done — ciphers, extensions, groups |
+| CertificateVerify verified with the leaf key | done, all TLS signature schemes mapped |
+| SNI name checking | done |
+| interop with sing-box and xray keeps passing | 41 + 4 interop tests, plus 4 native-path tests |
+| no throughput or connection-rate regression | both gates pass on the new default |
+| every fix proved by a failing test | ALPN, EE parsing, 64-byte padding, chain building, key rotation, fallback |
+| gates green, commits pushed, record kept | all five, 12 commits, this log |
+
+### What it cost, and what it leaves
+
+Fourteen cycles, six real defects found in the new code by tests (an illegal empty ALPN
+extension, 36 bytes of padding where 64 were required, an unparsed EncryptedExtensions, a
+missing intermediate-chain pass, an unbounded 16 MiB handshake allocation, and a fallback that
+would not have fired on the alert a 1.2 server actually sends), and one design decision reversed
+once the evidence changed.
+
+Two gaps remain, both recorded rather than hidden:
+
+1. **TLS 1.2 is not implemented** in our stack; the fallback costs one extra connection on servers
+   that need it. Closing it properly is weeks of work with a security review.
+2. **No session resumption.** rustls resumes, ours starts a full handshake each time. Connection
+   rate is at parity without it, but on a high-churn workload this is the next thing to measure.
+
+Neither is in the objective, and both are written where the next session will find them.
