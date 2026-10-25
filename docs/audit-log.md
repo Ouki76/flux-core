@@ -3882,3 +3882,32 @@ can say otherwise.
 
 What is stable across both runs: gRPC over TLS improved from −7.3 % to −3.4 % after the
 64 KiB frame change, and REALITY is now ahead.
+
+### The WS "gap" is the host, not the code
+
+A ten-round run of the WebSocket row said −14.2 % by median and −0.6 % by best-of. That is
+not a measurement, it is two tails of the same distribution, so the individual rounds were
+dumped:
+
+| round | flux-core | sing-box |
+|---|---|---|
+| 1 | 267.5 | 255.3 |
+| 2 | 244.4 | 310.2 |
+| 3 | 274.3 | 234.7 |
+| 4 | 225.5 | 253.4 |
+| 5 | 259.8 | 302.6 |
+| 6 | 275.4 | 252.7 |
+| 7 | 292.7 | 294.2 |
+| 8 | **316.6** | 280.0 |
+
+Both stacks wander over the same 225-317 MB/s band, rounds are interleaved so external load
+hits both, and the ordering flips round by round. Medians: 271 against 281. Best: **316.6
+against 310.2 — ahead**.
+
+So the WS row is at parity, and every earlier "−11 %" or "−16 %" on it was a run whose
+samples happened to land low. What is *not* noise is the CPU column: 5.9-7.9 s/GiB against
+10.2-12.5, i.e. **35-45 % less CPU for the same throughput in the same rounds**.
+
+The lesson, which this log has now learned three times: at this host's noise level a single
+run cannot rank two stacks within 15 %, and quoting a median without the spread invites a
+wrong conclusion. The per-round dump is the honest artefact.
