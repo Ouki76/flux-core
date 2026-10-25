@@ -3759,3 +3759,25 @@ one.
 
 The pattern worth keeping: a profile that names a *library* is as valuable as one that names
 a bug, because it tells the next cycle where to stop looking.
+
+### The last functional item, closed with a precise reason
+
+The browser-grade ClientHello has been marked "partial" for many cycles without saying what
+would move it. Checked properly this time:
+
+- **General GREASE (RFC 8701)** — rustls emits none. Its `hs.rs` uses GREASE only for the ECH
+  extension. Nothing in the public API asks for per-extension GREASE, so a ClientHello with
+  the padding and grease values a browser sends is not expressible.
+- **GREASE-ECH**, which is what Chrome actually sends today, *is* available —
+  `ClientConfig::builder(..).with_ech(EchMode::Grease(..))` — but `EchGreaseConfig::new` needs
+  a `&'static dyn Hpke`, and the only provider in rustls 0.23 that implements `Hpke` is
+  **aws-lc-rs** (`crypto/aws_lc_rs/hpke.rs`; the ring provider has none).
+
+So enabling it means the aws-lc-rs provider, which this audit already tried and reverted in
+cycle 64: with both providers compiled in, rustls panics because it cannot choose a default,
+and forcing aws-lc-rs breaks REALITY interop with xray — the handshake stopped matching.
+
+The gap is therefore bounded and named: what a browser ClientHello needs from this stack is
+an HPKE-capable provider, and adopting one is a REALITY interop project, not a flag. That is
+what "partial" now means in `docs/HANDOFF.md`, and it is the only item in the functional list
+that is not closed.

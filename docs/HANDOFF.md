@@ -35,7 +35,10 @@ Never compare absolutes across machines.
 **Functional gaps vs the competitors: closed.** mKCP (both directions, interop proven),
 XHTTP (stream-one, interop proven and measured), IDNA, GeoIP fixture, private-CA knob, UDP
 associations, nested config-key typo detection. The one partial item is the browser-grade
-ClientHello, which is a property of the TLS library rather than of this codebase.
+ClientHello, and the reason is now precise: rustls emits no general GREASE, and GREASE-ECH —
+what Chrome actually sends — requires an HPKE provider, which only aws-lc-rs supplies; adopting
+it makes rustls panic with two providers compiled in and breaks REALITY interop with Xray when
+forced (cy 64). It is a REALITY interop project, not a flag.
 
 **The defect that hid for thirty cycles was a missing `poll_flush`** in the relay's
 copier: writers above a socket hold accepted bytes until flushed, so the tail of a transfer
