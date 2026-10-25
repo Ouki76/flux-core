@@ -80,6 +80,14 @@ const TROJAN_PASSWORD: &str = "bench-trojan-secret-0123";
 const SS_AEAD_PASSWORD: &str = "bench-ss-aead-secret-4567";
 /// "0123456789abcdef" — the 16-byte key `2022-blake3-aes-128-gcm` requires.
 const SS2022_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZg==";
+/// WireGuard row keys. Test-only, fixed so a failure reproduces.
+const WG_SERVER_PRIVATE: &str = "SORi6jKObYLq3t4+vJXhV0SzvOHCRU2+xrV7L68vz38=";
+const WG_SERVER_PUBLIC: &str = "YGWKfUozSjihgplzX2ayTKnoyPuIQdwb28kN0ofrtRQ=";
+const WG_CLIENT_PRIVATE: &str = "WHZn47P2gYvxnZREdVOZPI15fgsWjWh8EL4T/bOLIHE=";
+const WG_CLIENT_PUBLIC: &str = "bHNDnKVogC44UvRVr++6CBusJ3dlEO0RicIeGAnS1G0=";
+const WG_SERVER_IP: &str = "10.9.0.1";
+const WG_CLIENT_IP: &str = "10.9.0.2";
+
 /// Password for the Hysteria2 row; the protocol authenticates with one.
 const HY2_PASSWORD: &str = "bench-hy2-pass";
 
@@ -513,6 +521,8 @@ enum Kind {
     Hysteria2,
     /// TUIC v5: another QUIC proxy protocol, with its own auth and framing.
     Tuic,
+    /// WireGuard: an L3 tunnel over UDP, not a proxy protocol with its own addressing.
+    WireGuard,
     /// VLESS over XHTTP in stream-one mode.
     VlessXhttp,
     VlessWsTls,
@@ -536,6 +546,12 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "VLESS / TCP",
         kind: Kind::VlessTcp,
+        needs_cert: false,
+        needs_decoy: false,
+    },
+    Scenario {
+        name: "WireGuard",
+        kind: Kind::WireGuard,
         needs_cert: false,
         needs_decoy: false,
     },
@@ -804,6 +820,10 @@ impl Scenario {
             Kind::VlessTls => flux_in(port, &[flux_tls_server(s)], &flux_vless(false)),
             // Hysteria2 carries itself over QUIC, so the node is a UDP carrier with the
             // protocol on top rather than a transport under VLESS.
+            Kind::WireGuard => format!(
+                r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"wg-in","type":"wireguard","listen":"127.0.0.1","listen_port":{port},"private_key":"{WG_SERVER_PRIVATE}","peers":[{{"public_key":"{WG_CLIENT_PUBLIC}","allowed_ips":["0.0.0.0/0"]}}]}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"route":{{"final":"direct"}}}}"#,
+                level = log_level()
+            ),
             Kind::Tuic => format!(
                 r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"in","carrier":{{"type":"udp","listen":"127.0.0.1","listen_port":{port}}},{tls},"protocol":{{"type":"tuic","uuid":"{UUID}","password":"{pass}"}}}}],"outbounds":[{{"type":"direct","tag":"direct"}}]}}"#,
                 level = log_level(),
@@ -859,6 +879,10 @@ impl Scenario {
         match self.kind {
             Kind::VlessTcp => flux_out(socks, port, &[], &flux_vless(false)),
             Kind::VlessXhttp => flux_out(socks, port, &[flux_xhttp_client()], &flux_vless(false)),
+            Kind::WireGuard => format!(
+                r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"socks-in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"udp","address":"127.0.0.1:{port}"}},"protocol":{{"type":"wireguard","private_key":"{WG_CLIENT_PRIVATE}","peer_public_key":"{WG_SERVER_PUBLIC}","local_address":"{WG_CLIENT_IP}"}}}}],"route":{{"final":"node"}}}}"#,
+                level = log_level()
+            ),
             Kind::Tuic => format!(
                 r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"socks-in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"udp","address":"127.0.0.1:{port}"}},{tls},"protocol":{{"type":"tuic","uuid":"{UUID}","password":"{pass}"}}}}],"route":{{"final":"node"}}}}"#,
                 level = log_level(),
@@ -933,6 +957,14 @@ impl Scenario {
                 r#"{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}],{}}}"#,
                 sbox_tls_server(s)
             ),
+            Kind::WireGuard => {
+                // A server, too, is an `endpoint` rather than an inbound: sing-box 1.11
+                // removed the `wireguard` inbound type entirely.
+                return format!(
+                    r#"{{"log":{{"level":"{level}"}},"endpoints":[{{"type":"wireguard","tag":"wg","system":false,"address":["{WG_SERVER_IP}/24"],"listen_port":{port},"private_key":"{WG_SERVER_PRIVATE}","peers":[{{"public_key":"{WG_CLIENT_PUBLIC}","allowed_ips":["0.0.0.0/0"]}}]}}],"outbounds":[{{"type":"direct","tag":"direct"}}],"route":{{"final":"direct"}}}}"#,
+                    level = log_level()
+                );
+            }
             Kind::Tuic => format!(
                 r#"{{"type":"tuic","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}","password":"{HY2_PASSWORD}"}}],{}}}"#,
                 sbox_tls_server(s)
@@ -993,6 +1025,14 @@ impl Scenario {
                 r#"{{"type":"vless","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}",{}}}"#,
                 sbox_tls_client()
             ),
+            Kind::WireGuard => {
+                // A sing-box WireGuard client is an *endpoint*, not an outbound, so the whole
+                // config shape differs and is built here rather than below.
+                return format!(
+                    r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"type":"socks","tag":"in","listen":"127.0.0.1","listen_port":{socks}}}],"endpoints":[{{"type":"wireguard","tag":"wg","address":["{WG_CLIENT_IP}/24"],"private_key":"{WG_CLIENT_PRIVATE}","peers":[{{"address":"127.0.0.1","port":{port},"public_key":"{WG_SERVER_PUBLIC}","allowed_ips":["0.0.0.0/0"]}}]}}],"route":{{"final":"wg"}}}}"#,
+                    level = log_level()
+                );
+            }
             Kind::Tuic => format!(
                 r#"{{"type":"tuic","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}","password":"{HY2_PASSWORD}",{}}}"#,
                 sbox_tls_client()
@@ -1047,9 +1087,18 @@ impl Scenario {
     /// The scenario as the xray builders name it, or `None` where xray has no
     /// equivalent (REALITY + Vision is an xray-only flow, and it is present).
     /// Whether sing-box can run this scenario at all.
+    /// Whether the tunnel needs a routable address rather than loopback.
+    ///
+    /// WireGuard carries IP packets, and sing-box refuses to route a packet whose
+    /// destination is a loopback address through an endpoint — correctly, since that is how a
+    /// tunnel becomes a loop. Those rows therefore dial the host's LAN address.
+    fn needs_routable_target(&self) -> bool {
+        matches!(self.kind, Kind::WireGuard)
+    }
+
     /// Whether this scenario's server is a QUIC listener rather than a TCP one.
     fn is_quic(&self) -> bool {
-        matches!(self.kind, Kind::Hysteria2 | Kind::Tuic)
+        matches!(self.kind, Kind::Hysteria2 | Kind::Tuic | Kind::WireGuard)
     }
 
     fn sbox_capable(&self) -> bool {
@@ -1068,6 +1117,7 @@ impl Scenario {
                 | Kind::TrojanTls
                 | Kind::Hysteria2
                 | Kind::Tuic
+                | Kind::WireGuard
         )
     }
 
@@ -1079,7 +1129,7 @@ impl Scenario {
             Kind::VlessGrpcTls => P::VlessGrpc,
             Kind::VlessXhttp => P::VlessXhttp,
             Kind::VlessGrpcPlain => P::VlessGrpc,
-            Kind::Hysteria2 | Kind::Tuic => return None,
+            Kind::Hysteria2 | Kind::Tuic | Kind::WireGuard => return None,
             Kind::VlessTls => P::VlessTls,
             Kind::VlessReality => P::Reality,
             Kind::VlessRealityVision => P::RealityVision,
@@ -1167,9 +1217,24 @@ async fn wait_for_listener(addr: SocketAddr, timeout: Duration, udp: bool) -> bo
     }
 }
 
-async fn start_echo_server() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+/// A routable address of this machine, for rows whose tunnel cannot carry loopback.
+fn lan_ipv4() -> Option<std::net::Ipv4Addr> {
+    let probe = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    probe
+        .connect((std::net::Ipv4Addr::new(192, 0, 2, 1), 9))
+        .ok()?;
+    match probe.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_unspecified() => Some(v4),
+        _ => None,
+    }
+}
+
+async fn start_echo_server() -> (SocketAddr, Option<SocketAddr>) {
+    // Bound on every interface so a tunnel row can reach it by a non-loopback address:
+    // sing-box refuses to route a loopback destination through WireGuard.
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let lan = lan_ipv4().map(|ip| SocketAddr::new(std::net::IpAddr::V4(ip), addr.port()));
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             let _ = socket.set_nodelay(true);
@@ -1189,7 +1254,7 @@ async fn start_echo_server() -> SocketAddr {
             });
         }
     });
-    addr
+    (addr, lan)
 }
 
 /// A real TLS 1.3 echo server. REALITY servers fetch the served certificate
@@ -1532,11 +1597,19 @@ fn pid_suffix() -> String {
     )
 }
 
+/// Where a row's traffic is aimed: loopback, plus a routable alternative for tunnels that
+/// cannot carry `127.0.0.1`.
+#[derive(Clone, Copy)]
+struct EchoTargets {
+    loopback: SocketAddr,
+    routable: Option<SocketAddr>,
+}
+
 async fn run_scenario(
     scenario: &Scenario,
     setup: &Setup,
     args: &Args,
-    echo: SocketAddr,
+    targets: EchoTargets,
     flux_bin: &Path,
     sbox_bin: Option<&Path>,
     xray_bin: Option<&Path>,
@@ -1606,6 +1679,25 @@ async fn run_scenario(
         samples.insert(Stack::Xray, Some(Vec::new()));
         errors.insert(Stack::Xray, None);
     }
+
+    // WireGuard cannot carry a loopback destination, so its rows dial a routable one.
+    let echo = if scenario.needs_routable_target() {
+        match targets.routable {
+            Some(addr) => addr,
+            None => {
+                for stack in [Stack::Flux, Stack::Singbox, Stack::Xray] {
+                    errors.insert(
+                        stack,
+                        Some("no non-loopback address on this host; a WireGuard tunnel cannot carry 127.0.0.1".into()),
+                    );
+                    samples.insert(stack, None);
+                }
+                targets.loopback
+            }
+        }
+    } else {
+        targets.loopback
+    };
 
     // A tunnel that cannot carry one warm-up transfer is not a throughput
     // result; fail it before measuring so the reason is quoted, not averaged.
@@ -1853,7 +1945,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let mut setup = Setup::new()?;
-    let echo = start_echo_server().await;
+    let (echo, lan_echo) = start_echo_server().await;
 
     let needs_decoy = scenarios.iter().any(|s| s.needs().1);
     if needs_decoy {
@@ -1904,7 +1996,10 @@ async fn main() -> anyhow::Result<()> {
             scenario,
             &setup,
             &args,
-            echo,
+            EchoTargets {
+                loopback: echo,
+                routable: lan_echo,
+            },
             &args.flux_bin,
             sbox_bin.as_deref(),
             xray_bin.as_deref(),
