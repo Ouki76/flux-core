@@ -599,6 +599,14 @@ pub enum InboundSecurityConfig {
         /// PEM private key that matches the certificate.
         #[serde(default)]
         key_path: Option<String>,
+        /// ALPN protocols to accept.
+        ///
+        /// A server that cannot advertise `h3` cannot serve TUIC, and one that cannot
+        /// advertise `h2` cannot serve gRPC or XHTTP behind a browser — the client offers
+        /// the protocol and the server has to agree. Empty means "no ALPN", which is what
+        /// every non-QUIC row here uses.
+        #[serde(default)]
+        alpn: Vec<String>,
     },
     /// REALITY: TLS that cannot be attributed to this server.
     #[serde(rename = "reality")]

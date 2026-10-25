@@ -511,6 +511,8 @@ enum Kind {
     VlessTls,
     /// Hysteria2: a proxy protocol over QUIC, not a transport under VLESS.
     Hysteria2,
+    /// TUIC v5: another QUIC proxy protocol, with its own auth and framing.
+    Tuic,
     /// VLESS over XHTTP in stream-one mode.
     VlessXhttp,
     VlessWsTls,
@@ -535,6 +537,12 @@ const SCENARIOS: &[Scenario] = &[
         name: "VLESS / TCP",
         kind: Kind::VlessTcp,
         needs_cert: false,
+        needs_decoy: false,
+    },
+    Scenario {
+        name: "TUIC v5",
+        kind: Kind::Tuic,
+        needs_cert: true,
         needs_decoy: false,
     },
     Scenario {
@@ -631,6 +639,20 @@ fn flux_tls_server(s: &Setup) -> String {
         s.cert_str(),
         s.key_str()
     )
+}
+
+/// Server TLS advertising `h3`, which TUIC requires its ALPN to include.
+fn flux_tls_server_alpn(s: &Setup) -> String {
+    format!(
+        r#""security":{{"type":"tls","certificate_path":"{}","key_path":"{}","alpn":["h3"]}}"#,
+        s.cert_str(),
+        s.key_str()
+    )
+}
+
+/// Client TLS offering `h3`, for the QUIC proxy protocols.
+fn flux_tls_client_h3() -> String {
+    format!(r#""security":{{"type":"tls","insecure":true,"sni":"{TLS_SNI}","alpn":["h3"]}}"#)
 }
 
 fn flux_tls_client(alpn_h2: bool) -> String {
@@ -782,6 +804,12 @@ impl Scenario {
             Kind::VlessTls => flux_in(port, &[flux_tls_server(s)], &flux_vless(false)),
             // Hysteria2 carries itself over QUIC, so the node is a UDP carrier with the
             // protocol on top rather than a transport under VLESS.
+            Kind::Tuic => format!(
+                r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"in","carrier":{{"type":"udp","listen":"127.0.0.1","listen_port":{port}}},{tls},"protocol":{{"type":"tuic","uuid":"{UUID}","password":"{pass}"}}}}],"outbounds":[{{"type":"direct","tag":"direct"}}]}}"#,
+                level = log_level(),
+                tls = flux_tls_server_alpn(s),
+                pass = HY2_PASSWORD
+            ),
             Kind::Hysteria2 => format!(
                 r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"in","carrier":{{"type":"udp","listen":"127.0.0.1","listen_port":{port}}},{tls},"protocol":{{"type":"hysteria2","password":"{pass}"}}}}],"outbounds":[{{"type":"direct","tag":"direct"}}]}}"#,
                 level = log_level(),
@@ -831,6 +859,12 @@ impl Scenario {
         match self.kind {
             Kind::VlessTcp => flux_out(socks, port, &[], &flux_vless(false)),
             Kind::VlessXhttp => flux_out(socks, port, &[flux_xhttp_client()], &flux_vless(false)),
+            Kind::Tuic => format!(
+                r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"socks-in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"udp","address":"127.0.0.1:{port}"}},{tls},"protocol":{{"type":"tuic","uuid":"{UUID}","password":"{pass}"}}}}],"route":{{"final":"node"}}}}"#,
+                level = log_level(),
+                tls = flux_tls_client_h3(),
+                pass = HY2_PASSWORD
+            ),
             Kind::Hysteria2 => format!(
                 r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"socks-in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"udp","address":"127.0.0.1:{port}"}},{tls},"protocol":{{"type":"hysteria2","password":"{pass}"}}}}],"route":{{"final":"node"}}}}"#,
                 level = log_level(),
@@ -899,6 +933,10 @@ impl Scenario {
                 r#"{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}],{}}}"#,
                 sbox_tls_server(s)
             ),
+            Kind::Tuic => format!(
+                r#"{{"type":"tuic","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}","password":"{HY2_PASSWORD}"}}],{}}}"#,
+                sbox_tls_server(s)
+            ),
             Kind::Hysteria2 => format!(
                 r#"{{"type":"hysteria2","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"password":"{HY2_PASSWORD}"}}],{}}}"#,
                 sbox_tls_server(s)
@@ -955,6 +993,10 @@ impl Scenario {
                 r#"{{"type":"vless","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}",{}}}"#,
                 sbox_tls_client()
             ),
+            Kind::Tuic => format!(
+                r#"{{"type":"tuic","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}","password":"{HY2_PASSWORD}",{}}}"#,
+                sbox_tls_client()
+            ),
             Kind::Hysteria2 => format!(
                 r#"{{"type":"hysteria2","tag":"node","server":"127.0.0.1","server_port":{port},"password":"{HY2_PASSWORD}",{}}}"#,
                 sbox_tls_client()
@@ -1007,7 +1049,7 @@ impl Scenario {
     /// Whether sing-box can run this scenario at all.
     /// Whether this scenario's server is a QUIC listener rather than a TCP one.
     fn is_quic(&self) -> bool {
-        matches!(self.kind, Kind::Hysteria2)
+        matches!(self.kind, Kind::Hysteria2 | Kind::Tuic)
     }
 
     fn sbox_capable(&self) -> bool {
@@ -1025,6 +1067,7 @@ impl Scenario {
                 | Kind::SsAead
                 | Kind::TrojanTls
                 | Kind::Hysteria2
+                | Kind::Tuic
         )
     }
 
@@ -1036,7 +1079,7 @@ impl Scenario {
             Kind::VlessGrpcTls => P::VlessGrpc,
             Kind::VlessXhttp => P::VlessXhttp,
             Kind::VlessGrpcPlain => P::VlessGrpc,
-            Kind::Hysteria2 => return None,
+            Kind::Hysteria2 | Kind::Tuic => return None,
             Kind::VlessTls => P::VlessTls,
             Kind::VlessReality => P::Reality,
             Kind::VlessRealityVision => P::RealityVision,

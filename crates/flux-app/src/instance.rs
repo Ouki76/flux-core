@@ -1544,6 +1544,7 @@ fn compile_server_securities(
             InboundSecurityConfig::Tls {
                 certificate_path,
                 key_path,
+                alpn,
                 ..
             } => {
                 let (certs, key) = if let (Some(cp), Some(kp)) = (certificate_path, key_path) {
@@ -1558,7 +1559,8 @@ fn compile_server_securities(
                         PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
                     )
                 };
-                let acceptor = TlsTransport::create_server_acceptor(certs, key, vec![])?;
+                let alpn: Vec<Vec<u8>> = alpn.into_iter().map(|s| s.into_bytes()).collect();
+                let acceptor = TlsTransport::create_server_acceptor(certs, key, alpn)?;
                 list.push(flux_transport::pipeline::ServerSecurityLayer::Tls(acceptor));
             }
             InboundSecurityConfig::Reality {
