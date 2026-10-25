@@ -790,3 +790,56 @@ fn fuzz_kcp_segment_parser() {
         }
     }
 }
+
+/// The XHTTP server decides whether a request is its own by matching a path prefix, and
+/// that decision is reachable by any HTTP client on the internet. It must be total — every
+/// byte sequence produces "accept" or "refuse" — and it must not be walkable: a path with
+/// `..` in it is refused outright rather than normalised, because normalising for a peer is
+/// how a proxy gets walked out of its own tree.
+#[test]
+fn fuzz_xhttp_path_matching() {
+    use flux_transport::xhttp::is_under_base;
+
+    // The cases that decide whether the rule is safe, spelled out.
+    assert!(is_under_base("/tunnel", "/tunnel"));
+    assert!(is_under_base("/tunnel", "/tunnel/"));
+    assert!(is_under_base("/tunnel", "/tunnel/session-abc"));
+    assert!(is_under_base("tunnel", "/tunnel/x"));
+    assert!(!is_under_base("/tunnel", "/elsewhere"));
+    assert!(!is_under_base("/tunnel", "/tunnels")); // prefix, not a word
+    assert!(!is_under_base("/tunnel", "/tunnel/../etc/passwd"));
+    assert!(!is_under_base("/tunnel", "/tunnel/%2e%2e/etc"));
+    assert!(!is_under_base("/a/b", "/a/bc"));
+    assert!(is_under_base("/", "/anything"));
+
+    let mut rng = Rng(0x5eed_0000_1234_abcd);
+    let bases = [
+        "/",
+        "/tunnel",
+        "tunnel",
+        "/a/b",
+        "",
+        "/with spaces",
+        "/tunnel/",
+    ];
+    for base in bases {
+        // The rule must never panic on any input a peer can send.
+        for _ in 0..256 {
+            let n = (rng.next() % 96) as usize;
+            let mut path = String::new();
+            for _ in 0..n {
+                path.push(match rng.next() % 8 {
+                    0 => '/',
+                    1 => '.',
+                    2 => '?',
+                    3 => '%',
+                    4 => 'a',
+                    5 => '\0',
+                    6 => '-',
+                    _ => 'z',
+                });
+            }
+            let _ = is_under_base(base, &path);
+        }
+    }
+}

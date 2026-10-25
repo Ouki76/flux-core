@@ -97,13 +97,8 @@ where
             message: format!("error receiving the XHTTP request: {e}"),
         })?;
 
-    let base = normalize_path(path);
     let uri_path = request.uri().path().to_string();
-    let under_base = if base == "/" {
-        uri_path.starts_with('/')
-    } else {
-        uri_path == base || uri_path.starts_with(&format!("{}/", base.trim_end_matches('/')))
-    };
+    let under_base = is_under_base(path, &uri_path);
 
     // Xray only ever uses POST for a streaming upload; anything else is not this
     // transport and gets a plain 404 rather than a stream that would never work.
@@ -146,6 +141,29 @@ where
 /// Xray compares with `strings.HasPrefix(request.URL.Path, config.Path)` after
 /// normalising its own path to have both, so a request without the trailing slash is
 /// refused with 404 even though it names the same endpoint.
+/// Whether a request path belongs to this listener.
+///
+/// Public and separately testable: this is the one decision an unauthenticated HTTP client
+/// can steer, so it must be total and must not be loose. `../` segments are rejected
+/// outright rather than normalised, because a proxy that resolves them for a peer is a
+/// proxy that can be walked out of its own tree.
+pub fn is_under_base(base: &str, request_path: &str) -> bool {
+    // Refuse anything that reads as a traversal attempt, literal or percent-encoded. This
+    // proxy serves no filesystem behind a path, so an encoded `..` would in fact be inert —
+    // but a rule that says "not ours" to a path shaped like an escape is a rule that cannot
+    // become wrong when someone later puts something else behind it.
+    let lowered = request_path.to_ascii_lowercase();
+    if lowered.contains("..") || lowered.contains("%2e") {
+        return false;
+    }
+    let base = normalize_path(base);
+    if base == "/" {
+        return request_path.starts_with('/');
+    }
+    let base_no_slash = base.trim_end_matches('/');
+    request_path == base_no_slash || request_path.starts_with(&base)
+}
+
 fn normalize_path(path: &str) -> String {
     let mut p = path.trim();
     if p.is_empty() {
