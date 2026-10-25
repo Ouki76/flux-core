@@ -407,6 +407,9 @@ use crate::tls13::{
     Tls13Suite, TrafficState, crypto_err,
 };
 
+/// The ALPN protocols this client offers, and the only ones a server may select.
+const ALPN_OFFERED: [&[u8]; 2] = [b"h2", b"http/1.1"];
+
 /// The REALITY handshake: client authentication via `session_id`, and the server side that
 /// authenticates it or relays to the cover site.
 pub struct RealityHandshake;
@@ -635,7 +638,7 @@ impl Tls13Client {
         // browser offers `h2` and `http/1.1`, and the cover site almost certainly
         // serves HTTP/2. The REALITY server ignores the contents (it authenticates
         // the session id), so this only affects what an on-path observer sees.
-        let alpn: [&[u8]; 2] = [b"h2", b"http/1.1"];
+        let alpn: [&[u8]; 2] = ALPN_OFFERED;
         let alpn_list_len: usize = alpn.iter().map(|p| 1 + p.len()).sum();
         ext.extend_from_slice(&0x0010u16.to_be_bytes()); // extension_type
         ext.extend_from_slice(&((2 + alpn_list_len) as u16).to_be_bytes()); // ext length
@@ -820,6 +823,7 @@ impl Tls13Client {
         let mut hs_buf: Vec<u8> = Vec::new();
         let mut got_finished = false;
         let mut cert_der: Option<Vec<u8>> = None;
+
         let mut server_fin: Vec<u8> = Vec::new();
 
         while !got_finished {
@@ -866,6 +870,12 @@ impl Tls13Client {
 
                 match mtype {
                     HS_ENCRYPTED_EXTENSIONS => {
+                        // The ALPN the server selects has to be one we offered, and it must not
+                        // volunteer early_data. Both checks used to be skipped.
+                        // Validation happens inside the parser; REALITY does not act on the
+                        // result, it only refuses a server that answers something else.
+                        let parsed = crate::tls13::parse_encrypted_extensions(&msg, &ALPN_OFFERED)?;
+                        let _ = parsed.alpn;
                         transcript.extend_from_slice(&msg);
                     }
                     HS_CERTIFICATE => {

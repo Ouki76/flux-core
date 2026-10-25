@@ -1057,3 +1057,171 @@ mod verify_tests {
         assert!(err.to_string().contains("PEM"), "unexpected: {err}");
     }
 }
+
+/// What the server's `EncryptedExtensions` message said.
+#[derive(Debug)]
+pub(crate) struct ServerExtensions {
+    /// The ALPN protocol the server selected, if it selected one.
+    pub(crate) alpn: Option<Vec<u8>>,
+}
+
+/// Parses `EncryptedExtensions` and validates it against what this client offered.
+///
+/// The message used to be added to the transcript and otherwise ignored, which meant a server
+/// could select an ALPN protocol that was never offered and the client would carry on believing
+/// otherwise — fatal for a transport that then speaks h2 down the same socket. Two checks live
+/// here, both of them things a conforming server never trips:
+///
+/// - a selected ALPN must be one we offered;
+/// - `early_data` must not appear, because we never offer it (RFC 8446 §4.2).
+pub(crate) fn parse_encrypted_extensions(
+    msg: &[u8],
+    offered_alpn: &[&[u8]],
+) -> FluxResult<ServerExtensions> {
+    if msg.len() < 6 {
+        return Err(crypto_err("short EncryptedExtensions message"));
+    }
+    let body_len = u32::from_be_bytes([0, msg[1], msg[2], msg[3]]) as usize;
+    if msg.len() < 4 + body_len {
+        return Err(crypto_err("truncated EncryptedExtensions message"));
+    }
+    let body = &msg[4..4 + body_len];
+    if body.len() < 2 {
+        return Err(crypto_err("EncryptedExtensions has no extension block"));
+    }
+    let ext_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    if body.len() != 2 + ext_len {
+        return Err(crypto_err(
+            "EncryptedExtensions extension block length does not match the message",
+        ));
+    }
+    let mut i = 2;
+    let end = 2 + ext_len;
+    let mut alpn = None;
+    while i < end {
+        if i + 4 > end {
+            return Err(crypto_err("short extension header in EncryptedExtensions"));
+        }
+        let ty = u16::from_be_bytes([body[i], body[i + 1]]);
+        let len = u16::from_be_bytes([body[i + 2], body[i + 3]]) as usize;
+        i += 4;
+        if i + len > end {
+            return Err(crypto_err(format!(
+                "extension {ty:#06x} overruns EncryptedExtensions"
+            )));
+        }
+        let data = &body[i..i + len];
+        match ty {
+            0x0010 => {
+                // ALPN: a 2-byte list length then one length-prefixed protocol.
+                if data.len() < 3 {
+                    return Err(crypto_err("malformed ALPN in EncryptedExtensions"));
+                }
+                let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                if list_len + 2 != data.len() {
+                    return Err(crypto_err("ALPN list length does not match its body"));
+                }
+                let proto_len = data[2] as usize;
+                if proto_len + 3 != data.len() {
+                    return Err(crypto_err("ALPN protocol length does not match its body"));
+                }
+                let proto = data[3..].to_vec();
+                if !offered_alpn.contains(&proto.as_slice()) {
+                    return Err(crypto_err(format!(
+                        "server selected ALPN {:?}, which this client never offered",
+                        String::from_utf8_lossy(&proto)
+                    )));
+                }
+                alpn = Some(proto);
+            }
+            0x002a => {
+                return Err(crypto_err(
+                    "server sent early_data, which this client never offered",
+                ));
+            }
+            _ => {}
+        }
+        i += len;
+    }
+    if i != end {
+        return Err(crypto_err("trailing bytes in EncryptedExtensions"));
+    }
+    Ok(ServerExtensions { alpn })
+}
+
+#[cfg(test)]
+mod ee_tests {
+    use super::*;
+
+    /// Builds an `EncryptedExtensions` message from (type, body) pairs.
+    fn ee(exts: &[(u16, Vec<u8>)]) -> Vec<u8> {
+        let mut block = Vec::new();
+        for (ty, body) in exts {
+            block.extend_from_slice(&ty.to_be_bytes());
+            block.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            block.extend_from_slice(body);
+        }
+        let mut out = vec![HS_ENCRYPTED_EXTENSIONS, 0, (block.len() + 2) as u8, 0];
+        out[2] = ((block.len() + 2) >> 8) as u8;
+        out[3] = (block.len() + 2) as u8;
+        out.extend_from_slice(&(block.len() as u16).to_be_bytes());
+        out.extend_from_slice(&block);
+        out
+    }
+
+    fn alpn_body(proto: &[u8]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&((proto.len() + 1) as u16).to_be_bytes());
+        b.push(proto.len() as u8);
+        b.extend_from_slice(proto);
+        b
+    }
+
+    #[test]
+    fn a_selected_alpn_we_offered_is_accepted() {
+        let msg = ee(&[(0x0010, alpn_body(b"h2"))]);
+        let parsed = parse_encrypted_extensions(&msg, &[b"h2", b"http/1.1"]).expect("valid");
+        assert_eq!(parsed.alpn.as_deref(), Some(b"h2".as_slice()));
+    }
+
+    /// A server may not select a protocol the client never offered — RFC 8446 §4.2. Unless this
+    /// is checked, a transport that then speaks h2 would do so down a connection the server
+    /// believes carries something else.
+    #[test]
+    fn a_selected_alpn_we_never_offered_is_refused() {
+        let msg = ee(&[(0x0010, alpn_body(b"http/1.1"))]);
+        let err = parse_encrypted_extensions(&msg, &[b"h2"])
+            .expect_err("an unoffered ALPN must be refused");
+        assert!(
+            err.to_string().contains("never offered"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// `early_data` in a response to a client that never offered it is a protocol violation and
+    /// would silently change what the first records mean.
+    #[test]
+    fn early_data_is_refused() {
+        let msg = ee(&[(0x002a, Vec::new())]);
+        let err =
+            parse_encrypted_extensions(&msg, &[b"h2"]).expect_err("early_data must be refused");
+        assert!(err.to_string().contains("early_data"), "unexpected: {err}");
+    }
+
+    /// Malformed length fields must be errors, not silent truncation.
+    #[test]
+    fn a_truncated_message_is_refused() {
+        let mut msg = ee(&[(0x0010, alpn_body(b"h2"))]);
+        msg.truncate(msg.len() - 1);
+        assert!(parse_encrypted_extensions(&msg, &[b"h2"]).is_err());
+    }
+
+    /// An extension block whose length disagrees with the message must be refused.
+    #[test]
+    fn a_length_mismatch_is_refused() {
+        let mut msg = ee(&[(0x0010, alpn_body(b"h2"))]);
+        let last = msg.len() - 1;
+        msg[last] ^= 0xff;
+        assert!(parse_encrypted_extensions(&msg, &[b"h2"]).is_err());
+    }
+}
