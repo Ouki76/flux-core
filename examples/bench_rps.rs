@@ -293,6 +293,9 @@ fn main() -> Result<()> {
     let mut idle: usize = 0;
     let mut framing = String::from("none");
     let mut use_tls = false;
+    // Exits non-zero when flux is behind a competitor by more than this fraction — the same
+    // gate `bench_matrix --assert` provides for throughput, for the connection-rate axis.
+    let mut assert_tolerance: Option<f64> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--exchanges" => exchanges = args.next().unwrap_or_default().parse()?,
@@ -300,6 +303,12 @@ fn main() -> Result<()> {
             "--idle" => idle = args.next().unwrap_or_default().parse()?,
             "--framing" => framing = args.next().unwrap_or_else(|| "none".into()),
             "--tls" => use_tls = true,
+            "--assert" => {
+                assert_tolerance = Some(match args.next() {
+                    Some(v) if !v.starts_with("--") => v.parse()?,
+                    _ => 0.10,
+                })
+            }
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -320,6 +329,7 @@ fn main() -> Result<()> {
     let dir = std::env::temp_dir().join(format!("flux-rps-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let echo = start_echo();
+    let mut rates: Vec<(String, f64)> = Vec::new();
     let (cert, key, pin) = if use_tls {
         make_cert(&dir)?
     } else {
@@ -480,15 +490,53 @@ fn main() -> Result<()> {
             .get((lats.len() * 99 / 100).min(lats.len().saturating_sub(1)))
             .copied()
             .unwrap_or(0);
+        let rate = completed as f64 / elapsed;
         println!(
             "{:<12} {:>13.0} {:>9} µs {:>9} µs",
             stack.name(),
-            completed as f64 / elapsed,
+            rate,
             median,
             p99
         );
+        rates.push((stack.name().to_string(), rate));
         drop((server, client));
         std::thread::sleep(Duration::from_millis(300));
+    }
+
+    if let Some(tolerance) = assert_tolerance {
+        let flux = rates
+            .iter()
+            .find(|(n, _)| n == "flux-core")
+            .map(|(_, r)| *r);
+        let mut failures = Vec::new();
+        for (name, other) in &rates {
+            if name == "flux-core" {
+                continue;
+            }
+            if let (Some(f), true) = (flux, *other > 0.0)
+                && f < *other * (1.0 - tolerance)
+            {
+                failures.push(format!(
+                    "exchanges/s vs {name}: {f:.0} < {:.0} ({:+.1}%, tolerance {:.0}%)",
+                    other,
+                    (f / other - 1.0) * 100.0,
+                    tolerance * 100.0
+                ));
+            }
+        }
+        if failures.is_empty() {
+            println!(
+                "\nASSERT PASSED: flux-core is at or above every competitor within {:.0}%",
+                tolerance * 100.0
+            );
+        } else {
+            println!("\nASSERT FAILED (tolerance {:.0}%):", tolerance * 100.0);
+            for f in &failures {
+                println!("  {f}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            std::process::exit(1);
+        }
     }
 
     let _ = std::fs::remove_dir_all(&dir);
