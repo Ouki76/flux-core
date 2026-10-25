@@ -80,6 +80,9 @@ const TROJAN_PASSWORD: &str = "bench-trojan-secret-0123";
 const SS_AEAD_PASSWORD: &str = "bench-ss-aead-secret-4567";
 /// "0123456789abcdef" — the 16-byte key `2022-blake3-aes-128-gcm` requires.
 const SS2022_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZg==";
+/// Password for the Hysteria2 row; the protocol authenticates with one.
+const HY2_PASSWORD: &str = "bench-hy2-pass";
+
 const TLS_SNI: &str = "example.com";
 const REALITY_SNI: &str = "www.microsoft.com";
 const REALITY_SHORT_ID: &str = "01020304";
@@ -506,6 +509,8 @@ enum Kind {
     VlessGrpcPlain,
     /// Plain VLESS over TLS: no framing above the cipher, so this row is the cipher.
     VlessTls,
+    /// Hysteria2: a proxy protocol over QUIC, not a transport under VLESS.
+    Hysteria2,
     /// VLESS over XHTTP in stream-one mode.
     VlessXhttp,
     VlessWsTls,
@@ -530,6 +535,12 @@ const SCENARIOS: &[Scenario] = &[
         name: "VLESS / TCP",
         kind: Kind::VlessTcp,
         needs_cert: false,
+        needs_decoy: false,
+    },
+    Scenario {
+        name: "Hysteria2",
+        kind: Kind::Hysteria2,
+        needs_cert: true,
         needs_decoy: false,
     },
     Scenario {
@@ -769,6 +780,14 @@ impl Scenario {
             Kind::VlessXhttp => flux_in(port, &[flux_xhttp_server()], &flux_vless(false)),
             Kind::VlessGrpcPlain => flux_in(port, &[flux_grpc_server()], &flux_vless(false)),
             Kind::VlessTls => flux_in(port, &[flux_tls_server(s)], &flux_vless(false)),
+            // Hysteria2 carries itself over QUIC, so the node is a UDP carrier with the
+            // protocol on top rather than a transport under VLESS.
+            Kind::Hysteria2 => format!(
+                r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"in","carrier":{{"type":"udp","listen":"127.0.0.1","listen_port":{port}}},{tls},"protocol":{{"type":"hysteria2","password":"{pass}"}}}}],"outbounds":[{{"type":"direct","tag":"direct"}}]}}"#,
+                level = log_level(),
+                tls = flux_tls_server(s),
+                pass = HY2_PASSWORD
+            ),
             Kind::VlessWsTls => flux_in(
                 port,
                 &[flux_tls_server(s), flux_ws_server()],
@@ -812,6 +831,12 @@ impl Scenario {
         match self.kind {
             Kind::VlessTcp => flux_out(socks, port, &[], &flux_vless(false)),
             Kind::VlessXhttp => flux_out(socks, port, &[flux_xhttp_client()], &flux_vless(false)),
+            Kind::Hysteria2 => format!(
+                r#"{{"log":{{"level":"{level}"}},"inbounds":[{{"tag":"socks-in","carrier":{{"type":"tcp","listen":"127.0.0.1","listen_port":{socks}}},"protocol":{{"type":"socks"}}}}],"outbounds":[{{"tag":"node","carrier":{{"type":"udp","address":"127.0.0.1:{port}"}},{tls},"protocol":{{"type":"hysteria2","password":"{pass}"}}}}],"route":{{"final":"node"}}}}"#,
+                level = log_level(),
+                tls = flux_tls_client(false),
+                pass = HY2_PASSWORD
+            ),
             Kind::VlessGrpcPlain => {
                 flux_out(socks, port, &[flux_grpc_client()], &flux_vless(false))
             }
@@ -874,6 +899,10 @@ impl Scenario {
                 r#"{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}],{}}}"#,
                 sbox_tls_server(s)
             ),
+            Kind::Hysteria2 => format!(
+                r#"{{"type":"hysteria2","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"password":"{HY2_PASSWORD}"}}],{}}}"#,
+                sbox_tls_server(s)
+            ),
             Kind::VlessTcp => format!(
                 r#"{{"type":"vless","tag":"in","listen":"127.0.0.1","listen_port":{port},"users":[{{"uuid":"{UUID}"}}]}}"#
             ),
@@ -926,6 +955,10 @@ impl Scenario {
                 r#"{{"type":"vless","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}",{}}}"#,
                 sbox_tls_client()
             ),
+            Kind::Hysteria2 => format!(
+                r#"{{"type":"hysteria2","tag":"node","server":"127.0.0.1","server_port":{port},"password":"{HY2_PASSWORD}",{}}}"#,
+                sbox_tls_client()
+            ),
             Kind::VlessTcp => format!(
                 r#"{{"type":"vless","tag":"node","server":"127.0.0.1","server_port":{port},"uuid":"{UUID}"}}"#
             ),
@@ -972,6 +1005,11 @@ impl Scenario {
     /// The scenario as the xray builders name it, or `None` where xray has no
     /// equivalent (REALITY + Vision is an xray-only flow, and it is present).
     /// Whether sing-box can run this scenario at all.
+    /// Whether this scenario's server is a QUIC listener rather than a TCP one.
+    fn is_quic(&self) -> bool {
+        matches!(self.kind, Kind::Hysteria2)
+    }
+
     fn sbox_capable(&self) -> bool {
         // sing-box has no XHTTP transport.
         matches!(
@@ -986,6 +1024,7 @@ impl Scenario {
                 | Kind::Ss2022
                 | Kind::SsAead
                 | Kind::TrojanTls
+                | Kind::Hysteria2
         )
     }
 
@@ -997,6 +1036,7 @@ impl Scenario {
             Kind::VlessGrpcTls => P::VlessGrpc,
             Kind::VlessXhttp => P::VlessXhttp,
             Kind::VlessGrpcPlain => P::VlessGrpc,
+            Kind::Hysteria2 => return None,
             Kind::VlessTls => P::VlessTls,
             Kind::VlessReality => P::Reality,
             Kind::VlessRealityVision => P::RealityVision,
@@ -1061,10 +1101,20 @@ fn addr_of(port: u16) -> SocketAddr {
 
 /// Waits until `addr` accepts connections. Returns `false` on timeout instead of
 /// panicking, so a broken daemon becomes a table entry rather than a crash.
-async fn wait_for_listener(addr: SocketAddr, timeout: Duration) -> bool {
+/// Waits for a listener, checking UDP when the scenario's server speaks QUIC.
+///
+/// A TCP connect can never succeed against a Hysteria2 server, which is why the readiness
+/// probe has to know the carrier: without this the row simply reported "server never
+/// listened" while the server was listening perfectly well.
+async fn wait_for_listener(addr: SocketAddr, timeout: Duration, udp: bool) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if TcpStream::connect(addr).await.is_ok() {
+        if udp {
+            // Nothing to connect to; bindable means the server took the port.
+            if std::net::UdpSocket::bind(addr).is_err() {
+                return true;
+            }
+        } else if TcpStream::connect(addr).await.is_ok() {
             return true;
         }
         if Instant::now() > deadline {
@@ -1391,7 +1441,8 @@ async fn prepare_tunnel(
     let server_argv: Vec<&str> = server_argv.iter().map(String::as_str).collect();
     let server = ProxyProc::spawn(bin, &server_log, &server_argv)?;
 
-    if !wait_for_listener(addr_of(server_port), Duration::from_secs(20)).await {
+    let udp = scenario.is_quic();
+    if !wait_for_listener(addr_of(server_port), Duration::from_secs(20), udp).await {
         let why = server.log_tail();
         return Err(format!(
             "server never listened on 127.0.0.1:{server_port}{}",
@@ -1408,7 +1459,7 @@ async fn prepare_tunnel(
     let client = ProxyProc::spawn(bin, &client_log, &client_argv)?;
 
     let socks = addr_of(socks_port);
-    if !wait_for_listener(socks, Duration::from_secs(20)).await {
+    if !wait_for_listener(socks, Duration::from_secs(20), false).await {
         let why = client.log_tail();
         return Err(format!(
             "client never listened on {socks}{}",
