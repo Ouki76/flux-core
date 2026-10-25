@@ -772,7 +772,10 @@ impl WgTunnel {
             .ok_or_else(|| FluxError::Network("wireguard handshake waiter closed".into()))?;
         drop(waiter_guard);
 
-        let session = WireGuardHandshake::consume_response(state, &resp_pkt)?;
+        let session = WireGuardHandshake::consume_response(state, &resp_pkt).map_err(|e| {
+            tracing::debug!("wireguard: handshake response rejected: {e}");
+            e
+        })?;
         Ok(Arc::new(Mutex::new(session)))
     }
 
@@ -956,11 +959,27 @@ impl WgTunnel {
                             continue;
                         }
                         let msg_type = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        tracing::trace!(
+                            "wireguard: rx {} bytes type={} (expect h1={} h2={})",
+                            buf.len(),
+                            msg_type,
+                            1_u32,
+                            awg_h2
+                        );
                         if msg_type == awg_h2 {
                             // Handshake response: forward to the in-flight handshake.
                             let waiter = self.handshake_waiter.lock().clone();
-                            if let Some(tx) = waiter {
-                                let _ = tx.try_send(buf);
+                            match waiter {
+                                Some(tx) => {
+                                    if tx.try_send(buf).is_err() {
+                                        tracing::debug!(
+                                            "wireguard: handshake response arrived but the waiter channel refused it"
+                                        );
+                                    }
+                                }
+                                None => tracing::debug!(
+                                    "wireguard: handshake response arrived with no waiter registered"
+                                ),
                             }
                             continue;
                         }

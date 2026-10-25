@@ -116,18 +116,24 @@ pub struct AwgConfig {
     pub h1: u32, // Initiation message type (default: 1)
     /// AmneziaWG: magic header for the response packet.
     pub h2: u32, // Response message type (default: 2)
-    /// Whether to carry the stream over HTTP/3 rather than raw QUIC.
+    /// AmneziaWG: magic header for the cookie packet.
     pub h3: u32, // Cookie message type (default: 3)
     /// AmneziaWG: magic header for the transport packet.
     pub h4: u32, // Data message type (default: 4)
 }
 
 impl Default for AwgConfig {
+    /// A configuration with **no obfuscation at all**.
+    ///
+    /// This used to default to `jc: 4, jmin: 40, jmax: 70` — the settings a typical
+    /// AmneziaWG profile carries — which meant every plain WireGuard connection sent four
+    /// randomsized junk datagrams before its handshake. Obfuscation has to be opt-in: a peer
+    /// that is not expecting it sees four malformed packets on every connect.
     fn default() -> Self {
         Self {
-            jc: 4,
-            jmin: 40,
-            jmax: 70,
+            jc: 0,
+            jmin: 0,
+            jmax: 0,
             s1: 0,
             s2: 0,
             h1: 1,
@@ -1061,5 +1067,33 @@ mod tests {
             "Legitimate packet 0 must succeed; replay window must not be poisoned by forged packet"
         );
         assert_eq!(&legit_res.unwrap(), b"legitimate packet 0");
+    }
+}
+
+#[cfg(test)]
+mod awg_default_tests {
+    use super::*;
+
+    /// A configuration without an `awg` block must not obfuscate.
+    ///
+    /// The default used to carry AmneziaWG's `jc: 4, jmin: 40, jmax: 70`, so a plain
+    /// WireGuard client sent four junk datagrams before every handshake — visible on the
+    /// wire and enough to make a strict peer drop or rate-limit the flow.
+    #[test]
+    fn the_default_configuration_sends_no_junk_packets() {
+        let awg = AwgConfig::default();
+        assert_eq!(
+            awg.jc, 0,
+            "a plain configuration must not send junk packets"
+        );
+        assert_eq!(
+            WireGuardHandshake::generate_junk_packets(&awg).len(),
+            0,
+            "generate_junk_packets still produced packets for an inert configuration"
+        );
+        // The message types keep their RFC defaults, so a plain handshake looks exactly
+        // like one.
+        assert_eq!((awg.h1, awg.h2, awg.h3, awg.h4), (1, 2, 3, 4));
+        assert_eq!((awg.s1, awg.s2), (0, 0));
     }
 }
