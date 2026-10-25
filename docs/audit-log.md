@@ -6782,3 +6782,47 @@ push", and the first thing CI will do is parse it.
 Recorded because the alternative — saying "workflows validated" after a hand check — is the kind
 of small overstatement this log exists to avoid. The command exists, it needs a package this
 machine does not have, and that is the state.
+
+---
+
+## Cycle 151 — 2026-10-25
+
+### The proper workflow check cannot run here, and that is final
+
+Attempted every route to a YAML parser on this host:
+
+| route | result |
+|---|---|
+| `python3 -c "import yaml"` | not installed |
+| `python3 -m pip` | no pip module |
+| `sudo xbps-install python3-pyyaml` | password required, not available |
+| `node -e "require('yaml')"` | no such module |
+| `ruby -ryaml` | ruby not installed |
+| `perl -MYAML::XS` | module not installed |
+| `yq` | not installed |
+
+So `scripts/check_workflows.sh` genuinely cannot run here, and the edit's validity will be
+settled by CI on the next push — which is the first thing that will parse the file anyway.
+
+### The repository, in numbers
+
+| | |
+|---|---|
+| Rust lines by crate | transport 21 496, protocol 12 944, inbound 12 258, app 10 331, outbound 6 802, dns 6 802, router 3 423, common 2 541, types 701 |
+| `#[test]` / `#[tokio::test]` attributes | 1 058 |
+| tests as reported by `cargo test` | 1 101 passed, 0 failed |
+| commits in this audit session | 404 |
+| uncommitted changes | none |
+| unpushed commits | none |
+
+Seventy-two thousand lines of Rust across nine crates, every one with `#![warn(missing_docs)]`,
+zero `todo!`, zero undocumented `unsafe`, and a test suite of just over a thousand cases of which
+ten files drive real `sing-box` and `xray` binaries.
+
+### Postscript on method
+
+The most useful thing this audit produced is not the throughput table — a well-funded project
+would eventually get there. It is the habit of asking of every claim "what command would show
+this false?" and then running it. Four guards in a single session turned out hollow that way; two
+fixes turned out unnecessary; one "defect" turned out to be my own test script. None of that was
+visible from the code, and all of it was visible in ten seconds of reverting something.
