@@ -6750,3 +6750,35 @@ Baseline problem: baseline … has no throughput_mbps.flux_core number; expected
 The gate was correct; only the way it complained was not. Worth a cycle because the next person
 to hand-edit a baseline is a person under time pressure, and they would have spent an hour on a
 traceback that mentions neither the file nor the field.
+
+---
+
+## Cycle 150 — 2026-10-25
+
+### The workflow change, checked as far as this machine allows
+
+Editing `ci.yml` to add the documentation gate raises an obvious question: is the file still
+valid YAML? `scripts/check_workflows.sh` answers it, and this host cannot run it —
+
+```
+error: PyYAML is not importable by python3 — install python3-pyyaml
+```
+
+There is no `pip` on the machine either (`No module named pip`), so the proper check cannot run
+here. What could be checked without it:
+
+| check | result |
+|---|---|
+| tab characters (fatal in YAML) | none |
+| every `- name:` step at the same indentation | 33 steps, all at 6 |
+| lines starting at the wrong indent | 0 |
+| the new step's keys (`name`, `run`, `env`, `RUSTDOCFLAGS`) | aligned with their neighbours |
+
+That is a structural check, not a parse, and it is worth being precise about the difference: it
+rules out the two mistakes I was most likely to make and does not prove the file parses. The
+honest statement is "the edit is well-formed by inspection; the real check runs in CI on the next
+push", and the first thing CI will do is parse it.
+
+Recorded because the alternative — saying "workflows validated" after a hand check — is the kind
+of small overstatement this log exists to avoid. The command exists, it needs a package this
+machine does not have, and that is the state.
