@@ -5285,3 +5285,34 @@ and it carries a real risk of destabilising the segment path that currently inte
 
 What the research buys is that the next attempt starts from a specification instead of a
 search — the same trade as the Shadowsocks-2022 profile two cycles before it.
+
+---
+
+## Cycle 112 — 2026-10-25
+
+### A primitive tested, a feature not shipped
+
+With the specification read from upstream last cycle, the AES-GCM mask was implemented:
+
+- `flux_transport::kcp::seed_mask` — key `SHA-256(seed)[..16]`, AES-128-GCM, wire form
+  `nonce ‖ ciphertext ‖ tag`.
+- Three tests: the key is the first half of the digest and **not** the second; a sealed payload
+  round-trips without its plaintext appearing on the wire; a wrong key, a flipped bit and a
+  short datagram are all refused.
+- `KcpConfig` gained `seed_key`, and both the send path (`ObfsState::wrap`) and the receive path
+  (`unwrap_datagram`, the hub, the minimum-size check, the MSS calculation) honour it.
+
+Then the end-to-end attempt failed, and **the configuration wiring was reverted**:
+
+> With a seed on both sides, the server logged "dropped a 54 byte datagram (mask=aes-gcm)" on
+> every packet, and the client logged *nothing at all* — not even the branch that seals with the
+> original envelope. The client's send path never ran. That points at the config plumbing rather
+> than the mask, but I did not isolate it inside the cycle.
+
+So `as_kcp` passes `seed_key: None` with a comment saying the option is not wired, and the
+primitive sits behind tests until someone finishes the job. This is the same rule this audit
+applied to every performance change — **ship what is measured, not what is plausible** — and it
+is worth naming that the rule costs something here: the mask is real, correct and unused.
+
+Two things make the next attempt cheap: the specification with its source references, and a
+test suite for the primitive that will fail loudly if the wiring gets the key wrong.
