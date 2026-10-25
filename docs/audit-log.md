@@ -6347,3 +6347,30 @@ it.
 
 1100 tests, 0 failed. The suite was run after a full process cleanup, three times in a row
 across recent cycles, each green.
+
+---
+
+## Cycle 139 — 2026-10-25
+
+### The flakiness fix, tested under the condition that produced the flakiness
+
+The retry added last cycle is worth nothing unless it works when the machine is busy — that is
+the only situation in which the old code failed. So the mux suite was run **while
+`bench_matrix` was saturating the host with real tunnel traffic**:
+
+| suite | runs | result |
+|---|---|---|
+| `test_mux_interop` | 4 consecutive | 16 passed, 0 failed — every time |
+| `test_kcp_interop` | 2 consecutive | 7 passed, 0 failed — every time |
+
+Before the change, the same suites failed under this load with `ConnectionRefused` and with
+timeouts, several times across sessions, and every failure was written off as "busy machine".
+Now the condition that caused them is reproduced deliberately and the suites hold.
+
+That is the shape a fix should take: reproduce the failing condition, not the passing one.
+
+### A note on what the load test also showed
+
+While saturating the host, the benchmark's own per-round lines were still sensible —
+flux 323.6 MB/s against sing-box 262.8 and xray 220.1 in the same round — which is the property
+the `--assert` gate relies on: absolute numbers sag under load, the ratios do not.
