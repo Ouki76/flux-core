@@ -237,14 +237,18 @@ What is left is functional and bounded:
 
 1. **Browser-grade ClientHello.** See section 0: GREASE-ECH needs an HPKE provider, and the
    only one in rustls 0.23 breaks REALITY interop with Xray. Closing it is a REALITY project.
-2. **mKCP parity with xray's newer options** — our mKCP interoperates with Xray 26 in both
-   directions, but does not implement xray's AES-GCM payload mask. The exact construction is
-   now in the module docs at the top of `crates/flux-transport/src/kcp.rs`, with the commit
-   that fixed it: SHA-256(seed)[:16] as an AES-128-GCM key, wire form `nonce‖ciphertext‖tag`,
-   and — importantly — xray 26 removed `kcpSettings.seed` in favour of
-   `finalmask.udp: [{"type":"mkcp-aes128gcm"}]`, so an interop test needs that shape. Not
-   implemented here because the mKCP *transport* interop, which is what the objective asked
-   for, works and is tested both ways.
+2. **mKCP AES-GCM mask (`mkcp-aes128gcm`), client direction only.** The mask is implemented
+   (`flux_transport::kcp::seed_mask`), wired to `carrier.seed` on both sides, and **a real
+   Xray 26 client connects through our server with it** — that direction is pinned by
+   `a_real_xray_client_reaches_our_aes_masked_kcp_server`. The opposite direction (our client
+   into an Xray server) does not establish: Xray accepts the request and opens the
+   destination (`accepted tcp:…` in its log), then marks its data segments
+   `SegmentOptionClose`, and we honour that as EOF. Everything before that point is proven —
+   mask, key (`SHA-256(password)[..16]`, and the setting is **`password`**, not `seed`),
+   composition order (header outside), segment codec, VLESS framing. The open question is
+   narrow: **why Xray's server decides the stream is finished immediately after dialling.**
+   Four `debug` log lines in `kcp.rs` name the cause when it happens: unroutable conversation,
+   TERMINATE, OPTION_CLOSE, and kill reason.
 
 If you are picking this up cold: run the matrix first (`cargo run --release --example
 bench_matrix -- --rounds 4 --mb 200`), then read `docs/audit-log.md` from cycle 89 onwards.
