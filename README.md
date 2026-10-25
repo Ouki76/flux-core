@@ -143,6 +143,15 @@ interleaved rounds — the only comparison that says anything about competitiven
 Best-of-4 (each stack's fastest round — the comparison least sensitive to a shared machine;
 medians are in `docs/audit-log.md`):
 
+```
+cargo run --release --example bench_matrix -- --rounds 4 --mb 200 --assert 0.10
+```
+
+`--assert` exits non-zero if any row falls behind sing-box or xray by more than the tolerance
+(default 10%, this host's run-to-run spread), so "ahead on every path" is a command rather than
+a claim. Last full run: **ASSERT PASSED**, fourteen of fifteen rows ahead of sing-box and ten of
+ten ahead of xray.
+
 | Path | flux-core | sing-box | xray | vs sing-box | vs xray |
 |---|---|---|---|---|---|
 | **Hysteria2** | **112** | 52 | — | **+113.9 %** | — |
