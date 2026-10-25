@@ -4106,3 +4106,28 @@ Two observations worth keeping:
 - **WS reads −8.7 % here** while three dedicated runs gave +4.6 %, −7.8 % and +11.2 %. Both
   numbers are true measurements of the same binary; the row is simply not resolvable to
   better than ±10 % on this machine, and the README now says so beside the table.
+
+---
+
+## Cycle 84 — 2026-10-25
+
+### Guarding the branch that no existing test could reach
+
+The WebSocket fast path added last cycle has a short-write branch: when the inner stream
+accepts only part of the two iovecs, it buffers the frame and sets `write_pos` to what the
+peer already took. Every existing test uses a `duplex`, which accepts everything, so that
+branch had never run.
+
+`a_short_inner_write_still_produces_one_correct_frame` wraps a writer that accepts at most 1,
+3, 7, 64, 4 096 or 65 536 bytes per call and asserts for each that the peer sees exactly one
+well-formed unmasked binary frame, with a payload matching byte for byte and a length of
+exactly header plus payload.
+
+The first draft failed at limit 1 with *"the writer emitted extra bytes beyond one frame"* —
+and the test was wrong, not the code: a 70 000-byte payload legitimately becomes two frames,
+and the write loop had sent all of it. Rewritten at 50 000 bytes, where "exactly one frame" is
+a statement about correctness rather than about how many writes the caller chose to make.
+
+Worth writing down because it is the third time in this audit that a test failed for a reason
+in the test: the instinct to "fix the code until the test passes" is exactly wrong here, and
+the only defence is reading the assertion as carefully as the implementation.
