@@ -7101,3 +7101,51 @@ consistent with each other.
 | throughput and connection rate | **parity, measured** |
 | xray, WS+TLS and gRPC+TLS on the native path | next |
 | decide the default | after those |
+
+### B3.6 — interop behind the layers, and a decision that is smaller than the plan
+
+Two more cases for the native path:
+
+| test | what it establishes |
+|---|---|
+| our TLS → real **Xray** TLS server | a second, stricter TLS implementation accepts our ClientHello, our chain and our Finished |
+| our TLS + **gRPC** → real sing-box | ALPN is load-bearing: h2 does not work unless we negotiate `h2` and the server agrees |
+
+And the full matrix with our handshake under every TLS row:
+
+```
+bench_matrix --rounds 4 --mb 200 --native-tls --assert 0.10
+ASSERT PASSED
+VLESS / TLS          301.9   +7.6% vs sbox   +35.2% vs xray
+VLESS / WS + TLS     309.5  +10.4%           +224.9%
+VLESS / gRPC + TLS   243.4  +151.6%          +45.3%
+VMess / WS + TLS     209.6   +7.9%            +34.7%
+```
+
+### Decision: rustls remains the default
+
+The objective said "replace rustls on the TLS paths … then decide the default". The decision is
+**not** to flip it, and the reason is a coverage gap found while checking rather than a
+performance one:
+
+| | rustls path | native path |
+|---|---|---|
+| TLS 1.3 | yes | yes |
+| **TLS 1.2** | **yes** (`with_safe_default_protocol_versions` + the `tls12` feature) | **no** |
+| browser-shaped ClientHello with GREASE | no | **yes** |
+| throughput, connection rate | baseline | parity (B3.5) |
+
+Flipping the default would silently remove TLS 1.2 from every TLS transport — a functional
+regression traded for a fingerprint improvement that only some deployments need. `native_tls:
+true` selects the other half deliberately.
+
+That is a smaller claim than the plan's "replace rustls", and it is the one the evidence supports.
+Writing it down this way matters more than the code: a future session reading "B3: replace rustls"
+should find the measurement that says why it was not replaced wholesale, not a silent decision
+buried in a default value.
+
+### Closing the TLS 1.2 gap, if it is ever wanted
+
+It means implementing the TLS 1.2 handshake — CBC and GCM record layers, RSA and ECDHE key
+exchange, the signature algorithm list of an older era. Weeks of work with a security review, for
+a protocol version browsers are removing. Not worth starting without a user who needs it.
