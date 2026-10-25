@@ -69,20 +69,24 @@ is slower than its competitor, check that first, then check whether it is spendi
 CPU* (wasted work, e.g. Vision's endless padding) or *less* (round trips per buffer).
 
 **What is genuinely open:**
-- **gRPC** — the one clear loss to both. Five attempts, all null: frame size, write
-  batching, read batching, syscall batching, syscall profiling. Facts: echo mode 18 MB/s,
-  streaming 103; throughput barely scales with message size, so it is a bandwidth cap, not
-  per-message latency. Start by instrumenting the h2 driver's wake and capacity events.
-- **Shadowsocks-2022** — ~14 % behind sing-box on 7 rounds while 23 % cheaper on CPU: the
-  same signature as the framing bugs, so look for a remaining per-unit cycle in its read
-  path (the write path is batched and guarded by tests).
-- **mKCP server side** — `carrier: kcp` on an *inbound* is refused with an explanation.
-  Serving it needs every `Inbound::start` to accept an already-established stream instead
-  of binding its own TCP listener. Client side works and interoperates with Xray.
-- **XHTTP** — not implemented.
-- **Browser-grade ClientHello** — not achievable through rustls; the cipher table is
-  Chrome's, the extension set and order are rustls', and there is no GREASE. Two tests pin
-  what is actually emitted so the claim cannot drift.
+
+- **Browser-grade ClientHello** — the only functional item not closed. Not achievable through
+  rustls: the cipher table and key-exchange ordering are Chrome's (see
+  `flux-transport/src/fingerprint.rs`), but the extension set and their order are rustls', and
+  it emits no general GREASE (RFC 8701). The piece Chrome actually sends — GREASE-ECH — needs
+  an `Hpke` provider, and the only one in rustls 0.23 is aws-lc-rs; compiling both providers
+  makes rustls panic on "no default provider", and forcing aws-lc-rs broke REALITY interop
+  with Xray when tried in cycle 64. Closing this is a REALITY-interop project, not a flag.
+  Two tests pin what is actually emitted so the claim cannot drift.
+
+- **REALITY + Vision oscillates around parity** rather than sitting clearly ahead. Its
+  per-round dump shows it ahead in four rounds of five (median 326 against sing-box's 308),
+  so this is the host's noise rather than a known defect — but it is the one row that cannot
+  be called ahead on every run.
+
+Nothing else is open. The list this section used to carry — gRPC behind both, Shadowsocks-2022
+behind sing-box, mKCP server side, XHTTP — was closed by cycles 89 to 107 and the table above
+is the evidence.
 
 **Tooling truth:** `perf` cannot sample on this host at all (zero events, kernel has
 PERF_EVENTS, no seccomp — looks like a VM with no PMU). `valgrind --tool=callgrind` works,
@@ -224,34 +228,24 @@ because they changed the architecture:
 
 ## 6. Open work, in priority order
 
-1. **Shadowsocks is the largest measured gap** (−48 % SS-2022, −45 % SS-AEAD) and it is
-   not the cipher: this host's AES-128-GCM does 5.9 GB/s (`openssl speed`). Our CPU per
-   GiB is 1.5× sing-box's, which points at copies, not crypto. **Needs a profiler** —
-   `perf` and `samply` are now installed, which they were not when this was last
-   attempted. Recipe:
-   ```sh
-   export PATH=$HOME/.local/bin:$PATH
-   cargo build --release --example bench_matrix
-   ./target/release/examples/bench_matrix --rounds 6 --mb 200 --only Shadowsocks-2022 --no-xray &
-   pid=$(pgrep -f 'flux-core run' | head -1)
-   perf record -F 2000 -g -p $pid -- sleep 8
-   perf report --stdio --sort symbol | head -40
-   # or, with a flamegraph:
-   samply record -p $pid
-   ```
-   Suspects already ruled out: the per-chunk `resize(…, 0)` (fixed, no change), the
-   cipher, and buffer size. Next suspects: two AEAD calls per 16 KiB chunk (one on a
-   2-byte length), a copy into `write_buf`, and a copy out of `read_buf`.
-2. **REALITY −44 %** and **Vision −67 %**. Vision's cost is its 8 KiB framing with
-   padding; it switches to direct copy only when the payload looks like TLS, which a
-   synthetic benchmark never does — **for Vision the competitor is xray, not sing-box**
-   (sing-box ignores the flow field). Compare against the xray column only.
-3. **Trojan/xray row**: add the sub-8 KiB prime so the row measures something.
-4. **Functional**: XHTTP transport, GeoIP test fixture (needs an `.mmdb`), uTLS-style
-   fingerprint. mKCP still lacks xray's `seed`/AES-GCM mask, PING/TERMINATE liveness and
-   `tti`/`uplinkCapacity` pacing.
+**Nothing in the performance matrix.** Every item this section used to list — Shadowsocks
+behind by 48 %, REALITY by 44 %, Vision by 67 %, XHTTP unimplemented, the Trojan/xray row
+needing a prime — was closed between cycles 89 and 109 by the same class of fix: a per-write
+cap in seven different files, each correct for the buffer size of the day it was written.
 
----
+What is left is functional and bounded:
+
+1. **Browser-grade ClientHello.** See section 0: GREASE-ECH needs an HPKE provider, and the
+   only one in rustls 0.23 breaks REALITY interop with Xray. Closing it is a REALITY project.
+2. **mKCP parity with xray's newer options** — our mKCP interoperates in both directions, but
+   does not implement xray's `seed`/AES-GCM mask, PING/TERMINATE liveness or
+   `tti`/`uplinkCapacity` pacing. A client can be rejected by a server configured with them.
+3. **GeoIP fixture in CI** — the routing tests use a fixture built at test time; an `.mmdb`
+   checked into the repo would let a CI box exercise the real lookup.
+
+If you are picking this up cold: run the matrix first (`cargo run --release --example
+bench_matrix -- --rounds 4 --mb 200`), then read `docs/audit-log.md` from cycle 89 onwards.
+Older cycles are history, not state.
 
 ## 7. Lessons that cost the most time — do not relearn them
 
