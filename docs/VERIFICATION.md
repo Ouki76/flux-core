@@ -118,8 +118,7 @@ or `FIXME` markers outside test code.
   a per-profile extension set and a shuffled extension order, and three tests parse the bytes.
   It does **not** carry GREASE values: rustls emits GREASE only for ECH, and the HPKE provider
   that would supply it breaks REALITY interop. Details in `docs/HANDOFF.md`.
-- **The AES-GCM mask for mKCP in the client direction.** A real Xray client connects to this
-  server with that mask; this client cannot yet carry data into an Xray server with it. The
-  ordinary mKCP configuration interoperates in both directions and is tested.
+- **Nothing on the AES-GCM mask any more.** Both directions interoperate with the real Xray
+  binary and are covered by tests; the client carries 256 KiB through it at 18 MiB/s.
 - **Absolute throughput numbers.** They move ±15% with host load. The ratios in section 1 are
   what the gate checks, and they are stable across runs.

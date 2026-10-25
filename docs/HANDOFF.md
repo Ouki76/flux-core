@@ -78,7 +78,7 @@ CPU* (wasted work, e.g. Vision's endless padding) or *less* (round trips per buf
 | XHTTP transport | **met** — stream-one, interop proven and measured | `tests/test_xhttp_interop.rs` |
 | IDNA, GeoIP fixture, private CA, UDP associations, nested-key typos | **met** — each with a test | see the crate docs |
 | browser-grade TLS fingerprint | **partial, and bounded** — see above | `fingerprint.rs` tests pin the cipher order, extension set and per-connection extension shuffle; GREASE is not expressible through rustls |
-| mKCP AES-GCM mask | **open, one direction** — server accepts a real Xray client; client-into-Xray does not carry data | cycle 119 |
+| mKCP AES-GCM mask | **met, both directions** | cycles 121-134 |
 
 **What is genuinely open:**
 
@@ -249,18 +249,15 @@ What is left is functional and bounded:
 
 1. **Browser-grade ClientHello.** See section 0: GREASE-ECH needs an HPKE provider, and the
    only one in rustls 0.23 breaks REALITY interop with Xray. Closing it is a REALITY project.
-2. **mKCP AES-GCM mask (`mkcp-aes128gcm`), client direction only.** The mask is implemented
-   (`flux_transport::kcp::seed_mask`), wired to `carrier.seed` on both sides, and **a real
-   Xray 26 client connects through our server with it** — that direction is pinned by
-   `a_real_xray_client_reaches_our_aes_masked_kcp_server`. The opposite direction (our client
-   into an Xray server) does not establish: Xray accepts the request and opens the
-   destination (`accepted tcp:…` in its log), then marks its data segments
-   `SegmentOptionClose`, and we honour that as EOF. Everything before that point is proven —
-   mask, key (`SHA-256(password)[..16]`, and the setting is **`password`**, not `seed`),
-   composition order (header outside), segment codec, VLESS framing. The open question is
-   narrow: **why Xray's server decides the stream is finished immediately after dialling.**
-   Four `debug` log lines in `kcp.rs` name the cause when it happens: unroutable conversation,
-   TERMINATE, OPTION_CLOSE, and kill reason.
+2. **mKCP AES-GCM mask (`mkcp-aes128gcm`) — done, both directions.** A real Xray 26 client
+   reaches our server with it, and our client carries 28 MB at 18 MiB/s into a real Xray
+   server. The eleven-cycle hunt found three genuine defects along the way: `sending_next`
+   carrying the receive counter, an opening PING sent 30 µs after the first segment, and — the
+   one that actually blocked everything — a source-address pin that dropped every reply from a
+   peer which switches its sending socket. The setting is **`password`**, not `seed`; a config
+   written with the wrong name parses and silently derives a key from the empty string.
+   Pinned by `a_real_xray_client_reaches_our_aes_masked_kcp_server` and
+   `our_client_reaches_a_real_xray_server_through_the_aes_mask`.
 
 If you are picking this up cold: run the matrix first (`cargo run --release --example
 bench_matrix -- --rounds 4 --mb 200`), then read `docs/audit-log.md` from cycle 89 onwards.
