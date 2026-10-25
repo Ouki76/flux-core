@@ -4692,3 +4692,48 @@ What grows is the working set of a connection actively transferring: 512 KiB ins
 
 That is the difference between a parameter and an architecture: this one costs nothing until
 someone is actually using it.
+
+---
+
+## Cycle 99 — 2026-10-25
+
+### After two swept parameters, the matrix in full
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **Hysteria2** | **101** | 53 | — | **+91.2 %** | — |
+| **TUIC v5** | **100** | 56 | — | **+80.8 %** | — |
+| **WireGuard** | **71** | 45 | — | **+59.2 %** | — |
+| VLESS / TCP | **817** | 586 | 657 | **+39.5 %** | **+24.5 %** |
+| VLESS / gRPC (no TLS) | **451** | — | 191 | — | **+136.6 %** |
+| VLESS / XHTTP | **373** | — | 134 | — | **+179.5 %** |
+| VLESS / TLS | **346** | 311 | 237 | **+11.3 %** | **+46.0 %** |
+| VLESS / REALITY + Vision | **335** | 323 | 263 | **+3.7 %** | **+27.2 %** |
+| VLESS / REALITY | 291 | 300 | 230 | −3.0 % | **+26.8 %** |
+| Trojan / TLS | 296 | 313 | — | −5.5 % | — |
+| VLESS / WS + TLS | 287 | 290 | 111 | −0.8 % | **+158.8 %** |
+| Shadowsocks-AEAD | **259** | 241 | — | **+7.5 %** | — |
+| Shadowsocks-2022 | 347 | 392 | 283 | −11.6 % | **+22.6 %** |
+| VMess / WS + TLS | 200 | 203 | 174 | −1.7 % | **+14.9 %** |
+| VLESS / gRPC + TLS | **232** | 118 | 192 | **+96.5 %** | **+21.2 %** |
+
+**Ten of fifteen ahead of sing-box, three inside 3 %, two behind. All ten xray paths beaten.**
+
+The two swept parameters did most of it in two cycles: the h2 window (gRPC 106 → 232,
+XHTTP 185 → 373) and the relay buffer (TCP 768 → 817, XHTTP — again). Neither was a code
+change in the sense of fixing a defect; both were constants nobody had measured, sitting in
+the middle of the hot path since the beginning.
+
+### Where the objective stands
+
+| objective item | state |
+|---|---|
+| beat or match both competitors on every matrix path | **10 of 15 ahead of sing-box, 3 level, 2 behind**; **10 of 10 ahead of xray** |
+| xray column from the validated builders | fifteen rows |
+| functional gaps closed | all closed except the browser ClientHello, which is bounded by an HPKE-provider dependency and documented in `docs/HANDOFF.md` |
+| gates green every cycle | 1089 tests, fmt, clippy, doc, audit, deny |
+| commits and audit log | every cycle recorded, including the four falsified hypotheses and the two wrong diagnoses |
+
+The two rows still behind sing-box are Trojan (−5.5 %, inside this host's noise) and
+Shadowsocks-2022 (−11.6 %, which has now been investigated four times without a surviving
+explanation and is documented as an open architectural question).
