@@ -4204,3 +4204,46 @@ logging in place, not one `rx` line appears, while the same client receives corr
 our own server and from a Python responder that answers with a fake 92-byte type-2 packet
 (which it correctly rejects as "mismatched receiver index"). The loss is below the demux and
 specific to sing-box's response, which is where the next cycle starts.
+
+### WireGuard interop: works, and two cycles said otherwise
+
+Cycle 85 concluded the interop was broken. It is not. The harness dialled `127.0.0.1` inside
+the tunnel, and **sing-box refuses to route a loopback destination through a WireGuard
+endpoint** — sensibly, since that is how a tunnel becomes a loop. Sweeping the destination to
+a LAN address resolves everything:
+
+| pairing | result |
+|---|---|
+| flux client through sing-box's endpoint | **57-64 MB/s** |
+| sing-box client through our server | **128-132 MB/s** |
+| flux client through our own server | 121-145 MB/s |
+
+The wire capture that made the mistake visible was a UDP relay between the two, which showed
+the exchange in both directions:
+
+```
+-> INIT  len=148 sender=0x5054ebbe
+<- RESP  len=92  sender=0x21c43af4
+-> DATA  len=84  receiver=0x21c43af4 OK
+<- DATA  len=96
+-> DATA  len=72
+<- DATA  len=1408
+```
+
+Indices matching, nothing malformed — a tunnel that had been working for some time while this
+audit wrote down that it did not.
+
+`tests/test_wireguard_interop.rs` now covers both cross-implementation directions, with fixed
+test keys, a one-way source, and an honest skip when the machine has no non-loopback address —
+the exact condition that produced the false negative.
+
+### What went wrong in the reasoning, twice
+
+Cycle 85 blamed a stack task that had not died (the error came from my own `timeout`). Cycle 86
+found a real defect on the way — four junk packets per handshake from an AmneziaWG default
+applied to plain WireGuard — but then read "no packets received" as a protocol failure when the
+exchange was in fact completing.
+
+Both times the missing step was the same: **look at the wire before naming a cause**. A relay
+between the peers costs twenty lines of Python and answered in one run what two cycles of
+reasoning from logs could not.
