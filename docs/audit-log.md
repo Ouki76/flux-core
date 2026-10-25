@@ -5591,3 +5591,38 @@ The first full-suite run after the change reported two failures, both
 interop runs, still holding ports. Cleaned up, the suite is **1095 passed, 0 failed**. Recorded
 because "the tests fail" and "the machine is full of my debris" look identical in a summary
 line, and only one of them is about the code.
+
+---
+
+## Cycle 120 — 2026-10-25
+
+### The scorecard, written down where the objective can be checked against it
+
+`docs/HANDOFF.md` now carries the objective item by item, with the evidence for each and, where
+the answer is not simply "done", the honest qualifier:
+
+| item | state |
+|---|---|
+| beat/match both competitors on every matrix path | **met** |
+| xray column from the validated builders | **met** |
+| mKCP transport | **met** (interop both directions with Xray 26) |
+| XHTTP transport | **met** |
+| IDNA, GeoIP fixture, private CA, UDP associations, nested-key typos | **met**, each with a test |
+| browser-grade TLS fingerprint | **partial and bounded** |
+| mKCP AES-GCM mask | **open in one direction** |
+
+The two non-green rows are different kinds of thing and the table says which: the fingerprint is
+bounded by a library — rustls cannot express GREASE, and the GREASE-ECH path needs an HPKE
+provider whose only implementation breaks REALITY interop; the AES mask's server direction
+works against a real Xray client and its client direction does not carry data yet.
+
+Every other row has a test or a command behind it, which is what this objective asked for in the
+first place: *"until each is defended by a command and its output."*
+
+### On the fingerprint, specifically
+
+Checked rather than recalled: `fingerprint.rs` emits a per-profile cipher order, a per-profile
+extension set, and shuffles extension order between connections — and three tests parse the
+actual emitted bytes so the claim cannot drift. What is missing is GREASE values (RFC 8701) and
+an extension order that matches a specific browser build. rustls' `hs.rs` emits GREASE only for
+ECH. That is the whole gap, and it is a library's, not this code's.
