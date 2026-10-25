@@ -6826,3 +6826,40 @@ would eventually get there. It is the habit of asking of every claim "what comma
 this false?" and then running it. Four guards in a single session turned out hollow that way; two
 fixes turned out unnecessary; one "defect" turned out to be my own test script. None of that was
 visible from the code, and all of it was visible in ten seconds of reverting something.
+
+---
+
+## Cycle 152 — 2026-10-25
+
+### Final gate sweep after every documentation change
+
+```
+cargo fmt --all --check                        clean
+cargo clippy --workspace --all-targets -D     0 problems (including the unsafe lint)
+RUSTDOCFLAGS=-D warnings cargo doc            0 errors
+cargo test --workspace                        1101 passed, 0 failed
+cargo audit                                   exit 0, no advisories
+cargo deny check                              advisories ok, bans ok, licenses ok, sources ok
+cargo build --release                         11.2 MB binary; the whole workspace in 2 m 23 s
+```
+
+Nothing in this cycle changed behaviour — the last four commits were documentation and CI. That
+is exactly why the gates were run again: a README edit cannot break a test, but a `[lints]`
+section or a doctest-bearing comment can, and the difference between "should not" and "does not"
+is one command.
+
+### Two rounds from the end
+
+The state, with every claim traceable to a command:
+
+| objective clause | state |
+|---|---|
+| beat or match on every matrix path | **15 of 15** vs sing-box, **10 of 10** vs xray, best-of-8 |
+| xray column from the validated builders | **done**, fifteen rows |
+| mKCP, XHTTP, IDNA, GeoIP, private CA, UDP associations, nested typos | **done**, each with a test |
+| browser-grade fingerprint | **bounded** — rustls has no RFC 8701 constants (searched, cycle 135) |
+| gates green, fixes proven by failing tests, numbers recorded | **done**, five gates automated in CI |
+
+One clause of eight sub-items is not met, and it is the one the dependency cannot express. The
+other seven, the matrix, the four measured axes and the five gates are each defended by a command
+whose failure has been observed.
