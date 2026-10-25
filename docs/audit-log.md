@@ -6948,3 +6948,47 @@ So the honest state is: **the transport that hides in plain sight is now browser
 transports that present a normal certificate are limited by their TLS library.** That is a
 better split than "bounded", and it only exists because the earlier conclusion was re-examined
 instead of cited.
+
+---
+
+## B3.1 — the handshake was not reading EncryptedExtensions
+
+Starting B3 (replacing rustls on the TLS paths with our own client) begins with the code that
+already exists. Reading the REALITY handshake for what a general client would need turned up a
+defect in what is already shipped:
+
+```rust
+HS_ENCRYPTED_EXTENSIONS => {
+    transcript.extend_from_slice(&msg);
+}
+```
+
+The message went into the transcript and was never inspected. Two consequences:
+
+| missing check | what a hostile server could do |
+|---|---|
+| ALPN selection vs the offered list | answer `http/1.1` when we offered only `h2`, and the transport carries on speaking h2 over a connection the server believes is something else |
+| `early_data` refused | send it though we never offered it (RFC 8446 §4.2), silently changing what the first records mean |
+
+`tls13::parse_encrypted_extensions` now parses the block, validates the ALPN against the offer,
+refuses `early_data`, and checks every length field. The offer is one constant shared with the
+ClientHello, so the two cannot drift.
+
+Five tests; the ALPN one proved by disabling the comparison:
+
+```
+an unoffered ALPN must be refused: ServerExtensions { alpn: Some([104, 116, 116, 112, 47, 49, 46, 49]) }
+```
+
+REALITY interop against the real Xray binary still passes 4 of 4 — Xray selects `h2`, which we do
+offer. 1111 tests, 0 failed.
+
+### Progress on B3
+
+| step | state |
+|---|---|
+| TLS 1.3 core extracted into `tls13.rs` | done (B3.0) |
+| WebPKI chain verification, private CA, name check | done (B3.0), 5 tests |
+| ALPN negotiation and `early_data` refusal | **done**, 5 tests |
+| general handshake driver with a pluggable verifier | next |
+| wire into `tls.rs`, interop + measurement | after that |
