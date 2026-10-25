@@ -7014,3 +7014,27 @@ tests against the real Xray binary in both directions, 1111 tests overall.
 | shared ClientHello builder | **done** |
 | general handshake driver with a pluggable verifier | next |
 | wire into `tls.rs`, measure, decide default | after |
+
+### B3.3 — the general handshake, and the two bugs that writing it found
+
+`tls13::connect` now runs a whole TLS 1.3 handshake: greeting, ServerHello, key schedule, the
+encrypted flight, chain validation, the client's Finished. Not yet wired into `tls.rs` — the point
+of this cycle was to find out whether it works against a real server, and it is tested against a
+**rustls** server precisely because rustls is the thing being replaced.
+
+Two defects surfaced, neither visible by reading:
+
+| bug | symptom | why it matters |
+|---|---|---|
+| an empty ALPN extension was emitted when no protocols were offered | `InvalidMessage(IllegalEmptyList("ProtocolNames"))` — the server rejects the connection | any caller that wants no ALPN would fail against every strict server |
+| the CertificateVerify padding was a 36-character string, not 64 bytes of `0x20` | `CertificateVerify rejected: InvalidSignatureForPublicKey` | the message names neither the field nor the cause; reverting the fix reproduces it |
+
+Three tests: a handshake that carries `ping!`/`pong!` through, an unknown CA refused, a
+certificate for another name refused. 1114 tests, 0 failed.
+
+| B3 step | state |
+|---|---|
+| core extracted, WebPKI, ALPN, shared hello | done |
+| general handshake driver | **done**, works against a real server |
+| wire into `tls.rs` behind a flag | next |
+| interop + measurement, then the default | after |
