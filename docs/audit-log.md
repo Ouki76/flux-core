@@ -3806,3 +3806,28 @@ copy means scatter-gather all the way down, which the h2 crate does not offer.
 So this row is TLS plus one unavoidable framing copy: −7.3 % against sing-box, −46 % against
 xray, and the only row behind both. It is written here rather than chased, because the
 profile says both halves are structural.
+
+### Final validation of this cycle
+
+| gate | result |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy --workspace --all-targets -D warnings` | clean |
+| `cargo test --workspace` | **1084 passed, 0 failed** |
+| `cargo doc --workspace -D warnings` | clean (one private-item link fixed) |
+| `cargo audit` | clean |
+| `cargo deny check` | advisories, bans, licenses, sources ok |
+
+And a soak on the changed code, because the buffer pool and both UDP receive paths are
+exactly what a leak would hide in:
+
+```
+requests: 5 795 408, errors: 0, bytes proxied: 45 276 MB
+RSS min/max: 13.2 / 16.9 MB | head-median: 14.6 | tail-median: 16.5
+final FDs: 267 | final threads: 26
+OK: bounded memory (tail/head median delta 1.9 MB, 13%)
+```
+
+5.8 million requests, not one error, memory plateaued, descriptors and threads flat. The
+scrub change does not leak the buffers it no longer zeroes, which is the property the soak
+was run to check.

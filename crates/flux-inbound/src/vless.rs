@@ -61,7 +61,7 @@ impl VlessInbound {
     /// Serves mKCP conversations instead of accepting TCP.
     ///
     /// The port is the same; only the carrier changes. TLS, WebSocket, the VLESS
-    /// handshake and dispatch are shared, because [`serve_connection`] takes a plain
+    /// handshake and dispatch are shared, because `serve_connection` takes a plain
     /// stream rather than a socket.
     pub fn with_kcp(mut self, cfg: flux_transport::KcpConfig) -> Self {
         self.kcp = Some(cfg);
