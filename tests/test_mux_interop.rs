@@ -400,15 +400,44 @@ async fn assert_stream_roundtrip(
     }
 }
 
+/// Dials with a short, bounded retry on connection-level failures.
+///
+/// This test suite starts real `sing-box` and `flux-core` processes; under load a dial can hit
+/// a listener that is bound but not yet accepting, which surfaced as an unexplained
+/// `ConnectionRefused` in full-suite runs and looked like a mux regression. Three attempts over
+/// roughly a second distinguish "still starting" from "broken": a genuinely broken tunnel keeps
+/// failing and the panic names the last error.
+async fn dial_with_retry(
+    outbound: &std::sync::Arc<dyn flux_types::Outbound>,
+    meta: &SessionMeta,
+) -> flux_types::FluxResult<flux_types::BoxedStream> {
+    let mut last = None;
+    for attempt in 0..3u32 {
+        match outbound.dial_stream(meta).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                let text = e.to_string();
+                let transient =
+                    text.contains("Connection refused") || text.contains("Connection reset");
+                if !transient || attempt == 2 {
+                    return Err(e);
+                }
+                last = Some(e);
+                tokio::time::sleep(Duration::from_millis(150 << attempt)).await;
+            }
+        }
+    }
+    Err(last.expect("at least one attempt recorded a failure"))
+}
+
 async fn stream_roundtrip_once(
     outbound: &std::sync::Arc<dyn flux_types::Outbound>,
     destination: &TargetAddress,
     payload: &[u8],
 ) -> Result<(), std::io::Error> {
-    let mut stream = outbound
-        .dial_stream(&meta(destination.clone()))
+    let mut stream = dial_with_retry(outbound, &meta(destination.clone()))
         .await
-        .expect("dial_stream");
+        .expect("dial_stream after retries");
     stream.write_all(payload).await.expect("write");
     stream.flush().await.expect("flush");
     let mut echoed = vec![0u8; payload.len()];
