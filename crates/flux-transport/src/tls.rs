@@ -32,9 +32,14 @@ pub struct TlsClientConfig {
     pub ca_certs: Vec<std::path::PathBuf>,
     /// Use this crate's own TLS 1.3 client instead of rustls.
     ///
-    /// Off by default while B3 is being proved: rustls stays the path everyone gets until the
-    /// native one has passed the interop suites and the throughput measurements. The reason to
-    /// turn it on is the ClientHello — ours is browser-shaped with GREASE, rustls' is not.
+    /// **On by default:** the ClientHello is the reason this exists — ours is browser-shaped
+    /// with GREASE (RFC 8701) in the cipher list, the extension list and `supported_groups`,
+    /// and rustls cannot produce that. It is at parity on throughput and connection rate, and
+    /// tested against the real `sing-box` and `xray` binaries.
+    ///
+    /// The one thing it cannot do is TLS 1.2, so the dial path retries once with rustls when
+    /// the handshake fails for a reason other than a rejected certificate. Setting this to
+    /// `false` skips that retry entirely.
     pub native: bool,
 }
 
@@ -47,7 +52,7 @@ impl TlsClientConfig {
             insecure: false,
             fingerprint: None,
             ca_certs: vec![],
-            native: false,
+            native: true,
         }
     }
 

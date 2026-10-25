@@ -151,113 +151,159 @@ impl LayeredTransportPipeline {
     }
 }
 
+impl LayeredTransportPipeline {
+    /// One dial attempt. `allow_native` is false for the rustls fallback, so a server that
+    /// cannot speak TLS 1.3 is reached with a stack that also negotiates 1.2.
+    async fn dial_with(&self, allow_native: bool) -> FluxResult<BoxedStream> {
+        // 1. Layer 1 (Carrier): TCP, or mKCP when the node asks for it. KCP is a
+        // reliable byte stream over UDP, so everything above this line — TLS,
+        // REALITY, WebSocket, the protocol itself — is unchanged.
+        let mut stream: BoxedStream = match &self.kcp {
+            Some(kcp_cfg) => {
+                let kcp_stream = tokio::time::timeout(
+                    self.connect_timeout,
+                    crate::kcp::connect(self.resolved_addr, *kcp_cfg),
+                )
+                .await
+                .map_err(|_| FluxError::Timeout("mKCP connect timed out".into()))??;
+                Box::new(kcp_stream)
+            }
+            None => {
+                let tcp_stream =
+                    TcpTransport::connect(self.resolved_addr, self.connect_timeout).await?;
+                Box::new(tcp_stream)
+            }
+        };
+
+        // 2. Layer 2 (Security): Sequentially apply security layers
+        for sec in &self.securities {
+            stream = match sec {
+                SecurityLayer::None => stream,
+                SecurityLayer::Tls(cfg) => {
+                    let mut cfg = cfg.clone();
+                    if !allow_native {
+                        cfg.native = false;
+                    }
+                    TlsTransport::connect(stream, &cfg).await?
+                }
+                SecurityLayer::Reality(cfg) => {
+                    let s = RealityHandshake::client_handshake(stream, cfg).await?;
+                    Box::new(s)
+                }
+                SecurityLayer::ShadowTls(cfg) => {
+                    ShadowTlsHandshake::client_handshake(stream, cfg).await?
+                }
+                SecurityLayer::Fragment(cfg) => {
+                    Box::new(crate::fragment::FragmentedStream::new(stream, *cfg))
+                }
+            };
+        }
+
+        // 3. Layer 3 (Framing): Sequentially apply framing layers
+        for framing in &self.framings {
+            stream = match framing {
+                FramingLayer::Raw => stream,
+                FramingLayer::Xhttp { path, headers } => {
+                    let st =
+                        crate::xhttp::connect(stream, &self.host_header, path, headers).await?;
+                    Box::new(st)
+                }
+                FramingLayer::WebSocket { path, headers } => {
+                    let ws = crate::websocket::client_handshake(
+                        stream,
+                        &self.host_header,
+                        path,
+                        headers,
+                    )
+                    .await?;
+                    Box::new(ws)
+                }
+                FramingLayer::HttpUpgrade { path, headers } => {
+                    crate::httpupgrade::client_handshake(stream, &self.host_header, path, headers)
+                        .await?
+                }
+                FramingLayer::Http2 { path, headers } => {
+                    let h2 = crate::h2::H2Transport::client_handshake(
+                        stream,
+                        &self.host_header,
+                        path,
+                        headers,
+                    )
+                    .await?;
+                    Box::new(h2)
+                }
+                FramingLayer::Grpc {
+                    service_name,
+                    headers,
+                } => {
+                    let grpc = crate::grpc::GrpcTransport::client_handshake(
+                        stream,
+                        &self.host_header,
+                        service_name,
+                        headers,
+                    )
+                    .await?;
+                    Box::new(grpc)
+                }
+            };
+        }
+
+        Ok(stream)
+    }
+}
+
 #[async_trait]
 impl StreamDialer for LayeredTransportPipeline {
     async fn dial(&self) -> FluxResult<BoxedStream> {
-        let dial_fut = async {
-            // 1. Layer 1 (Carrier): TCP, or mKCP when the node asks for it. KCP is a
-            // reliable byte stream over UDP, so everything above this line — TLS,
-            // REALITY, WebSocket, the protocol itself — is unchanged.
-            let mut stream: BoxedStream = match &self.kcp {
-                Some(kcp_cfg) => {
-                    let kcp_stream = tokio::time::timeout(
-                        self.connect_timeout,
-                        crate::kcp::connect(self.resolved_addr, *kcp_cfg),
-                    )
-                    .await
-                    .map_err(|_| FluxError::Timeout("mKCP connect timed out".into()))??;
-                    Box::new(kcp_stream)
-                }
-                None => {
-                    let tcp_stream =
-                        TcpTransport::connect(self.resolved_addr, self.connect_timeout).await?;
-                    Box::new(tcp_stream)
-                }
-            };
-
-            // 2. Layer 2 (Security): Sequentially apply security layers
-            for sec in &self.securities {
-                stream = match sec {
-                    SecurityLayer::None => stream,
-                    SecurityLayer::Tls(cfg) => TlsTransport::connect(stream, cfg).await?,
-                    SecurityLayer::Reality(cfg) => {
-                        let s = RealityHandshake::client_handshake(stream, cfg).await?;
-                        Box::new(s)
-                    }
-                    SecurityLayer::ShadowTls(cfg) => {
-                        ShadowTlsHandshake::client_handshake(stream, cfg).await?
-                    }
-                    SecurityLayer::Fragment(cfg) => {
-                        Box::new(crate::fragment::FragmentedStream::new(stream, *cfg))
-                    }
-                };
+        let started = std::time::Instant::now();
+        let first = match tokio::time::timeout(self.connect_timeout, self.dial_with(true)).await {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(flux_types::FluxError::Timeout(format!(
+                    "layered transport dial to {} timed out after {:?}",
+                    self.server_address, self.connect_timeout
+                )));
             }
-
-            // 3. Layer 3 (Framing): Sequentially apply framing layers
-            for framing in &self.framings {
-                stream = match framing {
-                    FramingLayer::Raw => stream,
-                    FramingLayer::Xhttp { path, headers } => {
-                        let st =
-                            crate::xhttp::connect(stream, &self.host_header, path, headers).await?;
-                        Box::new(st)
-                    }
-                    FramingLayer::WebSocket { path, headers } => {
-                        let ws = crate::websocket::client_handshake(
-                            stream,
-                            &self.host_header,
-                            path,
-                            headers,
-                        )
-                        .await?;
-                        Box::new(ws)
-                    }
-                    FramingLayer::HttpUpgrade { path, headers } => {
-                        crate::httpupgrade::client_handshake(
-                            stream,
-                            &self.host_header,
-                            path,
-                            headers,
-                        )
-                        .await?
-                    }
-                    FramingLayer::Http2 { path, headers } => {
-                        let h2 = crate::h2::H2Transport::client_handshake(
-                            stream,
-                            &self.host_header,
-                            path,
-                            headers,
-                        )
-                        .await?;
-                        Box::new(h2)
-                    }
-                    FramingLayer::Grpc {
-                        service_name,
-                        headers,
-                    } => {
-                        let grpc = crate::grpc::GrpcTransport::client_handshake(
-                            stream,
-                            &self.host_header,
-                            service_name,
-                            headers,
-                        )
-                        .await?;
-                        Box::new(grpc)
-                    }
-                };
-            }
-
-            Ok(stream)
         };
 
-        match tokio::time::timeout(self.connect_timeout, dial_fut).await {
-            Ok(res) => res,
-            Err(_) => Err(flux_types::FluxError::Timeout(format!(
-                "layered transport dial to {} timed out after {:?}",
-                self.server_address, self.connect_timeout
-            ))),
+        // A server that cannot speak TLS 1.3 is old, not hostile. The native client exists for
+        // its ClientHello; if that is the only reason the dial failed, redial once with rustls,
+        // which negotiates 1.2 as well. Every other error is returned untouched — a failed
+        // certificate check must never be retried with a different stack.
+        let Some(err) = first.as_ref().err() else {
+            return first;
+        };
+        // Retry only for a handshake this client could not complete, and never for a rejected
+        // certificate: that decision belongs to whichever stack made it, and swapping stacks to
+        // get a different answer is the definition of a downgrade.
+        let retryable = match err {
+            flux_types::FluxError::Protocol { protocol, message } if *protocol == "tls13" => {
+                !crate::tls13::is_verification_failure(message)
+            }
+            _ => false,
+        };
+        let text = err.to_string();
+        if !retryable || !self.securities.iter().any(is_native_tls) {
+            return first;
+        }
+        tracing::debug!(
+            "the server did not negotiate TLS 1.3; retrying this dial with rustls ({text})"
+        );
+        let remaining = self
+            .connect_timeout
+            .saturating_sub(started.elapsed())
+            .max(std::time::Duration::from_millis(500));
+        match tokio::time::timeout(remaining, self.dial_with(false)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            // The fallback failing is less informative than the original error.
+            _ => first,
         }
     }
+}
+
+/// Whether a security layer is the one this client's own handshake would drive.
+fn is_native_tls(layer: &SecurityLayer) -> bool {
+    matches!(layer, SecurityLayer::Tls(cfg) if cfg.native)
 }
 
 #[derive(Clone)]

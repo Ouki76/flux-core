@@ -53,6 +53,27 @@ pub(crate) const HS_KEY_UPDATE: u8 = 24;
 #[allow(dead_code)]
 pub(crate) const MAX_TLS_RECORD: usize = 16384;
 
+/// Marker in the error text when a server cannot speak TLS 1.3.
+///
+/// The dial path looks for this string to decide whether retrying with another TLS stack is
+/// appropriate. A constant keeps the two ends from drifting.
+pub const NOT_TLS13: &str = "not-tls13";
+
+/// Text that marks a *verification* failure, as opposed to a handshake this client could not
+/// complete. Only the second kind may be retried with another stack: retrying a rejected
+/// certificate would silently replace a security decision with a different implementation's.
+pub(crate) fn is_verification_failure(message: &str) -> bool {
+    const MARKERS: [&str; 6] = [
+        "certificate chain rejected",
+        "not valid for",
+        "no trust anchors",
+        "CertificateVerify rejected",
+        "unusable trust anchor",
+        "the server sent no certificate",
+    ];
+    MARKERS.iter().any(|m| message.contains(m))
+}
+
 /// Largest handshake message this client will buffer.
 ///
 /// A length field is 24 bits, so a peer can claim 16 MiB and make the client allocate it before
@@ -1471,8 +1492,13 @@ where
     let suite_id = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
     pos += 2;
     pos += 1; // legacy compression method
-    let suite = Tls13Suite::from_id(suite_id)
-        .ok_or_else(|| crypto_err(format!("server chose cipher suite {suite_id:#06x}")))?;
+    // A server that answers with a TLS 1.2 suite is not broken — it is old. The caller is told
+    // which case this is, because falling back to another TLS stack is only right for this one.
+    let suite = Tls13Suite::from_id(suite_id).ok_or_else(|| {
+        crypto_err(format!(
+            "the server did not negotiate TLS 1.3 (it chose cipher suite {suite_id:#06x}); {NOT_TLS13}"
+        ))
+    })?;
 
     if pos + 2 > sh.len() {
         return Err(crypto_err("short ServerHello (extensions)"));
@@ -1752,8 +1778,19 @@ async fn read_record_typed<S: AsyncRead + Unpin>(
             let body = read_record_body(stream, &hdr).await?;
             let level = body.first().copied().unwrap_or(0);
             let desc = body.get(1).copied().unwrap_or(0);
+            // Alert 70 is `protocol_version`: a server that cannot do TLS 1.3 refuses the
+            // greeting outright rather than choosing a lower suite. Say so, because the dial
+            // path falls back to another TLS stack on exactly this.
+            let name = match desc {
+                70 => "protocol_version; not-tls13",
+                40 => "handshake_failure",
+                47 => "illegal_parameter",
+                112 => "unrecognized_name",
+                _ => "unrecognised",
+            };
             return Err(crypto_err(format!(
-                "the server sent a TLS alert before {expect} (level {level}, description {desc})"
+                "the server refused the handshake before {expect} (level {level}, {name}, \
+                 description {desc})"
             )));
         }
         return Err(crypto_err(format!(
@@ -2063,5 +2100,138 @@ mod size_limit_tests {
     fn the_ceiling_is_above_a_realistic_certificate_chain() {
         // Three 8 KiB certificates, a size no real chain exceeds by much.
         assert!(check_handshake_len(3 * 8 * 1024).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod fallback_policy_tests {
+    use super::*;
+
+    /// A rejected certificate must never be retried with another TLS stack: that would be a
+    /// downgrade dressed as resilience.
+    #[test]
+    fn verification_failures_are_not_retryable() {
+        for message in [
+            "certificate chain rejected: CertExpired",
+            "certificate is not valid for 'example.com': NotValidForName",
+            "no trust anchors are configured, so no server certificate can be verified",
+            "CertificateVerify rejected: InvalidSignatureForPublicKey",
+            "the server sent no certificate",
+        ] {
+            assert!(
+                is_verification_failure(message),
+                "must not be retried with another stack: {message}"
+            );
+        }
+    }
+
+    /// A handshake this client could not complete is exactly what the fallback is for.
+    #[test]
+    fn handshake_failures_are_retryable() {
+        for message in [
+            "the server did not negotiate TLS 1.3 (it chose cipher suite 0xc02f); not-tls13",
+            "server asked for a HelloRetryRequest; this client always offers an x25519 key share",
+            "the server chose key share group 0x0017, which this client did not offer",
+        ] {
+            assert!(
+                !is_verification_failure(message),
+                "must be retryable with another stack: {message}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tls12_trigger_tests {
+    use crate::tls::{TlsClientConfig, TlsTransport};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that speaks **only** TLS 1.2, which the native client cannot do.
+    fn tls12_only_acceptor(cert_pem: &str, key_pem: &str) -> tokio_rustls::TlsAcceptor {
+        let certs: Vec<_> = pem::parse_many(cert_pem)
+            .expect("cert")
+            .into_iter()
+            .filter(|b| b.tag() == "CERTIFICATE")
+            .map(|b| rustls_pki_types::CertificateDer::from(b.contents().to_vec()))
+            .collect();
+        let key = pem::parse_many(key_pem)
+            .expect("key")
+            .into_iter()
+            .next()
+            .expect("one key");
+        let key = rustls_pki_types::PrivateKeyDer::Pkcs8(key.contents().to_vec().into());
+        let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let cfg = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS12])
+            .expect("TLS 1.2 only")
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .expect("server config");
+        tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg))
+    }
+
+    fn cert_and_key() -> (String, String) {
+        let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("cert");
+        (c.cert.pem(), c.key_pair.serialize_pem())
+    }
+
+    /// The native client names this case distinctly, so the dial path can decide to fall back.
+    #[tokio::test]
+    async fn the_native_client_reports_a_tls12_server_as_not_tls13() {
+        crate::tls::init_crypto_provider();
+        let (cert, key) = cert_and_key();
+        let acceptor = tls12_only_acceptor(&cert, &key);
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = acceptor.accept(server_raw).await;
+        });
+        let cfg = TlsClientConfig {
+            native: true,
+            insecure: true,
+            ..TlsClientConfig::new("localhost")
+        };
+        let err = match TlsTransport::connect(client_raw, &cfg).await {
+            Ok(_) => panic!("the native client cannot speak TLS 1.2"),
+            Err(e) => e.to_string(),
+        };
+        // A 1.2-only server refuses the greeting with alert 70 rather than choosing a lower
+        // suite, so the marker has to be on the alert path as well as the suite path.
+        assert!(
+            err.contains(crate::tls13::NOT_TLS13),
+            "the error must be recognisable as a version problem: {err}"
+        );
+        assert!(
+            !crate::tls13::is_verification_failure(&err),
+            "and it must not look like a certificate failure: {err}"
+        );
+    }
+
+    /// The other half: rustls reaches the same server, which is what the fallback relies on.
+    #[tokio::test]
+    async fn rustls_reaches_the_same_tls12_server() {
+        crate::tls::init_crypto_provider();
+        let (cert, key) = cert_and_key();
+        let acceptor = tls12_only_acceptor(&cert, &key);
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acceptor.accept(server_raw).await {
+                let mut b = [0u8; 4];
+                if srv.read_exact(&mut b).await.is_ok() {
+                    let _ = srv.write_all(&b).await;
+                }
+            }
+        });
+        let cfg = TlsClientConfig {
+            native: false,
+            insecure: true,
+            ..TlsClientConfig::new("localhost")
+        };
+        let mut client = TlsTransport::connect(client_raw, &cfg)
+            .await
+            .expect("rustls negotiates TLS 1.2");
+        client.write_all(b"hi12").await.expect("write");
+        let mut buf = [0u8; 4];
+        client.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"hi12");
     }
 }

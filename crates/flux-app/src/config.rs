@@ -532,6 +532,11 @@ pub enum InboundCarrierConfig {
     },
 }
 
+/// `true` for a boolean flag that is on unless a config says otherwise.
+fn default_true() -> bool {
+    true
+}
+
 /// Maps a user-facing header name onto the obfuscation mode.
 fn kcp_obfs_from_header(header: &str) -> FluxResult<flux_transport::KcpObfs> {
     Ok(match header.to_ascii_lowercase().as_str() {
@@ -614,8 +619,9 @@ pub enum SecurityConfig {
         /// Use this project's own TLS 1.3 client instead of rustls.
         ///
         /// The difference is the ClientHello: ours is browser-shaped with GREASE, rustls'
-        /// is not. Off by default until the native path has passed interop and throughput.
-        #[serde(default)]
+        /// is not. On by default; set it to `false` to use rustls only, without the automatic
+        /// retry that a TLS 1.2-only server triggers.
+        #[serde(default = "default_true")]
         native_tls: bool,
     },
     /// REALITY: TLS that cannot be attributed to this server.
