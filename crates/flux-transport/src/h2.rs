@@ -298,6 +298,12 @@ pub(crate) mod shared {
 
     /// `SETTINGS_INITIAL_WINDOW_SIZE` advertised to the peer, in bytes.
     const INITIAL_STREAM_WINDOW: u32 = 1024 * 1024;
+    /// Largest DATA frame either side will send, negotiated in SETTINGS.
+    ///
+    /// The relay moves 64 KiB at a time, so a 64 KiB frame is the size that stops one
+    /// buffer becoming four frames and four `writev` calls. Anything above the peer's
+    /// advertised limit is its own business: SETTINGS is symmetric and h2 respects it.
+    const MAX_FRAME_SIZE: u32 = 64 * 1024;
     /// Connection-level window advertised to the peer, in bytes.
     const INITIAL_CONNECTION_WINDOW: u32 = 2 * 1024 * 1024;
     /// Consecutive non-I/O `accept()` failures tolerated before the driver gives
@@ -313,8 +319,11 @@ pub(crate) mod shared {
     where
         S: AsyncStream + 'static,
     {
+        let mut builder = h2::client::Builder::new();
+        builder.max_frame_size(MAX_FRAME_SIZE);
         let (client, connection) =
-            h2::client::handshake(stream)
+            builder
+                .handshake(stream)
                 .await
                 .map_err(|e| FluxError::Protocol {
                     protocol,
@@ -342,6 +351,10 @@ pub(crate) mod shared {
         // small enough that an idle peer cannot pin unbounded memory.
         builder.initial_window_size(INITIAL_STREAM_WINDOW);
         builder.initial_connection_window_size(INITIAL_CONNECTION_WINDOW);
+        // h2's default DATA frame is 16 KiB, so a 64 KiB relay write left as four
+        // frames — four `writev`s for one buffer. The setting is negotiated in SETTINGS,
+        // so both ends agree and a peer that does not support it simply keeps its own.
+        builder.max_frame_size(MAX_FRAME_SIZE);
         builder
             .handshake(stream)
             .await
