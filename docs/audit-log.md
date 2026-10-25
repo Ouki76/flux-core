@@ -6160,3 +6160,44 @@ relay working — that outlived the explanation I built on top of it.
 The audit's own rule applies to its author: **the hypothesis that survives is the one with the
 awkward fact attached to it**, and I had an awkward fact in hand since cycle 114 without noticing
 it contradicted the story I was telling.
+
+### The last "defect" was my measurement
+
+After the address fix, a 6 MB transfer stalled where 3 MB worked, and I spent a cycle
+instrumenting the connection state:
+
+```
+kcp state: snd_buf=0 snd_una=0 snd_nxt=1 peer_edge=311 rcv_nxt=2134 rcv_free=0
+```
+
+`snd_buf=0` — nothing of ours pending. `rcv_free=0` — our receive window exhausted because the
+application is not draining it. That is not a network state; it is a **deadlock between two
+socket buffers**, and the application on the other end was my test script, which wrote the whole
+payload before reading a byte.
+
+Reading and writing concurrently:
+
+```
+28.6 MiB за 1.58с = 18.1 MiB/s
+```
+
+28 MB at 18 MiB/s through a real Xray server behind `mkcp-aes128gcm`. There was never a second
+defect.
+
+### What the AES-mask hunt actually produced
+
+| finding | real? | kept |
+|---|---|---|
+| `sending_next` carried `rcv_nxt` | yes | yes, with a test that fails without it |
+| opening PING 30 µs after the first segment | yes | yes, labelled a guard |
+| cumulative acknowledgement missing in `on_ack` | **no** | deleted |
+| source-address pin dropping replies | **yes, the blocker** | yes |
+| "stalls at 6 MB" | **no — my test script** | — |
+
+Two genuine defects, one of which was the whole blockage; one fix retracted; one phantom
+failure that cost a cycle of instrumentation. The phantom is the interesting one: the
+instrumentation was right (`rcv_free=0`, `snd_buf=0` is unambiguous) and it took one more step —
+*who is not draining?* — to see that the answer was me.
+
+Both directions now interoperate with the real binary and are pinned by tests, which is the
+state the objective asked for.
