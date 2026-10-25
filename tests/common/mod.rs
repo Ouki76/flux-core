@@ -94,6 +94,23 @@ pub async fn port_is_free(port: u16) -> bool {
 /// Every port handed out is recorded in a process-local ledger so that a bind
 /// failure can be attributed: [`diagnose_bind_failure`] reports whether the
 /// failing port came from this allocator, when, and to which test thread.
+/// A free **UDP** port, for protocols whose listener is not a TCP one.
+///
+/// The TCP allocator cannot answer this: a port can be free for TCP and busy for UDP, and a
+/// QUIC or WireGuard listener will fail to bind on a port the TCP probe reported as free.
+#[allow(dead_code)]
+pub fn get_free_udp_port_sync() -> u16 {
+    for _ in 0..64 {
+        let sock = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("bind udp probe");
+        let port = sock.local_addr().expect("local addr").port();
+        drop(sock);
+        if port >= 1024 {
+            return port;
+        }
+    }
+    panic!("could not find a free UDP port");
+}
+
 #[allow(dead_code)]
 pub async fn get_free_tcp_port() -> u16 {
     warn_once_if_ephemeral_range_overlaps();
