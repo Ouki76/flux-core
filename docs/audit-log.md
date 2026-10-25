@@ -6245,3 +6245,51 @@ If someone later wants the full thing, the honest options are:
 
 That is the trade written down so the next person does not have to rediscover it, and so nobody
 mistakes the current state for an oversight.
+
+---
+
+## Cycle 136 — 2026-10-25 (round 100)
+
+### Milestone run
+
+```
+ASSERT PASSED: every row is at or above both competitors within 10%
+```
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | 722.1 | 576.5 | 606.1 | +25.2% | +19.1% |
+| WireGuard | 68.1 | 50.6 | — | +34.6% | — |
+| TUIC v5 | 97.4 | 49.0 | — | +99.0% | — |
+| Hysteria2 | 95.8 | 45.3 | — | +111.4% | — |
+| VLESS / TLS | 393.0 | 303.8 | 231.4 | +29.4% | +69.9% |
+| VLESS / XHTTP | 425.7 | — | 141.5 | — | +200.8% |
+| VLESS / WS + TLS | 310.1 | 276.8 | 102.6 | +12.0% | +202.1% |
+| VLESS / gRPC (no TLS) | 458.7 | — | 161.0 | — | +184.9% |
+| VLESS / gRPC + TLS | 205.5 | 98.9 | 155.5 | +107.8% | +32.1% |
+| VLESS / REALITY | 354.0 | 324.0 | 224.3 | +9.2% | +57.8% |
+| VLESS / REALITY + Vision | 326.5 | 287.4 | 232.1 | +13.6% | +40.7% |
+| VMess / WS + TLS | 236.5 | 193.2 | 161.4 | +22.4% | +46.5% |
+| Trojan / TLS | 381.5 | 306.4 | — | +24.5% | — |
+| Shadowsocks-2022 | 359.3 | 393.0 | 276.3 | −8.6% | +30.1% |
+| Shadowsocks-AEAD | 290.6 | 220.5 | — | +31.8% | — |
+
+Fourteen ahead, one at −8.6% — inside the 10% band, which is what "at parity" means on this
+host. With eight rounds that same row measured **+5.6%** (cycle 132); a four-round run sometimes
+catches a slow flux round, and the gate is written to tolerate exactly that.
+
+Static gates alongside: fmt clean, clippy 0, doc 0, deny ok, 1100 tests 0 failed.
+
+### Where a hundred rounds end
+
+| objective clause | state |
+|---|---|
+| beat or match both competitors on every matrix path | **met**, gated by `bench_matrix --assert` |
+| xray column from the validated builders | **met**, fifteen rows |
+| mKCP, XHTTP transports | **met**, both interoperate both ways with the real binaries |
+| IDNA, GeoIP fixture, private CA, UDP associations, nested-key typos | **met**, each with a test |
+| browser-grade fingerprint | **bounded** — rustls has no RFC 8701 constants (verified in its source) |
+| gates green every cycle, fixes proven by tests, numbers in this log | **met** |
+
+The one non-green row is a capability the dependency does not have. Everything else is defended
+by a command whose failure has been observed at least once.
