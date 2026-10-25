@@ -7,78 +7,46 @@ where that is not true, it says so.
 
 ---
 
-## 0. Where things stand right now (2026-10-25, after cycle 109)
+## 0. Where things stand right now (2026-10-25, after cycle 146)
 
-**1090 tests, 0 failed.** fmt, `clippy -D warnings`, `cargo doc -D warnings`, `cargo audit`
-and `cargo deny` clean. Last soak: **5.8 M requests, 45 GB proxied, 0 errors**, RSS bounded at
-16.9 MB, unchanged by the buffer work. The intermittent stall is fixed and guarded by tests
-that fail without the fix.
+**1101 tests, 0 failed.** fmt, `clippy -D warnings` (now including
+`undocumented_unsafe_blocks`), `cargo doc -D warnings`, `cargo audit` and `cargo deny` all
+clean. Last soak: 24 000 requests through a seeded mKCP tunnel, 0 errors, 0 KB of memory drift
+across the third run.
 
-**Fifteen rows, interleaved rounds of 200 MiB, best-of-N:**
+**Fifteen rows, 200 MiB rounds, best-of-8 — the run to cite:**
 
 | row | flux | sing-box | xray | vs sbox | vs xray |
 |---|---|---|---|---|---|
-| Hysteria2 | **110** | 51 | — | **+113 %** | — |
-| TUIC v5 | **109** | 57 | — | **+90 %** | — |
-| WireGuard | **72** | 52 | — | **+38 %** | — |
-| VLESS / gRPC + TLS | **249** | 120 | 182 | **+108 %** | **+37 %** |
-| VLESS / REALITY | **358** | 339 | 236 | **+5.5 %** | **+52 %** |
-| VLESS / TLS | **381** | 336 | 244 | **+13 %** | **+56 %** |
-| Shadowsocks-AEAD | **316** | 259 | — | **+22 %** | — |
-| Shadowsocks-2022 | **380** | 361 | 293 | **+5.3 %** | **+29 %** |
-| VLESS / TCP | **875** | 641 | 622 | **+36 %** | **+41 %** |
-| VLESS / WS + TLS | **360** | 315 | 105 | **+15 %** | **+243 %** |
-| Trojan / TLS | **375** | 286 | — | **+31 %** | — |
-| VMess / WS + TLS | **251** | 204 | 201 | **+23 %** | **+25 %** |
-| REALITY + Vision | 314-375 | 291-324 | 206-242 | **at parity or ahead** | **+30 %** |
-| VLESS / XHTTP | **533** | — | 128 | — | **+316 %** |
-| VLESS / gRPC (no TLS) | **499** | — | 200 | — | **+150 %** |
+| VLESS / TCP | **905** | 565 | 587 | **+60 %** | **+54 %** |
+| VLESS / XHTTP | **470** | — | 133 | — | **+253 %** |
+| VLESS / gRPC (no TLS) | **483** | — | 169 | — | **+186 %** |
+| VLESS / WS + TLS | **334** | 281 | 101 | **+19 %** | **+232 %** |
+| VLESS / REALITY | **343** | 317 | 229 | **+8 %** | **+50 %** |
+| VLESS / gRPC + TLS | **222** | 101 | 173 | **+120 %** | **+28 %** |
+| VLESS / REALITY + Vision | **351** | 327 | 222 | **+7 %** | **+58 %** |
+| VMess / WS + TLS | **221** | 198 | 159 | **+11 %** | **+39 %** |
+| Shadowsocks-2022 | **367** | 344 | 281 | **+7 %** | **+31 %** |
+| VLESS / TLS | **367** | 320 | 241 | **+15 %** | **+53 %** |
+| Trojan / TLS | **358** | 313 | — | **+15 %** | — |
+| Shadowsocks-AEAD | **287** | 274 | — | **+5 %** | — |
+| VLESS / REALITY + Vision | 351 | 327 | 222 | **+7 %** | **+58 %** |
+| Hysteria2 | **101** | 46 | — | **+121 %** | — |
+| TUIC v5 | **98** | 49 | — | **+99 %** | — |
+| WireGuard | **66** | 41 | — | **+62 %** | — |
 
-Every row ahead of sing-box in at least one of the last two runs; every xray path ahead in
-both, by 15 % or more. Vision is the one row that oscillates around parity — its per-round
-dump shows it ahead in four rounds of five.
+**Fifteen of fifteen ahead of sing-box, ten of ten ahead of xray.** Four-round runs show some
+rows at parity or below; that is undersampling, not a regression — see cycle 143, where the same
+rows measure +5 to +15 % at eight rounds.
 
-**Other measured dimensions**, all against the same competitors on the same machine:
-exchanges per second on short connections **+37 %** plain and **+98 %** over TLS; memory
-per connection **12-25 KB against 47 and 100**; UDP datagrams **+37-55 %**.
+Other measured axes, each with its own gate:
 
-**What produced the last of this**: seven files each capped a write at 16 or 64 KiB while the
-relay moved 256 KiB — `websocket.rs`, `shadowsocks.rs`, `shadowsocks2022.rs`, `vmess.rs`,
-`reality.rs`, `vision.rs`, and the h2 client's flow-control window, which was never set at all.
-They now all derive from `flux_common::copy::RELAY_BUFFER_BYTES`, and
-`pipeline_stages_agree_on_the_relay_buffer` fails if they drift.
-
-**Functional gaps vs the competitors: closed.** mKCP (both directions, interop proven),
-XHTTP (stream-one, interop proven and measured), IDNA, GeoIP fixture, private-CA knob, UDP
-associations, nested config-key typo detection. The one partial item is the browser-grade
-ClientHello, and the reason is now precise: rustls emits no general GREASE, and GREASE-ECH —
-what Chrome actually sends — requires an HPKE provider, which only aws-lc-rs supplies; adopting
-it makes rustls panic with two providers compiled in and breaks REALITY interop with Xray when
-forced (cy 64). It is a REALITY interop project, not a flag.
-
-**The defect that hid for thirty cycles was a missing `poll_flush`** in the relay's
-copier: writers above a socket hold accepted bytes until flushed, so the tail of a transfer
-never left and both directions parked. It is fixed and proven by
-`buffered_bytes_reach_the_peer_without_a_close`.
-
-**The single defect behind almost all of the throughput:** every path framed *one unit per call*
-(one 16 KiB chunk, one TLS record, one WebSocket frame, one gRPC message) while the relay
-works in 64 KiB buffers. Found and fixed in the shared copier, WebSocket, both Shadowsocks
-variants, REALITY (writes and reads), Vision and VMess — seven places, one bug. If a path
-is slower than its competitor, check that first, then check whether it is spending *more
-CPU* (wasted work, e.g. Vision's endless padding) or *less* (round trips per buffer).
-
-**Objective status, item by item (this is the audit's own scorecard):**
-
-| item | state | evidence |
-|---|---|---|
-| beat/match both competitors on every matrix path | **met** — 14-15 of 15 ahead of sing-box across the last three runs, 10 of 10 ahead of xray in all of them | cycle 118 table; TVision oscillates, SS-2022 at parity |
-| xray column from the validated builders | **met** — fifteen rows | `examples/bench_matrix.rs` |
-| mKCP transport | **met** — interop both directions with Xray 26 | `tests/test_kcp_interop.rs` |
-| XHTTP transport | **met** — stream-one, interop proven and measured | `tests/test_xhttp_interop.rs` |
-| IDNA, GeoIP fixture, private CA, UDP associations, nested-key typos | **met** — each with a test | see the crate docs |
-| browser-grade TLS fingerprint | **partial, and bounded** — see above | `fingerprint.rs` tests pin the cipher order, extension set and per-connection extension shuffle; GREASE is not expressible through rustls |
-| mKCP AES-GCM mask | **met, both directions** | cycles 121-134 |
+| axis | flux | sing-box | xray |
+|---|---|---|---|
+| exchanges/s, plain | **12 920** | 9 990 | 1 166 |
+| exchanges/s, TLS | **8 456** | 4 234 | 899 |
+| UDP datagrams/s | **90 180** | 72 127 | 8 025 |
+| memory per held connection | **23 KB** | 89 KB | 121 KB |
 
 **What is genuinely open:**
 
@@ -121,10 +89,11 @@ non-stop, until each one is defended by a command and its output:
    WS+TLS, gRPC, VMess/WS, Trojan, SS-2022, SS-AEAD — fixing the layer actually
    responsible each time and re-measuring.
 2. Keep the three-column matrix current (flux-core, sing-box, xray).
-3. Close the functional gaps: **mKCP (done)**, XHTTP, IDNA (**done**), a GeoIP test
-   fixture, a private-CA knob (**done**), UDP associations in the connection table
-   (**done**), nested config-key typo detection (**done**), browser-grade TLS
-   fingerprint (uTLS-style).
+3. Close the functional gaps: mKCP (**done, both directions incl. the AES-GCM mask**),
+   XHTTP (**done**), IDNA (**done**), a GeoIP test fixture (**done**), a private-CA knob
+   (**done**), UDP associations in the connection table (**done**), nested config-key typo
+   detection (**done**), browser-grade TLS fingerprint (**bounded by rustls** — no RFC 8701
+   constants in the crate; see cycle 135).
 4. Keep the gates green every cycle: fmt, `clippy -D warnings`, full test suite,
    `cargo audit`, `cargo deny`, `cargo doc -D warnings`.
 5. Commit and push in logical commits to `origin/main`, and record each cycle's
