@@ -6992,3 +6992,25 @@ offer. 1111 tests, 0 failed.
 | ALPN negotiation and `early_data` refusal | **done**, 5 tests |
 | general handshake driver with a pluggable verifier | next |
 | wire into `tls.rs`, interop + measurement | after that |
+
+### B3.2 — the hello exists once
+
+The ClientHello moved from inside the REALITY handshake into `tls13::build_client_hello`, which
+takes a server name, an ALPN list, a client random and an X25519 key share, and returns the
+handshake message. REALITY calls it and patches `session_id` afterwards — the only part of those
+bytes that was ever REALITY-specific.
+
+The GREASE table, the group ids and the ALPN offer moved with it, which matters for the check
+added in B3.1: the greeting and the validation of the server's answer now read the same constant.
+
+Verified by the tests that would notice a byte going missing: 13 REALITY unit tests, 4 interop
+tests against the real Xray binary in both directions, 1111 tests overall.
+
+| B3 step | state |
+|---|---|
+| core extracted | done |
+| WebPKI verification | done |
+| ALPN + early_data | done |
+| shared ClientHello builder | **done** |
+| general handshake driver with a pluggable verifier | next |
+| wire into `tls.rs`, measure, decide default | after |
