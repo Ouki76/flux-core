@@ -6904,3 +6904,47 @@ buffer, the h2 windows, the seven files that capped writes, the source-address p
 than the rest combined. The work is finished in the sense that matters: every claim is a command,
 every command has been seen to fail, and the one item that is not done is not done for a reason
 that a grep can demonstrate.
+
+---
+
+## Cycle 154 — 2026-10-25
+
+### The fingerprint item was half-done, and it was the half that mattered
+
+Cycle 135 closed this item as "bounded by rustls" after searching the crate for RFC 8701
+constants. That search was correct and the conclusion was too broad: it asked what **rustls** can
+emit, when one of our transports does not use rustls for this.
+
+REALITY builds its own ClientHello — it has to, because the authentication material goes in
+`session_id` and rustls will not let you touch that field. Those bytes are ours. And they were:
+
+```
+before:  3 cipher suites, 7 extensions, no GREASE
+         — a JA3 no browser produces, on the transport whose purpose is blending in
+after:   GREASE (RFC 8701) in the cipher list, in the extension list and in supported_groups,
+         Chrome's cipher list with the legacy suites as decoration,
+         plus extended_master_secret, renegotiation_info, ec_point_formats, session_ticket
+```
+
+| check | result |
+|---|---|
+| REALITY interop vs the real Xray binary, both directions, plain and Vision | **4 of 4 pass** |
+| `the_client_hello_is_browser_shaped` without the GREASE | **fails**: *"the cipher list must open with GREASE, got 0x1301"* |
+| REALITY throughput, 6 rounds | **397.2 MB/s**, +29.3% vs sing-box, +71.2% vs xray |
+| REALITY + Vision | +13.8% / +53.1% |
+
+Two extensions were deliberately **not** added — `status_request` and `compress_certificate`.
+Both invite server responses this minimal client does not parse, and a fingerprint that breaks
+the handshake is worse than one that is an extension short.
+
+### What is still bounded, precisely
+
+`VLESS/TLS`, `WS+TLS` and `gRPC+TLS` go through rustls, which offers no way to control the
+extension order or emit GREASE. Making those browser-grade means forking the TLS stack or
+writing full WebPKI certificate validation by hand — the second is a security-critical component
+that must not be written in passing, and the first is a project.
+
+So the honest state is: **the transport that hides in plain sight is now browser-shaped; the
+transports that present a normal certificate are limited by their TLS library.** That is a
+better split than "bounded", and it only exists because the earlier conclusion was re-examined
+instead of cited.
