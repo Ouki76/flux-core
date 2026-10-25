@@ -478,6 +478,8 @@ impl ProxySpec {
                 insecure: self.insecure,
                 utls: self.utls,
                 ca_cert_path: vec![],
+                // URI imports do not carry a native-TLS hint; the default is rustls.
+                native_tls: false,
             }))
         } else {
             None

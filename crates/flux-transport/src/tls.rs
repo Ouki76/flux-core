@@ -30,6 +30,12 @@ pub struct TlsClientConfig {
     /// certificate — a far worse trade than pinning the CA that actually signs
     /// your nodes.
     pub ca_certs: Vec<std::path::PathBuf>,
+    /// Use this crate's own TLS 1.3 client instead of rustls.
+    ///
+    /// Off by default while B3 is being proved: rustls stays the path everyone gets until the
+    /// native one has passed the interop suites and the throughput measurements. The reason to
+    /// turn it on is the ClientHello — ours is browser-shaped with GREASE, rustls' is not.
+    pub native: bool,
 }
 
 impl TlsClientConfig {
@@ -41,6 +47,7 @@ impl TlsClientConfig {
             insecure: false,
             fingerprint: None,
             ca_certs: vec![],
+            native: false,
         }
     }
 
@@ -292,10 +299,48 @@ impl TlsTransport {
     }
 
     /// Runs the handshake over `stream` and returns the encrypted stream.
+    /// Our own handshake, with the same configuration surface as the rustls path.
+    async fn connect_native<S>(stream: S, cfg: &TlsClientConfig) -> FluxResult<BoxedStream>
+    where
+        S: AsyncStream + 'static,
+    {
+        use crate::tls13;
+        let mut trust = if cfg.insecure {
+            tls13::verify::TrustStore::empty()
+        } else {
+            tls13::verify::TrustStore::system()
+        };
+        for path in &cfg.ca_certs {
+            let pem = std::fs::read(path).map_err(|e| {
+                FluxError::Config(format!("cannot read CA file {}: {e}", path.display()))
+            })?;
+            let added = trust.add_pem(&pem)?;
+            if added == 0 {
+                return Err(FluxError::Config(format!(
+                    "CA file {} contains no CERTIFICATE blocks",
+                    path.display()
+                )));
+            }
+        }
+        let alpn: Vec<&[u8]> = cfg.alpn.iter().map(|p| p.as_slice()).collect();
+        let hello = tls13::ClientHelloConfig {
+            server_name: &cfg.server_name,
+            alpn: &alpn,
+            trust: &trust,
+            insecure: cfg.insecure,
+        };
+        let stream = tls13::connect(stream, &hello).await?;
+        Ok(Box::new(stream))
+    }
+
+    /// Connects with a TLS 1.3 handshake, using rustls unless `cfg.native` asks otherwise.
     pub async fn connect<S>(stream: S, cfg: &TlsClientConfig) -> FluxResult<BoxedStream>
     where
         S: AsyncStream + 'static,
     {
+        if cfg.native {
+            return Self::connect_native(stream, cfg).await;
+        }
         let connector = Self::create_client_connector(cfg)?;
         let domain = ServerName::try_from(cfg.server_name.clone())
             .map_err(|e| {

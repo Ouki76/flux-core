@@ -611,6 +611,12 @@ pub enum SecurityConfig {
         /// Extra CA certificates to trust.
         #[serde(default)]
         ca_cert_path: Vec<String>,
+        /// Use this project's own TLS 1.3 client instead of rustls.
+        ///
+        /// The difference is the ClientHello: ours is browser-shaped with GREASE, rustls'
+        /// is not. Off by default until the native path has passed interop and throughput.
+        #[serde(default)]
+        native_tls: bool,
     },
     /// REALITY: TLS that cannot be attributed to this server.
     #[serde(rename = "reality")]
