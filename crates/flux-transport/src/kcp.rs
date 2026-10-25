@@ -1291,6 +1291,7 @@ impl Conn {
         if self.dead.is_some() {
             return;
         }
+        tracing::debug!("kcp: stream killed: {reason:?}");
         self.dead = Some(reason);
         if let Some(waker) = self.read_waker.take() {
             waker.wake();
@@ -1354,6 +1355,9 @@ impl Conn {
         match seg.cmd {
             CMD_DATA => {
                 if seg.option == OPTION_CLOSE {
+                    tracing::debug!(
+                        "kcp: peer closed the stream with a DATA segment (option=CLOSE)"
+                    );
                     self.peer_closed = true;
                 }
                 self.on_data(seg, now);
@@ -1365,6 +1369,7 @@ impl Conn {
                 let _ = seg.peer_rto;
             }
             CMD_TERMINATE => {
+                tracing::debug!("kcp: peer sent TERMINATE for this conversation");
                 self.peer_closed = true;
                 if let Some(waker) = self.read_waker.take() {
                     waker.wake();
