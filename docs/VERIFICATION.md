@@ -124,3 +124,25 @@ or `FIXME` markers outside test code.
   binary and are covered by tests; the client carries 256 KiB through it at 18 MiB/s.
 - **Absolute throughput numbers.** They move ±15% with host load. The ratios in section 1 are
   what the gate checks, and they are stable across runs.
+
+---
+
+## Guards that are weaker than they look
+
+Written down because a test that overstates its coverage is worse than a missing one, and this
+session found four of its own that way — each by reverting the thing it was supposed to protect
+and watching it pass anyway.
+
+| guard | what it does not cover | what covers the claim instead |
+|---|---|---|
+| `our_client_reaches_a_real_xray_server_through_the_aes_mask` | the peer-address switch: a short loopback transfer never triggers it | `the_dialler_follows_a_peer_that_changes_its_address`, a deterministic unit test with a second socket |
+| `the_first_flush_sends_no_ping` | the driver's keepalive path — the inline flush never reaches it | nothing; the captured trace in `docs/audit-log.md` cycle 119 is the evidence |
+| `the_h2_windows_track_the_relay_buffer` | that both builders *apply* the window | the measurement (gRPC 106 → 235 MB/s); h2 exposes no post-handshake settings |
+| the interop suites generally | behaviour under a loaded host, until cycle 138 | `dial_with_retry`, verified by running the suites while a benchmark saturates the machine |
+
+Two general rules came out of this, and they are the most useful thing in the document:
+
+1. **A test you have not seen fail is a test you have not checked.** Revert the fix, or demand
+   more of the tolerance than the measurement provides, and watch it break.
+2. **Reproduce the failing condition, not the passing one.** A flakiness fix verified on an idle
+   machine verifies nothing.
