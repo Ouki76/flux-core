@@ -331,6 +331,8 @@ impl PacketEndpoint for ShadowsocksPacketEndpoint {
                 .await
                 .map_err(FluxError::Io)?;
 
+            // Report the used length so the pool scrubs only this datagram's prefix.
+            guard.set_used(len);
             match self.decode_datagram(&guard[..len], from).await {
                 Ok(pkt) => return Ok(pkt),
                 Err(e) => {

@@ -148,6 +148,8 @@ impl PacketEndpoint for SocksPacketEndpoint {
             .recv_from(&mut guard)
             .await
             .map_err(FluxError::Io)?;
+        // Report the used length so the pool scrubs only this datagram's prefix.
+        guard.set_used(len);
         let payload = bytes::Bytes::copy_from_slice(&guard[..len]);
 
         let mut pkt = decode_socks5_udp(TargetAddress::Ip(self.relay_addr), payload)?;
