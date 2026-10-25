@@ -50,6 +50,9 @@ A high-performance, asynchronous proxy core written in Rust (Edition 2024).
 - **Soak / leak detection**: `scripts/soak.sh [duration_secs]` (default 24h) — sustained load with RSS/FD/thread sampling and leak assertion.
 - 41 sing-box interop tests plus 17 mux interop tests run against the real `sing-box` binary (graceful skip when absent), including Salamander-obfuscated Hysteria 2 **in both directions**.
 - 4 Xray interop tests run against the real `xray` binary: REALITY plain and REALITY + XTLS Vision, both directions.
+- 7 mKCP interop tests against the real `xray` binary: VLESS over mKCP both directions, the
+  AES-GCM mask (`finalmask.udp` → `mkcp-aes128gcm`) both directions, and an Xray client reaching
+  our server through it.
 - `h2spec` 2.6.0 against the H2 listener: 108/108 applicable cases pass.
 - TUN, REDIRECT and TPROXY are tested end-to-end inside a user network namespace, so they are no longer skipped.
 - **UDP relay e2e** for every UDP-capable protocol (SOCKS5, Trojan, VMess, SS/SS-2022, VLESS, TUIC, Hy2), including reply-address-header correctness.
