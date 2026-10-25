@@ -1159,7 +1159,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
         // write became four frames — four copies, four masks and four syscalls — on
         // the single hottest path of this transport. 64 KiB matches the relay's copy
         // buffer, so a normal write is framed once.
-        let chunk_len = buf.len().min(64 * 1024);
+        let chunk_len = buf.len().min(256 * 1024);
 
         // Fast path for the unmasked side — a server never masks (RFC 6455 §5.1), so the
         // header can be written straight from the stack with the payload as a second
@@ -2774,7 +2774,7 @@ mod short_write_tests {
             };
             assert_eq!(
                 body,
-                payload.len().min(64 * 1024),
+                payload.len().min(256 * 1024),
                 "limit {limit}: wrong frame length"
             );
             assert_eq!(
