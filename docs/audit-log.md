@@ -4167,3 +4167,40 @@ Two things were also learned about sing-box 1.11 that will matter when this is p
 Honest status: **WireGuard is the one protocol in this project with no interop evidence**, and
 a first attempt says the evidence would be negative. Recorded rather than papered over; the
 next cycle starts from the stack task's exit path.
+
+### Correcting cycle 85, and one real defect found
+
+**Cycle 85 was wrong about the symptom.** It read "wireguard stack actor gone" as the stack
+task dying. The full log shows that error is emitted *after* `Received SIGTERM; shutting
+down` — it was my own `timeout 12` killing the daemon while a connection was still waiting.
+The stack was fine; the connection had simply hung for nine seconds. Recorded because the
+wrong diagnosis was written down with confidence, and the next cycle would have chased it.
+
+What the wire actually showed, captured with a UDP listener standing in for the peer:
+
+| packet | size | what it is |
+|---|---|---|
+| 1 | 53 B | junk |
+| 2 | 44 B | junk |
+| 3 | 53 B | junk |
+| 4 | 57 B | junk |
+| 5 | **148 B, type 1** | the real WireGuard initiation |
+
+**A plain WireGuard connection was sending four junk datagrams before every handshake.**
+`AwgConfig::default()` carried AmneziaWG's sample profile (`jc: 4, jmin: 40, jmax: 70`) and
+the outbound calls `unwrap_or_default()`, so a configuration with no `awg` block inherited it.
+Fixed: obfuscation is now opt-in, with a test asserting the default emits nothing.
+
+With that fixed, sing-box's trace log shows the remaining state precisely:
+
+```
+peer(ukBc…5enY) - received handshake initiation
+peer(ukBc…5enY) - sending handshake response
+```
+
+So our initiation is **accepted by a real implementation** — the static key decrypts, the MACs
+validate, the peer matches. And then our client receives nothing: with per-datagram trace
+logging in place, not one `rx` line appears, while the same client receives correctly from
+our own server and from a Python responder that answers with a fake 92-byte type-2 packet
+(which it correctly rejects as "mismatched receiver index"). The loss is below the demux and
+specific to sing-box's response, which is where the next cycle starts.
