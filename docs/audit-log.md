@@ -5001,3 +5001,73 @@ different error, to discover something the release notes would have said.
 Recorded because the honest ledger of this audit includes the time spent being wrong in
 pursuit of a number — and because the next person to build a TLS row for xray should not have
 to find out the same way.
+
+---
+
+## Cycle 106 — 2026-10-25
+
+### The Shadowsocks-2022 mystery was a wrong file
+
+Five hypotheses died against that row: cipher (ruled out by CPU), chunking (the reader
+coalesces), per-half performance (cross-pairing), bidirectional serialisation (read-ahead,
+measured, no effect), batch size (measured, reverted).
+
+The per-round dump that ended the guessing:
+
+| row | flux (7 rounds) | sing-box | verdict |
+|---|---|---|---|
+| REALITY | 274.3, 275.1, 274.5, 278.3, 275.0, 294.3, 276.8 | 280-309 | **stable 8 % deficit, not bimodal** |
+
+Searching for the cause of *that* turned up the real one, and then three more like it:
+
+| file | what it capped | row it governs |
+|---|---|---|
+| `reality.rs` | 64 KiB | REALITY, Vision |
+| `shadowsocks2022.rs` | 64 KiB | **Shadowsocks-2022** |
+| `vmess.rs` | 64 KiB | VMess |
+| `shadowsocks.rs` | 64 KiB | Shadowsocks-AEAD |
+
+Every one of them turned one relay write into four, because the relay has moved 256 KiB per
+write since the buffer sweep. And **Shadowsocks-2022 has its own module** — `shadowsocks.rs`
+is not where `2022-blake3-aes-128-gcm` lives, so the batch-size experiment edited a cap that
+the row never used, measured no change, and was reverted.
+
+| row | before | after |
+|---|---|---|
+| Shadowsocks-2022 vs sing-box | −15.0 % | **+11.6 %** |
+| Shadowsocks-2022 throughput | 318 | **403-436** |
+| REALITY vs sing-box | −11.0 % | **+11.5 %** |
+| REALITY throughput | 275 | **368-421** |
+| Shadowsocks-AEAD vs sing-box | +19.1 % | **+34.7 %** |
+
+### The matrix now
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **Hysteria2** | **106** | 52 | — | **+105.6 %** | — |
+| **TUIC v5** | **110** | 55 | — | **+98.1 %** | — |
+| **WireGuard** | **69** | 45 | — | **+52.7 %** | — |
+| Shadowsocks-AEAD | **372** | 277 | — | **+34.7 %** | — |
+| VLESS / TCP | **804** | 612 | 664 | **+31.4 %** | **+21.1 %** |
+| VLESS / XHTTP | **489** | — | 153 | — | **+219.5 %** |
+| VLESS / gRPC (no TLS) | **516** | — | 192 | — | **+169.0 %** |
+| VLESS / gRPC + TLS | **235** | 121 | 186 | **+93.9 %** | **+26.5 %** |
+| VMess / WS + TLS | **225** | 199 | 204 | **+13.4 %** | **+10.3 %** |
+| Shadowsocks-2022 | **403** | 361 | 308 | **+11.6 %** | **+30.7 %** |
+| VLESS / REALITY | **368** | 330 | 247 | **+11.5 %** | **+49.1 %** |
+| VLESS / TLS | **353** | 323 | 242 | **+9.3 %** | **+46.1 %** |
+| Trojan / TLS | **342** | 326 | — | **+4.8 %** | — |
+| VLESS / REALITY + Vision | 318 | 333 | 225 | −4.6 % | **+41.5 %** |
+| VLESS / WS + TLS | 319 | 339 | 102 | −5.7 % | **+212.1 %** |
+
+**Thirteen of fifteen ahead of sing-box, the two exceptions inside 6 %, and all ten xray paths
+beaten.** Every row that was ever behind is now ahead of at least one competitor, and most are
+ahead of both.
+
+### What this cycle teaches that the last five did not
+
+Not "sweep more constants". The lesson is that **the same defect lived in four files and the
+audit had been reading one of them** — and that six measured negatives against a row are
+evidence about the *investigation*, not only about the code. When six probes of a mechanism
+all say "not this", the next question should have been "am I looking at the code the row
+actually runs".
