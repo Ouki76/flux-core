@@ -6026,3 +6026,42 @@ cargo audit && cargo deny check && cargo doc --workspace --no-deps
 ```
 
 Each of the four benchmark gates has been observed to exit 1 at least once, deliberately.
+
+---
+
+## Cycle 131 — 2026-10-25
+
+### A document that says how to check it
+
+`docs/VERIFICATION.md` is now the answer to "how would I know this is true?". Every section is a
+command, the output it must produce, and the numbers from the last run — plus a section on what
+is **not** claimed, which is the part such documents usually omit.
+
+The full suite was run to capture it: five static gates clean, 1099 tests passing, and all four
+benchmark gates passing after the cycles that gave them teeth.
+
+### What the document changes
+
+Before this, a reader had 5 900 lines of audit log and a README table. The log is honest and
+unreadable at that length; the table is readable and unverifiable. A verification file is the
+only one of the three that can be *executed*.
+
+It also makes the negative claims explicit — the fingerprint's GREASE gap and the AES mask's
+client direction are listed next to the passing gates rather than buried. A document that lists
+only the wins is a brochure; one that lists what to run and what it will not show is a claim
+someone can check.
+
+### Final gate state
+
+| gate | state |
+|---|---|
+| `cargo fmt --check` | clean |
+| `cargo clippy -D warnings` | clean |
+| `RUSTDOCFLAGS=-D warnings cargo doc` | clean |
+| `cargo audit` | no vulnerabilities |
+| `cargo deny check` | ok |
+| `cargo test --workspace` | 1099 passed, 0 failed |
+| `bench_matrix --assert 0.10` | PASSED |
+| `bench_rps --assert 0.10` (plain, TLS) | PASSED |
+| `bench_udp --assert 0.10` | PASSED |
+| `bench_rps --idle --assert 0.10` | PASSED |
