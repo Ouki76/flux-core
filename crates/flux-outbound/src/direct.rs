@@ -115,6 +115,9 @@ impl PacketEndpoint for DirectPacketEndpoint {
             .recv_from(&mut guard)
             .await
             .map_err(FluxError::Io)?;
+        // Tell the pool how much of the buffer this datagram used, so its release
+        // scrubs only that prefix instead of all 64 KiB.
+        guard.set_used(len);
         let payload = bytes::Bytes::copy_from_slice(&guard[..len]);
 
         Ok(UdpPacket::new(

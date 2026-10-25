@@ -106,6 +106,7 @@ impl BufferPool {
         BufferGuard {
             buf: Some(self.acquire()),
             pool: self,
+            used: self.buffer_size,
         }
     }
 
@@ -125,7 +126,15 @@ impl BufferPool {
     /// connection the previous connection's payload. The buffer is zeroed here,
     /// on release, rather than on acquisition so that pooled memory never holds
     /// payload at rest.
-    pub fn release(&self, mut buf: Vec<u8>) {
+    pub fn release(&self, buf: Vec<u8>) {
+        self.release_scrubbing(buf, self.buffer_size)
+    }
+
+    /// Releases a buffer, scrubbing only `used` bytes at the front.
+    ///
+    /// Safe by induction: every release zeroes at least the prefix it used, so bytes past
+    /// any caller's `used` are already zero from the release that last covered them.
+    fn release_scrubbing(&self, mut buf: Vec<u8>, used: usize) {
         if buf.capacity() < self.buffer_size {
             return;
         }
@@ -140,7 +149,10 @@ impl BufferPool {
         if buf.len() != self.buffer_size {
             buf.resize(self.buffer_size, 0);
         }
-        buf.fill(0);
+        // Scrub what the caller actually used. `used == buffer_size` (the default for
+        // callers that cannot say) keeps the old behaviour.
+        let n = used.min(buf.len());
+        buf[..n].fill(0);
         let idx = self.shard_index();
         let mut guard = self.shards[idx].lock();
         if guard.len() < self.shard_capacity {
@@ -153,6 +165,15 @@ impl BufferPool {
 pub struct BufferGuard {
     buf: Option<Vec<u8>>,
     pool: &'static BufferPool,
+    /// How many bytes the caller actually used, when it knows.
+    ///
+    /// The pool scrubs on release so that pooled memory never hands one caller another
+    /// caller's payload. Scrubbing the whole `buffer_size` costs a `memset` of 64 KiB per
+    /// UDP datagram, which a profile showed to be the single largest cost in the datagram
+    /// path. Scrubbing only the used prefix preserves the property by induction — the rest
+    /// of the buffer was already zeroed when the previous, longer user released it — and
+    /// costs what the datagram actually occupied.
+    used: usize,
 }
 
 impl Deref for BufferGuard {
@@ -174,10 +195,21 @@ impl DerefMut for BufferGuard {
     }
 }
 
+impl BufferGuard {
+    /// Records how many bytes of the buffer the caller filled in.
+    ///
+    /// Callers that know their length must call this, or the whole buffer is scrubbed as
+    /// before. It is a plain store, so the cheap path stays cheap.
+    pub fn set_used(&mut self, used: usize) {
+        self.used = used.min(self.pool.buffer_size);
+    }
+}
+
 impl Drop for BufferGuard {
     fn drop(&mut self) {
         if let Some(buf) = self.buf.take() {
-            self.pool.release(buf);
+            let used = self.used;
+            self.pool.release_scrubbing(buf, used);
         }
     }
 }
@@ -293,6 +325,39 @@ mod tests {
         assert!(
             !retained.1,
             "release must scrub the buffer before pooling it"
+        );
+    }
+
+    /// A guard that reports how much it used still leaves nothing readable behind.
+    ///
+    /// This is the security property the pool exists for, and it is now enforced without
+    /// scrubbing 64 KiB per datagram: each release zeroes at least the prefix it used, so
+    /// bytes past any caller's mark were already zeroed by the release that last covered
+    /// them.
+    #[test]
+    fn a_short_release_still_leaves_no_payload_behind() {
+        let pool: &'static BufferPool = Box::leak(Box::new(BufferPool::new(4096, 4)));
+        // A long user fills the whole buffer and releases it.
+        {
+            let mut g = pool.acquire_guard();
+            g.fill(0xAB);
+            g.set_used(g.len());
+        }
+        // A short user sees a clean buffer, writes 16 bytes and releases.
+        {
+            let mut g = pool.acquire_guard();
+            assert!(
+                g.iter().all(|b| *b == 0),
+                "a recycled buffer must not still hold the earlier payload"
+            );
+            g[..16].fill(0xCD);
+            g.set_used(16);
+        }
+        // Whatever the next caller gets must hold neither payload.
+        let g = pool.acquire_guard();
+        assert!(
+            g.iter().all(|b| *b == 0),
+            "neither the long nor the short payload may survive"
         );
     }
 
