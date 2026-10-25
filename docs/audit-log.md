@@ -4813,3 +4813,27 @@ Three of the last four cycles moved the matrix with parameters rather than algor
 window (2.4x on gRPC), the relay buffer (up to 2x on XHTTP), and now a one-line symmetry fix.
 The lesson from all three is the same one, in three different shapes: **the hot path had
 constants nobody had measured, and a fix applied to one side left the other behind.**
+
+---
+
+## Cycle 101 — 2026-10-25
+
+### The same defect, one layer up
+
+The WebSocket frame cap was raised from 16 KiB to 64 KiB in an earlier cycle, precisely
+because the relay wrote 64 KiB at a time and four frames meant four copies and four syscalls.
+The relay buffer then moved to 256 KiB — and the defect reappeared, because the layer above
+had changed and the cap had not.
+
+| frame cap | VLESS / WS + TLS | VMess / WS + TLS |
+|---|---|---|
+| 64 KiB | 298.9, 326.9 | 226.6, 202.1 |
+| **256 KiB** | **317.3, 317.2** | **232.5, 237.8** |
+
+The throughput gain is modest. The **reproducibility** gain is not: 317.3 and 317.2 in two
+passes, against 298.9 and 326.9 — a 28 MB/s spread collapsing to 0.1. A number that repeats
+is worth more than one that averages higher, because every comparison from now on rests on it.
+
+That is the third constant this week that had been correct for the buffer size of the day it
+was chosen: the h2 window, the relay buffer, the WebSocket frame. They are not independent
+facts about three subsystems; they are one fact about a pipeline whose stages must agree.
