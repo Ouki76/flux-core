@@ -5480,3 +5480,40 @@ the peer.
 
 Three cycles ago this was "the mask does not work". It is now "our stream ends early", which is
 a different and much smaller thing to be wrong about.
+
+### Xray says the stream is closed — and it is Xray's decision
+
+Instrumented the three ways a `KcpStream` can end: the silence timeout, a TERMINATE, and a
+DATA segment carrying the close option. The first two never fire. The third fires immediately:
+
+```
+kcp: peer closed the stream with a DATA segment (option=CLOSE)
+kcp: peer closed the stream with a DATA segment (option=CLOSE)
+kcp: peer closed the stream with a DATA segment (option=CLOSE)
+kcp: peer closed the stream with a DATA segment (option=CLOSE)
+```
+
+The instinct was that our constants must be wrong — `CommandData` and `SegmentOptionClose` are
+small integers and easy to transpose. Read Xray's `segment.go`: `CommandACK = 0`,
+`CommandData = 1`, `CommandTerminate = 2`, `CommandPing = 3`, and `SegmentOptionClose = 1`.
+**Our constants already match.** The parse is right, and Xray is deliberately marking its data
+as closing because its side believes the stream is finished.
+
+So the remaining defect is one question with a name: *why does Xray's server consider the
+stream closed immediately after accepting the destination* — its own log says
+`accepted tcp:127.0.0.1:34809`, so it processed the request. Everything before that point is
+proven: mask, key derivation, composition order, segment codec, VLESS framing, and the
+client's outbound data path.
+
+### What four debug lines would have bought
+
+| line | when it would have helped |
+|---|---|
+| conversation id of an unroutable datagram | cycle 79 |
+| TERMINATE received | cycles 78–80 |
+| OPTION_CLOSE received | cycles 78–80 |
+| stream kill reason | cycles 78–80 |
+
+Each is one `tracing::debug!` and all four are now in the tree. The lesson is not "add logging"
+— it is that a protocol implementation with no visibility into *which* end decided to stop
+invites exactly the guessing this audit keeps claiming to refuse.
