@@ -242,6 +242,39 @@ which preserves the property it exists for (a recycled buffer never holds the pr
 caller's payload, asserted by `a_short_release_still_leaves_no_payload_behind`) and moved the
 relay from 55 000 to 98 000 datagrams/s.
 
+### Short connections and memory (the shape a browser actually makes)
+
+Bulk throughput is one dimension. A proxy in front of a browser serves dozens of short
+connections, each a request and a reply, and it has to hold them open cheaply. Both are
+measured by `examples/bench_rps.rs` against the same competitors.
+
+**6 000 exchanges over 32 concurrent connections** (fresh SOCKS connect, 1 KiB round trip,
+close), four runs:
+
+| Stack | Exchanges/s | Median exchange |
+|---|---|---|
+| **flux-core** | **14 159 – 14 799** | **1.9 ms** |
+| sing-box | 10 465 – 10 980 | 2.7 ms |
+| xray | 1 065 – 1 148 | 1.9 ms |
+
+Holds at every concurrency level tried — **+49 % at 8 connections, +33 % at 32, +27 % at
+128**. The xray figure is *reported, not claimed*: its rate stays near 1.2 k/s at every level
+while its median latency looks normal, and an xray SOCKS inbound with no tunnel at all
+measures the same 1 172/s standalone. Something in that configuration costs ~0.8 ms of
+serialisation per connection; until it is understood the number is a property of this setup.
+
+**Memory with 2 000 connections held open through the tunnel:**
+
+| Stack | RSS idle | RSS loaded | Per connection |
+|---|---|---|---|
+| **flux-core** | **15.4 MB** | 40.6 – 66.5 MB | **12 – 25 KB** |
+| sing-box | 50.6 MB | 144.9 MB | 47 KB |
+| xray | 61.3 MB | 261.5 MB | 100 KB |
+
+A third of sing-box's resident memory before any traffic arrives, and half its cost per
+connection afterwards. The range is wide because buffers are allocated lazily — the same
+property that keeps the idle footprint small.
+
 **Sustained-load evidence**, not a snapshot: a 30-minute soak through a live instance moved
 **24 631 216 requests and 192 GB** with **0 errors**, RSS bounded at 18 MB (head median 16.9,
 tail median 18.2), file descriptors flat around 550 under load and 267 at rest, threads
