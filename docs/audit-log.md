@@ -4968,3 +4968,36 @@ Two tests are new since the last full checkout of this list: the pipeline-agreem
 guards the relay-buffer invariant, and the WebSocket short-write test. The doc warning was the
 same class as an earlier one — a public constant linking to a private helper — and was fixed by
 naming the helper in backticks rather than as a link.
+
+---
+
+## Cycle 105 — 2026-10-25
+
+### The second exchange-rate dimension: with TLS
+
+`bench_rps` measured plain TCP. Real HTTPS proxying pays a TLS handshake per connection, and a
+stack fast at plain connections can be slow at that shape. Added `--tls`, with a self-signed
+certificate generated per run:
+
+| stack | exchanges/s | median |
+|---|---|---|
+| **flux-core** | **8 235 / 8 398 / 8 554** | **3.4 ms** |
+| sing-box | 4 236 / 4 321 / 4 338 | 6.7 ms |
+| xray | 1 172 / 1 185 | 7.3 ms |
+
+**2x sing-box, 7x xray**, with the margin visible in the median (3.4 ms against 6.7 ms) rather
+than only in the aggregate. Three runs each, spread under 4 %.
+
+The xray figure is the same ~1 180/s its plain SOCKS inbound produces with no tunnel at all,
+so it is connection handling rather than crypto — reported, not claimed, as before.
+
+### Two hours lost to a two-word format
+
+Xray 26 removed `allowInsecure` and pins `pinnedPeerCertSha256` instead. That pin is
+**lowercase hex**: passing the same SHA-256 as base64 fails with `encoding/hex: invalid byte`,
+and passing it as a one-element array fails to unmarshal. Three attempts, each returning a
+different error, to discover something the release notes would have said.
+
+Recorded because the honest ledger of this audit includes the time spent being wrong in
+pursuit of a number — and because the next person to build a TLS row for xray should not have
+to find out the same way.
