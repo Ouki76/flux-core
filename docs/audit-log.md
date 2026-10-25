@@ -7256,3 +7256,49 @@ three fat certificates still passes.
 That second test is the important one. A hardening limit set low enough to break a legitimate
 certificate chain is a compatibility bug wearing a security hat, and the only way to know which
 one you have written is to test both ends of the range.
+
+---
+
+## B3.11 — the default flips, with a net under it
+
+B3.6 decided to leave rustls as the default because it negotiates TLS 1.2 and our client does
+not. That decision was correct for the evidence available then, and this cycle found a way to
+have both.
+
+**The fallback.** The dial path now:
+
+1. runs the native handshake;
+2. on failure for any reason **other than a rejected certificate**, redials once with rustls,
+   within whatever time remains of the original connect timeout;
+3. never retries a certificate failure — swapping stacks to get a different answer on a
+   certificate is a downgrade, not resilience. `is_verification_failure` names the six messages
+   that count as one, and two unit tests pin both sides of that line.
+
+**One discovery on the way.** A TLS 1.2-only server does not answer with a 1.2 cipher suite — it
+refuses the greeting with **alert 70, `protocol_version`**. A marker that only recognised the
+suite case would have missed the case it was written for. Alerts now name themselves
+(`protocol_version`, `handshake_failure`, `illegal_parameter`, `unrecognized_name`) instead of
+printing a bare number, which is worth having on its own: "description 70" is a lookup, and
+"protocol_version" is an answer.
+
+**Evidence that the default is safe to flip:**
+
+| check | result |
+|---|---|
+| full suite, native default | **1126 passed, 0 failed** — 41 sing-box + 4 xray interop included |
+| `bench_matrix --assert 0.10`, untouched config | **ASSERT PASSED**, **15 of 15** rows ahead of sing-box |
+| TLS row | 354.8 MB/s, **+23.1%** vs sing-box, +66.0% vs xray |
+| gRPC + TLS | +137.5% / +51.6% |
+| WS + TLS, VMess/WS, Trojan | +6.8%, +17.7%, +23.9% |
+
+So the objective's headline is met: the TLS-carrying transports run our handshake by default,
+and the browser-shaped ClientHello with GREASE is what a connection now sends. Rustls remains
+available, both as the fallback and as an explicit choice (`native_tls: false`).
+
+### What is still not done
+
+- **TLS 1.2 with our own stack.** The fallback hides the gap rather than closing it; a 1.2-only
+  server costs one extra connection. Implementing it is weeks of work with a security review.
+- **Session resumption** on the native path. rustls resumes; ours starts a full handshake every
+  time. Connection rate is at parity without it, so this is an efficiency gap rather than a
+  functional one — but on a high-churn workload it is the next thing to measure.
