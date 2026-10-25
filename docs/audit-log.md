@@ -3947,3 +3947,40 @@ one-way download shows the real figure.
 
 Worth recording because the wrong workload produced a *believable* number (25 vs 1 MiB/s) that
 looked like a 25× win and would have been reported as one.
+
+---
+
+## Cycle 81 — 2026-10-25
+
+### Writing the TUIC row found a configuration gap first
+
+TUIC is the second QUIC proxy protocol, and adding its row to the matrix failed with:
+
+```
+unknown field `alpn` in config.inbounds[0].security;
+expected one of: certificate_path, key_path, server_name, type
+```
+
+An inbound's TLS block could present a certificate but could not advertise an ALPN list — so
+a flux **server** could never accept `h3`, and a TUIC client offering it had nothing to agree
+with. `create_server_acceptor` had taken an ALPN list from the start; only the configuration
+never reached it. That is a real gap and not a benchmark artefact: the same field is what an
+XHTTP or gRPC server behind a browser needs.
+
+**The row**, once the server could speak:
+
+| | flux-core | sing-box | delta |
+|---|---|---|---|
+| TUIC v5 | **101.6 MB/s** | 55.0 MB/s | **+84.9 %** |
+| Hysteria2 | **101.8 MB/s** | 51.8 MB/s | **+96.5 %** |
+
+### What the last two cycles say about the audit itself
+
+Two dimensions — both QUIC-based protocols — went unmeasured for eighty cycles while the same
+nine TCP paths were tuned. They were not skipped deliberately; the matrix grew around a
+TCP-shaped harness, and a UDP listener simply failed its readiness probe and reported
+"unsupported". Adding them took one cycle each and produced the two widest margins in the
+table.
+
+The lesson is about coverage, not speed: a benchmark that cannot express a transport will
+report that the transport does not exist, and nobody will question it.
