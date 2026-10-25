@@ -4247,3 +4247,36 @@ exchange was in fact completing.
 Both times the missing step was the same: **look at the wire before naming a cause**. A relay
 between the peers costs twenty lines of Python and answered in one run what two cycles of
 reasoning from logs could not.
+
+---
+
+## Cycle 87 — 2026-10-25
+
+### WireGuard joins the matrix — and it is the widest margin yet
+
+The last protocol both competitors support, and the last one nothing measured. The row needed
+three things the harness did not have:
+
+1. **A routable destination.** WireGuard carries IP packets, and sing-box refuses to route a
+   loopback destination through an endpoint. The echo server now binds every interface, and
+   the row dials the host's LAN address — with a clear reason reported when there is none
+   rather than a mysterious failure.
+2. **sing-box's endpoint shape.** 1.11 removed the `wireguard` inbound: server and client are
+   both `endpoints`, so those two configs are now assembled whole instead of as an
+   inbound/outbound node.
+3. **A UDP readiness probe**, already added for the QUIC rows.
+
+| | flux-core | sing-box | xray | delta |
+|---|---|---|---|---|
+| WireGuard | **70.3 MB/s** | 44.4 MB/s | — (no client) | **+58.5 %** |
+
+The row is only worth reporting because `tests/test_wireguard_interop.rs` — added in the
+previous cycle — shows both implementations carrying real traffic in both directions. Without
+that, a throughput number would be a measurement of our own client talking to our own server.
+
+### Coverage, finally complete
+
+Thirteen rows when this audit started, all TCP-carried. The table now has **fifteen**, and the
+three added since — Hysteria2, TUIC, WireGuard — produced the three widest margins in it
+(+92 %, +78 %, +58 %). They were not skipped deliberately; the harness could not express a
+UDP-carried protocol, and a row that cannot run reports "unsupported" rather than "unmeasured".
