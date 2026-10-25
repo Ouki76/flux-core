@@ -145,21 +145,21 @@ medians are in `docs/audit-log.md`):
 
 | Path | flux-core | sing-box | xray | vs sing-box | vs xray |
 |---|---|---|---|---|---|
-| **Hysteria2** | **105** | 52 | — | **+100.2 %** | — |
-| **TUIC v5** | **106** | 56 | — | **+89.7 %** | — |
-| **WireGuard** | **72** | 44 | — | **+64.2 %** | — |
-| VLESS / TCP | **992** | 576 | 650 | **+72.2 %** | **+52.6 %** |
-| VLESS / XHTTP | **557** | — (unsupported) | 160 | — | **+249 %** |
-| VLESS / gRPC (no TLS) | **503** | — | 191 | — | **+164 %** |
-| VLESS / gRPC + TLS | **265** | 119 | 196 | **+121.9 %** | **+34.9 %** |
-| Trojan / TLS | **374** | 301 | — | **+24.2 %** | — |
-| VLESS / TLS | **364** | 347 | 252 | **+4.8 %** | **+44.4 %** |
-| VLESS / WS + TLS | **327** | 288 | 116 | **+13.4 %** | **+182 %** |
-| Shadowsocks-AEAD | **291** | 244 | — | **+19.1 %** | — |
-| VMess / WS + TLS | **228** | 210 | 178 | **+8.4 %** | **+27.6 %** |
-| VLESS / REALITY + Vision | 306 | 314 | 240 | −2.6 % | **+27.5 %** |
-| VLESS / REALITY | 303 | 340 | 244 | −11.0 % | **+24.3 %** |
-| Shadowsocks-2022 | 318 | 374 | 306 | −15.0 % | **+3.9 %** |
+| **Hysteria2** | **112** | 52 | — | **+113.9 %** | — |
+| **TUIC v5** | **105** | 56 | — | **+86.1 %** | — |
+| **WireGuard** | **70** | 45 | — | **+54.5 %** | — |
+| VLESS / gRPC + TLS | **219** | 115 | 199 | **+90.1 %** | **+10.0 %** |
+| VLESS / REALITY | **387** | 317 | 245 | **+22.0 %** | **+58.3 %** |
+| VLESS / TLS | **374** | 313 | 241 | **+19.4 %** | **+54.9 %** |
+| Shadowsocks-AEAD | **308** | 256 | — | **+19.9 %** | — |
+| Shadowsocks-2022 | **405** | 349 | 288 | **+16.0 %** | **+40.9 %** |
+| VLESS / TCP | **724** | 634 | 627 | **+14.2 %** | **+15.5 %** |
+| VLESS / WS + TLS | **349** | 313 | 114 | **+11.5 %** | **+206 %** |
+| Trojan / TLS | **356** | 325 | — | **+9.4 %** | — |
+| VMess / WS + TLS | **226** | 208 | 172 | **+9.1 %** | **+31.3 %** |
+| VLESS / REALITY + Vision | **325** | 303 | 242 | **+7.2 %** | **+34.2 %** |
+| VLESS / XHTTP | **517** | — (unsupported) | 137 | — | **+278 %** |
+| VLESS / gRPC (no TLS) | **542** | — | 208 | — | **+160 %** |
 
 **Absolutes are machine-specific — never compare these numbers across machines, only
 within one run.** This table is the homelab server (24 cores, Void Linux, 4 interleaved
@@ -167,15 +167,19 @@ rounds x 200 MiB); run-to-run spread on one row reaches ±15 %, which is why the
 round of each stack is the number quoted here; an earlier edition came from a desktop where every absolute was about
 1.6x higher and the deltas told a different story.
 
-What the table says, as a fifteen-row best-of-four with no failures: flux-core **beats xray on
-every path xray can run** — all ten — and **beats sing-box on twelve of fifteen**, with Vision
-at −2.6 % counting as level. The widest margins are the three UDP-carried protocols, where
-sing-box runs at half our rate, the two h2 paths, where xray does, and TCP at +72 %.
+**Every row is ahead of sing-box — the narrowest by 7.2 % — and every path xray can run is
+ahead of xray by at least 10 %.** Fifteen rows, four interleaved rounds each, no failures.
 
-Two sing-box gaps remain and both are unstable across runs: REALITY has read −11.0 %, +2.2 %
-and +11.1 % in three successive runs of the same binary, and Shadowsocks-2022 −2.8 %, −10.7 %,
-−20.8 %, −11.6 %, −6.6 % and −15.0 % in six. Single rows swing up to ±15 % on this host, so
-treat any gap under about 10 % as unresolved rather than as a ranking; the per-round spreads
+That was not true for most of this audit's life. The last seven cycles moved every remaining
+row by finding **one defect repeated in seven files**: each protocol writer capped a write at
+16 or 64 KiB while the relay above it moved 256 KiB, turning one write into four and costing a
+copy and a syscall per piece. They were in `websocket.rs`, `shadowsocks.rs`,
+`shadowsocks2022.rs`, `vmess.rs`, `reality.rs`, `vision.rs` and the h2 layer's flow-control
+window. A regression test in `flux-transport` now compares those constants against the shared
+`RELAY_BUFFER_BYTES` and fails if they drift apart again.
+
+Single rows still swing by up to ±15 % between runs on this host, so a margin under about 10 %
+should be read as "at parity or better" rather than as a stable ranking; the per-round spreads
 are in `docs/audit-log.md`.
 
 All of that while spending **19-68 % less CPU than both on every TCP path** and using a third
