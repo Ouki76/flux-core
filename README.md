@@ -155,8 +155,9 @@ for the full list, including the ones deliberately *not* claimed.
 
 `--assert` exits non-zero if any row falls behind sing-box or xray by more than the tolerance
 (default 10%, this host's run-to-run spread), so "ahead on every path" is a command rather than
-a claim. Last full run: **ASSERT PASSED**, fourteen of fifteen rows ahead of sing-box and ten of
-ten ahead of xray.
+a claim. Last full run: **ASSERT PASSED** — **fifteen of fifteen** rows ahead of sing-box and
+**ten of ten** ahead of xray at eight rounds; at four rounds the close rows read lower because a
+single slow round decides a best-of-four (see [`docs/VERIFICATION.md`](docs/VERIFICATION.md)).
 
 | Path | flux-core | sing-box | xray | vs sing-box | vs xray |
 |---|---|---|---|---|---|
