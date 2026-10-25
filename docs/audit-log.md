@@ -4472,3 +4472,24 @@ the number of alternations and make it visible.
 
 That is a real architectural difference and a real piece of work, not a tuning knob. It is
 left open, stated plainly, rather than closed with a number that would not survive review.
+
+### Why the double-buffer fix was not made today
+
+The named remaining suspect — one task servicing both directions — has a fix: give each
+direction a second buffer so a read can proceed while the other write drains, keeping one
+task and skipping the goroutine-per-direction model entirely.
+
+The cost is concrete: the copier allocates two 64 KiB buffers per connection today
+(`dispatcher.rs:557` passes `64 * 1024`), so double buffering makes it four, i.e. **256 KiB per
+relayed TCP connection**. At a thousand concurrent connections that is a quarter of a gigabyte
+of resident memory, spent to gain roughly 11 % on a workload where the same implementation is
+already faster in both directions separately and lower in round-trip latency.
+
+The project's memory footprint is one of its published advantages — 13-17 MB resident against
+competitors that idle in the tens — and trading that for a symmetric-echo number is not
+obviously right. It is a decision with a real cost on both sides, so it is written down rather
+than made silently at 3 a.m. in cycle 53.
+
+What would settle it: a way to get the benefit without the memory, e.g. allocating the second
+buffer only while a write is actually outstanding and shrinking the pair to 2 x 32 KiB in that
+case. That is the next experiment, not the next paragraph.
