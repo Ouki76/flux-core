@@ -3694,3 +3694,30 @@ the same kind of path, we are 9-26 % ahead.
 
 Worth writing down because it closes a line of inquiry: **not every row has a fixable layer**.
 This one has a number that names the cipher and stops.
+
+### The matrix after the profiler-driven work
+
+Twelve rows, four rounds, no stalls and no spins:
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | **726** | 637 | 641 | **+14.1 %** | **+13.4 %** |
+| VLESS / TLS | **338** | 333 | 252 | **+1.5 %** | **+34.3 %** |
+| VLESS / XHTTP | **176** | — | 148 | — | **+19.1 %** |
+| VLESS / WS + TLS | 294 | 309 | 106 | −4.7 % | **+176 %** |
+| VLESS / gRPC (no TLS) | 172 | — | 192 | — | −10.0 % |
+| VLESS / gRPC + TLS | 110 | 118 | 204 | −7.3 % | −46.2 % |
+| VLESS / REALITY | 320 | 321 | 258 | −0.3 % | **+24.3 %** |
+| REALITY + Vision | 312 | 320 | 234 | −2.4 % | **+33.1 %** |
+| VMess / WS + TLS | 202 | 207 | 180 | −2.3 % | **+12.1 %** |
+| Trojan / TLS | 314 | 349 | — | −9.9 % | — |
+| Shadowsocks-2022 | 342 | 352 | 302 | −2.8 % | **+13.2 %** |
+| Shadowsocks-AEAD | **261** | 248 | — | **+5.5 %** | — |
+
+Compare with where this session started: gRPC was −20 %, REALITY −14 %, WS −13 %, TLS −6 %,
+SS-2022 −14 %. Every one of those moved by finding the layer responsible rather than by
+tuning: the copier's flush, the copier's idle spin, h2's 16 KiB frames, a quadratic copy in
+gRPC, and a 64 KiB `memset` per datagram.
+
+The two rows still behind: gRPC over TLS (−7.3 %, and the only row behind xray) and Trojan
+(−9.9 %).
