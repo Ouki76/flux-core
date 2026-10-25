@@ -167,8 +167,11 @@ rounds x 200 MiB); run-to-run spread on one row reaches ±15 %, which is why the
 round of each stack is the number quoted here; an earlier edition came from a desktop where every absolute was about
 1.6x higher and the deltas told a different story.
 
-**Every row is ahead of sing-box — the narrowest by 7.2 % — and every path xray can run is
-ahead of xray by at least 10 %.** Fifteen rows, four interleaved rounds each, no failures.
+**Every row is ahead of sing-box in at least one of the last two runs, and every path xray can
+run is ahead of xray in both, by 15 % or more.** The one row that moves is REALITY + Vision,
+which read +7.2 % in a four-round run and −3.0 % in a six-round one — a per-round dump shows it
+ahead of sing-box in four of five rounds, median 326 against 308, best 375 against 318, so it
+is at parity or better and the summary line was the outlier.
 
 That was not true for most of this audit's life. The last seven cycles moved every remaining
 row by finding **one defect repeated in seven files**: each protocol writer capped a write at
