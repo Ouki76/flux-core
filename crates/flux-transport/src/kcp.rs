@@ -264,8 +264,8 @@ impl ObfsState {
     /// Writes `header ‖ mask(segment)` into `out`.
     fn wrap(&mut self, segment: &[u8], out: &mut Vec<u8>) {
         let len = self.mode.header_len();
+        let mut header = [0u8; 13];
         if len > 0 {
-            let mut header = [0u8; 13];
             match self.mode {
                 KcpObfs::None => {}
                 KcpObfs::Srtp => {
@@ -304,10 +304,16 @@ impl ObfsState {
                     header[0] = 0x04; // transport data message
                 }
             }
-            out.extend_from_slice(&header[..len]);
         }
-        // Xray's AES-GCM mask, when one is configured, replaces the "original"
-        // envelope — the two are alternatives, not layers.
+        // Xray's mask list is applied in order and each entry wraps everything the
+        // previous one produced: `[header-srtp, mkcp-aes128gcm]` encrypts header *and*
+        // segment, not the segment alone. The envelope mask, by contrast, covers only
+        // the segment.
+        // The mask list is applied outside-in: the header camouflage wraps the
+        // AES-GCM output, so the datagram is `header ‖ nonce ‖ ciphertext ‖ tag`.
+        // Confirmed against Xray's `aes128gcmConn::WriteTo`, which encrypts in place and
+        // leaves the write to the wrapping conn.
+        out.extend_from_slice(&header[..len]);
         match &self.key {
             Some(key) => seed_mask::seal(key, segment, out),
             None => envelope::seal(segment, out),
