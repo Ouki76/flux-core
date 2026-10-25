@@ -1104,6 +1104,18 @@ impl Conn {
         let mut plain = Vec::with_capacity(seg.wire_len());
         encode_segment(self.conv, &seg, &mut plain);
 
+        if self.stats.segments_sent < 3 {
+            tracing::debug!(
+                "kcp: sending conv={:#06x} cmd={} option={} sn={} sending_next={} una={} len={}",
+                self.conv,
+                seg.cmd,
+                seg.option,
+                seg.sn,
+                seg.sending_next,
+                self.rcv_nxt,
+                seg.data.len()
+            );
+        }
         let mut datagram = Vec::with_capacity(plain.len() + self.cfg.obfs_overhead());
         self.obfs.wrap(&plain, &mut datagram);
 
@@ -1135,7 +1147,12 @@ impl Conn {
             return;
         };
         let (ts, data) = (seg.ts, seg.data.clone());
-        let sending_next = self.rcv_nxt;
+        // `sending_next` is what *this* side will send next — Xray's peer uses it to decide
+        // whether the stream has ended (`peer_next == snd_nxt` means "nothing more coming").
+        // It used to carry `rcv_nxt`, the receiver's expectation, which told a real Xray peer
+        // that we had nothing further to send on the very first data segment; Xray answered
+        // by marking its own segments `SegmentOptionClose` and the tunnel died on connect.
+        let sending_next = self.snd_nxt;
         self.send_segment(Segment::data(sn, sending_next, ts, data.to_vec()), now);
     }
 
