@@ -5071,3 +5071,55 @@ audit had been reading one of them** — and that six measured negatives against
 evidence about the *investigation*, not only about the code. When six probes of a mechanism
 all say "not this", the next question should have been "am I looking at the code the row
 actually runs".
+
+---
+
+## Cycle 107 — 2026-10-25
+
+### Fifteen of fifteen
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **Hysteria2** | **112** | 52 | — | **+113.9 %** | — |
+| **TUIC v5** | **105** | 56 | — | **+86.1 %** | — |
+| **WireGuard** | **70** | 45 | — | **+54.5 %** | — |
+| VLESS / gRPC + TLS | **219** | 115 | 199 | **+90.1 %** | **+10.0 %** |
+| VLESS / REALITY | **387** | 317 | 245 | **+22.0 %** | **+58.3 %** |
+| VLESS / TLS | **374** | 313 | 241 | **+19.4 %** | **+54.9 %** |
+| Shadowsocks-AEAD | **308** | 256 | — | **+19.9 %** | — |
+| Shadowsocks-2022 | **405** | 349 | 288 | **+16.0 %** | **+40.9 %** |
+| VLESS / TCP | **724** | 634 | 627 | **+14.2 %** | **+15.5 %** |
+| VLESS / WS + TLS | **349** | 313 | 114 | **+11.5 %** | **+206 %** |
+| Trojan / TLS | **356** | 325 | — | **+9.4 %** | — |
+| VMess / WS + TLS | **226** | 208 | 172 | **+9.1 %** | **+31.3 %** |
+| VLESS / REALITY + Vision | **325** | 303 | 242 | **+7.2 %** | **+34.2 %** |
+| VLESS / XHTTP | **517** | — | 137 | — | **+278 %** |
+| VLESS / gRPC (no TLS) | **542** | — | 208 | — | **+160 %** |
+
+**Every row ahead of sing-box. Every xray path ahead by at least 10 %.** Four interleaved
+rounds per row, no failures, 1090 tests green.
+
+The last one was Vision, reading through a 16 KiB scratch buffer while the transport was handed
+256 KiB — the seventh file to contain the same defect.
+
+### What the seven files add up to
+
+The matrix was at parity or behind on most rows when this audit started. The changes that
+moved it were overwhelmingly **not algorithms**:
+
+| change | effect |
+|---|---|
+| h2 flow-control window (client never set it) | gRPC 106 → 235 |
+| relay buffer 64 → 256 KiB | TCP, XHTTP |
+| WebSocket frame cap to the relay buffer | WS +12 % |
+| TLS write buffer on the client, not just the server | Trojan +10 %, VMess +9 % |
+| Shadowsocks-2022 / VMess / REALITY / Shadowsocks-AEAD 64 KiB caps | SS-2022 −15 % → +16 % |
+| Vision 16 KiB scratch buffer | Vision −4.6 % → +7.2 % |
+
+Seven files, four constants, one invariant. What they had in common was that each was correct
+for the buffer size of the day it was written, and nothing compared them — the same fact
+repeated across seven subsystems because the pipeline had never been looked at as a pipeline.
+
+That is the finding this audit will be worth, more than any single percentage: **the
+architecture was sound and the joints were not.** A `pipeline_stages_agree_on_the_relay_buffer`
+test now fails if they drift again.
