@@ -23,6 +23,8 @@ struct Args {
     rounds: usize,
     payload_size: usize,
     flux_bin: std::path::PathBuf,
+    /// Exits non-zero when the relay is behind a competitor by more than this fraction.
+    assert_tolerance: Option<f64>,
 }
 
 impl Args {
@@ -33,6 +35,7 @@ impl Args {
             rounds: 5,
             payload_size: 1200,
             flux_bin: std::path::PathBuf::from("./target/release/flux-core"),
+            assert_tolerance: None,
         };
         let argv: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
@@ -47,6 +50,16 @@ impl Args {
                 "--rounds" => a.rounds = val(&mut i).parse().unwrap_or(a.rounds),
                 "--payload-size" => a.payload_size = val(&mut i).parse().unwrap_or(a.payload_size),
                 "--flux" => a.flux_bin = std::path::PathBuf::from(val(&mut i)),
+                "--assert" => {
+                    let next = argv.get(i + 1).cloned();
+                    a.assert_tolerance = Some(match next {
+                        Some(v) if !v.starts_with("--") => {
+                            i += 1;
+                            v.parse().unwrap_or(0.10)
+                        }
+                        _ => 0.10,
+                    })
+                }
                 other => {
                     eprintln!("unknown argument: {other}");
                     std::process::exit(2);
@@ -393,4 +406,32 @@ async fn main() {
         f > 1000.0,
         "UDP relay throughput collapsed to {f:.0} pps — the datagram path is broken"
     );
+
+    // The same gate the other benchmarks carry: this axis is a claim too, and a claim
+    // should be able to fail. Lower is not better here, so flux must be at or above each
+    // competitor within the tolerance.
+    if let Some(tolerance) = args.assert_tolerance {
+        let mut failures = Vec::new();
+        for (name, pps) in &vendors {
+            if *pps > 0.0 && f < *pps * (1.0 - tolerance) {
+                failures.push(format!(
+                    "datagrams/s vs {name}: {f:.0} < {pps:.0} ({:+.1}%, tolerance {:.0}%)",
+                    (f / pps - 1.0) * 100.0,
+                    tolerance * 100.0
+                ));
+            }
+        }
+        if failures.is_empty() {
+            println!(
+                "ASSERT PASSED: the relay is at or above every competitor within {:.0}%",
+                tolerance * 100.0
+            );
+        } else {
+            println!("ASSERT FAILED (tolerance {:.0}%):", tolerance * 100.0);
+            for failure in &failures {
+                println!("  {failure}");
+            }
+            std::process::exit(1);
+        }
+    }
 }

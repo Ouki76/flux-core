@@ -330,6 +330,8 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let echo = start_echo();
     let mut rates: Vec<(String, f64)> = Vec::new();
+    // Bytes per held connection, for the memory gate. Lower is better on this axis.
+    let mut footprints: Vec<(String, u64)> = Vec::new();
     let (cert, key, pin) = if use_tls {
         make_cert(&dir)?
     } else {
@@ -437,6 +439,7 @@ fn main() -> Result<()> {
             match measure_footprint(socks_addr, echo, idle, srv_pid, cli_pid) {
                 Ok((before, after)) => {
                     let per = after.saturating_sub(before) / idle as u64;
+                    footprints.push((stack.name().to_string(), per));
                     println!(
                         "{:<12} {:>13} K {:>13} K {:>13} K",
                         stack.name(),
@@ -503,7 +506,53 @@ fn main() -> Result<()> {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    if let Some(tolerance) = assert_tolerance {
+    if let Some(tolerance) = assert_tolerance
+        && !footprints.is_empty()
+    {
+        // Memory: flux must not use more than the competitor by the tolerance.
+        let flux = footprints
+            .iter()
+            .find(|(n, _)| n == "flux-core")
+            .map(|(_, b)| *b);
+        let mut failures = Vec::new();
+        for (name, other) in &footprints {
+            if name == "flux-core" || *other == 0 {
+                continue;
+            }
+            // Computed in floating point: casting a negative tolerance to u64 saturates
+            // at zero, which silently turned a demanding tolerance into "no requirement".
+            let ceiling = (*other as f64 * (1.0 + tolerance)).max(0.0) as u64;
+            if let Some(f) = flux
+                && f > ceiling
+            {
+                failures.push(format!(
+                    "bytes per connection vs {name}: {f} > {other} ({:+.1}%, tolerance {:.0}%)",
+                    (f as f64 / *other as f64 - 1.0) * 100.0,
+                    tolerance * 100.0
+                ));
+            }
+        }
+        if failures.is_empty() {
+            println!(
+                "\nASSERT PASSED: memory per connection is at or below every competitor within {:.0}%",
+                tolerance * 100.0
+            );
+        } else {
+            println!(
+                "\nASSERT FAILED (memory, tolerance {:.0}%):",
+                tolerance * 100.0
+            );
+            for f in &failures {
+                println!("  {f}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            std::process::exit(1);
+        }
+    }
+
+    if let Some(tolerance) = assert_tolerance
+        && !rates.is_empty()
+    {
         let flux = rates
             .iter()
             .find(|(n, _)| n == "flux-core")
