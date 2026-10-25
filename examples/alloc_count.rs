@@ -107,8 +107,60 @@ async fn main() {
 
     let total = after - before;
     println!(
-        "allocations for {N} datagrams: {total}  ({:.2} per datagram)",
+        "UDP: allocations for {N} datagrams: {total}  ({:.2} per datagram)",
         total as f64 / N as f64
+    );
+
+    // --- TCP: does the allocator scale with bytes moved, or with connections? ---
+    let tcp_echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_echo_port = tcp_echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut c, _)) = tcp_echo.accept().await {
+            tokio::spawn(async move {
+                let mut b = vec![0u8; 64 * 1024];
+                while let Ok(n) = c.read(&mut b).await {
+                    if n == 0 || c.write_all(&b[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    conn.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    conn.read_exact(&mut hello).await.unwrap();
+    let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+    req.extend_from_slice(&tcp_echo_port.to_be_bytes());
+    conn.write_all(&req).await.unwrap();
+    conn.read_exact(&mut rep).await.unwrap();
+    assert_eq!(rep[1], 0x00, "the CONNECT must succeed");
+
+    let chunk = vec![0x5Au8; 64 * 1024];
+    let mut sink = vec![0u8; 64 * 1024];
+    let mib = 64usize;
+    // Warm up so per-connection allocations are not charged to the measurement.
+    conn.write_all(&chunk).await.unwrap();
+    let mut got = 0;
+    while got < chunk.len() {
+        got += conn.read(&mut sink[..chunk.len() - got]).await.unwrap();
+    }
+
+    let before = ALLOCS.load(Ordering::Relaxed);
+    for _ in 0..mib {
+        conn.write_all(&chunk).await.unwrap();
+        let mut got = 0;
+        while got < chunk.len() {
+            got += conn.read(&mut sink[..chunk.len() - got]).await.unwrap();
+        }
+    }
+    let after = ALLOCS.load(Ordering::Relaxed);
+    println!(
+        "TCP: allocations for {mib} MiB relayed: {} ({:.2} per MiB)",
+        after - before,
+        (after - before) as f64 / mib as f64
     );
     instance.stop().await.ok();
 }
