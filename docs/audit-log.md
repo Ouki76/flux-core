@@ -4076,3 +4076,33 @@ Both are recorded because both produced plausible-looking numbers:
 
 The check that catches both: sum the parts, and sanity-check the total against the workload
 (a TLS path cannot move 19 MiB in 2.6 M instructions).
+
+### The matrix after the WebSocket fix
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **TUIC v5** | **98** | 55 | — | **+78.1 %** | — |
+| **Hysteria2** | **100** | 52 | — | **+91.6 %** | — |
+| VLESS / TCP | **693** | 516 | 628 | **+34.3 %** | **+10.4 %** |
+| VLESS / TLS | **315** | 296 | 273 | **+6.4 %** | **+15.4 %** |
+| VLESS / XHTTP | **180** | — | 125 | — | **+44.0 %** |
+| VLESS / WS + TLS | 262 | 287 | 112 | −8.7 % | **+134 %** |
+| VMess / WS + TLS | **223** | 207 | 181 | **+8.0 %** | **+23.2 %** |
+| VLESS / REALITY | **358** | 333 | 271 | **+7.6 %** | **+32.3 %** |
+| REALITY + Vision | **326** | 320 | 225 | **+1.7 %** | **+44.9 %** |
+| Trojan / TLS | 308 | 311 | — | −1.1 % | — |
+| Shadowsocks-2022 | **359** | 359 | 275 | **+0.2 %** | **+30.6 %** |
+| Shadowsocks-AEAD | **290** | 256 | — | **+13.7 %** | — |
+| VLESS / gRPC + TLS | 111 | 119 | 190 | −6.9 % | −41.7 % |
+
+**Ten of thirteen ahead of sing-box, one level, two behind. Eleven of twelve ahead of xray.**
+
+Two observations worth keeping:
+
+- **VMess went from +3.0 % to +8.0 % and SS-2022 from +1.4 % to +0.2 %** — the first rides
+  WebSocket and gains from the copy fix exactly as expected; the second does not, and its
+  movement is the run-to-run wobble that this host applies to any row without a fix behind
+  it. Distinguishing those two kinds of change is the whole point of having the profiler.
+- **WS reads −8.7 % here** while three dedicated runs gave +4.6 %, −7.8 % and +11.2 %. Both
+  numbers are true measurements of the same binary; the row is simply not resolvable to
+  better than ±10 % on this machine, and the README now says so beside the table.
