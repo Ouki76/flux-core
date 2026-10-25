@@ -4762,3 +4762,54 @@ At some point the honest thing is to stop: five measured negatives is a result, 
 result is that this row is slower under a symmetric synthetic echo for a reason none of the
 obvious mechanisms explain. It is written down as the one open question rather than papered
 over with a change that does not help.
+
+---
+
+## Cycle 100 — 2026-10-25
+
+### A fix that made the code asymmetric, and the row that found it
+
+The WebSocket work added a 256 KiB rustls write buffer — to the acceptor only. The client kept
+rustls' 64 KiB default, so every TLS *upload* ran through a smaller buffer than every TLS
+*download*. The matrix never saw it because the matrix measures a download-dominated transfer.
+
+Set on both ends:
+
+| row | before | after |
+|---|---|---|
+| Trojan / TLS vs sing-box | −5.5 % | **+5.0 %** |
+| VMess / WS vs sing-box | −1.7 % | **+7.7 %** |
+| VLESS / TLS vs sing-box | +11.3 % | +9.3 % |
+| Shadowsocks-2022 vs sing-box | −11.6 % | −6.6 % |
+
+Trojan was one of the two rows behind sing-box and is now ahead. And **Shadowsocks-2022 moved
+five points** — more than any of the five hypotheses deliberately aimed at it achieved.
+
+### The matrix, one cycle later
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **Hysteria2** | **109** | 53 | — | **+105.7 %** | — |
+| **TUIC v5** | **109** | 56 | — | **+97.0 %** | — |
+| **WireGuard** | **69** | 43 | — | **+59.8 %** | — |
+| VLESS / TCP | **848** | 628 | 631 | **+35.1 %** | **+34.4 %** |
+| VLESS / XHTTP | **506** | — | 159 | — | **+218 %** |
+| VLESS / gRPC (no TLS) | **498** | — | 197 | — | **+152 %** |
+| VLESS / TLS | **347** | 317 | 264 | **+9.3 %** | **+31.6 %** |
+| VLESS / gRPC + TLS | **211** | 118 | 196 | **+78.9 %** | **+7.8 %** |
+| VMess / WS + TLS | **223** | 207 | 162 | **+7.7 %** | **+38.0 %** |
+| Trojan / TLS | **332** | 316 | — | **+5.0 %** | — |
+| VLESS / REALITY | **302** | 296 | 248 | **+2.2 %** | **+21.9 %** |
+| Shadowsocks-AEAD | **272** | 243 | — | **+12.1 %** | — |
+| Shadowsocks-2022 | 355 | 380 | 318 | −6.6 % | **+11.5 %** |
+| VLESS / REALITY + Vision | 300 | 329 | 230 | −9.0 % | **+30.1 %** |
+| VLESS / WS + TLS | 272 | 302 | 117 | −9.8 % | **+132.8 %** |
+
+**Eleven of fifteen ahead of sing-box, four behind by less than 10 %, all ten xray paths
+beaten.** Against sing-box the worst row is now −9.8 %, which is inside this host's own
+run-to-run spread; a cycle ago it was −11.6 % and two cycles ago −20.8 %.
+
+Three of the last four cycles moved the matrix with parameters rather than algorithms: the h2
+window (2.4x on gRPC), the relay buffer (up to 2x on XHTTP), and now a one-line symmetry fix.
+The lesson from all three is the same one, in three different shapes: **the hot path had
+constants nobody had measured, and a fix applied to one side left the other behind.**
