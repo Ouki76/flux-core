@@ -68,6 +68,18 @@ variants, REALITY (writes and reads), Vision and VMess — seven places, one bug
 is slower than its competitor, check that first, then check whether it is spending *more
 CPU* (wasted work, e.g. Vision's endless padding) or *less* (round trips per buffer).
 
+**Objective status, item by item (this is the audit's own scorecard):**
+
+| item | state | evidence |
+|---|---|---|
+| beat/match both competitors on every matrix path | **met** — 14-15 of 15 ahead of sing-box across the last three runs, 10 of 10 ahead of xray in all of them | cycle 118 table; TVision oscillates, SS-2022 at parity |
+| xray column from the validated builders | **met** — fifteen rows | `examples/bench_matrix.rs` |
+| mKCP transport | **met** — interop both directions with Xray 26 | `tests/test_kcp_interop.rs` |
+| XHTTP transport | **met** — stream-one, interop proven and measured | `tests/test_xhttp_interop.rs` |
+| IDNA, GeoIP fixture, private CA, UDP associations, nested-key typos | **met** — each with a test | see the crate docs |
+| browser-grade TLS fingerprint | **partial, and bounded** — see above | `fingerprint.rs` tests pin the cipher order, extension set and per-connection extension shuffle; GREASE is not expressible through rustls |
+| mKCP AES-GCM mask | **open, one direction** — server accepts a real Xray client; client-into-Xray does not carry data | cycle 119 |
+
 **What is genuinely open:**
 
 - **Browser-grade ClientHello** — the only functional item not closed. Not achievable through
