@@ -7,6 +7,12 @@ use flux_types::{BoxedStream, FluxError, FluxResult, StreamDialer, TargetAddress
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// Plaintext rustls may hold before it stops accepting writes.
+///
+/// One relay buffer plus a framing header has to fit, or a vectored write of a whole frame
+/// is always short and the layer above falls back to copying.
+const TLS_WRITE_BUFFER: usize = 256 * 1024;
+
 #[derive(Clone, Debug)]
 /// A client-side security layer to apply, outermost last.
 pub enum SecurityLayer {
@@ -350,10 +356,13 @@ impl ServerTransportPipeline {
                 stream = match sec {
                     ServerSecurityLayer::None => stream,
                     ServerSecurityLayer::Tls(acceptor) => {
-                        let s = acceptor.accept(stream).await.map_err(FluxError::Io)?;
-                        // rustls delivers one TLS record per `poll_read`; the relay
-                        // reads 64 KiB at a time. Coalescing at the boundary leaves
-                        // rustls untouched (see `coalesce.rs`).
+                        let mut s = acceptor.accept(stream).await.map_err(FluxError::Io)?;
+                        // A writer above this layer may hand rustls a whole 64 KiB frame
+                        // plus its header in one vectored write, and rustls' default
+                        // 64 KiB buffer limit makes that a short write every time. Raising
+                        // it lets the frame pass through in one call instead of being
+                        // copied into a frame buffer first.
+                        s.get_mut().1.set_buffer_limit(Some(TLS_WRITE_BUFFER));
                         Box::new(s)
                     }
                     ServerSecurityLayer::Reality(cfg) => {

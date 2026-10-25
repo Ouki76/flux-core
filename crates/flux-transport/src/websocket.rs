@@ -514,6 +514,26 @@ fn mask_in_place(key: [u8; 4], offset: usize, data: &mut [u8]) {
     }
 }
 
+/// Writes the frame header into `out`, returning its length.
+///
+/// Split out from [`encode_frame_into`] so an unmasked writer can send the header and the
+/// payload as one vectored write instead of copying the payload into a frame buffer.
+fn write_frame_header(out: &mut [u8; 10], fin: bool, opcode: u8, len: usize) -> usize {
+    out[0] = if fin { 0x80 } else { 0x00 } | opcode;
+    if len <= 125 {
+        out[1] = len as u8;
+        2
+    } else if len <= 65_535 {
+        out[1] = 126;
+        out[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        4
+    } else {
+        out[1] = 127;
+        out[2..10].copy_from_slice(&(len as u64).to_be_bytes());
+        10
+    }
+}
+
 /// Serialises one frame. A client masks with a fresh random key per frame, a
 /// server never masks (RFC 6455 §5.1).
 fn build_frame(is_client: bool, opcode: u8, fin: bool, payload: &[u8]) -> Vec<u8> {
@@ -1140,6 +1160,35 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
         // the single hottest path of this transport. 64 KiB matches the relay's copy
         // buffer, so a normal write is framed once.
         let chunk_len = buf.len().min(64 * 1024);
+
+        // Fast path for the unmasked side — a server never masks (RFC 6455 §5.1), so the
+        // header can be written straight from the stack with the payload as a second
+        // iovec. `tokio_rustls` implements `poll_write_vectored` properly (it encrypts
+        // every iovec as it goes), so the payload reaches the record layer without the
+        // copy through `write_buf`. That copy is one of four passes over the payload on
+        // this path and was measured at 20 M instructions per 20 MiB.
+        //
+        // A short write falls back to the buffered path with `write_pos` set to what the
+        // peer already took; everything else is unchanged.
+        let mut prewritten = 0usize;
+        if !this.is_client {
+            let mut header = [0u8; 10];
+            let header_len = write_frame_header(&mut header, true, 0x02, chunk_len);
+            let bufs = [
+                std::io::IoSlice::new(&header[..header_len]),
+                std::io::IoSlice::new(&buf[..chunk_len]),
+            ];
+            match Pin::new(&mut this.inner).poll_write_vectored(cx, &bufs) {
+                Poll::Ready(Ok(n)) if n >= header_len + chunk_len => {
+                    return Poll::Ready(Ok(chunk_len));
+                }
+                Poll::Ready(Ok(n)) => prewritten = n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                // Nothing was taken, so nothing is lost: frame it normally below.
+                Poll::Pending => {}
+            }
+        }
+
         this.write_buf.clear();
         encode_frame_into(
             &mut this.write_buf,
@@ -1148,7 +1197,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
             true,
             &buf[..chunk_len],
         );
-        this.write_pos = 0;
+        this.write_pos = prewritten.min(this.write_buf.len());
         this.pending_chunk_len = chunk_len;
 
         // Step 3: Write out as much as possible
