@@ -6605,3 +6605,32 @@ One process note: the commit message for this change lost two config snippets to
 substitution and went out describing the wiring inaccurately. Repaired with an explicit
 follow-up commit rather than left standing, because a message that misdescribes a change is a
 small lie with a long life.
+
+---
+
+## Cycle 146 — 2026-10-25
+
+### The handoff was describing a project two versions old
+
+`docs/HANDOFF.md` is the file a new session reads first, and it still said "after cycle 109:
+1090 tests", listed rows at parity that measure +7 to +15% now, and described mKCP as partial —
+all of it true when written, none of it true now.
+
+Refreshed against the definitive run: the eight-round matrix, the four gated axes, 1101 tests,
+and a gap list with exactly one item not done.
+
+A handoff that lags the code is worse than no handoff, because it is trusted. The same applies to
+the README line about interop tests (cycle 142) and to this file's own summary of the objective —
+every document that states a fact about the code has an expiry, and the only defence is to
+re-check the ones a newcomer reads first.
+
+### State at the end of this cycle
+
+| | |
+|---|---|
+| matrix | 15/15 ahead of sing-box, 10/10 ahead of xray, gate passing |
+| other axes | connection rate, UDP, memory — each gated and passing |
+| tests | 1101, 0 failed |
+| static gates | fmt, clippy (with the unsafe lint), doc, audit, deny — clean |
+| unsafe blocks | 88 total, 0 undocumented |
+| open items | browser-grade fingerprint, bounded by rustls |
