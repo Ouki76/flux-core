@@ -3781,3 +3781,28 @@ The gap is therefore bounded and named: what a browser ClientHello needs from th
 an HPKE-capable provider, and adopting one is a REALITY interop project, not a flag. That is
 what "partial" now means in `docs/HANDOFF.md`, and it is the only item in the functional list
 that is not closed.
+
+### gRPC over TLS: the last row, and why it stops here
+
+| function | instructions | share |
+|---|---|---|
+| `memcpy` | 69.3 M | 39.8 % |
+| `_aesni_ctr32_ghash_6x` (AES-GCM) | 66.3 M | 38.1 % |
+
+The copies split cleanly in two halves of about 14 M each:
+
+| caller | cost | calls |
+|---|---|---|
+| rustls `OutboundChunks::copy_to_vec` (plaintext into the record) | 14.2 M | 2 756 |
+| rustls `take_received_plaintext` (decrypted out of the record) | 14.2 M | 2 080 |
+| `GrpcStream::poll_write` (caller buffer into the frame) | 15.0 M | 460 |
+| `GrpcStream::poll_read` (h2 bytes into the read buffer) | 14.8 M | 3 896 |
+
+Half of it is rustls, which every TLS row pays. The other half is the gRPC envelope: a
+message needs a five-byte header and a protobuf length in front of the payload, and h2 needs
+each `send_data` contiguous, so the frame must exist as one buffer. Producing that without a
+copy means scatter-gather all the way down, which the h2 crate does not offer.
+
+So this row is TLS plus one unavoidable framing copy: −7.3 % against sing-box, −46 % against
+xray, and the only row behind both. It is written here rather than chased, because the
+profile says both halves are structural.
