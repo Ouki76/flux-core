@@ -4837,3 +4837,41 @@ is worth more than one that averages higher, because every comparison from now o
 That is the third constant this week that had been correct for the buffer size of the day it
 was chosen: the h2 window, the relay buffer, the WebSocket frame. They are not independent
 facts about three subsystems; they are one fact about a pipeline whose stages must agree.
+
+---
+
+## Cycle 102 — 2026-10-25
+
+### From "fixed it" to "cannot ship it again"
+
+Three constants drifted apart twice in one week:
+
+| when | what | consequence |
+|---|---|---|
+| original | 16 KiB WS frame under a 64 KiB relay buffer | every write became four frames |
+| the fix | frame cap raised to 64 KiB | worked |
+| the relay buffer moved to 256 KiB | frame cap left at 64 KiB | **the same defect, at the new size** |
+
+Each constant was correct when it was written and wrong later, and nothing in the code
+compared them. The audit's usual move — measure, find the layer, fix it — had already been
+applied to *this same bug* once and had not stopped it coming back.
+
+`flux_common::copy::RELAY_BUFFER_BYTES` is now the single source of truth, and the WebSocket
+frame cap, the TLS write buffer and both h2 windows derive from it.
+`pipeline_stages_agree_on_the_relay_buffer` fails when they disagree, and the TLS relation is
+a compile-time `const` assertion so that one breaks the build instead of a test run.
+
+Proven by breaking it: putting the frame cap back to 64 KiB produces
+
+```
+assertion `left == right` failed: the WebSocket frame cap must equal the relay buffer,
+or a write is split into several frames
+  left: 65536
+ right: 262144
+```
+
+which is the defect, named, at the moment it is introduced.
+
+**This changes no number in the matrix.** It is the only change in the last ten cycles that
+does not, and it may be the most valuable: the previous nine fixed instances, this one fixes
+the class.
