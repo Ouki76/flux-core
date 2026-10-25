@@ -5854,3 +5854,34 @@ get there.
 
 The matrix itself remains guarded only by re-measurement — a benchmark cannot be a unit test —
 and the audit log's per-round dumps are the evidence for it.
+
+---
+
+## Cycle 127 — 2026-10-25
+
+### The matrix becomes a command that can fail
+
+Every other claim in this audit has a guard. The matrix — the centrepiece — had only re-reading
+a table, which is exactly the thing this log has spent a hundred cycles distrusting.
+
+`bench_matrix --assert [TOLERANCE]` now walks the best-of-N summary and exits 1 if any row is
+behind either competitor by more than the tolerance, defaulting to 10%: the host's own
+run-to-run spread, so a row inside it is at parity rather than behind.
+
+Both branches demonstrated:
+
+```
+--assert 0.10   ASSERT PASSED: every row is at or above both competitors within 10%     exit 0
+--assert -0.5   ASSERT FAILED (tolerance -50%):
+                  VLESS / TCP vs sing-box: 631.0 < 629.9 MB/s (+0.2%, tolerance -50%)
+                  VLESS / TCP vs xray: 631.0 < 564.0 MB/s (+11.9%, tolerance -50%)       exit 1
+```
+
+The negative tolerance is not a typo: when flux is ahead on every row, no non-negative
+tolerance can trigger the failure branch, so demanding +50% is the only way to watch it run.
+That is the same discipline as reverting a fix to see its test fail — exercise the failure path
+or you do not know it exists.
+
+Now `cargo run --release --example bench_matrix -- --rounds 4 --assert` is the objective's
+first clause as a command: it prints the numbers and exits non-zero when the claim stops being
+true.
