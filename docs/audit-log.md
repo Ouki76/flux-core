@@ -3589,3 +3589,42 @@ gRPC is the one row still clearly behind both competitors (−17 % against sing-
 against xray). It is now measurable the same way — run our client under callgrind, drive it
 with a plain SOCKS client, and let the peer be a real xray gRPC server — and that is the next
 cycle's work.
+
+---
+
+## Cycle 75 — 2026-10-25
+
+### gRPC: a quadratic copy, 45× the instructions
+
+The profiler recipe generalises: our client under callgrind, a real xray gRPC server on the
+far end, a plain SOCKS client driving it. The result named the layer immediately —
+**61.9 % of all instructions in `memcpy`**, split almost evenly across three callers:
+
+| caller | instructions | calls |
+|---|---|---|
+| `GrpcStream::poll_read` | 22.0 M | 4 887 |
+| `GrpcStream::poll_write` | 20.0 M | 2 444 |
+| `Bytes::copy_from_slice`, called from `poll_drain` | 20.0 M | 1 234 |
+
+The third is not just waste, it is **quadratic**: `poll_drain` copied the whole remaining
+frame into a fresh `Bytes` on every partial `send_data`, so a frame whose capacity arrived in
+several small increments was copied again from its start each time.
+
+`write_buf` is a `BytesMut` now, and draining hands ownership over with
+`split_to(..).freeze()` — no copy at all. Same workload, same profile:
+
+| | before | after |
+|---|---|---|
+| total instructions | 114.4 M | **2.54 M** |
+| `memcpy` share | 61.9 % | not in the top of the profile |
+
+**45× less work per byte.** Throughput did not move (gRPC+TLS 96.0 MB/s, no-TLS 150-161),
+which is the honest reading: the copy was not the limiter, and the row's remaining gap is
+elsewhere. What did change is what the row costs to run — 9.1 and 15.6 CPU s/GiB.
+
+### What the method is now worth
+
+Two cycles, two profiler runs, two defects that six rounds of hypotheses never found: a
+64 KiB `memset` per datagram and a quadratic copy per gRPC frame. Both were invisible to
+throughput measurements taken on a machine whose own noise is ±15 %, and both are obvious in
+an instruction profile that does not care how loaded the box is.
