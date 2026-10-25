@@ -6672,3 +6672,38 @@ Ten test files drive the real `sing-box` or `xray` binaries.
 Every one of those rows has been observed failing at least once — by reverting a fix, by
 deliberately breaking a guard, or by demanding more of a tolerance than the measurement supports.
 That is the only reason to believe any of them.
+
+---
+
+## Cycle 148 — 2026-10-25
+
+### The fifth gate was not in CI
+
+This project promises five gates every cycle: fmt, clippy, tests, audit, deny, doc. CI ran four.
+
+```
+grep -c "cargo doc" .github/workflows/ci.yml
+0
+```
+
+Documentation was the one left to whoever remembered to run it — and this audit's own history
+shows what that costs: `cargo doc -D warnings` broke twice on links to private items
+(`serve_connection`, `encode_frame_into`), both found late and by hand.
+
+Added to the existing `check-and-test` job with `RUSTDOCFLAGS: -D warnings`, so a missing doc
+comment on a public item and a broken intra-doc link both fail the build like everything else.
+Verified locally with the exact command and flags CI will use:
+
+```
+cargo doc --locked --workspace --no-deps --all-features     (RUSTDOCFLAGS=-D warnings)
+0 errors
+```
+
+### Why this mattered more than it looks
+
+Every other claim in this file has a command. Four of the five gates were guarded by CI, so a
+regression would have been caught by a machine on the next push. The fifth was guarded by an
+agent's memory across a hundred and forty-eight cycles — and the agent is the thing whose
+fallibility this entire log is about.
+
+A gate that is not automated is a gate that is *usually* run.
