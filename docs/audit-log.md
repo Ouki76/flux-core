@@ -3555,3 +3555,37 @@ profile rather than a guess.
 The TCP copy path scrubs a 16 KiB buffer once per 16 KiB moved — a 1:1 ratio that is much
 better but still one `memset` per buffer. With UDP measured, the question for the next cycle
 is whether those callers can report their used length too.
+
+---
+
+## Cycle 74 — 2026-10-25
+
+### The same question for TCP, answered with the same instrument
+
+The daemon's TCP profile shows 31 % of instructions in `malloc`/`free`, which reads like an
+opportunity right up until you ask *per what*. The counting allocator, now measuring both
+transports:
+
+```
+UDP: allocations for 2000 datagrams: 10000  (5.00 per datagram)
+TCP: allocations for 64 MiB relayed:  0      (0.00 per MiB)
+```
+
+**The TCP data path allocates nothing.** The 31 % is connection setup, the sampler and
+start-up — per-connection costs that a 64 MiB transfer amortises to nothing. There is no
+allocator work to remove from the TCP relay, and its lead over both competitors does not
+depend on any.
+
+This is the value of a number per unit rather than a percentage of a profile: "31 % in
+malloc" and "0 allocations per MiB" are the same code, and only the second one tells you
+whether to do anything.
+
+UDP remains at 5 allocations per datagram (from 7), and the relay is +37-55 % over sing-box
+on that axis, so those are no longer the next thing worth chasing.
+
+### Where the profiler workflow goes next
+
+gRPC is the one row still clearly behind both competitors (−17 % against sing-box, −50 %
+against xray). It is now measurable the same way — run our client under callgrind, drive it
+with a plain SOCKS client, and let the peer be a real xray gRPC server — and that is the next
+cycle's work.
