@@ -7214,3 +7214,28 @@ was not found"* — because that invocation did not have `~/.local/bin` on `PATH
 regression, and worth recording as such: the harness needs the competitor binaries on `PATH`, and
 a run without them fails loudly rather than skipping silently, which is the behaviour the tests
 were built to have.
+
+### B3.9 — stability and the checks a security reviewer would ask for
+
+| check | result |
+|---|---|
+| `bench_rps --tls --native-tls --assert 0.10` | **ASSERT PASSED** — 8 123/s against sing-box 4 316 and xray 910 |
+| soak: 24 000 requests over the native TLS path | **0 errors**, 4 700/s, RSS 13.6 → 14.1 MB across three runs, flat |
+| expired certificate with a trusted chain | **refused** |
+| chain through an intermediate (B3.7) | verified |
+| traffic-key rotation mid-stream (B3.8) | followed |
+
+The expiry test is worth more than it looks: it proves the client passes the **wall clock** to
+`rustls-webpki` rather than a constant. A constant would have accepted the certificate this test
+signs with a 2019–2020 window, and every other test in the module would still have passed.
+
+### Where B3 stands
+
+The objective asked for our TLS 1.3 client on the TLS paths, with WebPKI, ALPN, GREASE, chain and
+name checks, interop, no regression, and a decision about the default. All of it exists and is
+measured; the one deliberate deviation is the default, kept on rustls because it negotiates TLS
+1.2 and the native path does not.
+
+What that means in practice: `native_tls: true` gives a browser-shaped ClientHello to anyone who
+wants it, at parity on both speed axes, tested against two real implementations. Anyone who does
+not set it keeps exactly the behaviour the project had before this work started.
