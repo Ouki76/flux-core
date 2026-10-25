@@ -5316,3 +5316,42 @@ is worth naming that the rule costs something here: the mask is real, correct an
 
 Two things make the next attempt cheap: the specification with its source references, and a
 test suite for the primitive that will fail loudly if the wiring gets the key wrong.
+
+---
+
+## Cycle 113 — 2026-10-25
+
+### The bug was one lost match, and the instrumentation was lying
+
+Last cycle left the mask implemented and unused, with the note that the client's send path
+"never ran". It did run. **`ObfsState::wrap` had lost its mask selection** — a `match &self.key`
+that my earlier edit had failed to re-apply — so every datagram went out with the original
+envelope while the server expected AES-GCM and dropped them.
+
+How the wrong conclusion survived: I added `tracing::trace!` to both branches of the mask
+match, saw no output from the client, and concluded the client never sent. The check that would
+have caught this costs one command — **run the same instrumentation on the working path**. When
+that was finally done, neither side printed the trace lines, because the match did not exist to
+print them from. The absence of logs was evidence of a missing match, and I read it as evidence
+of a missing send.
+
+With the match restored:
+
+| check | result |
+|---|---|
+| seeded kcp, our client → our server | **41.0 MB/s**, payload intact |
+| mismatched seed | carries nothing |
+
+Configuration now honours the fields on both sides, which also fixed a quieter defect: the
+inbound passed `KcpConfig::default()`, so a server silently ignored `header` **and** could not
+be reached by any client using a non-default one.
+
+`a_seeded_kcp_pair_relays_and_a_wrong_seed_does_not` asserts both halves of the claim — the
+matching seed carries 8 KiB through intact, the wrong seed carries nothing.
+
+### The lesson this cycle actually taught
+
+Two cycles were spent on this, and the cost was not the code: it was trusting an instrument
+whose silence had been calibrated nowhere. **A log line that never fires tells you nothing
+until you have seen it fire.** Every profiling conclusion in this audit has that rule behind
+it; this one did not, and cost two cycles.
