@@ -15,12 +15,16 @@ struct Pipe {
 impl Pipe {
     fn new() -> io::Result<Self> {
         let mut fds = [0; 2];
+        // SAFETY: `fds` is a live two-element array, which is exactly the buffer `pipe2`
+        // writes two `c_int` descriptors into.
         let ret = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
         // Set in-kernel pipe capacity to 256KB (fewer wakeups per MB on the splice
         // hot path; kernel pipe pages are allocated lazily, so idle pipes cost ~0).
+        // SAFETY: a plain fd plus integer arguments; the return value is deliberately
+        // ignored because a kernel that refuses the size is not an error.
         unsafe {
             libc::fcntl(fds[0], libc::F_SETPIPE_SZ, 262144);
         };
@@ -35,6 +39,8 @@ impl Pipe {
     fn drain(&self) -> bool {
         let mut scratch = [0u8; 16384];
         loop {
+            // SAFETY: `self.reader` is an open pipe descriptor owned by this `Pipe`, and
+            // `scratch` is a live array of the length passed alongside its pointer.
             let res = unsafe {
                 libc::read(
                     self.reader,
@@ -60,6 +66,8 @@ impl Pipe {
 #[cfg(target_os = "linux")]
 impl Drop for Pipe {
     fn drop(&mut self) {
+        // SAFETY: `Drop` runs once per `Pipe`, and both descriptors were created by
+        // `Pipe::new` and are owned by it, so each is closed exactly once.
         unsafe {
             libc::close(self.reader);
             libc::close(self.writer);
@@ -148,6 +156,9 @@ async fn splice_direction(
                         return Ok(());
                     }
 
+                    // SAFETY: both descriptors are alive for the call (borrowed from
+                    // `read_stream` and the `Pipe`), the offsets are null because neither
+                    // side seeks, and the length never exceeds the pipe's capacity.
                     let res = unsafe {
                         libc::splice(
                             read_stream.as_raw_fd(),
@@ -183,6 +194,8 @@ async fn splice_direction(
             .await?;
 
         if eof && pipe_filled == 0 {
+            // SAFETY: `write_stream` is alive and its descriptor valid; `shutdown` with
+            // SHUT_WR only affects the write half.
             unsafe {
                 libc::shutdown(write_stream.as_raw_fd(), libc::SHUT_WR);
             }
@@ -199,6 +212,8 @@ async fn splice_direction(
                         if pipe_rem == 0 {
                             return Ok(());
                         }
+                        // SAFETY: as above — both descriptors live, null offsets, length
+                        // bounded by the pipe's contents.
                         let res = unsafe {
                             libc::splice(
                                 pipe.reader,
@@ -240,6 +255,7 @@ async fn splice_direction(
         }
 
         if eof {
+            // SAFETY: `write_stream` is alive and its descriptor valid.
             unsafe {
                 libc::shutdown(write_stream.as_raw_fd(), libc::SHUT_WR);
             }
@@ -269,6 +285,7 @@ async fn copy_direction_ref(
         let n = match read_stream.try_read(&mut buf) {
             Ok(0) => {
                 #[cfg(unix)]
+                // SAFETY: `write_stream` is alive and its descriptor valid.
                 unsafe {
                     use std::os::fd::AsRawFd;
                     libc::shutdown(write_stream.as_raw_fd(), libc::SHUT_WR);
@@ -390,6 +407,8 @@ mod tests {
     fn test_pipe_drain_on_recycle() {
         let pipe = Pipe::new().unwrap();
         // Write dirty bytes to pipe
+        // SAFETY: `pipe.writer` is an open descriptor owned by `pipe`, and the static byte
+        // string outlives the call with the length passed matching it.
         unsafe {
             libc::write(
                 pipe.writer,

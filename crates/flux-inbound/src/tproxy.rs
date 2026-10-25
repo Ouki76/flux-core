@@ -19,6 +19,9 @@ const IPV6_RECVORIGDSTADDR: libc::c_int = 74;
 pub fn enable_tproxy_socket(socket: &Socket, is_v6: bool) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let fd = socket.as_raw_fd();
+    // SAFETY: `fd` is a valid socket owned by the caller, the option value is a live
+    // `c_int` with the length passed matching its size, and the level/name pair is a real
+    // setsockopt option for the address family in use.
     unsafe {
         let enable: libc::c_int = 1;
         let level = if is_v6 { libc::SOL_IPV6 } else { libc::SOL_IP };
@@ -67,6 +70,9 @@ pub fn recv_tproxy_udp(
     fd: std::os::fd::RawFd,
     buf: &mut [u8],
 ) -> std::io::Result<(usize, SocketAddr, Option<SocketAddr>)> {
+    // SAFETY: `sockaddr_storage` is a POD type for which all-zero is a valid
+    // representation, `iov` points at a live buffer with the length passed alongside it,
+    // and the control buffer is sized by the `CMSG_SPACE` call that precedes this block.
     unsafe {
         let mut src_addr: libc::sockaddr_storage = std::mem::zeroed();
         let mut iov = libc::iovec {
