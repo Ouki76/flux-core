@@ -471,6 +471,106 @@ async fn a_real_xray_client_reaches_our_aes_masked_kcp_server() {
     instance.stop().await.expect("stop our server");
 }
 
+/// **Our client into a real Xray server, through the AES-GCM mask.**
+///
+/// The direction that took eleven cycles to work. The defect was not in the mask: Xray binds
+/// a new sending socket and answers from a different port, and we dropped every reply as
+/// coming from a stranger. The conversation id identifies a stream, not the source address.
+///
+/// The payload is large enough that a fix which only works for the first few segments fails
+/// here.
+#[tokio::test]
+async fn our_client_reaches_a_real_xray_server_through_the_aes_mask() {
+    let Some(bin) = xray_bin() else {
+        panic!("the `xray` binary is required by this test but was not found");
+    };
+    let echo_port = echo_server().await;
+    let server_port = get_free_tcp_port().await;
+    let socks_port = get_free_tcp_port().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // A real Xray server. Xray 26 removed `kcpSettings.seed`; the mask arrives through
+    // `finalmask.udp`, and its setting is `password` — a config written with `seed` parses
+    // cleanly and silently derives a key from the empty string.
+    let xray_cfg = format!(
+        r#"{{
+  "log": {{"loglevel": "warning"}},
+  "inbounds": [{{
+    "port": {server_port}, "listen": "127.0.0.1", "protocol": "vless",
+    "settings": {{"clients": [{{"id": "{UUID}"}}], "decryption": "none"}},
+    "streamSettings": {{
+      "network": "kcp", "kcpSettings": {{"mtu": 1350, "tti": 20}},
+      "finalmask": {{"udp": [{{"type": "header-srtp"}},
+        {{"type": "mkcp-aes128gcm", "settings": {{"password": "directional-seed"}}}}]}}
+    }}
+  }}],
+  "outbounds": [{{"protocol": "freedom", "settings": {{}}}}]
+}}"#
+    );
+    let _xray = spawn_xray(&bin, &xray_cfg, dir.path());
+    let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+    wait_for_udp(server_addr).await;
+
+    let flux_cfg = format!(
+        r#"{{
+  "log": {{"level": "warn"}},
+  "inbounds": [{{
+    "tag": "socks-in",
+    "carrier": {{"type": "tcp", "listen": "127.0.0.1", "listen_port": {socks_port}}},
+    "protocol": {{"type": "socks"}}
+  }}],
+  "outbounds": [{{
+    "tag": "xray-kcp",
+    "carrier": {{"type": "kcp", "address": "127.0.0.1:{server_port}", "header": "srtp",
+                 "seed": "directional-seed"}},
+    "protocol": {{"type": "vless", "uuid": "{UUID}"}}
+  }}],
+  "route": {{"final": "xray-kcp"}}
+}}"#
+    );
+    let instance =
+        flux_app::Instance::new(flux_app::Config::from_json_str(&flux_cfg).expect("config"))
+            .expect("instance");
+    instance.start().await.expect("start");
+
+    // Big enough that a fix which only carries the first few segments fails.
+    let payload: Vec<u8> = (0..262_144).map(|i| (i % 251) as u8).collect();
+    let got = tokio::time::timeout(Duration::from_secs(60), async {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", socks_port))
+            .await
+            .ok()?;
+        s.write_all(&[0x05, 0x01, 0x00]).await.ok()?;
+        let mut m = [0u8; 2];
+        s.read_exact(&mut m).await.ok()?;
+        let mut req = vec![0x05, 0x01, 0x00, 0x01];
+        req.extend_from_slice(&[127, 0, 0, 1]);
+        req.extend_from_slice(&echo_port.to_be_bytes());
+        s.write_all(&req).await.ok()?;
+        let mut head = [0u8; 10];
+        s.read_exact(&mut head).await.ok()?;
+        if head[1] != 0 {
+            return None;
+        }
+        // Read and write concurrently: a sequential writer-then-reader deadlocks on the
+        // socket buffers well below this payload size, which is what hid this working.
+        let (mut rd, mut wr) = s.into_split();
+        let expect = payload.len();
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; expect];
+            rd.read_exact(&mut buf).await.ok().map(|_| buf)
+        });
+        wr.write_all(&payload).await.ok()?;
+        wr.flush().await.ok()?;
+        reader.await.ok()?
+    })
+    .await
+    .expect("the tunnel must answer")
+    .expect("socks request must succeed");
+
+    assert_eq!(got, payload, "the AES mask corrupted the payload");
+    let _ = instance.stop().await;
+}
+
 /// A header name we do not implement must be a configuration error, not a silent
 /// fallback to a different camouflage.
 #[tokio::test]
