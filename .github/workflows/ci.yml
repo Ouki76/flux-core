@@ -94,6 +94,15 @@ jobs:
       - name: Run Clippy linter
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
+      # Documentation is one of the five gates this project promises, and it was the only one
+      # missing from CI — which meant a broken intra-doc link was found by whoever happened to
+      # run `cargo doc` by hand. Every crate carries `#![warn(missing_docs)]`, so this also
+      # fails on a public item with no documentation.
+      - name: Build documentation
+        run: cargo doc --locked --workspace --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Run unit & integration tests
         run: cargo test --locked --workspace
         env:
