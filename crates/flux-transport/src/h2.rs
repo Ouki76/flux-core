@@ -429,6 +429,26 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// The h2 windows must stay tied to the relay buffer.
+    ///
+    /// The client used to keep h2's 64 KiB defaults while the server side advertised 1 MiB,
+    /// which capped a download at 64 KiB per round trip — the largest single win of this
+    /// audit (gRPC 106 MB/s to 235 MB/s). This pins the *values*; that both builders apply
+    /// them is checked by that measurement rather than by a unit test, because h2 does not
+    /// expose a built connection's settings.
+    #[test]
+    fn the_h2_windows_track_the_relay_buffer() {
+        let relay = flux_common::copy::RELAY_BUFFER_BYTES as u32;
+        assert_eq!(
+            shared::STREAM_WINDOW,
+            relay,
+            "the stream window must equal the relay buffer, or a stream stalls once per buffer"
+        );
+        assert!(
+            shared::CONNECTION_WINDOW >= 2 * relay,
+            "the connection window must cover at least two streams' worth of buffering"
+        );
+    }
     #[tokio::test]
     async fn test_h2_bidirectional_streaming() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
