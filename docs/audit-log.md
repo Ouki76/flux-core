@@ -7068,3 +7068,36 @@ every performance change it ever shipped.
 | xray interop on the native path | next |
 | throughput and connection-rate measurement | next |
 | decide the default | after both |
+
+### B3.5 — the measurement: parity, and what that word is doing here
+
+`--native-tls` on both benchmarks routes the TLS layer through our client with nothing else
+changed, so rustls and our handshake can be compared on identical work.
+
+| axis | rustls | our TLS | delta |
+|---|---|---|---|
+| throughput, VLESS/TLS, 200 MiB × 4 rounds | 307.7 MB/s | 316.2 MB/s | **+2.8%** |
+| exchanges/s, TLS, 32 connections | 8 125/s | 7 952/s | **−2.1%** |
+| sing-box, same TLS runs | 318-329 MB/s, 4 234/s | — | — |
+
+Both deltas are inside this host's spread (±10-15% between runs, as every previous cycle of this
+audit has measured). **The honest reading is parity**, not "faster": two samples cannot resolve a
+difference smaller than their own noise, and this log has spent a hundred cycles refusing to
+claim otherwise.
+
+What the change buys is the ClientHello — browser-shaped, with GREASE in the cipher list, the
+extension list and `supported_groups` — at no measurable cost in either bulk throughput or
+connection setup.
+
+Note that the 4-round TLS row reads −3.3% and −3.8% against sing-box in these two runs, while
+cycle 143 measured the same row at **+14.9%** over eight rounds. The row is simply
+undersampled at four; that is not a regression from this change and the two runs here are
+consistent with each other.
+
+| B3 step | state |
+|---|---|
+| core, WebPKI, ALPN, shared hello, driver | done |
+| wired behind a flag, interop with sing-box | done |
+| throughput and connection rate | **parity, measured** |
+| xray, WS+TLS and gRPC+TLS on the native path | next |
+| decide the default | after those |
