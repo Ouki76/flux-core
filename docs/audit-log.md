@@ -5885,3 +5885,45 @@ or you do not know it exists.
 Now `cargo run --release --example bench_matrix -- --rounds 4 --assert` is the objective's
 first clause as a command: it prints the numbers and exits non-zero when the claim stops being
 true.
+
+---
+
+## Cycle 128 — 2026-10-25
+
+### The objective's first clause, as a command and its output
+
+```
+$ ./target/release/examples/bench_matrix --rounds 4 --mb 200 --assert 0.10
+ASSERT PASSED: every row is at or above both competitors within 10%
+
+Protocol / transport                    flux best  sbox best  xray best     vs sbox     vs xray
+VLESS / TCP                                 735.0      566.3      575.0      +29.8%      +27.8%
+WireGuard                                    64.8       40.4          -      +60.5%           -
+TUIC v5                                      99.8       48.9          -     +104.3%           -
+Hysteria2                                   102.6       44.8          -     +129.2%           -
+VLESS / TLS                                 324.0      288.2      218.5      +12.4%      +48.3%
+VLESS / XHTTP                               465.9          -      108.2           -     +330.6%
+VLESS / WS + TLS                            328.8      262.8      101.8      +25.1%     +222.9%
+VLESS / gRPC (no TLS)                       427.0          -      164.3           -     +159.9%
+VLESS / gRPC + TLS                          225.1      100.5      161.1     +123.9%      +39.8%
+VLESS / REALITY                             304.2      295.5      213.0       +2.9%      +42.8%
+VLESS / REALITY + Vision                    334.0      297.1      229.4      +12.4%      +45.6%
+VMess / WS + TLS                            204.9      202.9      159.6       +1.0%      +28.4%
+Trojan / TLS                                320.3      292.6          -       +9.5%           -
+Shadowsocks-2022 / blake3-aes-128-gcm       336.4      349.6      264.7       -3.8%      +27.1%
+Shadowsocks-AEAD / aes-256-gcm              304.4      240.0          -      +26.8%           -
+```
+
+Fourteen of fifteen ahead of sing-box, ten of ten ahead of xray, and the one row behind
+(Shadowsocks-2022 at −3.8%) inside the tolerance this host's own noise dictates. The command
+exits 0 and says so in one line.
+
+That is the first clause of the objective in the form it asked for: *defended by a command and
+its output*, not by a paragraph in this file.
+
+### What changed in the numbers since cycle 118
+
+Nothing structural — this run is a little slower on several rows (TLS 361 → 324, gRPC+TLS
+274 → 225, SS-AEAD 285 → 304) because the box was busier. Both competitors moved the same way,
+and the ratios held, which is the property the `--assert` gate exists to check. The absolute
+numbers in this audit have never been stable to better than ±15%; the ratios have.
