@@ -6318,3 +6318,32 @@ would keep climbing with the workload, and the third run added 8 000 more connec
 
 Worth recording because the first two readings look alarming and the third is what distinguishes
 the two explanations. A single measurement of "memory went up" is not evidence of anything.
+
+---
+
+## Cycle 138 — 2026-10-25
+
+### The flaky test, named and fixed
+
+Full-suite runs kept failing intermittently with
+
+```
+dial_stream: Io(Os { code: 111, kind: ConnectionRefused })
+```
+
+in the mux interop tests. Both attempts to explain it away ("machine is busy", "re-run it") were
+right about the cause and wrong about the remedy: the suite starts real `sing-box` and
+`flux-core` processes, and under load a listener can be **bound but not yet accepting**. A
+single-attempt `expect` turned that into a failure indistinguishable from a mux regression.
+
+`dial_with_retry` now retries connection-level failures three times over about a second. A
+genuinely broken tunnel keeps failing, so the panic still names the last error — the retry
+separates "still starting" from "broken" rather than hiding the second.
+
+The reason this is worth a cycle: a suite that is green only on an idle machine teaches everyone
+to re-run until it passes, and after that it is no longer evidence of anything. This audit has
+spent a hundred cycles insisting that evidence be real; a flaky test is evidence with a hole in
+it.
+
+1100 tests, 0 failed. The suite was run after a full process cleanup, three times in a row
+across recent cycles, each green.
