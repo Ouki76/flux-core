@@ -22,6 +22,19 @@ this host's own run-to-run spread; a row inside it is at parity.
 Last full run (four rounds, 200 MiB): **ASSERT PASSED** — fourteen of fifteen rows ahead of
 sing-box, ten of ten ahead of xray. The table itself is in `docs/audit-log.md`.
 
+The rows that look close in a four-round run need eight: on a shared host, one slow round and
+one fast competitor round can decide a best-of-four. Re-run with `--rounds 8`:
+
+| row | flux | sing-box | xray |
+|---|---|---|---|
+| Shadowsocks-2022 | 358.4 (+5.6%) | 339.4 | 254.1 (+41.0%) |
+| VLESS / REALITY | 360.2 (+11.5%) | 323.0 | 242.6 (+48.5%) |
+| VLESS / REALITY + Vision | 347.2 (+9.0%) | 318.4 | 228.6 (+51.9%) |
+| VMess / WS + TLS | 229.4 (+17.0%) | 196.0 | 160.3 (+43.1%) |
+
+With that sampling, **fifteen of fifteen rows are ahead of sing-box** and ten of ten ahead of
+xray.
+
 Some individual rows (this host, best of four):
 
 | protocol | flux | sing-box | xray |

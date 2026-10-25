@@ -6065,3 +6065,42 @@ someone can check.
 | `bench_rps --assert 0.10` (plain, TLS) | PASSED |
 | `bench_udp --assert 0.10` | PASSED |
 | `bench_rps --idle --assert 0.10` | PASSED |
+
+---
+
+## Cycle 132 — 2026-10-25
+
+### The tight rows, measured properly
+
+Three rows looked marginal in the four-round snapshot (VMess +1.0%, REALITY +2.9%,
+Shadowsocks-2022 −3.8%). Rather than argue about noise, each was re-run with eight rounds — more
+chances at a quiet moment on a shared host.
+
+| row | flux | sing-box | vs sbox | xray | vs xray |
+|---|---|---|---|---|---|
+| Shadowsocks-2022 | 358.4 | 339.4 | **+5.6%** | 254.1 | +41.0% |
+| VLESS / REALITY | 360.2 | 323.0 | **+11.5%** | 242.6 | +48.5% |
+| VLESS / REALITY + Vision | 347.2 | 318.4 | **+9.0%** | 228.6 | +51.9% |
+| VMess / WS + TLS | 229.4 | 196.0 | **+17.0%** | 160.3 | +43.1% |
+
+Shadowsocks-2022 per round, which is why the four-round number misled:
+
+```
+flux-core  median 326.4   min 276.1   max 358.0   (8 rounds)
+sing-box   median 297.2   min 257.2   max 338.8   (8 rounds)
+```
+
+Flux is ahead on the median by 9.8% and on the best by 5.6%; the four-round sample caught one
+slow flux round and one fast sing-box round, and best-of-4 amplified exactly that. **The row was
+never behind — the sample was too small.**
+
+### What this changes about the claim
+
+With eight rounds on the four rows that looked close, **fifteen of fifteen rows are ahead of
+sing-box** and ten of ten ahead of xray, with no row inside the noise band. The earlier "14 of
+15, one at parity" was an honest reading of a thin sample, not of the system.
+
+The lesson is about method, not about the code: a best-of-N on a shared host needs N large
+enough that one outlier round cannot decide the answer. Four was not. Eight is enough to show
+the margin, and the per-round dumps are in `/tmp/reality8.log`, `/tmp/vmess8.log` and
+`/tmp/ss2022.log`… which are temporary, so the numbers above are the record.

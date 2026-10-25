@@ -147,6 +147,9 @@ medians are in `docs/audit-log.md`):
 cargo run --release --example bench_matrix -- --rounds 4 --mb 200 --assert 0.10
 ```
 
+Every claim in this README has a command behind it — see **[docs/VERIFICATION.md](docs/VERIFICATION.md)**
+for the full list, including the ones deliberately *not* claimed.
+
 `--assert` exits non-zero if any row falls behind sing-box or xray by more than the tolerance
 (default 10%, this host's run-to-run spread), so "ahead on every path" is a command rather than
 a claim. Last full run: **ASSERT PASSED**, fourteen of fifteen rows ahead of sing-box and ten of
