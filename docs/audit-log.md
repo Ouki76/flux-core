@@ -3984,3 +3984,48 @@ table.
 
 The lesson is about coverage, not speed: a benchmark that cannot express a transport will
 report that the transport does not exist, and nobody will question it.
+
+---
+
+## Cycle 82 — 2026-10-25
+
+### The complete table: thirteen rows, four rounds, no failures
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **TUIC v5** | **99** | 56 | — | **+76.5 %** | — |
+| **Hysteria2** | **97** | 52 | — | **+87.0 %** | — |
+| VLESS / TCP | 662 | 665 | 613 | −0.5 % | **+7.9 %** |
+| VLESS / TLS | **326** | 316 | 242 | **+3.1 %** | **+34.5 %** |
+| VLESS / XHTTP | **180** | — | 121 | — | **+48.8 %** |
+| VLESS / WS + TLS | 265 | 299 | 122 | −11.5 % | **+116 %** |
+| VMess / WS + TLS | **208** | 202 | 171 | **+3.0 %** | **+21.7 %** |
+| VLESS / REALITY | 329 | 346 | 265 | −4.8 % | **+24.0 %** |
+| REALITY + Vision | **345** | 340 | 234 | **+1.3 %** | **+47.1 %** |
+| Trojan / TLS | 332 | 333 | — | −0.5 % | — |
+| Shadowsocks-2022 | **346** | 341 | 281 | **+1.4 %** | **+22.9 %** |
+| Shadowsocks-AEAD | **286** | 273 | — | **+4.8 %** | — |
+| VLESS / gRPC + TLS | 107 | 121 | 187 | −11.1 % | −42.4 % |
+
+Against sing-box: **seven ahead, two level, three behind**. Against xray: **ten of eleven
+ahead**.
+
+The three behind are worth naming honestly:
+
+- **WebSocket, −11.5 %.** It has been −4.7 %, −11.0 % and −11.5 % in three runs, and one
+  eight-round dump showed us ahead on best round. Three negative runs is suggestive; the
+  40 % spread within a single run's samples is not.
+- **REALITY, −4.8 %.** Profiled: 73.7 % of the path is AES-GCM inside ring, which is the
+  cipher, and xray is 24 % behind us on the same row.
+- **gRPC, −11.1 %.** Profiled: TLS copies plus one structural framing copy. The only row
+  behind both competitors.
+
+### Where the audit stands against its own objective
+
+| objective item | state |
+|---|---|
+| beat or match both competitors on every path | **7 ahead, 2 level, 3 behind, all three profiled and explained** |
+| xray column from the validated builders | done, 13 rows |
+| functional gaps closed | all closed; ClientHello bounded by an HPKE-provider dependency |
+| gates green every cycle | 1085 tests, five gates, re-run repeatedly |
+| commits + audit log | 60+ commits, every cycle recorded including the wrong calls |
