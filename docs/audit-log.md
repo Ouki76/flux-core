@@ -6538,3 +6538,47 @@ of sampling found the answer, which is that the question was wrong.
 Every row that looked marginal at four rounds is comfortably ahead at eight. The four-round
 number is not wrong, it is **undersampled**, and best-of-N punishes that specifically because the
 competitor only needs one good round to set the bar.
+
+---
+
+## Cycle 144 — 2026-10-25
+
+### Sixty-one unsafe blocks, nine SAFETY comments
+
+Clippy's `undocumented_unsafe_blocks` was run across the workspace for the first time in this
+audit. The count:
+
+```
+61 unsafe blocks in library code
+ 9 SAFETY comments
+```
+
+Nothing here is unsound that I know of — the blocks are `pipe2`, `splice`, `sendmsg`, `recvmsg`,
+`setsockopt`, `close` and `shutdown`, all of them necessary and all of them with the surrounding
+invariants written down in prose nearby. But "the invariants are nearby, in the module
+documentation" is not what a reviewer of an `unsafe` block needs; they need to know, at that
+line, what makes the pointer valid.
+
+Documented so far, with the invariant rather than the syscall name:
+
+| crate | blocks | state |
+|---|---|---|
+| `flux-common` (splice fast path) | 10 | **done** |
+| `flux-inbound` (tproxy) | 2 | **done** |
+| `flux-inbound` (tun, wireguard, redirect) | 27 | next |
+| `flux-outbound` (wireguard) | 12 | next |
+| tests and examples | 27 | last |
+
+The comments that were written say things like:
+
+> `fds` is a live two-element array, which is exactly the buffer `pipe2` writes two `c_int`
+> descriptors into
+
+which is worth having, rather than
+
+> SAFETY: calls libc
+
+which is not.
+
+This is the least exciting work in the audit and it is the kind that pays off exactly once, when
+someone changes a length or an offset and a comment tells them what they just broke.
