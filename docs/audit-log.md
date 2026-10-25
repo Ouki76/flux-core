@@ -4554,3 +4554,30 @@ verified why, so the number is reported and the explanation is not claimed.
 The matrix said we were at parity or better on throughput. This says the same code is 37 %
 faster at the workload that a browser actually generates, and it was invisible until it was
 measured — the same lesson as the three UDP protocols, arriving from a different direction.
+
+### Scaling, and an xray number that is not a claim
+
+Three concurrency levels, 4 000 exchanges each:
+
+| connections | flux-core | sing-box | xray |
+|---|---|---|---|
+| 8 | **14 758** (507 µs) | 9 914 (708 µs) | 1 424 (862 µs) |
+| 32 | **14 063** (1 935 µs) | 10 598 (2 711 µs) | 1 177 (2 192 µs) |
+| 128 | **13 401** (8 225 µs) | 10 558 (10 298 µs) | 1 203 (8 580 µs) |
+
+The median latency scales with concurrency exactly as it should — 8 connections at 507 µs,
+128 at 8.2 ms — which says the harness is measuring per-exchange work and not something
+artificial. Throughput stays flat across a 16x range in both our stack and sing-box, and the
+margin holds at every level: **+49 % at 8 connections, +33 % at 32, +27 % at 128**.
+
+**The xray column is reported, not claimed.** Its rate is ~1.2 k/s at every concurrency level,
+while its median latency looks normal, which cannot both be true of a healthy path: 32
+connections at 2.2 ms should produce ~14 k/s. Bisected it: an xray SOCKS inbound with a
+`freedom` outbound and **no tunnel at all** measures **1 172 exchanges/s** standalone, the same
+number the tunnelled row produces. So the limit is in the inbound as this configuration drives
+it, not in the tunnel and not in the harness — the same harness gets 14 k from the other two
+stacks.
+
+That is as far as the evidence goes. Something about how xray 26.3.27 serves this SOCKS
+configuration costs ~0.8 ms of serialisation per connection, and until that is understood the
+13x figure in this table is a property of this setup, not a fact about xray.
