@@ -4493,3 +4493,31 @@ than made silently at 3 a.m. in cycle 53.
 What would settle it: a way to get the benefit without the memory, e.g. allocating the second
 buffer only while a write is actually outstanding and shrinking the pair to 2 x 32 KiB in that
 case. That is the next experiment, not the next paragraph.
+
+### The read-ahead experiment: implemented, measured, reverted
+
+The double-buffer idea was implemented in its memory-neutral form — an extra buffer
+allocated per direction **only while a write is actually outstanding**, promoted to the head
+of the queue as soon as the previous write drains — and measured on the row it was written
+for.
+
+| run | flux | sing-box | delta |
+|---|---|---|---|
+| before, 6 rounds | 350.8 best | 404.0 best | −10.8 % |
+| after, 6 rounds | 319.4 | 342.0 | −6.6 % |
+| after, 6 rounds | 326.9 | 372.8 | −12.3 % |
+| after, 6 rounds | 350.6 | 390.7 | −10.3 % |
+
+Median delta before −10.8 %, after −10.3 %. **No effect**, and the absolutes moved on both
+sides because the machine did — exactly the trap this log keeps warning about.
+
+Reverted. It added two lazily allocated buffers, a second pending slot per direction and a
+promotion step to the hottest, most stall-prone function in the project, for a change in the
+fourth significant figure of a measurement whose noise is ten times larger.
+
+That makes **four** hypotheses falsified for this row — cipher (CPU), chunking (the reader
+already coalesces), halves (cross-pairing), serialisation (this experiment) — and one open
+question that has resisted every attempt to attribute it. Four measured negatives on a single
+row is where an audit should stop asserting and start saying: this is 11 % on a symmetric
+synthetic workload, every isolated dimension of the same code is faster, and no mechanism has
+survived testing.
