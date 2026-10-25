@@ -326,3 +326,71 @@ fn which_xray() -> Option<String> {
     let p = format!("{home}/.local/bin/xray");
     std::path::Path::new(&p).is_file().then_some(p)
 }
+
+/// **The fallback, end to end.** A server that speaks only TLS 1.2 cannot talk to the native
+/// client, which is 1.3-only; the dial path must notice and retry with rustls. Without the
+/// retry this test fails to connect at all, which is exactly what it exists to detect.
+#[tokio::test]
+async fn a_tls12_only_server_is_reached_through_the_fallback() {
+    let Some(bin) = which_xray() else {
+        panic!("the `xray` binary is required by this test but was not found");
+    };
+    let echo = echo_server().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cert_path, key_path) = self_signed(dir.path());
+    let server_port = common::get_free_tcp_port().await;
+    let socks_port = common::get_free_tcp_port().await;
+
+    // Xray pinned to TLS 1.2: the native client will be refused with alert 70.
+    let server_cfg = format!(
+        r#"{{
+  "log": {{"loglevel": "warning"}},
+  "inbounds": [{{
+    "port": {server_port}, "listen": "127.0.0.1", "protocol": "vless",
+    "settings": {{"clients": [{{"id": "{UUID}"}}], "decryption": "none"}},
+    "streamSettings": {{"security": "tls", "tlsSettings": {{
+      "minVersion": "1.2", "maxVersion": "1.2",
+      "certificates": [{{"certificateFile": "{}", "keyFile": "{}"}}]}}}}
+  }}],
+  "outbounds": [{{"protocol": "freedom"}}]
+}}"#,
+        cert_path.display(),
+        key_path.display()
+    );
+    let _server = spawn(&bin, &server_cfg, dir.path()).expect("spawn xray");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // No `native_tls` key at all: this is the default configuration.
+    let flux_cfg = format!(
+        r#"{{
+  "log": {{"level": "warn"}},
+  "inbounds": [{{
+    "tag": "socks-in",
+    "carrier": {{"type": "tcp", "listen": "127.0.0.1", "listen_port": {socks_port}}},
+    "protocol": {{"type": "socks"}}
+  }}],
+  "outbounds": [{{
+    "tag": "node",
+    "carrier": {{"type": "tcp", "address": "127.0.0.1:{server_port}"}},
+    "security": {{"type": "tls", "sni": "localhost", "insecure": true}},
+    "protocol": {{"type": "vless", "uuid": "{UUID}"}}
+  }}],
+  "route": {{"final": "node"}}
+}}"#
+    );
+    let instance =
+        flux_app::Instance::new(flux_app::Config::from_json_str(&flux_cfg).expect("config"))
+            .expect("instance");
+    instance.start().await.expect("start");
+
+    let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let got = tokio::time::timeout(
+        Duration::from_secs(25),
+        roundtrip(socks_port, echo, &payload),
+    )
+    .await
+    .expect("the fallback must reach a TLS 1.2-only server")
+    .expect("socks request must succeed");
+    assert_eq!(got, payload, "the fallback corrupted the payload");
+    let _ = instance.stop().await;
+}
