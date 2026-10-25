@@ -1098,7 +1098,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for VmessStream<S> {
         // chunk per `poll_write` turned a 64 KiB write into four frames, four seals
         // and four syscalls — the defect fixed in the WebSocket, Shadowsocks and
         // REALITY transports, which had all been capped at one framing unit per call.
-        let cap = buf.len().min(64 * 1024);
+        let cap = buf.len().min(flux_common::copy::RELAY_BUFFER_BYTES);
         let mut consumed = 0usize;
 
         this.write_buf.clear();

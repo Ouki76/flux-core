@@ -824,7 +824,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Ss2022Stream<S> {
         // One chunk per `poll_write` meant a 64 KiB write from the relay became four
         // calls, four seals and four syscalls — the same defect that capped the
         // WebSocket transport until its frame size matched the copy buffer.
-        let cap = buf.len().min(64 * 1024);
+        let cap = buf.len().min(flux_common::copy::RELAY_BUFFER_BYTES);
         let mut consumed = 0usize;
         this.write_buf.clear();
         while consumed < cap {

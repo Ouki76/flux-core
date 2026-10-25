@@ -1707,7 +1707,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
         // buffer, and hand them to the transport in one write. One record per call made
         // a 64 KiB write four records and four syscalls — the defect found in the
         // WebSocket, Shadowsocks, REALITY-read and VMess paths.
-        let cap = buf.len().min(64 * 1024);
+        let cap = buf.len().min(flux_common::copy::RELAY_BUFFER_BYTES);
         let mut n = 0usize;
         this.tx_buf.clear();
         while n < cap {

@@ -559,7 +559,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ShadowsocksStream<S> {
         // Frame several chunks per call, up to the relay's copy buffer, and write
         // them together: one chunk per call turned a 64 KiB write into four
         // syscalls and four seals.
-        let cap = buf.len().min(64 * 1024);
+        let cap = buf.len().min(flux_common::copy::RELAY_BUFFER_BYTES);
         let mut consumed = 0usize;
 
         let this = self.as_mut().get_mut();
