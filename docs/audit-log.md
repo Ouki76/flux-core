@@ -3911,3 +3911,39 @@ samples happened to land low. What is *not* noise is the CPU column: 5.9-7.9 s/G
 The lesson, which this log has now learned three times: at this host's noise level a single
 run cannot rank two stacks within 15 %, and quoting a median without the spread invites a
 wrong conclusion. The per-round dump is the honest artefact.
+
+---
+
+## Cycle 80 — 2026-10-25
+
+### A whole dimension was unmeasured: Hysteria2
+
+Every row in this audit until now carried a TCP-based protocol. Hysteria2 is a proxy protocol
+over QUIC — a different shape entirely — and it had no row, no comparison, and no number.
+It has one now:
+
+| | flux-core | sing-box | delta |
+|---|---|---|---|
+| Hysteria2 | **101.8 MB/s** | 51.8 MB/s | **+96.5 %** |
+
+Corroborated on a one-way download with a separate generator: 142-150 MiB/s against
+sing-box's 126-139 on the same workload.
+
+Two harness bugs had to be fixed before the row could exist, and both would have reported
+"unsupported" rather than "broken":
+
+1. **Readiness was TCP-only.** `wait_for_listener` connects with `TcpStream`, which can never
+   succeed against a UDP listener, so the row said *"server never listened"* while the server
+   was listening perfectly. `Scenario::is_quic` now picks the probe.
+2. **sing-box capability** was a list of transports, so it answered "no such transport" for a
+   protocol it supports.
+
+### And a workload that lies
+
+The first attempt measured Hy2 with the echo generator used everywhere else: both stacks fell
+to ~1 MiB/s. That is not a proxy property, it is the harness — a 16 KiB write-then-read over
+QUIC costs a full round trip each time, and the pattern measures latency, not throughput. A
+one-way download shows the real figure.
+
+Worth recording because the wrong workload produced a *believable* number (25 vs 1 MiB/s) that
+looked like a 25× win and would have been reported as one.
