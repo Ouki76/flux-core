@@ -3667,3 +3667,30 @@ argument: the instruction count does not care how loaded the machine is.
 Against xray, every row is ahead except gRPC (and Trojan, which xray 26 cannot run here).
 Against sing-box: TCP, TLS, WS, Vision, VMess and SS-AEAD are ahead or level, gRPC is −7 %,
 and the remaining gaps are inside this host's ±15 % noise.
+
+---
+
+## Cycle 77 — 2026-10-25
+
+### REALITY: 73.7 % in the cipher, and nothing to fix
+
+Profiled the same way as gRPC — our client under callgrind, a real xray REALITY server, a
+plain SOCKS driver:
+
+| function | instructions | calls |
+|---|---|---|
+| `_aesni_ctr32_ghash_6x` (ring's AES-GCM) | 151.3 M (**73.7 %**) | — |
+| ↳ from `aesni_gcm_encrypt` | 75.2 M | 1 832 |
+| ↳ from `aesni_gcm_decrypt` | 76.1 M | 3 672 |
+
+1 832 encrypt calls for 29 MiB is exactly one per 16 KiB TLS record, so the write side is
+correct. The read side shows twice as many calls because *xray* writes ~8 KiB records; our
+reader assembles full records before decrypting, which is checked, not assumed.
+
+So this row is the cipher and nothing else. We already offer AES-128-GCM first (the cheaper
+suite), the client and server agree on it, and the remaining ~8 % against sing-box is Go's
+AES-GCM against ring's — a library difference, not a defect here. Against xray, which uses
+the same kind of path, we are 9-26 % ahead.
+
+Worth writing down because it closes a line of inquiry: **not every row has a fixable layer**.
+This one has a number that names the cipher and stops.
