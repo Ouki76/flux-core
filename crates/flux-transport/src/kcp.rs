@@ -61,6 +61,23 @@
 //!   an AES-GCM AEAD keyed from the seed (`NewAEADAESGCMBasedOnSeed`, now
 //!   `finalmask/mkcp/aes128gcm`). [`KcpObfs`] has no such mode, and a peer
 //!   configured with `seed` cannot be read by this module.
+//!
+//!   The construction, read from Xray's source rather than guessed, so that
+//!   whoever implements it does not have to search again:
+//!
+//!   * `transport/internet/kcp/cryptreal.go`: `NewAEADAESGCMBasedOnSeed(seed)`
+//!     hashes the seed with SHA-256 and builds **AES-128-GCM** from
+//!     `hashedSeed[:16]` — the first 16 bytes, not all 32. (Commit `2b82366`,
+//!     "mKCP: Fix key derivation for obfuscation", is what changed `[:]` to
+//!     `[:16]`; a peer built before that change derives a different key.)
+//!   * `transport/internet/finalmask/mkcp/aes128gcm/conn.go`: the wire form is
+//!     `nonce ‖ ciphertext ‖ tag` with a 12-byte nonce, i.e. the standard
+//!     AES-GCM framing with the tag appended and no additional data.
+//!   * Xray 26 removed `seed` from the classic mKCP config and refuses it with
+//!     `PrintRemovedFeatureError`; the replacement is
+//!     `finalmask.udp: [{"type":"mkcp-aes128gcm"}]` composed with
+//!     `mkcp-original`. So an interop test needs the `finalmask` shape, not
+//!     `kcpSettings.seed`.
 //! * Congestion control shape. `no_congestion` mirrors Xray's `congestion:
 //!   false` (a fixed window), but the adaptive path here is a plain
 //!   slow-start/AIMD on the window rather than Xray's
