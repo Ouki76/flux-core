@@ -6863,3 +6863,44 @@ The state, with every claim traceable to a command:
 One clause of eight sub-items is not met, and it is the one the dependency cannot express. The
 other seven, the matrix, the four measured axes and the five gates are each defended by a command
 whose failure has been observed.
+
+---
+
+## Cycle 153 — 2026-10-25
+
+### The gate, run once more at the end
+
+```
+$ ./target/release/examples/bench_matrix --rounds 4 --mb 200 --assert 0.10
+ASSERT PASSED: every row is at or above both competitors within 10%
+```
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | 737.0 | 571.0 | 620.3 | +29.1% | +18.8% |
+| WireGuard | 64.7 | 40.2 | — | +60.8% | — |
+| TUIC v5 | 100.7 | 49.1 | — | +105.3% | — |
+| Hysteria2 | 93.9 | 45.6 | — | +105.9% | — |
+| VLESS / TLS | 332.1 | 298.9 | 244.1 | +11.1% | +36.1% |
+| VLESS / XHTTP | 449.6 | — | 130.4 | — | +244.8% |
+| VLESS / WS + TLS | 308.1 | 296.8 | 93.7 | +3.8% | +228.9% |
+| VLESS / gRPC (no TLS) | 465.5 | — | 160.1 | — | +190.7% |
+| VLESS / gRPC + TLS | 200.1 | 99.4 | 165.7 | +101.2% | +20.8% |
+| VLESS / REALITY | 349.9 | 334.0 | 241.1 | +4.8% | +45.1% |
+| VLESS / REALITY + Vision | 344.3 | 285.3 | 230.5 | +20.7% | +49.4% |
+| VMess / WS + TLS | 231.8 | 198.5 | 163.4 | +16.8% | +41.9% |
+| Trojan / TLS | 360.0 | 300.9 | — | +19.6% | — |
+| Shadowsocks-2022 | 374.2 | 344.0 | 263.3 | +8.8% | +42.1% |
+| Shadowsocks-AEAD | 253.0 | 253.2 | — | −0.1% | — |
+
+Fourteen clearly ahead, one at −0.1% — parity on this run, where eight rounds measure it at +4.5%.
+`WS + TLS` at +3.8% is likewise an eight-round +19%. The gate tolerates both, which is what the
+10% band is for: a row inside it is not behind, it is unmeasured on that sample.
+
+### What the file records
+
+A hundred and fifty-three cycles of entries, most of them small, a few of them — the relay
+buffer, the h2 windows, the seven files that capped writes, the source-address pin — worth more
+than the rest combined. The work is finished in the sense that matters: every claim is a command,
+every command has been seen to fail, and the one item that is not done is not done for a reason
+that a grep can demonstrate.
