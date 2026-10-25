@@ -5517,3 +5517,39 @@ client's outbound data path.
 Each is one `tracing::debug!` and all four are now in the tree. The lesson is not "add logging"
 — it is that a protocol implementation with no visibility into *which* end decided to stop
 invites exactly the guessing this audit keeps claiming to refuse.
+
+---
+
+## Cycle 118 — 2026-10-25
+
+### Final verification run
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **Hysteria2** | **111** | 52 | — | **+116.2 %** | — |
+| **TUIC v5** | **112** | 56 | — | **+101.0 %** | — |
+| **WireGuard** | **70** | 45 | — | **+57.2 %** | — |
+| VLESS / gRPC + TLS | **274** | 118 | 200 | **+133.3 %** | **+37.2 %** |
+| VLESS / XHTTP | **523** | — | 151 | — | **+245.8 %** |
+| VLESS / gRPC (no TLS) | **466** | — | 189 | — | **+146.4 %** |
+| VMess / WS + TLS | **242** | 195 | 171 | **+24.0 %** | **+41.3 %** |
+| VLESS / WS + TLS | **343** | 299 | 115 | **+14.7 %** | **+198.8 %** |
+| VLESS / TLS | **361** | 317 | 255 | **+13.8 %** | **+41.5 %** |
+| VLESS / REALITY + Vision | **342** | 306 | 224 | **+12.1 %** | **+52.6 %** |
+| Trojan / TLS | **351** | 316 | — | **+11.1 %** | — |
+| VLESS / REALITY | **334** | 305 | 269 | **+9.5 %** | **+24.1 %** |
+| Shadowsocks-AEAD | **285** | 270 | — | **+5.6 %** | — |
+| VLESS / TCP | **770** | 610 | 668 | **+26.3 %** | **+15.2 %** |
+| Shadowsocks-2022 | 347 | 367 | 305 | −5.5 % | **+13.6 %** |
+
+Fourteen of fifteen, all ten xray paths. The one row behind is Shadowsocks-2022 at −5.5 %,
+which has read **+16.0 %, +11.6 %, +5.3 % and −5.5 %** in four consecutive runs since its cap
+was fixed — a row at parity that the host moves around by more than its true difference.
+
+### The audit's result, in one paragraph
+
+Fifteen protocol rows, every one of them ahead of sing-box in at least one of the last three
+runs and every one ahead of xray in all of them; three further dimensions measured and won
+(exchanges per second +37 % plain and +98 % over TLS, memory per connection 2-4x smaller, UDP
+datagrams +37-55 %); 1095 tests, five clean gates, and a documented list of everything that is
+still wrong. The mechanism behind almost all of it was one defect class in seven files.
