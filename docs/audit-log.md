@@ -5553,3 +5553,41 @@ runs and every one ahead of xray in all of them; three further dimensions measur
 (exchanges per second +37 % plain and +98 % over TLS, memory per connection 2-4x smaller, UDP
 datagrams +37-55 %); 1095 tests, five clean gates, and a documented list of everything that is
 still wrong. The mechanism behind almost all of it was one defect class in seven files.
+
+---
+
+## Cycle 119 — 2026-10-25
+
+### `sending_next` was carrying the wrong counter entirely
+
+Nothing in four cycles of reasoning would have found this; one log line did. Instrumenting the
+first three outgoing segments:
+
+```
+sending conv=0x086f cmd=1 option=0 sn=0 sending_next=0 una=0 len=26
+sending conv=0x086f cmd=3 option=0 sn=0 sending_next=0 una=0 len=0
+sending conv=0x086f cmd=1 option=0 sn=0 sending_next=0 una=0 len=26
+```
+
+**`sn=0` with `sending_next=0`.** The field means "the next sequence number I will send", and
+it was set to `rcv_nxt` — the *receive* counter, which has nothing to do with what we will send.
+Xray uses it to decide whether a peer has finished (`peer_next == snd_nxt`), so our first data
+segment told a real server "I have nothing further to send". Xray answered by marking its own
+data `SegmentOptionClose`, which this module honours as EOF, and the stream died 130 ms after
+connecting — every time, in every attempt.
+
+Fixed to `snd_nxt`. The immediate close is gone and Xray now accepts the VLESS request and opens
+the destination.
+
+**The client direction still does not carry data**: segment 0 is retransmitted without an ACK,
+so the interop is one layer further in but not finished. Kept as a fix regardless: the value
+was wrong by the protocol's own definition, and a peer that does not happen to care is not a
+reason to keep telling it something untrue.
+
+### A note on the test run
+
+The first full-suite run after the change reported two failures, both
+`connection refused` to an xray SOCKS port — my own leftover `xray` processes from the manual
+interop runs, still holding ports. Cleaned up, the suite is **1095 passed, 0 failed**. Recorded
+because "the tests fail" and "the machine is full of my debris" look identical in a summary
+line, and only one of them is about the code.
