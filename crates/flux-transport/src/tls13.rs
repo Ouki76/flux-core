@@ -1225,3 +1225,133 @@ mod ee_tests {
         assert!(parse_encrypted_extensions(&msg, &[b"h2"]).is_err());
     }
 }
+
+/// TLS 1.3 group ids and the GREASE table (RFC 8701).
+pub(crate) const GROUP_X25519: u16 = 0x001d;
+pub(crate) const GROUP_SECP256R1: u16 = 0x0017;
+pub(crate) const GROUP_SECP384R1: u16 = 0x0018;
+pub(crate) const ALPN_OFFERED: [&[u8]; 2] = [b"h2", b"http/1.1"];
+/// RFC 8701 GREASE values. A browser puts one of these in its cipher list, extension list
+/// and group list, chosen per connection, and peers must ignore it.
+const GREASE_VALUES: [u16; 16] = [
+    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
+    0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
+];
+
+/// Builds a browser-shaped TLS 1.3 `ClientHello` handshake message.
+///
+/// Shared by every handshake this crate drives: the shape of this message is an observable
+/// fingerprint, so it must not be written twice and allowed to drift. `eph_pub` is the
+/// X25519 key share the caller will use for the handshake; `random` seeds the client random
+/// and the per-connection GREASE value.
+pub(crate) fn build_client_hello(
+    server_name: &str,
+    alpn: &[&[u8]],
+    random: &[u8; 32],
+    eph_pub: &[u8; 32],
+) -> Vec<u8> {
+    let mut hello: Vec<u8> = Vec::with_capacity(512);
+    hello.extend_from_slice(&[HS_CLIENT_HELLO, 0, 0, 0]); // length patched later
+    hello.extend_from_slice(&[0x03, 0x03]); // legacy_version
+    hello.extend_from_slice(random);
+    hello.push(32); // session_id length
+    hello.extend_from_slice(&[0u8; 32]); // session_id placeholder (offset 39)
+    // Cipher suites, Chrome's list with a GREASE value in front (RFC 8701). A ClientHello
+    // that offers only the three TLS 1.3 suites and no GREASE is not something any browser
+    // sends, and its JA3 is a stable signature — which is exactly what this transport exists
+    // to avoid. Only the 1.3 suites can be selected (supported_versions offers nothing else),
+    // so the legacy entries are decoration for the observer.
+    let grease = GREASE_VALUES[(random[0] as usize) % GREASE_VALUES.len()];
+    let suites: [u16; 10] = [
+        grease, 0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9, 0xCCA8,
+    ];
+    hello.extend_from_slice(&((suites.len() * 2) as u16).to_be_bytes());
+    for suite in suites {
+        hello.extend_from_slice(&suite.to_be_bytes());
+    }
+    hello.extend_from_slice(&[0x01, 0x00]); // compression methods
+
+    let mut ext: Vec<u8> = Vec::with_capacity(256);
+    // A GREASE extension of the same value, first in the list.
+    ext.extend_from_slice(&grease.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+    // extended_master_secret: every browser sends it, empty body.
+    ext.extend_from_slice(&0x0017u16.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+    // renegotiation_info: a single zero byte, as browsers send for a fresh connection.
+    ext.extend_from_slice(&0xff01u16.to_be_bytes());
+    ext.extend_from_slice(&1u16.to_be_bytes());
+    ext.push(0);
+    // server_name
+    let sni = server_name.as_bytes();
+    ext.extend_from_slice(&0x0000u16.to_be_bytes());
+    ext.extend_from_slice(&((5 + sni.len()) as u16).to_be_bytes());
+    ext.extend_from_slice(&((3 + sni.len()) as u16).to_be_bytes());
+    ext.push(0);
+    ext.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    ext.extend_from_slice(sni);
+    // ALPN: a ClientHello without it is a loud non-browser signal — every
+    // browser offers `h2` and `http/1.1`, and the cover site almost certainly
+    // serves HTTP/2. The REALITY server ignores the contents (it authenticates
+    // the session id), so this only affects what an on-path observer sees.
+
+    let alpn_list_len: usize = alpn.iter().map(|p| 1 + p.len()).sum();
+    ext.extend_from_slice(&0x0010u16.to_be_bytes()); // extension_type
+    ext.extend_from_slice(&((2 + alpn_list_len) as u16).to_be_bytes()); // ext length
+    ext.extend_from_slice(&(alpn_list_len as u16).to_be_bytes()); // protocol list
+    for proto in alpn {
+        ext.push(proto.len() as u8);
+        ext.extend_from_slice(proto);
+    }
+    // supported_versions: TLS 1.3
+    ext.extend_from_slice(&0x002bu16.to_be_bytes());
+    ext.extend_from_slice(&3u16.to_be_bytes());
+    ext.extend_from_slice(&[0x02, 0x03, 0x04]);
+    // ec_point_formats: uncompressed only, as every browser sends.
+    ext.extend_from_slice(&0x000bu16.to_be_bytes());
+    ext.extend_from_slice(&2u16.to_be_bytes());
+    ext.extend_from_slice(&[1, 0]);
+    // session_ticket: empty, which is what a browser without a cached ticket sends.
+    ext.extend_from_slice(&0x0023u16.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+    // supported_groups: GREASE first, then the curves we can actually use.
+    let groups: [u16; 4] = [grease, GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1];
+    ext.extend_from_slice(&0x000au16.to_be_bytes());
+    ext.extend_from_slice(&((2 + groups.len() * 2) as u16).to_be_bytes());
+    ext.extend_from_slice(&((groups.len() * 2) as u16).to_be_bytes());
+    for group in groups {
+        ext.extend_from_slice(&group.to_be_bytes());
+    }
+    // key_share: x25519 ephemeral
+    ext.extend_from_slice(&0x0033u16.to_be_bytes());
+    ext.extend_from_slice(&38u16.to_be_bytes());
+    ext.extend_from_slice(&36u16.to_be_bytes());
+    ext.extend_from_slice(&GROUP_X25519.to_be_bytes());
+    ext.extend_from_slice(&32u16.to_be_bytes());
+    ext.extend_from_slice(eph_pub);
+    // signature_algorithms (ed25519 first — REALITY server cert is ed25519)
+    let sigalgs: [u16; 9] = [
+        0x0807, 0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501,
+    ];
+    ext.extend_from_slice(&0x000du16.to_be_bytes());
+    ext.extend_from_slice(&((2 + sigalgs.len() * 2) as u16).to_be_bytes());
+    ext.extend_from_slice(&((sigalgs.len() * 2) as u16).to_be_bytes());
+    for alg in sigalgs {
+        ext.extend_from_slice(&alg.to_be_bytes());
+    }
+    // psk_key_exchange_modes: psk_dhe_ke (required for a spec-conformant CH)
+    ext.extend_from_slice(&0x002du16.to_be_bytes());
+    ext.extend_from_slice(&2u16.to_be_bytes());
+    ext.extend_from_slice(&[0x01, 0x01]);
+
+    hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    hello.extend_from_slice(&ext);
+
+    // Patch handshake length
+    let hs_len = (hello.len() - 4) as u32;
+    let hs_len_bytes = hs_len.to_be_bytes();
+    hello[1] = hs_len_bytes[1];
+    hello[2] = hs_len_bytes[2];
+    hello[3] = hs_len_bytes[3];
+    hello
+}
