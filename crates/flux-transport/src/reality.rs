@@ -52,6 +52,14 @@ const MAX_TLS_RECORD: usize = 16384;
 const MAX_HANDSHAKE_RECORD: usize = 16384 + 2048;
 
 const GROUP_X25519: u16 = 0x001d;
+const GROUP_SECP256R1: u16 = 0x0017;
+const GROUP_SECP384R1: u16 = 0x0018;
+/// RFC 8701 GREASE values. A browser puts one of these in its cipher list, extension list
+/// and group list, chosen per connection, and peers must ignore it.
+const GREASE_VALUES: [u16; 16] = [
+    0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A, 0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
+    0xCACA, 0xDADA, 0xEAEA, 0xFAFA,
+];
 const GROUP_X25519_MLKEM768: u16 = 0x11ec;
 const MLKEM768_ENC_KEY_SIZE: usize = 1184;
 
@@ -963,10 +971,32 @@ impl Tls13Client {
         hello.extend_from_slice(&random);
         hello.push(32); // session_id length
         hello.extend_from_slice(&[0u8; 32]); // session_id placeholder (offset 39)
-        hello.extend_from_slice(&[0x00, 0x06, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03]); // cipher suites
+        // Cipher suites, Chrome's list with a GREASE value in front (RFC 8701). A ClientHello
+        // that offers only the three TLS 1.3 suites and no GREASE is not something any browser
+        // sends, and its JA3 is a stable signature — which is exactly what this transport exists
+        // to avoid. Only the 1.3 suites can be selected (supported_versions offers nothing else),
+        // so the legacy entries are decoration for the observer.
+        let grease = GREASE_VALUES[(random[0] as usize) % GREASE_VALUES.len()];
+        let suites: [u16; 10] = [
+            grease, 0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9, 0xCCA8,
+        ];
+        hello.extend_from_slice(&((suites.len() * 2) as u16).to_be_bytes());
+        for suite in suites {
+            hello.extend_from_slice(&suite.to_be_bytes());
+        }
         hello.extend_from_slice(&[0x01, 0x00]); // compression methods
 
         let mut ext: Vec<u8> = Vec::with_capacity(256);
+        // A GREASE extension of the same value, first in the list.
+        ext.extend_from_slice(&grease.to_be_bytes());
+        ext.extend_from_slice(&0u16.to_be_bytes());
+        // extended_master_secret: every browser sends it, empty body.
+        ext.extend_from_slice(&0x0017u16.to_be_bytes());
+        ext.extend_from_slice(&0u16.to_be_bytes());
+        // renegotiation_info: a single zero byte, as browsers send for a fresh connection.
+        ext.extend_from_slice(&0xff01u16.to_be_bytes());
+        ext.extend_from_slice(&1u16.to_be_bytes());
+        ext.push(0);
         // server_name
         let sni = cfg.server_name.as_bytes();
         ext.extend_from_slice(&0x0000u16.to_be_bytes());
@@ -992,11 +1022,21 @@ impl Tls13Client {
         ext.extend_from_slice(&0x002bu16.to_be_bytes());
         ext.extend_from_slice(&3u16.to_be_bytes());
         ext.extend_from_slice(&[0x02, 0x03, 0x04]);
-        // supported_groups: x25519
-        ext.extend_from_slice(&0x000au16.to_be_bytes());
-        ext.extend_from_slice(&4u16.to_be_bytes());
+        // ec_point_formats: uncompressed only, as every browser sends.
+        ext.extend_from_slice(&0x000bu16.to_be_bytes());
         ext.extend_from_slice(&2u16.to_be_bytes());
-        ext.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        ext.extend_from_slice(&[1, 0]);
+        // session_ticket: empty, which is what a browser without a cached ticket sends.
+        ext.extend_from_slice(&0x0023u16.to_be_bytes());
+        ext.extend_from_slice(&0u16.to_be_bytes());
+        // supported_groups: GREASE first, then the curves we can actually use.
+        let groups: [u16; 4] = [grease, GROUP_X25519, GROUP_SECP256R1, GROUP_SECP384R1];
+        ext.extend_from_slice(&0x000au16.to_be_bytes());
+        ext.extend_from_slice(&((2 + groups.len() * 2) as u16).to_be_bytes());
+        ext.extend_from_slice(&((groups.len() * 2) as u16).to_be_bytes());
+        for group in groups {
+            ext.extend_from_slice(&group.to_be_bytes());
+        }
         // key_share: x25519 ephemeral
         ext.extend_from_slice(&0x0033u16.to_be_bytes());
         ext.extend_from_slice(&38u16.to_be_bytes());
@@ -3169,6 +3209,25 @@ mod client_hello_shape_tests {
         out
     }
 
+    /// The cipher list from the same walk. Kept separate because GREASE has to be visible
+    /// there too, and a fingerprint is read from all three lists at once.
+    fn parse_ciphers(hello: &[u8]) -> Vec<u16> {
+        let hs_len = u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) as usize;
+        let body = &hello[9..9 + hs_len];
+        let sid_len = body[34] as usize;
+        let i = 35 + sid_len;
+        let cs_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        body[i + 2..i + 2 + cs_len]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect()
+    }
+
+    /// RFC 8701: GREASE values have the form `0x?a?a` with both bytes equal.
+    fn is_grease(value: u16) -> bool {
+        value & 0x0f0f == 0x0a0a && value.to_be_bytes()[0] == value.to_be_bytes()[1]
+    }
+
     /// A ClientHello with no ALPN is a loud non-browser signal, and the shape of
     /// the block must stay self-consistent or a REALITY server (and any on-path
     /// observer) sees something no browser emits.
@@ -3219,5 +3278,61 @@ mod client_hello_shape_tests {
                 "required extension {required:#06x} missing from {exts:?}"
             );
         }
+
+        // A browser's hello carries more than the minimum, and carries GREASE in three
+        // places. Without them the JA3 is short, stable and unmistakably a library's.
+        for browser_ext in [0x0017u16, 0xff01, 0x000b, 0x0023] {
+            assert!(
+                exts.contains(&browser_ext),
+                "browser extension {browser_ext:#06x} missing from {exts:?}"
+            );
+        }
+        assert!(
+            exts.iter().any(|t| is_grease(*t)),
+            "no GREASE extension in {exts:?}"
+        );
+
+        let ciphers = parse_ciphers(&hello);
+        assert!(
+            is_grease(ciphers[0]),
+            "the cipher list must open with GREASE, got {:#06x}",
+            ciphers[0]
+        );
+        assert!(ciphers.contains(&0x1301), "TLS 1.3 suites must be offered");
+
+        // And in supported_groups.
+        let groups_off = exts.iter().position(|t| *t == 0x000a).expect("groups");
+        let _ = groups_off;
+        assert!(
+            parse_groups(&hello).iter().any(|g| is_grease(*g)),
+            "no GREASE group"
+        );
+    }
+
+    /// The group list, for the same reason as the cipher list.
+    fn parse_groups(hello: &[u8]) -> Vec<u16> {
+        let hs_len = u32::from_be_bytes([0, hello[6], hello[7], hello[8]]) as usize;
+        let body = &hello[9..9 + hs_len];
+        let sid_len = body[34] as usize;
+        let mut i = 35 + sid_len;
+        let cs_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2 + cs_len + 2;
+        let ext_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+        i += 2;
+        let end = i + ext_len;
+        while i < end {
+            let ty = u16::from_be_bytes([body[i], body[i + 1]]);
+            let len = u16::from_be_bytes([body[i + 2], body[i + 3]]) as usize;
+            i += 4;
+            if ty == 0x000a {
+                let list_len = u16::from_be_bytes([body[i], body[i + 1]]) as usize;
+                return body[i + 2..i + 2 + list_len]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+            }
+            i += len;
+        }
+        Vec::new()
     }
 }
