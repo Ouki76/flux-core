@@ -215,6 +215,19 @@ connection's bytes is one careless `write_all(&guard)` away from cross-tenant
 disclosure. Resource cost per established TCP relay: ≈ 4 KB RSS and 6 file
 descriptors (2 sockets + 4 `splice` pipe ends); idle process footprint 7.5 MB.
 
+### UDP (datagrams, SOCKS5 relay, 1 200 B payload)
+
+| Path | flux-core | sing-box | xray |
+|---|---|---|---|
+| Relay, datagrams/s | **98 150** | 71 379 | 10 983 |
+
+Found by profiling rather than guessing: 90.7 % of the proxy's instructions under UDP load
+were in `memset`, because the buffer pool scrubbed its whole 64 KiB packet buffer on every
+release — once per datagram. The pool now scrubs only the prefix the caller reports as used,
+which preserves the property it exists for (a recycled buffer never holds the previous
+caller's payload, asserted by `a_short_release_still_leaves_no_payload_behind`) and moved the
+relay from 55 000 to 98 000 datagrams/s.
+
 **Sustained-load evidence**, not a snapshot: a 30-minute soak through a live instance moved
 **24 631 216 requests and 192 GB** with **0 errors**, RSS bounded at 18 MB (head median 16.9,
 tail median 18.2), file descriptors flat around 550 under load and 267 at rest, threads
