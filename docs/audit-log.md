@@ -4521,3 +4521,36 @@ question that has resisted every attempt to attribute it. Four measured negative
 row is where an audit should stop asserting and start saying: this is 11 % on a symmetric
 synthetic workload, every isolated dimension of the same code is faster, and no mechanism has
 survived testing.
+
+---
+
+## Cycle 94 — 2026-10-25
+
+### A dimension the matrix never had: requests per second
+
+Every measurement in this audit so far moves bulk data down one connection — 200 MiB for the
+matrix, 50 MiB for the direction experiments. That is the wrong shape for what a proxy serves
+in front of a browser: dozens of short connections, each a request and a reply. Nothing
+measured it.
+
+`examples/bench_rps.rs` does: 6 000 exchanges over 32 concurrent connections, each exchange a
+fresh SOCKS connect, a 1 KiB round trip and a close, against both competitors on the same row.
+
+| stack | run 1 | run 2 | run 3 | run 4 | median latency |
+|---|---|---|---|---|---|
+| **flux-core** | **14 655** | **14 799** | **14 418** | **14 159** | ~1.9 ms |
+| sing-box | 10 465 | 10 731 | 10 974 | 10 980 | ~2.7 ms |
+| xray | 1 065 | 1 067 | 1 068 | 1 148 | ~1.9 ms |
+
+**+37 % over sing-box on exchanges per second**, and the margin is where it should be: the
+median exchange is 1.9 ms against their 2.7 ms, on the same machine, payload and harness.
+
+xray is an order of magnitude behind on this workload while its median latency is identical
+to ours. That pattern says connection handling rather than per-request cost, but I have not
+verified why, so the number is reported and the explanation is not claimed.
+
+### Why this matters for the objective
+
+The matrix said we were at parity or better on throughput. This says the same code is 37 %
+faster at the workload that a browser actually generates, and it was invisible until it was
+measured — the same lesson as the three UDP protocols, arriving from a different direction.
