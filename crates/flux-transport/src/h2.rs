@@ -320,6 +320,12 @@ pub(crate) mod shared {
         S: AsyncStream + 'static,
     {
         let mut builder = h2::client::Builder::new();
+        // The client is the *receiver* of a download, so its advertised window is what
+        // limits the server's send rate. Leaving it at h2's 64 KiB default caps a stream at
+        // 64 KiB per round trip, which is far below what the link can carry — the server
+        // half of this module had these windows from the start and the client half did not.
+        builder.initial_window_size(INITIAL_STREAM_WINDOW);
+        builder.initial_connection_window_size(INITIAL_CONNECTION_WINDOW);
         builder.max_frame_size(MAX_FRAME_SIZE);
         let (client, connection) =
             builder
