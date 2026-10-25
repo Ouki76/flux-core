@@ -5743,3 +5743,43 @@ with the AES mask gets a tunnel that does not carry data. Without the mask — t
 So the recommendation for anyone reading this in the field is: **use the default mKCP
 configuration**, which works, and do not enable `seed` on a client until the next session
 finishes what this one left.
+
+---
+
+## Cycle 124 — 2026-10-25
+
+### A retraction, and what "prove it with a test" actually costs
+
+The objective says every fix must be proven by a test that fails without it. Applying that
+literally to the last three protocol changes produced a result worth more than the tests:
+
+| change | test fails without the change? | verdict |
+|---|---|---|
+| `sending_next` = `snd_nxt` | **yes** — `sn=0, sending_next=0` | keep |
+| first probe waits for idle | no | keep, but labelled a guard |
+| cumulative acknowledgement in `on_ack` | **no** | **delete the change** |
+
+The third was added last cycle on the theory that an empty numbers list meant the peer's
+acknowledgement was discarded. It was not: `process_peer_next` already releases everything below
+`receiving_next`. My block was dead code sitting in a hot path, and the test passed with and
+without it — which is exactly what a test is for when you are honest about running it that way.
+
+So the count from this hunt is now: **two real defects** (`sending_next`, the opening PING) and
+**one imaginary one** that I added and then removed. The one that mattered was proven by
+reverting it and watching the failure:
+
+```
+a DATA segment must advertise a sending_next past its own sn
+(sn=0, sending_next=0); rcv_nxt here tells the peer we are done
+```
+
+### Why the third test is kept anyway
+
+`the_first_flush_sends_no_ping` passes with the fix and, in this harness, also without it — the
+stream's inline flush does not reach the keepalive path the driver uses, so the test cannot see
+the regression. It is kept because it documents the intent and because a future refactor that
+makes the driver run first would give it teeth. The audit log says "guard", not "proof", which
+is the difference between a test suite and a ritual.
+
+Ninety-nine cycles of claims in this file, and the useful thing about this one is that it
+removes a claim instead of adding one.
