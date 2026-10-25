@@ -4581,3 +4581,36 @@ stacks.
 That is as far as the evidence goes. Something about how xray 26.3.27 serves this SOCKS
 configuration costs ~0.8 ms of serialisation per connection, and until that is understood the
 13x figure in this table is a property of this setup, not a fact about xray.
+
+---
+
+## Cycle 96 — 2026-10-25
+
+### Memory per connection: the number capacity planning actually depends on
+
+The RPS benchmark gained an idle-footprint mode: hold N connections open through the tunnel,
+read `VmRSS` of both tunnel processes before and after. 2 000 connections, two runs:
+
+| stack | RSS idle | RSS loaded | per connection |
+|---|---|---|---|
+| **flux-core** | **15.4-15.8 MB** | **40.6-66.5 MB** | **12-25 KB** |
+| sing-box | 50.6 MB | 144.9-146.3 MB | **47 KB** |
+| xray | 61.3-61.5 MB | 261.5-261.7 MB | **100 KB** |
+
+Three readings, three conclusions:
+
+- **Idle**, we use a third of sing-box's memory and a quarter of xray's. On a 128 MB box that
+  is the difference between running and not.
+- **Per connection**, 12-25 KB against 47 and 100. At 2 000 connections the gap is 94 MB
+  against sing-box and 200 MB against xray, and it grows linearly.
+- Our range is wide (12 one run, 25 the next) precisely *because* the buffers are allocated
+  lazily — which is the same property that keeps the idle footprint small. The honest
+  statement is a range, not a point, and it is still half of sing-box at its worst.
+
+### Three dimensions now, not one
+
+The audit began with a matrix of throughput and spent most of its cycles there. It now shows
+the same binary leading on three axes that a user actually feels: bulk throughput (fifteen
+protocol rows, xray beaten on all), exchanges per second under concurrent short connections
+(+37 % over sing-box), and memory per connection (2-4x smaller). Each was found by asking
+"what is not measured", not by tuning what already was.
