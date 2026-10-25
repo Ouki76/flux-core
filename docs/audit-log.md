@@ -6465,3 +6465,34 @@ gate's tolerance exists for the four-round case; the eight-round case does not n
 
 Five of six fully met; the sixth is a capability the dependency does not have, documented with
 the source search that proves it.
+
+---
+
+## Cycle 142 — 2026-10-25
+
+### Checking the documents against the code, not against each other
+
+After 141 cycles the likeliest remaining defect is not in the code but in a sentence written
+when the code was different. So the docs were checked for claims that had gone stale:
+
+| check | result |
+|---|---|
+| "AES mask open in one direction" in README/HANDOFF/VERIFICATION | **gone** — updated when the direction was fixed |
+| test counts in the audit log | historical by construction, and left as written |
+| interop inventory in the README | **stale** — it listed 4 Xray tests and no mKCP ones |
+
+The README now names the seven mKCP interop tests, including the AES-GCM mask in both
+directions, because that line was written before any of them existed.
+
+This is the least glamorous kind of correctness and the easiest to skip: a README that
+under-describes what is tested costs a reader the discovery that the capability exists at all,
+and one that over-describes costs them trust in every other line.
+
+### The state, one more time
+
+- fifteen of fifteen matrix rows ahead of sing-box, ten of ten ahead of xray, gate passing
+- four measured dimensions, each with a command that has been seen to fail
+- 1101 tests, five static gates
+- one objective item bounded by the dependency, with the source search that proves it
+- `docs/VERIFICATION.md` lists every claim, the command, and the guards that are weaker than
+  they look
