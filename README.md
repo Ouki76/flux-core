@@ -145,17 +145,19 @@ medians are in `docs/audit-log.md`):
 
 | Path | flux-core | sing-box | xray | vs sing-box | vs xray |
 |---|---|---|---|---|---|
-| VLESS / TCP | **726** | 637 | 641 | **+14.1 %** | **+13.4 %** |
-| VLESS / TLS | **338** | 333 | 252 | **+1.5 %** | **+34.3 %** |
-| VLESS / XHTTP | **176** | — (unsupported) | 148 | — | **+19.1 %** |
-| VLESS / WS + TLS | 294 | 309 | 106 | −4.7 % | **+176 %** |
-| VMess / WS + TLS | 202 | 207 | 180 | −2.3 % | **+12.1 %** |
-| VLESS / REALITY | 320 | 321 | 258 | −0.3 % | **+24.3 %** |
-| REALITY + Vision | 312 | 320 | 234 | −2.4 % | **+33.1 %** |
-| Trojan / TLS | 314 | 349 | — | −9.9 % | — |
-| Shadowsocks-2022 | 342 | 352 | 302 | −2.8 % | **+13.2 %** |
-| Shadowsocks-AEAD | **261** | 248 | — | **+5.5 %** | — |
-| VLESS / gRPC + TLS | 110 | 118 | 204 | −7.3 % | −46.2 % |
+| **TUIC v5** | **99** | 56 | — | **+76.5 %** | — |
+| **Hysteria2** | **97** | 52 | — | **+87.0 %** | — |
+| VLESS / TCP | 662 | 665 | 613 | −0.5 % | **+7.9 %** |
+| VLESS / TLS | **326** | 316 | 242 | **+3.1 %** | **+34.5 %** |
+| VLESS / XHTTP | **180** | — (unsupported) | 121 | — | **+48.8 %** |
+| VLESS / WS + TLS | 265 | 299 | 122 | −11.5 % | **+116 %** |
+| VMess / WS + TLS | **208** | 202 | 171 | **+3.0 %** | **+21.7 %** |
+| VLESS / REALITY | 329 | 346 | 265 | −4.8 % | **+24.0 %** |
+| REALITY + Vision | **345** | 340 | 234 | **+1.3 %** | **+47.1 %** |
+| Trojan / TLS | 332 | 333 | — | −0.5 % | — |
+| Shadowsocks-2022 | **346** | 341 | 281 | **+1.4 %** | **+22.9 %** |
+| Shadowsocks-AEAD | **286** | 273 | — | **+4.8 %** | — |
+| VLESS / gRPC + TLS | 107 | 121 | 187 | −11.1 % | −42.4 % |
 
 **Absolutes are machine-specific — never compare these numbers across machines, only
 within one run.** This table is the homelab server (24 cores, Void Linux, 4 interleaved
@@ -163,12 +165,16 @@ rounds x 200 MiB); run-to-run spread on one row reaches ±15 %, which is why the
 round of each stack is the number quoted here; an earlier edition came from a desktop where every absolute was about
 1.6x higher and the deltas told a different story.
 
-What the table says: flux-core **beats xray on ten of the twelve paths** (the exceptions are
-the gRPC rows) and **beats sing-box on three**, with five more inside 5 % — REALITY at
-−0.3 %, Vision at −2.4 %, VMess at −2.3 %, Shadowsocks-2022 at −2.8 %, WS at −4.7 %. All of
-that while spending **19-68 % less CPU than both on every single path** and using a third of
-the memory. The one remaining double-digit gap is Trojan, and the one row behind both
-competitors is gRPC over TLS.
+What the table says, as a thirteen-row best-of-four with no failures: flux-core **beats xray
+on ten of the eleven paths xray can run** (the exception is gRPC), **beats sing-box on seven**,
+is level on two more (TCP and Trojan, both −0.5 %), and is behind on three — WS (−11.5 %),
+REALITY (−4.8 %) and gRPC (−11.1 %). The widest margins are the two QUIC protocols, where
+sing-box runs at half our rate.
+
+All of that while spending **19-68 % less CPU than both on every TCP path** and using a third
+of the memory. Single rows swing up to ±15 % between runs on this host, so treat any gap under
+about 10 % as unresolved rather than as a ranking; the per-round spreads are in
+`docs/audit-log.md`.
 
 Reproduce: `cargo run --release --example bench_matrix -- --rounds 5 --mb 200`.
 
