@@ -5824,3 +5824,33 @@ not the same thing as a guard.
 
 Two of the three things I set out to pin this cycle fell in the second category — one deleted,
 one relabelled. That is a useful ratio to know.
+
+---
+
+## Cycle 126 — 2026-10-25
+
+### Three guards, tested by removing what they guard
+
+Continuing cycle 125's method — revert the fix, watch the test — across the other measured axes.
+
+| axis | guard | removal produces |
+|---|---|---|
+| relay buffer (WS frame cap) | `pipeline_stages_agree_on_the_relay_buffer` | *"the WebSocket frame cap must equal the relay buffer"* |
+| buffer-pool scrub (UDP path) | `pooled_buffer_never_carries_the_previous_tenants_bytes` + 1 | 2 tests fail |
+| WireGuard junk packets | `the_default_configuration_sends_no_junk_packets` | 1 test fails |
+
+All three have teeth. The buffer one is worth noting: commenting out the single `buf[..n].fill(0)`
+that the prefix-only-scrub optimisation left in place breaks **two** tests, one of them a
+security property rather than a performance claim — the pool would hand the next tenant the
+previous tenant's plaintext.
+
+### What this adds up to
+
+The audit has made a lot of claims over a hundred cycles. Three of the four centrepieces now have
+a guard that has been *demonstrated* to fail when the thing it protects is removed, and the
+fourth (the h2 window) is labelled as measurement-only rather than dressed up as a guard. That is
+a better state than most performance work reaches, and it took two cycles of deleting things to
+get there.
+
+The matrix itself remains guarded only by re-measurement — a benchmark cannot be a unit test —
+and the audit log's per-round dumps are the evidence for it.
