@@ -1104,18 +1104,6 @@ impl Conn {
         let mut plain = Vec::with_capacity(seg.wire_len());
         encode_segment(self.conv, &seg, &mut plain);
 
-        if self.stats.segments_sent < 3 {
-            tracing::debug!(
-                "kcp: sending conv={:#06x} cmd={} option={} sn={} sending_next={} una={} len={}",
-                self.conv,
-                seg.cmd,
-                seg.option,
-                seg.sn,
-                seg.sending_next,
-                self.rcv_nxt,
-                seg.data.len()
-            );
-        }
         let mut datagram = Vec::with_capacity(plain.len() + self.cfg.obfs_overhead());
         self.obfs.wrap(&plain, &mut datagram);
 
@@ -1466,11 +1454,29 @@ impl Conn {
         self.peer_edge = self.peer_edge.max(seg.window_edge);
         self.process_peer_next(seg.receiving_next);
 
-        if seg.numbers.is_empty() {
-            return;
-        }
         let mut acked = 0u32;
         let mut highest = self.snd_una;
+
+        // A KCP ACK can acknowledge cumulatively: `receiving_next` is the next sequence
+        // number the peer expects, so everything below it has arrived even when the
+        // numbers list is empty. Only the explicit list used to be honoured here, which
+        // meant a peer that acks cumulatively — Xray does — never had its acknowledgements
+        // applied, and the same segment was retransmitted forever.
+        let cumulative = seg.receiving_next;
+        if cumulative > self.snd_una {
+            let due: Vec<u32> = self
+                .snd_buf
+                .range(..cumulative)
+                .map(|(sn, _)| *sn)
+                .collect();
+            for sn in due {
+                if self.snd_buf.remove(&sn).is_some() {
+                    acked += 1;
+                    highest = highest.max(sn.wrapping_add(1));
+                }
+            }
+        }
+
         for sn in &seg.numbers {
             if *sn < self.snd_una || *sn >= self.snd_nxt {
                 continue;
