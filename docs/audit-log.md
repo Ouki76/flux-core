@@ -5253,3 +5253,35 @@ Three cycles, three false statements in the handoff — two inherited, one mine.
 not carelessness about numbers; the matrix has never been wrong. It is that **prose is written
 from memory and numbers are derived from commands**. The handoff now says so at the top, and
 the two remaining open items are the only ones that survived being checked.
+
+---
+
+## Cycle 111 — 2026-10-25
+
+### Reading the reference instead of recalling it
+
+The one remaining protocol gap is xray's AES-GCM payload mask for mKCP. Rather than implement
+it from memory — which is how the last three documentation errors happened — the construction
+was read from Xray's own source:
+
+- `transport/internet/kcp/cryptreal.go`: `NewAEADAESGCMBasedOnSeed` hashes the seed with
+  SHA-256 and builds **AES-128-GCM from `hashedSeed[:16]`** — the first sixteen bytes, not all
+  thirty-two. Commit `2b82366` ("mKCP: Fix key derivation for obfuscation") is what changed
+  `[:]` to `[:16]`; a peer built before it derives a different key, so a test against an old
+  binary would fail for a reason unrelated to this code.
+- `finalmask/mkcp/aes128gcm/conn.go`: the wire form is `nonce ‖ ciphertext ‖ tag` with a
+  12-byte nonce and no additional data.
+- Xray 26 **removed** `kcpSettings.seed`, refusing it with `PrintRemovedFeatureError`; the
+  replacement is `finalmask.udp: [{"type":"mkcp-aes128gcm"}]`. An interop test written against
+  the classic config shape would never run.
+
+All three facts are now in the module documentation at the top of
+`crates/flux-transport/src/kcp.rs`, with the commit reference.
+
+**Not implemented**, and the reason is scope, not difficulty: the objective asks for the mKCP
+*transport* to work against the competitor, and it does — interop is proven in both directions
+by `tests/test_kcp_interop.rs`. The mask is an optional extra on top of a working transport,
+and it carries a real risk of destabilising the segment path that currently interops.
+
+What the research buys is that the next attempt starts from a specification instead of a
+search — the same trade as the Shadowsocks-2022 profile two cycles before it.
