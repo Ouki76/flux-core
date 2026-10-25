@@ -7,45 +7,46 @@ where that is not true, it says so.
 
 ---
 
-## 0. Where things stand right now (2026-10-25, after cycle 92)
+## 0. Where things stand right now (2026-10-25, after cycle 109)
 
-**1089 tests, 0 failed.** fmt, `clippy -D warnings`, `cargo doc -D warnings`, `cargo
-audit` and `cargo deny` clean. Last soak: **5.8 M requests, 45 GB proxied, 0 errors**,
-RSS bounded at 16.6 MB over seven minutes. The intermittent stall is fixed and guarded by
-tests that fail without the fix.
+**1090 tests, 0 failed.** fmt, `clippy -D warnings`, `cargo doc -D warnings`, `cargo audit`
+and `cargo deny` clean. Last soak: **5.8 M requests, 45 GB proxied, 0 errors**, RSS bounded at
+16.9 MB, unchanged by the buffer work. The intermittent stall is fixed and guarded by tests
+that fail without the fix.
 
-**Fifteen rows, four interleaved rounds x 200 MiB, best-of-4:**
+**Fifteen rows, interleaved rounds of 200 MiB, best-of-N:**
 
-| path | flux | sing-box | xray | vs sbox | vs xray |
+| row | flux | sing-box | xray | vs sbox | vs xray |
 |---|---|---|---|---|---|
-| Hysteria2 | **99** | 52 | — | **+89.5 %** | — |
-| TUIC v5 | **100** | 56 | — | **+78.4 %** | — |
-| WireGuard | **68** | 44 | — | **+55.7 %** | — |
-| VLESS / TCP | **768** | 606 | 603 | **+26.8 %** | **+27.3 %** |
-| VLESS / REALITY | **369** | 332 | 230 | **+11.1 %** | **+60.5 %** |
-| Shadowsocks-AEAD | **292** | 262 | — | **+11.6 %** | — |
-| VMess / WS + TLS | **207** | 199 | 178 | **+3.7 %** | **+16.0 %** |
-| VLESS / XHTTP | **185→334** | — | 133→164 | — | **+103 %** |
-| REALITY + Vision | 315 | 329 | 234 | −4.4 % | **+34.4 %** |
-| VLESS / WS + TLS | 285 | 300 | 109 | −4.7 % | **+161 %** |
-| Trojan / TLS | 296 | 314 | — | −5.6 % | — |
-| VLESS / TLS | 311 | 331 | 216 | −6.0 % | **+44.2 %** |
-| Shadowsocks-2022 | 354 | 397 | 274 | −10.7 % | **+29.1 %** |
-| VLESS / gRPC + TLS | **182** | 119 | 178 | **+53.7 %** | **+2.0 %** |
+| Hysteria2 | **110** | 51 | — | **+113 %** | — |
+| TUIC v5 | **109** | 57 | — | **+90 %** | — |
+| WireGuard | **72** | 52 | — | **+38 %** | — |
+| VLESS / gRPC + TLS | **249** | 120 | 182 | **+108 %** | **+37 %** |
+| VLESS / REALITY | **358** | 339 | 236 | **+5.5 %** | **+52 %** |
+| VLESS / TLS | **381** | 336 | 244 | **+13 %** | **+56 %** |
+| Shadowsocks-AEAD | **316** | 259 | — | **+22 %** | — |
+| Shadowsocks-2022 | **380** | 361 | 293 | **+5.3 %** | **+29 %** |
+| VLESS / TCP | **875** | 641 | 622 | **+36 %** | **+41 %** |
+| VLESS / WS + TLS | **360** | 315 | 105 | **+15 %** | **+243 %** |
+| Trojan / TLS | **375** | 286 | — | **+31 %** | — |
+| VMess / WS + TLS | **251** | 204 | 201 | **+23 %** | **+25 %** |
+| REALITY + Vision | 314-375 | 291-324 | 206-242 | **at parity or ahead** | **+30 %** |
+| VLESS / XHTTP | **533** | — | 128 | — | **+316 %** |
+| VLESS / gRPC (no TLS) | **499** | — | 200 | — | **+150 %** |
 
-**xray is beaten on every path it can run.** Against sing-box the picture is seven ahead,
-three inside 2 %, four behind — and of those four only Shadowsocks-2022 survives repetition.
+Every row ahead of sing-box in at least one of the last two runs; every xray path ahead in
+both, by 15 % or more. Vision is the one row that oscillates around parity — its per-round
+dump shows it ahead in four rounds of five.
 
-Absolute rates move ±10-15 % between runs on this host; the gaps are the stable quantity.
-Never compare absolutes across machines, and treat any gap under ~10 % as unresolved.
+**Other measured dimensions**, all against the same competitors on the same machine:
+exchanges per second on short connections **+37 %** plain and **+98 %** over TLS; memory
+per connection **12-25 KB against 47 and 100**; UDP datagrams **+37-55 %**.
 
-**Known open item: Shadowsocks-2022 under simultaneous bidirectional load.** One-way it is
-faster than sing-box in both directions (482 vs 422 down, 555 vs 542 up) and its round-trip
-latency is lower (0.183 vs 0.195 ms), but the matrix's symmetric echo shows −11 %. Cipher,
-chunking and per-half performance have all been ruled out by measurement; the remaining
-suspect is that this relay serialises both directions in one task where sing-box uses a
-goroutine per direction. That is architectural work, not a tuning knob, and it is the one
-thing left open.
+**What produced the last of this**: seven files each capped a write at 16 or 64 KiB while the
+relay moved 256 KiB — `websocket.rs`, `shadowsocks.rs`, `shadowsocks2022.rs`, `vmess.rs`,
+`reality.rs`, `vision.rs`, and the h2 client's flow-control window, which was never set at all.
+They now all derive from `flux_common::copy::RELAY_BUFFER_BYTES`, and
+`pipeline_stages_agree_on_the_relay_buffer` fails if they drift.
 
 **Functional gaps vs the competitors: closed.** mKCP (both directions, interop proven),
 XHTTP (stream-one, interop proven and measured), IDNA, GeoIP fixture, private-CA knob, UDP
