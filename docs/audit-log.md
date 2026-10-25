@@ -5706,3 +5706,40 @@ hidden in a helper.
 Measured, not asserted: fifteen matrix rows at 100-800 MB/s, exchanges at 8 500/s over TLS,
 RSS 13-17 MB steady and 12-25 KB per held connection. Those are in section 0 and the audit log
 with the commands that produced them.
+
+---
+
+## Cycle 123 — 2026-10-25
+
+### The code disagreed with its own comment
+
+`connect()` carries a note, written from an earlier capture, that an Xray server closes a session
+opening with anything but DATA — and that no opening PING is sent. The `Conn` constructor set
+`next_ping = now`, so the first flush sent a PING 30 µs after the opening DATA segment: the
+intent was in the comment, the timer had never been told.
+
+Fixed to `now + PING_IDLE`. It did not fix the AES-mask interop against an Xray server — that
+direction still carries nothing — but it removes a datagram a real peer has documented reason to
+resent, and the code now does what its documentation says it does.
+
+Three protocol defects from this one hunt, all found by looking at emitted and received bytes:
+
+| defect | how it showed | kept? |
+|---|---|---|
+| `sending_next` carried `rcv_nxt` | first data segment advertised `sn=0, sending_next=0` | yes |
+| cumulative ACK ignored | one segment retransmitted six times | yes |
+| opening PING sent immediately | second segment was a PING, 30 µs after the first | yes |
+
+None of them was findable by reading the code against the specification — all three are
+invisible unless a real peer is on the other end and the bytes are captured.
+
+### Where this leaves the mask, permanently for this audit
+
+The scorecard says "open in one direction". That has not changed, and after eleven cycles it is
+time to say what the remaining gap costs: a user who points this client at an Xray mKCP endpoint
+with the AES mask gets a tunnel that does not carry data. Without the mask — the ordinary
+`mkcp-original` path — the same client interoperates in both directions and is tested.
+
+So the recommendation for anyone reading this in the field is: **use the default mKCP
+configuration**, which works, and do not enable `seed` on a client until the next session
+finishes what this one left.
