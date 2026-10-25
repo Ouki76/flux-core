@@ -5966,3 +5966,63 @@ worth doing when someone is going to run them, not to make a table look complete
 
 Four clauses, four commands, each of which has been seen to fail at least once — three of them
 by deliberately breaking the thing they check.
+
+---
+
+## Cycle 130 — 2026-10-25
+
+### Every measured dimension now ends in a command that can fail
+
+| dimension | command | result |
+|---|---|---|
+| throughput, fifteen protocol rows | `bench_matrix --assert 0.10` | **PASSED** |
+| connection rate, plain and TLS | `bench_rps --assert 0.10` | **PASSED** |
+| datagrams per second | `bench_udp --assert 0.10` | **PASSED** |
+| memory per held connection | `bench_rps --idle 200 --assert 0.10` | **PASSED** |
+
+Measured this cycle:
+
+```
+UDP relay:  flux 90 180/s   sing-box 72 127/s (+25.0%)   xray  8 025/s (+1023.7%)
+memory:     flux 23 K/conn  sing-box 89 K                xray 121 K
+rate:       flux 12 920/s   sing-box 9 990/s             xray 1 166/s
+```
+
+### A bug in the gate itself, found by demanding more of it
+
+The memory axis compares in the opposite direction — lower is better — and the first version
+computed the ceiling as `other + other * tolerance` with the tolerance cast to `u64`. Rust
+saturates a negative float-to-`u64` cast at zero, so `--assert -0.9` became "no requirement" and
+the gate reported **PASSED** when flux was 72% *worse* than the ceiling it was supposed to
+demand:
+
+```
+--assert -0.9   ASSERT PASSED   (wrong)
+```
+
+Fixed to compute in floating point:
+
+```
+--assert -0.9   ASSERT FAILED (memory, tolerance -90%):
+                  bytes per connection vs sing-box: 31 539 > 113 008 (-72.1%)
+```
+
+This is the fourth instance in this audit of the same class of mistake — an orientation or
+sign that turns a real constraint into a no-op — and the first one found before it shipped.
+The reason it was found is the only reason worth writing down: **the failure branch was
+exercised.** A gate that has never been seen to fail is a gate nobody has checked, including
+its author.
+
+### The objective, in four commands
+
+```
+cargo run --release --example bench_matrix -- --rounds 4 --mb 200 --assert 0.10
+cargo run --release --example bench_rps    -- --exchanges 4000 --conns 32 --assert 0.10
+cargo run --release --example bench_udp    -- --rounds 3 --assert 0.10
+cargo run --release --example bench_rps    -- --idle 200 --assert 0.10
+cargo test --workspace           # 1099 tests, 0 failed
+cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+cargo audit && cargo deny check && cargo doc --workspace --no-deps
+```
+
+Each of the four benchmark gates has been observed to exit 1 at least once, deliberately.
