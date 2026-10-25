@@ -4920,3 +4920,35 @@ TCP at +72 % and XHTTP at +249 % against xray were not achieved by clever code. 
 from four constants, all measured inside the last ten cycles: the h2 flow-control window, the
 relay buffer size, the WebSocket frame cap, and the TLS write buffer on the client. Every one
 of them had been in the tree since before this audit began.
+
+### The first profile of Shadowsocks-2022 that resolved, and what it says
+
+Five cycles of hypotheses failed because the profile would not resolve symbols — two runs
+were spoiled by a stale `callgrind-amd64` holding the port, one by a binary rebuilt without
+debug info, and the annotation tool reports *inclusive* cost, where the tokio worker frame
+swallows everything above the threshold. Collection with `--separate-threads=yes` plus
+`--inclusive=yes` fixed the last of those, and the busiest thread now reads:
+
+| function | inclusive | share |
+|---|---|---|
+| `Ss2022Stream::poll_read` | 70.6 M | **62.6 %** |
+| — its own cost | 28.1 M | **24.9 %** |
+| → `Ss2022Aead::open_in_place` | 27.9 M | 24.7 % |
+| `Ss2022Stream::poll_write` | 40.1 M | 35.6 % |
+| — its own cost | 28.0 M | 24.8 % |
+| → `Ss2022Aead::seal_tail` | 28.0 M | 24.8 % |
+| `memcpy` (all callers) | 54.3 M | 48.1 % |
+| `_aesni_ctr32_ghash_6x` | 53.6 M | 47.5 % |
+
+**Our own read path costs 28 M instructions — 2.3 per payload byte — which is a copy.** It is
+the `chunk_data` → caller's buffer copy at the end of `poll_read`, and it is the largest single
+piece of cost in the row after the cipher itself.
+
+The fix would be to decrypt in place *inside the caller's buffer* instead of into
+`payload_buf` and copying afterwards. It is not made here, and the reason is the evidence from
+two cycles ago: this path is **CPU-cheaper than sing-box's and still slower**, so removing CPU
+is not obviously what would move the number. Making a change that is defensible on principle
+but unproven on the metric is exactly what this log has spent fifty cycles refusing to do.
+
+What the profile buys is narrower and real: the next attempt at this row has a named target
+and a number to move — 28 M instructions in `poll_read` — instead of six failed guesses.
