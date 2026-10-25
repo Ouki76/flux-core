@@ -4131,3 +4131,39 @@ a statement about correctness rather than about how many writes the caller chose
 Worth writing down because it is the third time in this audit that a test failed for a reason
 in the test: the instinct to "fix the code until the test passes" is exactly wrong here, and
 the only defence is reading the assertion as carefully as the implementation.
+
+---
+
+## Cycle 85 — 2026-10-25
+
+### WireGuard interop with sing-box is broken, and nothing tested it
+
+Looking for the last unmeasured protocol, the one both competitors support, turned up
+something the checklist did not contain: **there is no WireGuard interop test at all.**
+`tests/test_wireguard_inbound.rs` has five tests and every one of them uses this project's
+own client against this project's own server. Nothing has ever checked the wire format
+against another implementation.
+
+What the manual attempts established today:
+
+| pairing | result |
+|---|---|
+| flux client → flux server | **works, 121-145 MiB/s** on a one-way download |
+| flux client → sing-box endpoint | fails; our side logs **"wireguard stack actor gone"** |
+| sing-box client → flux server | fails |
+
+"Stack actor gone" is our own error from `wireguard.rs:843`: the command channel to the
+userspace-stack task is closed, which means **the stack task itself exited**. That is a bug by
+its own description — a tunnel whose peer does not answer should time out the connection, not
+tear down the process-wide stack and make every later connection fail instantly.
+
+Two things were also learned about sing-box 1.11 that will matter when this is picked up:
+
+- The `wireguard` **inbound was removed**; a server is now an `endpoint` with `listen_port`.
+- Its keys must be standard base64, where `xray x25519` emits base64url — a mismatch that
+  surfaced as `decode private key: illegal base64 data at input byte 13`. Our own config
+  accepts both, which is why this only broke one direction.
+
+Honest status: **WireGuard is the one protocol in this project with no interop evidence**, and
+a first attempt says the evidence would be negative. Recorded rather than papered over; the
+next cycle starts from the stack task's exit path.
