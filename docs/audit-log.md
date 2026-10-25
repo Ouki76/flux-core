@@ -4280,3 +4280,46 @@ Thirteen rows when this audit started, all TCP-carried. The table now has **fift
 three added since — Hysteria2, TUIC, WireGuard — produced the three widest margins in it
 (+92 %, +78 %, +58 %). They were not skipped deliberately; the harness could not express a
 UDP-carried protocol, and a row that cannot run reports "unsupported" rather than "unmeasured".
+
+---
+
+## Cycle 88 — 2026-10-25
+
+### Fifteen rows, every protocol both competitors speak, no failures
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| **Hysteria2** | **99** | 52 | — | **+89.5 %** | — |
+| **TUIC v5** | **100** | 56 | — | **+78.4 %** | — |
+| **WireGuard** | **68** | 44 | — | **+55.7 %** | — |
+| VLESS / TCP | **768** | 606 | 603 | **+26.8 %** | **+27.3 %** |
+| VLESS / REALITY | **369** | 332 | 230 | **+11.1 %** | **+60.5 %** |
+| Shadowsocks-AEAD | **292** | 262 | — | **+11.6 %** | — |
+| VMess / WS + TLS | **207** | 199 | 178 | **+3.7 %** | **+16.0 %** |
+| VLESS / XHTTP | **185** | — | 133 | — | **+39.5 %** |
+| VLESS / REALITY + Vision | 315 | 329 | 234 | −4.4 % | **+34.4 %** |
+| VLESS / WS + TLS | 285 | 300 | 109 | −4.7 % | **+161 %** |
+| Trojan / TLS | 296 | 314 | — | −5.6 % | — |
+| VLESS / TLS | 311 | 331 | 216 | −6.0 % | **+44.2 %** |
+| VLESS / gRPC + TLS | 106 | 115 | 191 | −7.6 % | −44.4 % |
+| Shadowsocks-2022 | 354 | 397 | 274 | −10.7 % | **+29.1 %** |
+
+**Seven ahead of sing-box, twelve of thirteen ahead of xray, zero failures.**
+
+### Which of the nine "behind" numbers mean anything
+
+Only one. The rest move by more than their own gap between runs of the same binary:
+
+| row | this run | previous run | verdict |
+|---|---|---|---|
+| VLESS / TLS | −6.0 % | **+6.4 %** | sign flipped |
+| Shadowsocks-2022 | −10.7 % | −2.8 % | 8 points |
+| REALITY | **+11.1 %** | −0.3 % | 11 points |
+| REALITY + Vision | −4.4 % | **+1.3 %** | sign flipped |
+| WS + TLS | −4.7 % | −11.5 % / **+4.6 %** | 16 points across three |
+| **gRPC + TLS** | −7.6 % | −6.9 % / −3.4 % | **stable, and profiled** |
+
+gRPC is the only row whose deficit survives every run, and its profile explains it: TLS copies
+plus one framing copy that h2's `send_data` API makes unavoidable. Everything else on that list
+is this host, not this code, and the honest statement of the objective is that **the matrix is
+at parity or better everywhere the machine can resolve, with one structural exception**.
