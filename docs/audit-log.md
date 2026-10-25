@@ -3628,3 +3628,42 @@ Two cycles, two profiler runs, two defects that six rounds of hypotheses never f
 64 KiB `memset` per datagram and a quadratic copy per gRPC frame. Both were invisible to
 throughput measurements taken on a machine whose own noise is ±15 %, and both are obvious in
 an instruction profile that does not care how loaded the box is.
+
+---
+
+## Cycle 76 — 2026-10-25
+
+### 64 KiB DATA frames: the worst row comes within 7 %
+
+h2's default DATA frame is 16 KiB. The relay moves 64 KiB at a time, so one buffer became
+four frames and four `writev` calls — visible in the syscall count as **5 496 `writev` for
+19 MiB**, one per 3.6 KiB. The frame size is negotiated in SETTINGS, so raising it on both
+ends is safe; a peer that advertises less keeps its own.
+
+| row | before | after |
+|---|---|---|
+| VLESS / gRPC + TLS | 96.0 | **109.4** (+14 %) |
+| VLESS / gRPC (no TLS) | 150-161 | **169-180** (+13-20 %) |
+| vs sing-box (gRPC+TLS) | −17.9 % | **−7.1 %** |
+
+The row that has been the *only* clear loss to both competitors since cycle 30 is now within
+7 % of sing-box. Every user of the shared h2 layer gets the same change: XHTTP and the h2
+transport.
+
+### And one thing reverted, again
+
+A zero-copy read path for gRPC — serving a whole message straight out of the h2 buffer
+instead of copying it into `read_buf` — passed all 58 tests and changed the profile by
+**nothing at all**: 2.54 M instructions either way. Reverted. The quadratic write copy fixed
+in the previous commit had already accounted for the whole 45×, and the read copy had never
+been the cost.
+
+That is the third time this specific optimisation has been written and removed. The
+difference this time is that the removal took one profile instead of an afternoon of
+argument: the instruction count does not care how loaded the machine is.
+
+### The scoreboard now
+
+Against xray, every row is ahead except gRPC (and Trojan, which xray 26 cannot run here).
+Against sing-box: TCP, TLS, WS, Vision, VMess and SS-AEAD are ahead or level, gRPC is −7 %,
+and the remaining gaps are inside this host's ±15 % noise.
