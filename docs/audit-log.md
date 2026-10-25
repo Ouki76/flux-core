@@ -5123,3 +5123,54 @@ repeated across seven subsystems because the pipeline had never been looked at a
 That is the finding this audit will be worth, more than any single percentage: **the
 architecture was sound and the joints were not.** A `pipeline_stages_agree_on_the_relay_buffer`
 test now fails if they drift again.
+
+---
+
+## Cycle 108 — 2026-10-25
+
+### Confirming the result, and what "confirmed" means here
+
+A single 4-round run said fifteen of fifteen. One run is not evidence at this host's noise
+level, so both things that could have made it a fluke were checked.
+
+**Memory first**, because the last three cycles moved every buffer to 256 KiB and that is
+exactly the kind of change that shows up as a resident-set regression under load:
+
+```
+requests: 5 795 374, errors: 0, bytes proxied: 45 276 MB
+RSS min/max: 13.3 / 16.9 MB | head-median 14.5 | tail-median 16.7
+OK: bounded memory (tail/head delta 2.1 MB, 15%)
+```
+
+Identical to the soak taken before the buffer changes. The larger buffers cost nothing at
+steady state because they are allocated per transfer and reused.
+
+**Then a six-round matrix**, twice the rounds of the run that produced the headline:
+
+| row | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | **874.6** | 641.1 | 621.7 | **+36.4 %** | **+40.7 %** |
+| Hysteria2 | **109.6** | 51.4 | — | **+113.2 %** | — |
+| TUIC v5 | **108.8** | 57.3 | — | **+90.1 %** | — |
+| VLESS / gRPC + TLS | **248.8** | 119.7 | 182.0 | **+107.9 %** | **+36.7 %** |
+| VLESS / WS + TLS | **359.9** | 314.5 | 105.1 | **+14.5 %** | **+242.5 %** |
+| Shadowsocks-AEAD | **316.3** | 258.5 | — | **+22.3 %** | — |
+| Trojan / TLS | **374.9** | 286.4 | — | **+30.9 %** | — |
+| VMess / WS + TLS | **251.2** | 203.6 | 201.1 | **+23.4 %** | **+24.9 %** |
+| VLESS / TLS | **380.8** | 336.3 | 243.8 | **+13.2 %** | **+56.2 %** |
+| VLESS / REALITY | **358.1** | 339.4 | 235.8 | **+5.5 %** | **+51.9 %** |
+| Shadowsocks-2022 | **379.8** | 360.6 | 293.4 | **+5.3 %** | **+29.4 %** |
+| WireGuard | **72.2** | 52.4 | — | **+37.8 %** | — |
+| VLESS / XHTTP | **533.1** | — | 128.3 | — | **+315.6 %** |
+| VLESS / gRPC (no TLS) | **499.3** | — | 199.6 | — | **+150.2 %** |
+| REALITY + Vision | 314.2 | 324.0 | 242.2 | −3.0 % | **+29.7 %** |
+
+**Fourteen of fifteen.** Vision is the one that moved, from +7.2 % to −3.0 % — an 10-point
+swing on a row whose per-round spread is that wide, and the same row that read −4.6 % before
+the scratch-buffer fix and +1.7 % immediately after.
+
+So the honest statement of the objective is **fourteen or fifteen of fifteen across two runs,
+with fifteen of fifteen reached once and Vision oscillating around parity**. Claiming "all
+fifteen, always" from one run would be the same error this log has recorded six times.
+
+**Every xray path is ahead in both runs, by at least 15 % and usually by far more.**
