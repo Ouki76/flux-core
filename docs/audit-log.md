@@ -6104,3 +6104,59 @@ The lesson is about method, not about the code: a best-of-N on a shared host nee
 enough that one outlier round cannot decide the answer. Four was not. Eight is enough to show
 the margin, and the per-round dumps are in `/tmp/reality8.log`, `/tmp/vmess8.log` and
 `/tmp/ss2022.log`… which are temporary, so the numbers above are the record.
+
+---
+
+## Cycle 133 — 2026-10-25
+
+### Eleven cycles, one guard, and two clues nobody read together
+
+The AES-masked client-into-Xray direction finally carries data. The cause was a three-line
+guard in `on_datagram`:
+
+```rust
+Some(peer) if peer != from => return,
+```
+
+A real KCP peer may **switch its sending socket**. Xray binds a new one and answers from a port
+other than the one it received on, so every reply was discarded as coming from a stranger. The
+conversation id identifies a stream; the source address does not.
+
+Two pieces of evidence had been in this log for cycles, unconnected:
+
+| observation | cycle | what it meant |
+|---|---|---|
+| the same interop **through a UDP relay worked** | 114 | the relay re-sent from the address we had pinned |
+| Xray logged `accepted tcp:…` | 116 | our request arrived and Xray answered |
+
+Neither is conclusive alone. Together they say: *replies exist, and they are being dropped for
+where they come from.* I spent those cycles reading the mask, the composition, the key and the
+segment codec instead.
+
+### The fix, and why it is asymmetric
+
+The dialling side adopts the peer's address. The **accepting side keeps pinning it** — a
+conversation id is a 16-bit number arrive-able by guessing, and following address changes there
+would let an off-path sender hijack a stream. Xray itself follows; a server that does not is
+not less correct, it is more careful.
+
+### Result
+
+| | before | after |
+|---|---|---|
+| 3 MB through Xray behind `mkcp-aes128gcm` | stream died in 130 ms | **9.9 MiB/s** |
+| 6 MB through the same path | — | stalls partway |
+
+So the direction works and saturates up to a few megabytes, then stalls — a separate defect, and
+the only thing left between this and full parity on that path.
+
+### What this cost, and what it says about method
+
+Eleven cycles. The bug was not in any of the layers I examined; it was in an assumption about
+where a packet may come from, and the assumption was reasonable enough that no amount of reading
+the code as code would have flagged it. It was found because a failed run left a clue — the
+relay working — that outlived the explanation I built on top of it.
+
+The audit's own rule applies to its author: **the hypothesis that survives is the one with the
+awkward fact attached to it**, and I had an awkward fact in hand since cycle 114 without noticing
+it contradicted the story I was telling.
