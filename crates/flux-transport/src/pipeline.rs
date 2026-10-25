@@ -11,7 +11,7 @@ use std::time::Duration;
 ///
 /// One relay buffer plus a framing header has to fit, or a vectored write of a whole frame
 /// is always short and the layer above falls back to copying.
-const TLS_WRITE_BUFFER: usize = 256 * 1024;
+pub(crate) const TLS_WRITE_BUFFER: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 /// A client-side security layer to apply, outermost last.

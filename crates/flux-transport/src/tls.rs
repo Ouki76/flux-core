@@ -310,6 +310,16 @@ impl TlsTransport {
             ))
         })?;
 
+        // The server side has had an enlarged write buffer since the WebSocket framing work;
+        // the client never had one, which left the *upload* direction on rustls' 64 KiB
+        // default while the download used the larger one. Both directions of a relay matter,
+        // so both ends get the same limit.
+        let mut tls_stream = tls_stream;
+        tls_stream
+            .get_mut()
+            .1
+            .set_buffer_limit(Some(crate::pipeline::TLS_WRITE_BUFFER));
+
         // rustls hands back one TLS record (16 KiB) per `poll_read`; the relay reads in
         // 64 KiB buffers. Coalescing here keeps the reads whole without touching the
         // dependency.
