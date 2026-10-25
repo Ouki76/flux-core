@@ -1461,26 +1461,6 @@ impl Conn {
         let mut acked = 0u32;
         let mut highest = self.snd_una;
 
-        // A KCP ACK can acknowledge cumulatively: `receiving_next` is the next sequence
-        // number the peer expects, so everything below it has arrived even when the
-        // numbers list is empty. Only the explicit list used to be honoured here, which
-        // meant a peer that acks cumulatively — Xray does — never had its acknowledgements
-        // applied, and the same segment was retransmitted forever.
-        let cumulative = seg.receiving_next;
-        if cumulative > self.snd_una {
-            let due: Vec<u32> = self
-                .snd_buf
-                .range(..cumulative)
-                .map(|(sn, _)| *sn)
-                .collect();
-            for sn in due {
-                if self.snd_buf.remove(&sn).is_some() {
-                    acked += 1;
-                    highest = highest.max(sn.wrapping_add(1));
-                }
-            }
-        }
-
         for sn in &seg.numbers {
             if *sn < self.snd_una || *sn >= self.snd_nxt {
                 continue;
@@ -2579,6 +2559,141 @@ mod tests {
         let ((), echoed) = tokio::join!(write_half, read_half);
         let stats = inner.lock().snapshot();
         (echoed, stats)
+    }
+
+    /// Decodes one datagram sent with `KcpObfs::None` into
+    /// `(cmd, option, sn, sending_next)`.
+    fn decode_none(datagram: &[u8]) -> (u8, u8, u32, u32) {
+        let seg = envelope::open(datagram).expect("envelope");
+        let cmd = seg[2];
+        let option = seg[3];
+        let sn = u32::from_be_bytes(seg[8..12].try_into().unwrap());
+        let sending_next = u32::from_be_bytes(seg[12..16].try_into().unwrap());
+        (cmd, option, sn, sending_next)
+    }
+
+    /// `sending_next` is what this side will send next. It used to carry `rcv_nxt`, the
+    /// receive counter, which a real peer reads as "I have nothing more to send" — Xray
+    /// answered by closing the session. Fails if the two counters are confused again.
+    #[tokio::test]
+    async fn a_data_segment_advertises_what_it_will_send_next() {
+        let peer = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let cfg = KcpConfig {
+            conv: 0x1234,
+            obfs: KcpObfs::None,
+            ..KcpConfig::default()
+        };
+        let mut client = connect(addr, cfg).await.expect("connect");
+        client
+            .write_all(b"hello")
+            .await
+            .expect("write must be accepted");
+        client.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), peer.recv_from(&mut buf))
+            .await
+            .expect("the client must send its first segment")
+            .unwrap();
+        let (cmd, _option, sn, sending_next) = decode_none(&buf[..n]);
+        assert_eq!(cmd, CMD_DATA, "the first segment must be DATA");
+        assert!(
+            sending_next > sn,
+            "a DATA segment must advertise a sending_next past its own sn \
+             (sn={sn}, sending_next={sending_next}); rcv_nxt here tells the peer we are done"
+        );
+    }
+
+    /// A peer may acknowledge cumulatively: `receiving_next` says "I have everything below
+    /// this" even with an empty numbers list, and `process_peer_next` releases the send
+    /// buffer accordingly. This pins that behaviour: a fix once claimed to add it here, and
+    /// removing that fix changed nothing because the path already existed.
+    #[tokio::test]
+    async fn a_cumulative_acknowledgement_releases_the_send_buffer() {
+        let peer = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let cfg = KcpConfig {
+            conv: 0x4321,
+            obfs: KcpObfs::None,
+            ..KcpConfig::default()
+        };
+        let mut client = connect(addr, cfg).await.expect("connect");
+        client.write_all(b"cumulative").await.expect("write");
+        client.flush().await.expect("flush");
+
+        // Take the first data segment, then acknowledge it cumulatively — no numbers list.
+        let mut buf = vec![0u8; 2048];
+        let (n, from) = tokio::time::timeout(Duration::from_secs(5), peer.recv_from(&mut buf))
+            .await
+            .expect("first segment")
+            .unwrap();
+        let (cmd, _, sn, _) = decode_none(&buf[..n]);
+        assert_eq!(cmd, CMD_DATA);
+
+        let ack = Segment {
+            cmd: CMD_ACK,
+            receiving_next: sn + 1,
+            window_edge: 1024,
+            numbers: Vec::new(),
+            ..Segment::default()
+        };
+        let mut datagram = Vec::new();
+        encode_segment(0x4321, &ack, &mut datagram);
+        let mut framed = Vec::new();
+        envelope::seal(&datagram, &mut framed);
+        peer.send_to(&framed, from).await.unwrap();
+        // The driver task has to receive and apply it before the buffer can be inspected.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The acknowledgement must actually empty the send buffer. Retransmission alone is
+        // too weak a signal — the timer can be long — so this inspects the state the fix
+        // touches.
+        let inner = client.inner.lock();
+        assert!(
+            !inner.snd_buf.contains_key(&sn),
+            "segment {sn} is still buffered after a cumulative acknowledgement \
+             (empty numbers list, receiving_next={}): the cumulative path is not applied",
+            sn + 1
+        );
+        assert!(
+            inner.snd_buf.is_empty(),
+            "the send buffer must be fully released"
+        );
+        drop(inner);
+    }
+
+    /// The first flush must not send a PING: a real Xray server closes a session that opens
+    /// with anything but DATA. The timer used to be initialised to `now`, which put a PING
+    /// 30 microseconds after the opening segment.
+    #[tokio::test]
+    async fn the_first_flush_sends_no_ping() {
+        let peer = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let addr = peer.local_addr().unwrap();
+        let cfg = KcpConfig {
+            conv: 0x5150,
+            obfs: KcpObfs::None,
+            ..KcpConfig::default()
+        };
+        let mut client = connect(addr, cfg).await.expect("connect");
+        client.write_all(b"first").await.expect("write");
+        client.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), peer.recv_from(&mut buf))
+            .await
+            .expect("first segment")
+            .unwrap();
+        assert_eq!(decode_none(&buf[..n]).0, CMD_DATA);
+
+        // Anything that arrives in the next quarter second must not be a PING.
+        let mut later = vec![0u8; 2048];
+        if let Ok(Ok((m, _))) =
+            tokio::time::timeout(Duration::from_millis(250), peer.recv_from(&mut later)).await
+        {
+            let (cmd, _, _, _) = decode_none(&later[..m]);
+            assert_ne!(cmd, CMD_PING, "a PING was sent immediately after opening");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
