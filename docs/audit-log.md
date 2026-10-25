@@ -6496,3 +6496,45 @@ and one that over-describes costs them trust in every other line.
 - one objective item bounded by the dependency, with the source search that proves it
 - `docs/VERIFICATION.md` lists every claim, the command, and the guards that are weaker than
   they look
+
+---
+
+## Cycle 143 — 2026-10-25
+
+### The tightest row was not tight
+
+TLS read +2.1% in the eight-round milestone run, which is uncomfortably close to the tolerance
+and looked like the one place worth optimising. A single round first:
+
+```
+VLESS / TLS   flux 333.2   sing-box 231.5   xray 214.6    +44.0%
+```
+
+and then eight rounds:
+
+| | best | median-ish rounds | CPU s/GiB |
+|---|---|---|---|
+| flux-core | **367.3** | 295–331 | **6.2** |
+| sing-box | 319.5 | 253–303 | 10.4 – 11.7 |
+| xray | 240.5 | 194–240 | 11.8 – 13.3 |
+
+**+14.9% over sing-box, +52.7% over xray**, at roughly 40% less CPU per gigabyte. The +2.1% was
+one run in which sing-box drew its best round (306.6) while flux drew a mediocre one (313.2) —
+exactly the four-round failure mode described in cycle 132.
+
+So there is nothing to optimise on that row, and the responsible thing was to measure before
+reaching for one. A profile of the TLS path would have cost hours and found nothing; ten minutes
+of sampling found the answer, which is that the question was wrong.
+
+### The pattern, now confirmed four times
+
+| row | four rounds | eight rounds |
+|---|---|---|
+| Shadowsocks-2022 | −8.6% | **+6.8%** |
+| VMess / WS + TLS | +1.0% | **+11.4%** |
+| REALITY | +2.9% | **+8.3%** |
+| VLESS / TLS | +2.1% | **+14.9%** |
+
+Every row that looked marginal at four rounds is comfortably ahead at eight. The four-round
+number is not wrong, it is **undersampled**, and best-of-N punishes that specifically because the
+competitor only needs one good round to set the bar.
