@@ -139,6 +139,57 @@ fn exchange(socks: SocketAddr, echo: SocketAddr) -> Result<Duration> {
     Ok(start.elapsed())
 }
 
+/// Resident set size of a process, in bytes, from `/proc`.
+fn rss_bytes(pid: u32) -> Option<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Opens `n` connections through the proxy and holds them open, returning the resident
+/// memory of both tunnel processes before and after.
+///
+/// Capacity planning is about this number, not about throughput: a proxy that moves
+/// 700 MiB/s and costs 512 KiB per connection cannot serve a phone.
+fn measure_footprint(
+    socks: SocketAddr,
+    echo: SocketAddr,
+    n: usize,
+    server_pid: u32,
+    client_pid: u32,
+) -> Result<(u64, u64)> {
+    let before = rss_bytes(server_pid).unwrap_or(0) + rss_bytes(client_pid).unwrap_or(0);
+    let mut held = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut s = TcpStream::connect(socks)?;
+        s.set_nodelay(true)?;
+        s.write_all(&[5, 1, 0])?;
+        let mut reply = [0u8; 2];
+        s.read_exact(&mut reply)?;
+        let mut req = vec![5, 1, 0, 1];
+        match echo.ip() {
+            std::net::IpAddr::V4(v4) => req.extend_from_slice(&v4.octets()),
+            std::net::IpAddr::V6(_) => anyhow::bail!("echo must be IPv4"),
+        }
+        req.extend_from_slice(&echo.port().to_be_bytes());
+        s.write_all(&req)?;
+        let mut head = [0u8; 10];
+        s.read_exact(&mut head)?;
+        held.push(s);
+    }
+    // Let the stacks settle: accept queues and buffers are allocated lazily, so a reading
+    // taken immediately measures an optimistic state.
+    std::thread::sleep(Duration::from_millis(1500));
+    let after = rss_bytes(server_pid).unwrap_or(0) + rss_bytes(client_pid).unwrap_or(0);
+    drop(held);
+    Ok((before, after))
+}
+
 fn start_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -168,10 +219,12 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut exchanges: u64 = 4000;
     let mut conns: usize = 32;
+    let mut idle: usize = 0;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--exchanges" => exchanges = args.next().unwrap_or_default().parse()?,
             "--conns" => conns = args.next().unwrap_or_default().parse()?,
+            "--idle" => idle = args.next().unwrap_or_default().parse()?,
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -193,12 +246,21 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let echo = start_echo();
 
-    println!("requests per second — {exchanges} exchanges over {conns} concurrent connections");
-    println!("{}", "-".repeat(74));
-    println!(
-        "{:<12} {:>13} {:>12} {:>12}",
-        "stack", "exchanges/s", "median", "p99"
-    );
+    if idle == 0 {
+        println!("requests per second — {exchanges} exchanges over {conns} concurrent connections");
+        println!("{}", "-".repeat(78));
+        println!(
+            "{:<12} {:>13} {:>12} {:>12}",
+            "stack", "exchanges/s", "median", "p99"
+        );
+    } else {
+        println!("memory per idle connection — {idle} connections held open through the tunnel");
+        println!("{}", "-".repeat(78));
+        println!(
+            "{:<12} {:>14} {:>14} {:>14}",
+            "stack", "RSS idle", "RSS loaded", "per connection"
+        );
+    }
 
     for stack in [Stack::Flux, Stack::Singbox, Stack::Xray] {
         let bin = match stack {
@@ -258,6 +320,27 @@ fn main() -> Result<()> {
         if !wait_listen(socks_addr, Duration::from_secs(15)) {
             println!("{:<12} {:>13}", stack.name(), "client never listened");
             drop((server, client));
+            continue;
+        }
+
+        if idle > 0 {
+            let srv_pid = server.0.id();
+            let cli_pid = client.0.id();
+            match measure_footprint(socks_addr, echo, idle, srv_pid, cli_pid) {
+                Ok((before, after)) => {
+                    let per = after.saturating_sub(before) / idle as u64;
+                    println!(
+                        "{:<12} {:>13} K {:>13} K {:>13} K",
+                        stack.name(),
+                        before / 1024,
+                        after / 1024,
+                        per / 1024
+                    );
+                }
+                Err(e) => println!("{:<12} {:>14}", stack.name(), format!("failed: {e}")),
+            }
+            drop((server, client));
+            std::thread::sleep(Duration::from_millis(300));
             continue;
         }
 
