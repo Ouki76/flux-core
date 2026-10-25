@@ -7239,3 +7239,20 @@ measured; the one deliberate deviation is the default, kept on rustls because it
 What that means in practice: `native_tls: true` gives a browser-shaped ClientHello to anyone who
 wants it, at parity on both speed axes, tested against two real implementations. Anyone who does
 not set it keeps exactly the behaviour the project had before this work started.
+
+### B3.10 — the allocation a peer could ask for
+
+Auditing the new module the way an attacker would read it:
+
+| question | answer |
+|---|---|
+| panics reachable from peer input? | no — the two `expect`s are an HMAC key (any length accepted) and a slice-to-array guarded by the length check above it |
+| bounded allocations from a length field? | **no** — a 24-bit handshake length let a peer ask for 16 MiB |
+
+`check_handshake_len` now refuses anything above 256 KiB, **before** the buffer grows rather than
+after. Two tests: a 16 MiB claim is refused with the number in the message, and a 768 KiB chain of
+three fat certificates still passes.
+
+That second test is the important one. A hardening limit set low enough to break a legitimate
+certificate chain is a compatibility bug wearing a security hat, and the only way to know which
+one you have written is to test both ends of the range.
