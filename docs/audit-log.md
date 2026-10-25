@@ -7038,3 +7038,33 @@ certificate for another name refused. 1114 tests, 0 failed.
 | general handshake driver | **done**, works against a real server |
 | wire into `tls.rs` behind a flag | next |
 | interop + measurement, then the default | after |
+
+### B3.4 — our TLS talks to a real sing-box server
+
+`native_tls: true` on a TLS security layer routes the connection through `tls13::connect`. The
+interop test is the one that matters:
+
+| what | result |
+|---|---|
+| our client → real sing-box TLS server | **works**, 8 KiB through a VLESS tunnel |
+| chain verified against a pinned self-signed CA | works |
+| ALPN negotiated | works |
+| xray and sing-box interop suites (rustls path) | unchanged, all pass |
+
+Two independent TLS 1.3 implementations, ours on the client side. A client that only talks to
+itself proves nothing; this crosses the boundary.
+
+Default is still rustls, and the flag is the point: the native path gets exercised by the suites
+and the benchmarks before it becomes what everyone gets — the same order this project used for
+every performance change it ever shipped.
+
+1115 tests, 0 failed.
+
+| B3 step | state |
+|---|---|
+| core, WebPKI, ALPN, shared hello | done |
+| general handshake driver | done |
+| wired into `tls.rs` behind a flag | **done** |
+| xray interop on the native path | next |
+| throughput and connection-rate measurement | next |
+| decide the default | after both |
