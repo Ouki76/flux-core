@@ -2712,6 +2712,46 @@ mod tests {
         }
     }
 
+    /// A peer may change its source address mid-stream, and the dialling side must follow it.
+    ///
+    /// Xray binds a new sending socket and answers from a port other than the one it received
+    /// on. A pin dropped every such reply as coming from a stranger, and that was the whole
+    /// reason a masked client could not talk to a real Xray server. The conversation id
+    /// identifies a stream; the source address does not.
+    ///
+    /// Deterministic: a second socket stands in for the peer's new port, so this does not
+    /// depend on an Xray version deciding to switch.
+    #[tokio::test]
+    async fn the_dialler_follows_a_peer_that_changes_its_address() {
+        let first = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let addr = first.local_addr().unwrap();
+        let cfg = KcpConfig {
+            conv: 0x7777,
+            obfs: KcpObfs::None,
+            ..KcpConfig::default()
+        };
+        let client = connect(addr, cfg).await.expect("connect");
+
+        // The peer's *new* socket: a different port, same conversation.
+        let moved = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let seg = Segment::data(0, 1, 0, b"from-a-new-port".to_vec());
+        let mut plain = Vec::new();
+        encode_segment(0x7777, &seg, &mut plain);
+        let mut datagram = Vec::new();
+        envelope::seal(&plain, &mut datagram);
+        let target = client.inner.lock().socket.local_addr().unwrap();
+        moved.send_to(&datagram, target).await.unwrap();
+
+        // The property under test is acceptance: the segment advances the receive counter
+        // only if the peer's new address was adopted.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let rcv = client.inner.lock().rcv_nxt;
+        assert_eq!(
+            rcv, 1,
+            "a segment from the peer's new address must be accepted (rcv_nxt={rcv})"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn round_trip_one_mib() {
         let socket = server_socket().await;
