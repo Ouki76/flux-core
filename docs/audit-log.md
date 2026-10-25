@@ -6707,3 +6707,46 @@ agent's memory across a hundred and forty-eight cycles — and the agent is the 
 fallibility this entire log is about.
 
 A gate that is not automated is a gate that is *usually* run.
+
+---
+
+## Cycle 149 — 2026-10-25
+
+### The CI regression gate, verified by arming it with a lie
+
+`scripts/bench_regress.sh` compares this run against a committed baseline and fails when flux
+drops more than the policy threshold. It is the guard behind every performance claim that is not
+a competitor comparison, so it was tested the same way as everything else — by making it fail.
+
+A baseline of 5000 MB/s marked `provisional: false` (armed) and matching the runner class:
+
+```
+**REGRESSION**: a 78.2 % drop exceeds the 25 % policy threshold and the baseline is armed
+for this runner class.
+exit=1
+```
+
+**It works**, and it also distinguishes an unarmed baseline (recorded on another machine) from a
+real regression by warning instead of failing — absolute throughput is not comparable across
+hosts, and the script says so in its own output.
+
+### The error path was wrong
+
+Getting there exposed a small defect of exactly the kind this log keeps finding: a baseline with
+`throughput_mbps` as a bare number reached `.get` and died with
+
+```
+AttributeError: 'float' object has no attribute 'get'
+```
+
+which names neither the file, nor the field, nor what a correct baseline looks like. It now
+checks the shape and says:
+
+```
+Baseline problem: baseline … has no throughput_mbps.flux_core number; expected an object like
+{"flux_core": 1234.5, ...}. Re-record it with --update-baseline rather than editing by hand.
+```
+
+The gate was correct; only the way it complained was not. Worth a cycle because the next person
+to hand-edit a baseline is a person under time pressure, and they would have spent an hour on a
+traceback that mentions neither the file nor the field.
