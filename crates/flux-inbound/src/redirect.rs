@@ -11,6 +11,9 @@ pub fn get_original_destination(socket: &tokio::net::TcpStream) -> std::io::Resu
     use std::os::fd::AsRawFd;
     let fd = socket.as_raw_fd();
 
+    // SAFETY: `socket` is a live stream whose descriptor stays valid for the call;
+    // `SO_ORIGINAL_DST` fills `addr` and rewrites `len`, whose initial value is exactly the
+    // size of the buffer passed.
     unsafe {
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;

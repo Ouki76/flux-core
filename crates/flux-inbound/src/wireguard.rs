@@ -653,6 +653,7 @@ impl GsoBatch {
                 std::ptr::copy_nonoverlapping((seg_len as u16).to_ne_bytes().as_ptr(), data, 2);
             }
         }
+        // SAFETY: a pure size computation for a 2-byte control message; no pointers.
         let ctrl_len = unsafe { libc::CMSG_SPACE(2) } as usize;
         let buf = &self.buf;
         let cmsg = &self.cmsg;
@@ -672,6 +673,8 @@ impl GsoBatch {
                 msg.msg_iovlen = 1;
                 msg.msg_control = cmsg.as_ptr() as *mut libc::c_void;
                 msg.msg_controllen = ctrl_len;
+                // SAFETY: `msg` points at `buf`, `name` and `cmsg`, all of which are
+                // alive for the duration of the call and sized by `total`/`ctrl_len`.
                 let r = unsafe { libc::sendmsg(fd, &msg, 0) };
                 if r < 0 {
                     Err(std::io::Error::last_os_error())
@@ -808,9 +811,11 @@ impl UdpBatch {
                     iov_len: 0,
                 })
                 .collect(),
+            // SAFETY: `mmsghdr` is a POD C struct for which all-zero is valid.
             hdr: (0..UDP_BATCH)
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect(),
+            // SAFETY: `sockaddr_storage` is a POD C struct for which all-zero is valid.
             addr: (0..UDP_BATCH)
                 .map(|_| unsafe { std::mem::zeroed() })
                 .collect(),
@@ -831,11 +836,17 @@ impl UdpBatch {
     fn recv(&mut self, fd: RawFd, max: usize) -> std::io::Result<usize> {
         let max = max.min(UDP_BATCH);
         for i in 0..max {
+            // SAFETY: `sockaddr_storage` is POD; zeroing resets it for reuse.
             self.addr[i] = unsafe { std::mem::zeroed() };
             self.iov[i] = libc::iovec {
                 iov_base: self.slots[i].as_mut_ptr() as *mut libc::c_void,
                 iov_len: UDP_DGRAM_CAP,
             };
+            // SAFETY: `mmsghdr` is POD; the pointers set below borrow `self.addr`,
+            // `self.iov` and `self.slots`, all owned by this struct and alive across the
+            // `recvmmsg` call.
+            // SAFETY: as in the receive path — POD zeroing, then pointers into
+            // storage owned by this struct.
             self.hdr[i] = unsafe { std::mem::zeroed() };
             self.hdr[i].msg_hdr.msg_name = &mut self.addr[i] as *mut _ as *mut libc::c_void;
             self.hdr[i].msg_hdr.msg_namelen =
@@ -843,6 +854,8 @@ impl UdpBatch {
             self.hdr[i].msg_hdr.msg_iov = &mut self.iov[i];
             self.hdr[i].msg_hdr.msg_iovlen = 1;
         }
+        // SAFETY: `hdr` is an array of `max` initialised `mmsghdr` values, each with
+        // pointers into live storage as set above.
         let ret = unsafe {
             libc::recvmmsg(
                 fd,
@@ -892,12 +905,16 @@ impl UdpBatch {
                 iov_base: datagrams[i].as_ptr() as *mut libc::c_void,
                 iov_len: datagrams[i].len(),
             };
+            // SAFETY: `mmsghdr` is POD; the pointers set below borrow `self.addr`,
+            // `self.iov` and the caller's datagrams, all alive across the call.
             self.hdr[i] = unsafe { std::mem::zeroed() };
             self.hdr[i].msg_hdr.msg_name = &mut self.addr[i] as *mut _ as *mut libc::c_void;
             self.hdr[i].msg_hdr.msg_namelen = addr_len;
             self.hdr[i].msg_hdr.msg_iov = &mut self.iov[i];
             self.hdr[i].msg_hdr.msg_iovlen = 1;
         }
+        // SAFETY: the first `n` entries of `self.hdr` are fully initialised above and
+        // their pointers borrow live storage.
         let ret = unsafe { libc::sendmmsg(fd, self.hdr.as_mut_ptr(), n as libc::c_uint, 0) };
         if ret < 0 {
             return Err(std::io::Error::last_os_error());
@@ -926,6 +943,8 @@ pub(crate) fn tune_socket_buffers(socket: &UdpSocket) {
 }
 
 fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    // SAFETY: `sockaddr_storage` is POD and all-zero is valid; the variant written
+    // below fits inside it by construction.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
         SocketAddr::V4(v4) => {
@@ -937,6 +956,8 @@ fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
                 },
                 sin_zero: [0; 8],
             };
+            // SAFETY: `sockaddr_in` is smaller than `sockaddr_storage` and properly
+            // aligned inside it, so writing one into the other is in bounds.
             unsafe { std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in, sin) };
             (
                 storage,
@@ -953,6 +974,8 @@ fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
                 },
                 sin6_scope_id: v6.scope_id(),
             };
+            // SAFETY: `sockaddr_in6` is smaller than `sockaddr_storage` and properly
+            // aligned inside it.
             unsafe { std::ptr::write(&mut storage as *mut _ as *mut libc::sockaddr_in6, sin6) };
             (
                 storage,
@@ -965,6 +988,8 @@ fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
 fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
+            // SAFETY: the match guarantees the family, so the storage holds a
+            // `sockaddr_in` written by `sockaddr_of`; the reference lives only here.
             let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
             Some(SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes()),
@@ -972,6 +997,7 @@ fn sockaddr_to_std(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
             )))
         }
         libc::AF_INET6 => {
+            // SAFETY: as above for the IPv6 variant.
             let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
             Some(SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::from(sin6.sin6_addr.s6_addr),

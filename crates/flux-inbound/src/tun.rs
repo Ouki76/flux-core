@@ -289,6 +289,8 @@ fn peek_ipv6_packet(packet: &[u8]) -> Option<PacketHeader> {
 fn open_tun_device(name: &str) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
     let dev_path = std::ffi::CString::new("/dev/net/tun")?;
+    // SAFETY: `dev_path` is a NUL-terminated string that outlives the call; `open`
+    // returns a fresh descriptor or -1, which is checked below.
     let fd = unsafe {
         libc::open(
             dev_path.as_ptr(),
@@ -310,6 +312,8 @@ fn open_tun_device(name: &str) -> std::io::Result<std::os::fd::OwnedFd> {
     const IFF_MULTI_QUEUE: libc::c_short = 0x0100;
     const TUNSETIFF: libc::c_ulong = 0x400454ca;
 
+    // SAFETY: `ifreq` is a POD C union for which all-zero is valid, and every field this
+    // code reads is written before use.
     let mut ifr: ifreq = unsafe { std::mem::zeroed() };
     ifr.ifr_flags = IFF_TUN | IFF_NO_PI | IFF_MULTI_QUEUE;
 
@@ -319,17 +323,24 @@ fn open_tun_device(name: &str) -> std::io::Result<std::os::fd::OwnedFd> {
         ifr.ifr_name[i] = b as libc::c_char;
     }
 
+    // SAFETY: `fd` is the descriptor just opened, and `ifr` is a live, fully initialised
+    // request buffer whose layout `TUNSETIFF` documents.
     let mut ret = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
     if ret < 0 {
         // Fallback without IFF_MULTI_QUEUE if unsupported by host kernel
         ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+        // SAFETY: as above; only the flags differ.
         ret = unsafe { libc::ioctl(fd, TUNSETIFF, &ifr) };
         if ret < 0 {
+            // SAFETY: `fd` was opened above and is not owned by anything else on this
+            // error path, so it is closed exactly once here.
             unsafe { libc::close(fd) };
             return Err(std::io::Error::last_os_error());
         }
     }
 
+    // SAFETY: `fd` is a valid descriptor with no other owner; `OwnedFd` takes over the
+    // responsibility to close it, which is why no path above both keeps and closes it.
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
@@ -357,10 +368,14 @@ fn set_interface_mtu(name: &str, mtu: usize) -> std::io::Result<()> {
 
     const SIOCSIFMTU: libc::c_ulong = 0x8922;
 
+    // SAFETY: a plain socket creation with constant arguments; the result is checked for
+    // -1 immediately.
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if sock < 0 {
         return Err(std::io::Error::last_os_error());
     }
+    // SAFETY: `ifreq_mtu` is POD; zeroing then filling the name and MTU is the documented
+    // way to build a `SIOCSIFMTU` request.
     let mut ifr: ifreq_mtu = unsafe { std::mem::zeroed() };
     let bytes = name.as_bytes();
     let len = bytes.len().min(libc::IFNAMSIZ - 1);
@@ -368,8 +383,11 @@ fn set_interface_mtu(name: &str, mtu: usize) -> std::io::Result<()> {
         ifr.ifr_name[i] = b as libc::c_char;
     }
     ifr.ifr_mtu = mtu as libc::c_int;
+    // SAFETY: `sock` is the descriptor created above and `ifr` is a live request buffer.
     let ret = unsafe { libc::ioctl(sock, SIOCSIFMTU, &ifr) };
     let err = std::io::Error::last_os_error();
+    // SAFETY: `sock` is owned by this function and closed exactly once here, before the
+    // error from `ioctl` is returned.
     unsafe { libc::close(sock) };
     if ret < 0 { Err(err) } else { Ok(()) }
 }
@@ -927,6 +945,8 @@ mod smol_stack {
     /// Reads one IP packet into `frame` (which must be `cap` bytes long).
     #[cfg(unix)]
     fn read_frame(fd: std::os::fd::RawFd, frame: &mut [u8], cap: usize) -> std::io::Result<usize> {
+        // SAFETY: `frame` is borrowed for the call and `cap` never exceeds its length, so
+        // the kernel writes only inside the caller's buffer.
         let n = unsafe { libc::read(fd, frame.as_mut_ptr() as *mut libc::c_void, cap) };
         if n < 0 {
             return Err(std::io::Error::last_os_error());
@@ -982,6 +1002,8 @@ mod smol_stack {
                         };
                         match guard.try_io(|inner| {
                             use std::os::fd::AsRawFd;
+                            // SAFETY: `pkt` is borrowed for the duration and `pkt.len()`
+                            // is the length passed, so the kernel reads only that much.
                             let res = unsafe {
                                 libc::write(
                                     inner.as_raw_fd(),
