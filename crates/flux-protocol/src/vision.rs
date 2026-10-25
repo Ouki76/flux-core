@@ -195,7 +195,7 @@ impl<S> VisionStream<S> {
             padding_phase: true,
             direct: false,
             enc_buf: Vec::new(),
-            read_tmp: vec![0u8; 16 * 1024],
+            read_tmp: vec![0u8; flux_common::copy::RELAY_BUFFER_BYTES],
             pending: Vec::new(),
             pending_pos: 0,
             plain_len: 0,
@@ -475,8 +475,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for VisionStream<S> {
             frames_this_call += 1;
 
             // 3. Need more bytes from the transport.
-            if this.read_tmp.len() < 16 * 1024 {
-                this.read_tmp.resize(16 * 1024, 0);
+            // The transport is handed 256 KiB per relay write; reading it 16 KiB at a time
+            // made one write four reads and four frames.
+            if this.read_tmp.len() < flux_common::copy::RELAY_BUFFER_BYTES {
+                this.read_tmp
+                    .resize(flux_common::copy::RELAY_BUFFER_BYTES, 0);
             }
             let mut read_buf = ReadBuf::new(&mut this.read_tmp);
             match Pin::new(&mut this.inner).poll_read(cx, &mut read_buf) {
