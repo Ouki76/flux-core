@@ -3499,3 +3499,59 @@ result rather than argue about it.
 
 The workflow itself is the deliverable: `examples/alloc_count` counts allocations around a
 live instance, and the valgrind recipe is in this log. Neither existed this morning.
+
+---
+
+## Cycle 73 — 2026-10-25
+
+### 90.7 % in `memset`: the UDP gap was a security scrub
+
+The profiler attached this time, and the answer was one line:
+
+```
+1,294,279,648 (90.69%)  __memset_avx2_unaligned_erms
+```
+
+The buffer pool scrubs a buffer on release so that one caller never receives another's
+payload. That property is worth keeping — it is why the pool exists — but it scrubbed the
+**whole 64 KiB packet buffer, once per datagram**. Disabling the scrub to measure its share
+took the entire profile from **1.43 billion instructions to 3.95 million**.
+
+The pool's own documentation had the number that mattered and nobody added up:
+
+> ~490 ns for the 64 KiB packet pool, once per datagram. Over half of the pool's
+> acquire/release cycle at that size
+
+At 55 000 datagrams/second, two thirds of the proxy's time was zeroing memory that the next
+datagram would immediately overwrite.
+
+### The fix keeps the property and drops the cost
+
+A `BufferGuard` can now report how many bytes it used, and release zeroes only that prefix.
+Safe by induction: every release zeroes at least the prefix it used, so bytes beyond any
+caller's mark were already zeroed by the release that last covered them.
+`a_short_release_still_leaves_no_payload_behind` asserts it directly — long user fills and
+releases, short user sees a clean buffer, writes 16 bytes, releases, and the next acquire
+holds neither payload.
+
+| | before | after | sing-box | xray |
+|---|---|---|---|---|
+| UDP relay, datagrams/s | 55 000 | **104 320** | 67 118 | 10 942 |
+
+**+55 % over sing-box**, where an hour earlier this cycle's own log recorded us 25 % behind,
+and +853 % over xray.
+
+### What this costs the previous six hours
+
+Every UDP hypothesis before this — the async mutexes, the channel hops, the per-datagram
+`Bytes` allocation — was wrong, and one of them (the std-mutex "fix") was measurably *worse*
+and correctly reverted. A profiler that attaches and a counting allocator would have pointed
+at a `memset` in an afternoon. That is now the standard here: `examples/alloc_count` and the
+valgrind recipe are in the repository, and the next datagram-path question starts with a
+profile rather than a guess.
+
+### The same class of bug elsewhere
+
+The TCP copy path scrubs a 16 KiB buffer once per 16 KiB moved — a 1:1 ratio that is much
+better but still one `memset` per buffer. With UDP measured, the question for the next cycle
+is whether those callers can report their used length too.
