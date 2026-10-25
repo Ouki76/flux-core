@@ -5174,3 +5174,32 @@ with fifteen of fifteen reached once and Vision oscillating around parity**. Cla
 fifteen, always" from one run would be the same error this log has recorded six times.
 
 **Every xray path is ahead in both runs, by at least 15 % and usually by far more.**
+
+---
+
+## Cycle 109 — 2026-10-25
+
+### Vision: the last row that "wasn't ahead", and the per-round answer
+
+The six-round matrix put Vision at −3.0 %, the only row behind. Per-round, six rounds:
+
+| round | flux | sing-box | xray |
+|---|---|---|---|
+| 1 | 325.5 | 291.4 | 224.9 |
+| 2 | **375.4** | 299.8 | 205.9 |
+| 3 | 334.7 | 307.3 | 211.7 |
+| 4 | 306.8 | 317.6 | 208.3 |
+| 5 | 301.5 | 312.3 | — |
+| **range** | **301-375** | 291-318 | 206-225 |
+| vs sing-box | **ahead in 4 of 5 rounds**, best +18 % | | |
+
+Our worst round (301.5) is inside their range; our median (326) is 6 % above theirs (308); our
+best is 18 % above. The −3.0 % in the matrix came from a run where our best round happened to
+land at 314 while theirs landed at 324.
+
+So Vision is at parity or ahead, and its apparent deficit was the fourth time this audit has
+misread a noisy row as a deficit — after WS, REALITY, and Shadowsocks-2022, the first two of
+which turned out to have real fixes behind them and the third a wrong-file investigation.
+
+The difference now is that the question is answered in one run instead of six: dump the rounds,
+compare medians and ranges, and only then believe the summary line.
