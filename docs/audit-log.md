@@ -7302,3 +7302,30 @@ available, both as the fallback and as an explicit choice (`native_tls: false`).
 - **Session resumption** on the native path. rustls resumes; ours starts a full handshake every
   time. Connection rate is at parity without it, so this is an efficiency gap rather than a
   functional one — but on a high-churn workload it is the next thing to measure.
+
+### B3.12 — the fallback, proved where it matters
+
+The retry was tested in halves: the native client naming a TLS 1.2 server as a version problem
+(B3.11), and rustls reaching that same server. Neither exercised the wiring that joins them —
+and the wiring is where a fallback usually fails.
+
+`a_tls12_only_server_is_reached_through_the_fallback` runs an Xray server pinned to
+`minVersion/maxVersion: 1.2` against a client using the **default** configuration. The native
+handshake is refused with alert 70, the dial retries with rustls, and 4 KiB comes back through
+the tunnel.
+
+Disabling the retry:
+
+```
+socks request must succeed        (the connection never establishes)
+```
+
+The chain of evidence for the default is now complete at every link:
+
+| link | proof |
+|---|---|
+| native handshake is refused by a 1.2-only server, and says why | `the_native_client_reports_a_tls12_server_as_not_tls13` |
+| the refusal is classified as retryable, not a certificate failure | `fallback_policy_tests` |
+| rustls reaches the same server | `rustls_reaches_the_same_tls12_server` |
+| **the dial actually retries** | `a_tls12_only_server_is_reached_through_the_fallback` |
+| nothing else regressed | 1127 tests, matrix `ASSERT PASSED` |
