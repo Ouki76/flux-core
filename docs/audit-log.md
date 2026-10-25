@@ -6634,3 +6634,41 @@ re-check the ones a newcomer reads first.
 | static gates | fmt, clippy (with the unsafe lint), doc, audit, deny — clean |
 | unsafe blocks | 88 total, 0 undocumented |
 | open items | browser-grade fingerprint, bounded by rustls |
+
+---
+
+## Cycle 147 — 2026-10-25
+
+### Final verification, all gates, one pass
+
+```
+cargo fmt --all --check                          clean
+cargo clippy --workspace --all-targets -D warnings    0 errors, 0 warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps        0 errors
+cargo deny check                                advisories ok, bans ok, licenses ok, sources ok
+cargo audit                                     271 dependencies, no vulnerabilities
+cargo test --workspace                          1101 passed, 0 failed, 7 skipped
+```
+
+The seven skipped are the ones that need an environment this host does not provide — a network
+namespace for the transparent inbounds — and they are hard failures when `CI` is set, not silent
+passes.
+
+Ten test files drive the real `sing-box` or `xray` binaries.
+
+### The audit in one screen
+
+| what | number | how it is checked |
+|---|---|---|
+| matrix rows ahead of sing-box | **15 of 15** | `bench_matrix --assert` |
+| matrix rows ahead of xray | **10 of 10** | same |
+| connection rate | **+29%** plain, **+100%** TLS | `bench_rps --assert` |
+| UDP datagrams | **+25%** vs sing-box, **+1024%** vs xray | `bench_udp --assert` |
+| memory per connection | **23 KB** vs 89 vs 121 | `bench_rps --idle --assert` |
+| tests | **1101**, 0 failed | `cargo test` |
+| static gates | 5 of 5 clean | above |
+| unsafe blocks | 88, **0 undocumented** | `clippy::undocumented_unsafe_blocks` |
+
+Every one of those rows has been observed failing at least once — by reverting a fix, by
+deliberately breaking a guard, or by demanding more of a tolerance than the measurement supports.
+That is the only reason to believe any of them.
