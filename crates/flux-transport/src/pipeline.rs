@@ -356,6 +356,8 @@ pub enum ServerFramingLayer {
     Xhttp {
         /// Base path; the client appends a per-connection suffix.
         path: Option<String>,
+        /// Xray's `noSSEHeader`: answer with a plain body type instead of `text/event-stream`.
+        no_sse_header: bool,
     },
     /// Upgrade framing.
     HttpUpgrade {
@@ -447,10 +449,14 @@ impl ServerTransportPipeline {
             for framing in &self.framings {
                 stream = match framing {
                     ServerFramingLayer::Raw => stream,
-                    ServerFramingLayer::Xhttp { path } => {
+                    ServerFramingLayer::Xhttp {
+                        path,
+                        no_sse_header,
+                    } => {
                         let st = crate::xhttp::accept(
                             stream,
                             path.as_deref().unwrap_or(crate::xhttp::DEFAULT_XHTTP_PATH),
+                            *no_sse_header,
                         )
                         .await?;
                         Box::new(st)

@@ -1661,7 +1661,10 @@ fn compile_server_framings(
                 settings
                     .validate("inbound xhttp")
                     .map_err(flux_types::FluxError::Config)?;
-                list.push(flux_transport::pipeline::ServerFramingLayer::Xhttp { path });
+                list.push(flux_transport::pipeline::ServerFramingLayer::Xhttp {
+                    path,
+                    no_sse_header: settings.no_sse_header.unwrap_or(false),
+                });
             }
             InboundFramingConfig::WebSocket { path } => {
                 list.push(flux_transport::pipeline::ServerFramingLayer::WebSocket { path });

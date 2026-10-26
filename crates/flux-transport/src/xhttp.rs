@@ -81,7 +81,7 @@ where
 /// `path` is the configured base path. Anything under it is accepted, because the client
 /// appends a per-session suffix; anything else is refused with 404, like a web server
 /// serving only its own tree.
-pub async fn accept<S>(stream: S, path: &str) -> FluxResult<H2Stream>
+pub async fn accept<S>(stream: S, path: &str, no_sse_header: bool) -> FluxResult<H2Stream>
 where
     S: AsyncStream + 'static,
 {
@@ -116,9 +116,16 @@ where
         });
     }
 
+    // Xray answers a download stream with `text/event-stream` so it looks like a long-poll, and
+    // `noSSEHeader` suppresses that. The body is identical either way; only the label changes.
+    let body_type = if no_sse_header {
+        "application/octet-stream"
+    } else {
+        "text/event-stream"
+    };
     let response = Response::builder()
         .status(StatusCode::OK)
-        .header("content-type", "application/octet-stream")
+        .header("content-type", body_type)
         .body(())
         .map_err(|e| FluxError::Protocol {
             protocol: "xhttp",
@@ -253,7 +260,7 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel").await.expect("server accept");
+            let mut s = accept(server_io, "/tunnel", false).await.expect("server accept");
             let mut buf = vec![0u8; 5];
             s.read_exact(&mut buf).await.expect("server read");
             assert_eq!(&buf, b"hello");
@@ -327,7 +334,7 @@ mod tests {
         // implementation does not speak. Answering 200 would leave a client waiting for
         // a download stream that never carries anything.
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(async move { accept(server_io, "/tunnel").await.is_err() });
+        let server = tokio::spawn(async move { accept(server_io, "/tunnel", false).await.is_err() });
         let mut client = shared::client_handshake(client_io, "xhttp")
             .await
             .expect("client");
@@ -350,7 +357,7 @@ mod tests {
         // Xray appends things to the base path; the prefix rule must not be exact-match.
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel").await.expect("accept");
+            let mut s = accept(server_io, "/tunnel", false).await.expect("accept");
             let mut buf = [0u8; 3];
             s.read_exact(&mut buf).await.expect("read");
             s.write_all(&buf).await.expect("write");
@@ -382,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_outside_the_base_is_refused() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(async move { accept(server_io, "/tunnel").await.is_err() });
+        let server = tokio::spawn(async move { accept(server_io, "/tunnel", false).await.is_err() });
         let mut client = shared::client_handshake(client_io, "xhttp")
             .await
             .expect("client");
