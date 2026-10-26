@@ -8747,3 +8747,31 @@ Cleaned up and verified: **0 matching files in `/tmp`, 0 processes left running.
 This is also where the earlier failures came from: three attempts produced `n=0` because a
 background process died before the client started, and one because the client config still pointed
 at the blocked port. The run that worked printed `n=100 ошибок=0` before anyone looked at a timing.
+
+### C3.10 — our TLS against rustls on a real link: parity, with the sign flipping
+
+Same machine pair, same tunnel, same workload, only the TLS implementation differs
+(`native_tls: true` vs `false`), 150 connections per run:
+
+| round | our TLS | rustls |
+|---|---|---|
+| 1 | 1.89 ms | **1.79 ms** |
+| 2 | **1.90 ms** | 2.07 ms |
+
+**The difference changes sign between rounds.** Round 1 favours rustls by 0.10 ms, round 2 favours
+ours by 0.17 ms, and the run-to-run spread within a configuration (1.79 → 2.07 for rustls) is larger
+than either difference.
+
+That is parity, stated honestly: not "we are faster", and not "we are slower". An earlier
+measurement on this project (B3.5) reached the same conclusion by a different route — 316.2 vs
+307.7 MB/s throughput and 7 952 vs 8 125 connections/s, both inside host noise.
+
+**What 1.8 ms is made of**, so the number is not read as a standalone TLS figure: one SOCKS
+negotiation, an SSH tunnel hop, the TLS handshake, a VLESS request, four bytes echoed back and a
+close. The handshake is a fraction of it. Without resumption the same path takes 2.76 ms (C3.9), so
+resumption accounts for about a third of the total.
+
+**Caveat on the link:** the traffic went through an SSH tunnel because the host's firewall refuses
+the benchmark port, and the tunnel adds its own latency. That inflates every number here equally, so
+the *comparison* between implementations is unaffected while the absolute figure is not portable to
+a direct connection.
