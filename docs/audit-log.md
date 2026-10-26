@@ -9625,3 +9625,39 @@ upload POST) and a client that drives two h2 requests concurrently and joins the
 `AsyncStream`. That is a day's work with its own interop matrix, and a half-applied version breaks
 connections silently — worse than the clear startup refusal we ship. The wire details are in C6.3,
 taken from Xray's own `hub.go` and `client.go`.
+
+---
+
+## C7.1 — can a wrapped protocol use splice? No, and the code says why
+
+The instruction profile (C6.2) put a 68× gap between the spliced TCP path (0.013 s/GiB) and TLS
+(0.88). The obvious question was whether splice could be extended to the wrapped protocols. It
+cannot, and the reason is structural rather than a missing optimisation.
+
+`splice(2)` moves bytes from one file descriptor to a pipe to another descriptor **entirely inside
+the kernel**. It works in this codebase only under one condition, visible in
+`dispatcher.rs:470`:
+
+```rust
+if let (Some(tcp_in), Some(tcp_out)) = (
+    inbound_stream.as_any().downcast_ref::<tokio::net::TcpStream>(),
+    outbound_stream.as_any().downcast_ref::<tokio::net::TcpStream>(),
+) { … copy_bidirectional_zero_copy_metered(…) }
+```
+
+**Both ends must be raw `TcpStream`.** The moment either side is a `TlsStream`, a `WebSocketStream`
+or an XHTTP stream, the payload has to be decrypted, deframed or re-encrypted — which means it
+enters userspace by definition, and a copy is unavoidable.
+
+So the 68× is not overhead we left on the table; it is **the price of looking at the bytes**. TLS
+pays it once for encryption and once for decryption; that is what encryption is.
+
+| path | splice possible | why |
+|---|---|---|
+| VLESS / TCP (direct) | **yes** — implemented, 0.013 s/GiB | bytes never inspected |
+| VLESS / TCP through a tunnel | yes, per leg | each leg is raw TCP after the header |
+| TLS, REALITY, WS, XHTTP, gRPC | **no** | payload must be decrypted in userspace |
+| UDP | **no** | datagram boundaries and SOCKS headers per packet |
+
+**Rejected optimisation, with the reason:** "splice for wrapped protocols" cannot be built. The only
+splice-eligible paths already use it.
