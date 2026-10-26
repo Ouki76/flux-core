@@ -8692,3 +8692,22 @@ and `bench_rps --tls --assert` **PASSED** at 7 674 exchanges/s against 4 258 and
 
 So the HelloRetryRequest work, the TLS 1.2 resumption and the IPv6 fix all landed without a
 regression on either measured axis.
+
+### C3.8 — correction: the escape hatch does not cover CBC either
+
+C3.4 said that a server offering only CBC or static RSA "is not silent-walled — the connection works
+through the reference stack". **That is wrong.** rustls, which is our fallback, implements AEAD
+suites only: no CBC, and no static RSA key exchange. So a server offering only those is unreachable
+by this project in either configuration, not reachable through the fallback.
+
+The reasoning in C3.4 stands — refusing CBC and static RSA is still the right call — but the cost is
+larger than recorded there: it is not "the client declines and the fallback copes", it is "this
+project cannot talk to that server at all".
+
+Who does support them, by documentation rather than measurement: the Go standard library (and
+therefore sing-box and xray) and OpenSSL-based servers (nginx, Apache, Caddy). Our stack matches
+rustls's strictness, not theirs.
+
+This correction was made after the maintainer asked directly whether the other implementations
+support these suites — which is the useful property of being asked a question: it finds the claims
+that were never tested.
