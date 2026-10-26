@@ -7546,3 +7546,44 @@ application records; silence means it is waiting for something we never sent.
 
 Recorded rather than glossed: seven cycles into the 1.2 path, the handshake is verified against
 three implementations and the return path is still unexplained.
+
+### C1.8 — the server was sending an alert all along
+
+A capture of the entire server-to-client stream, decoded record by record:
+
+```
+0: 0x15 0301 len 2      alert (legacy, plaintext)
+1: 0x16 0303 len 63     ServerHello
+2: 0x16 0303 len 416    Certificate
+3: 0x16 0303 len 116    ServerKeyExchange
+4: 0x16 0303 len 4      ServerHelloDone
+5: 0x14 0303 len 1      change_cipher_spec
+6: 0x16 0303 len 40     Finished
+7: 0x17 0303 len 26     the two-byte VLESS header
+8: 0x15 0303 len 26     ALERT — 8 nonce + 2 bytes + 16 tag
+```
+
+**The server was never silent.** It rejects something and sends a fatal alert, and our client
+reported that as a plain connection close. Five cycles of reading code could not have found this;
+one capture did.
+
+The alert path now decrypts the alert and names it — `bad_record_mac`, `decrypt_error`,
+`decode_error`, `protocol_version` — instead of the single word "alert". A described failure is a
+diagnosable one; an undescribed one is what this cost.
+
+**The remaining question is now one two-byte field**: which alert. The naming added here is what
+will read it, and the answer will point at one of two things — the AEAD inputs (mac/decrypt) or the
+record contents (decode).
+
+### Honest accounting, eight cycles in
+
+| what | state |
+|---|---|
+| TLS 1.2 handshake against three implementations | works |
+| chain, name, key-exchange signature checks | work, tested |
+| upload through a 1.2 tunnel | complete, counted by a third party |
+| return path | **the server sends a fatal alert; which one is not yet decoded** |
+| session resumption | not started |
+
+Two of the last three cycles produced a defect or a fact; this one produced a fact worth more than
+either — the problem is not a stall, it is a rejection with a reason we were discarding.
