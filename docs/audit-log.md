@@ -9156,3 +9156,57 @@ touches them.
 
 **What remains, and it is the only thing left:** `recvmmsg`/`sendmmsg` batching, which removes the
 syscalls themselves. Everything cheaper has now been tried and measured.
+
+### C5.3 — three hypotheses tested; the cost is per-packet and inherent
+
+C5.1 attributed UDP's cost to syscalls; C5.2 disproved the two cheap fixes. A third hypothesis was
+worth testing — that the cost is **scheduling**, a wakeup per datagram:
+
+```
+voluntary_ctxt_switches:   6 → 9  over 5 seconds of load
+```
+
+**Three context switches in five seconds.** Under continuous traffic the tokio worker never parks,
+so there is no per-datagram wakeup to remove. The scheduling hypothesis is dead, and it was the one
+that would have made batching a small change.
+
+### What the 27–29 s/GiB figure actually measures
+
+Re-reading C4.3 against this: the expensive rows were **WireGuard (29.1), TUIC (27.3) and
+Hysteria2 (29.4)** — every one of them an encrypted UDP protocol with per-datagram AEAD. The SOCKS
+UDP relay that `bench_udp` exercises is a different path, and it moves **112 494 datagrams/s,
+1079.9 Mbit/s** while beating sing-box by 55% and xray by 297%.
+
+So the comparison in C4.3 was not "our UDP relay is slow" — it was "UDP protocols cost more per byte
+than TCP", which is true of every implementation and is made of two inherent parts:
+
+| component | per 1200-byte datagram |
+|---|---|
+| four syscalls (two per relay process) | irreducible without `recvmmsg`/`sendmmsg` |
+| one AEAD operation per datagram (WireGuard, QUIC) | the protocol's design; there is no batching it away |
+| our userspace code | not visible in the profile |
+
+### The honest position on optimising UDP
+
+Three candidates were tried and measured; none survived:
+
+| candidate | measured effect | verdict |
+|---|---|---|
+| socket buffers 212 KiB → 4 MiB | +1.2% | noise, reverted |
+| `tokio::Mutex` → `std::Mutex` per datagram | +0.7% | noise, reverted |
+| per-datagram wakeups to remove | **none exist** (3 switches / 5 s) | hypothesis dead |
+
+What is left is `recvmmsg`/`sendmmsg` batching — up to 32 datagrams per syscall. It is the only
+lever the measurements support, it is structural (tokio has no batched UDP API, so the loop must
+poll readiness and call `libc::recvmmsg` under `MSG_DONTWAIT` with partial-batch handling), and it
+would need its own cycle with its own corruption tests.
+
+**Not implemented, and the reason is measured rather than asserted:** the syscall share of a
+datagram's cost has not been isolated from the crypto share. Batching 32 datagrams helps the first
+and does nothing for the second, and for WireGuard/QUIC the second may be the larger half. Doing
+that work on the strength of an unseparated estimate is exactly what this audit is supposed to
+refuse.
+
+**Reproduce the whole analysis:** `bench_udp --count 200000 --rounds 3 --payload-size 1200`, then
+`/proc/<pid>/status` for the switch counts, then `bench_matrix --only wireguard --rounds 3` for the
+CPU-per-GiB split.
