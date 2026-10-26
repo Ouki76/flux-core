@@ -8549,3 +8549,39 @@ result parses as a `SocketAddr`.
 **The lesson is about where the test lived, not what it checked.** A unit test at the transport
 layer proved the protocol stack speaks v6; nothing proved the *configuration* could express a v6
 address. Both are needed, and only the end-to-end run found the gap between them.
+
+### C3.4 — why TLS 1.2 CBC and static RSA are refused rather than added
+
+The objective said: where a limitation is deliberate, record the reasoning instead of adding weak
+cryptography. This is that record.
+
+Our TLS 1.2 client offers four suites, all ECDHE + AEAD:
+
+```
+TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256   0xC02B
+TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256     0xC02F
+TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384   0xC02C
+TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384     0xC030
+```
+
+**CBC suites are refused.** Every practical attack on TLS 1.2 in the last decade — BEAST, POODLE,
+Lucky Thirteen, the padding oracles that made them work — targets CBC. AEAD removes the entire
+class: no padding, no timing oracle in the MAC-then-encrypt construction. Adding CBC would be
+adding the part of 1.2 that has a history, to talk to a server that has not been updated.
+
+**Static RSA key exchange is refused.** It has no forward secrecy: whoever records the traffic and
+later obtains the server's private key reads all of it. ECDHE costs one signature and one key share
+and removes that. A server offering only static RSA is one whose traffic is worth capturing.
+
+**What this costs:** a server configured for `AES128-SHA` or `AES128-GCM-SHA256` (RSA key exchange)
+cannot be reached by us. That is a real compatibility cost and it is accepted deliberately: those
+configurations are not merely old, they are the ones with published breaks, and a proxy that
+carries credentials is the last place to accept them.
+
+**What the fallback does instead:** if a TLS layer's native handshake fails, the dial path retries
+with rustls, which *does* offer these suites. So a user with such a server is not silent-walled —
+the connection works through the reference stack, and the log says why. The native client is the
+default because its ClientHello is the point; the weak suites remain reachable, just not by us.
+
+Nothing here is a claim that the suites are safe. It is a record that the omission is a decision
+with a reason, a named cost, and an escape hatch.
