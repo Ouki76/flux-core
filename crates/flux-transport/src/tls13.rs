@@ -2545,6 +2545,66 @@ mod psk_hello_tests {
         assert_eq!(binder_at + 32, hello.len(), "the binder ends the hello");
     }
 
+    /// An **independent** walk of every length field in the hello we actually send.
+    ///
+    /// The other layout tests walk a hello the same code built; this one re-derives every offset
+    /// from the message header down and fails if any length field disagrees with the bytes that
+    /// follow it — which is the class of bug a server answers with `illegal_parameter`.
+    #[test]
+    fn every_length_in_the_psk_hello_agrees() {
+        let t = ticket();
+        let (hello, _, _) =
+            build_client_hello_with_psk("example.test", &[], &[1u8; 32], &[2u8; 32], &t)
+                .expect("hello");
+
+        // Handshake header.
+        assert_eq!(hello[0], HS_CLIENT_HELLO);
+        let declared = u32::from_be_bytes([0, hello[1], hello[2], hello[3]]) as usize;
+        assert_eq!(declared, hello.len() - 4, "handshake length");
+
+        let body = &hello[4..];
+        let mut p = 0;
+        assert_eq!(&body[p..p + 2], &[0x03, 0x03], "legacy_version");
+        p += 2;
+        p += 32; // random
+        let sid = body[p] as usize;
+        p += 1 + sid;
+        let suites = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        assert_eq!(suites % 2, 0, "cipher suites must be pairs");
+        p += 2 + suites;
+        let comp = body[p] as usize;
+        p += 1 + comp;
+        let ext_len = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        p += 2;
+        assert_eq!(
+            p + ext_len,
+            body.len(),
+            "the extension list must reach the end of the message: ext_len={ext_len}, remaining={}",
+            body.len() - p
+        );
+
+        // Walk the extensions and report what a server would see.
+        let end = p + ext_len;
+        let mut seen: Vec<u16> = Vec::new();
+        while p + 4 <= end {
+            let ty = u16::from_be_bytes([body[p], body[p + 1]]);
+            let len = u16::from_be_bytes([body[p + 2], body[p + 3]]) as usize;
+            assert!(p + 4 + len <= end, "extension {ty:#06x} overruns the list");
+            seen.push(ty);
+            p += 4 + len;
+        }
+        assert_eq!(p, end, "extensions must be exactly consumed");
+        assert_eq!(
+            *seen.last().expect("at least one"),
+            0x0029,
+            "order: {seen:04x?}"
+        );
+        assert!(
+            seen.iter().filter(|t| **t == 0x0029).count() == 1,
+            "pre_shared_key must appear once"
+        );
+    }
+
     /// The handshake length must cover the binder, because the truncated hash keeps the lengths
     /// the peer will actually read.
     #[test]
