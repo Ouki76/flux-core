@@ -1345,6 +1345,12 @@ mod ee_tests {
 }
 
 /// TLS 1.3 group ids and the GREASE table (RFC 8701).
+/// The fixed ServerHello.random that marks a HelloRetryRequest (RFC 8446 §4.1.3).
+pub(crate) const HRR_RANDOM: [u8; 32] = [
+    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
+    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
+];
+
 pub(crate) const GROUP_X25519: u16 = 0x001d;
 pub(crate) const GROUP_SECP256R1: u16 = 0x0017;
 pub(crate) const GROUP_SECP384R1: u16 = 0x0018;
@@ -1366,9 +1372,28 @@ pub(crate) fn build_client_hello(
     server_name: &str,
     alpn: &[&[u8]],
     random: &[u8; 32],
-    eph_pub: &[u8; 32],
+    eph_pub: &[u8],
 ) -> Vec<u8> {
     build_client_hello_with_extra(server_name, alpn, random, eph_pub, &[])
+}
+
+/// The same greeting for a chosen group, with an optional cookie the server asked us to echo.
+pub(crate) fn build_client_hello_for_group(
+    server_name: &str,
+    alpn: &[&[u8]],
+    random: &[u8; 32],
+    group: u16,
+    eph_pub: &[u8],
+    cookie: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut extra = Vec::new();
+    if let Some(c) = cookie {
+        extra.extend_from_slice(&0x002cu16.to_be_bytes());
+        extra.extend_from_slice(&((c.len() + 2) as u16).to_be_bytes());
+        extra.extend_from_slice(&(c.len() as u16).to_be_bytes());
+        extra.extend_from_slice(c);
+    }
+    build_client_hello_parts(server_name, alpn, random, group, eph_pub, &extra)
 }
 
 /// The same greeting with raw extension bytes appended at the end of the extension list.
@@ -1376,7 +1401,20 @@ pub(crate) fn build_client_hello_with_extra(
     server_name: &str,
     alpn: &[&[u8]],
     random: &[u8; 32],
-    eph_pub: &[u8; 32],
+    eph_pub: &[u8],
+    extra: &[u8],
+) -> Vec<u8> {
+    build_client_hello_parts(server_name, alpn, random, GROUP_X25519, eph_pub, extra)
+}
+
+/// The one builder every greeting goes through: group, key share and caller extras are
+/// parameters so the browser-shaped fingerprint cannot drift between code paths.
+pub(crate) fn build_client_hello_parts(
+    server_name: &str,
+    alpn: &[&[u8]],
+    random: &[u8; 32],
+    group: u16,
+    eph_pub: &[u8],
     extra: &[u8],
 ) -> Vec<u8> {
     let mut hello: Vec<u8> = Vec::with_capacity(512);
@@ -1456,12 +1494,13 @@ pub(crate) fn build_client_hello_with_extra(
     for group in groups {
         ext.extend_from_slice(&group.to_be_bytes());
     }
-    // key_share: x25519 ephemeral
+    // key_share: one ephemeral share for the group this greeting is for
+    let ks_body = 2 + 2 + eph_pub.len();
     ext.extend_from_slice(&0x0033u16.to_be_bytes());
-    ext.extend_from_slice(&38u16.to_be_bytes());
-    ext.extend_from_slice(&36u16.to_be_bytes());
-    ext.extend_from_slice(&GROUP_X25519.to_be_bytes());
-    ext.extend_from_slice(&32u16.to_be_bytes());
+    ext.extend_from_slice(&((ks_body + 2) as u16).to_be_bytes());
+    ext.extend_from_slice(&(ks_body as u16).to_be_bytes());
+    ext.extend_from_slice(&group.to_be_bytes());
+    ext.extend_from_slice(&(eph_pub.len() as u16).to_be_bytes());
     ext.extend_from_slice(eph_pub);
     // signature_algorithms (ed25519 first — REALITY server cert is ed25519)
     let sigalgs: [u16; 9] = [
@@ -1519,60 +1558,90 @@ where
 {
     use rand::RngCore;
     use tokio::io::AsyncWriteExt;
-    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
     // ---- 1. Greeting.
-    let eph = StaticSecret::random_from_rng(rand::rngs::OsRng);
-    let eph_pub = X25519PublicKey::from(&eph);
+    let mut group = GROUP_X25519;
+    let (mut eph, mut eph_pub) = Ephemeral::generate(group)?;
     let mut random = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut random);
     // A stored ticket turns this handshake into a resumption: the PSK authenticates the server and
     // the round trip that carries the certificate disappears.
-    // **Off until the offer is proven.** The extension is byte-for-byte what RFC 8446 describes —
-    // the layout test checks the vectors — but rustls answers `illegal_parameter`, so something
-    // semantic is still wrong. Offering it anyway would break every *reconnect* to a server that
-    // issued a ticket, which is worse than not resuming at all.
     let offered_psk = if psk_offer_enabled() {
         crate::resumption::get(cfg.server_name)
     } else {
         None
     };
-    let hello = match &offered_psk {
-        Some(ticket) => {
-            let (mut hello, truncate_at, binder_at) = build_client_hello_with_psk(
+    let mut offered_psk = offered_psk;
+    let build = |psk: &Option<crate::resumption::StoredTicket>,
+                 group: u16,
+                 eph_pub: &[u8],
+                 cookie: Option<&[u8]>|
+     -> FluxResult<Vec<u8>> {
+        match psk {
+            Some(ticket) => {
+                let (mut hello, truncate_at, binder_at) = build_client_hello_with_psk(
+                    cfg.server_name,
+                    cfg.alpn,
+                    &random,
+                    eph_pub,
+                    ticket,
+                )?;
+                let key = crate::resumption::binder_key(ticket.suite, &ticket.psk)?;
+                let binder = crate::resumption::binder(ticket.suite, &key, &hello[..truncate_at])?;
+                hello[binder_at..binder_at + binder.len()].copy_from_slice(&binder);
+                Ok(hello)
+            }
+            None => Ok(build_client_hello_for_group(
                 cfg.server_name,
                 cfg.alpn,
                 &random,
-                eph_pub.as_bytes(),
-                ticket,
-            )?;
-            let key = crate::resumption::binder_key(ticket.suite, &ticket.psk)?;
-            let binder = crate::resumption::binder(ticket.suite, &key, &hello[..truncate_at])?;
-            hello[binder_at..binder_at + binder.len()].copy_from_slice(&binder);
-            hello
+                group,
+                eph_pub,
+                cookie,
+            )),
         }
-        None => build_client_hello(cfg.server_name, cfg.alpn, &random, eph_pub.as_bytes()),
     };
+    let mut hello = build(&offered_psk, group, &eph_pub, None)?;
 
     let mut transcript: Vec<u8> = Vec::with_capacity(1024);
     transcript.extend_from_slice(&hello);
+    send_client_hello(&mut stream, &hello).await?;
+    let (mut sh_record, mut sh_body_start) = read_one_handshake_record(&mut stream).await?;
 
-    // The record, then a compatibility change_cipher_spec: middleboxes expect both, and some
-    // servers ignore a client that omits the second.
-    let mut record = Vec::with_capacity(5 + hello.len());
-    record.push(TLS_HANDSHAKE);
-    record.extend_from_slice(&[0x03, 0x01]);
-    record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
-    record.extend_from_slice(&hello);
-    record.extend_from_slice(&[TLS_CCS, 0x03, 0x03, 0x00, 0x01, 0x01]);
-    stream
-        .write_all(&record)
-        .await
-        .map_err(flux_types::FluxError::Io)?;
-    stream.flush().await.map_err(flux_types::FluxError::Io)?;
+    // ---- 1b. HelloRetryRequest, if the server wants a different group.
+    if is_hello_retry_request(&sh_record) {
+        let (retry_group, cookie, suite_id) = parse_hello_retry_request(&sh_record)?;
+        let suite = Tls13Suite::from_id(suite_id).ok_or_else(|| {
+            crypto_err(format!(
+                "the HelloRetryRequest named cipher suite {suite_id:#06x}"
+            ))
+        })?;
+        // RFC 8446 §4.4.1: the transcript becomes message_hash ‖ HelloRetryRequest ‖ ClientHello2,
+        // where message_hash is a synthetic handshake header carrying Hash(ClientHello1). Getting
+        // this wrong produces a Finished the server rejects, with no other symptom.
+        let mut retry_transcript = Vec::with_capacity(4 + suite.hash_len() + 64 + hello.len());
+        retry_transcript.extend_from_slice(&[0xfe, 0x00, 0x00, suite.hash_len() as u8]);
+        retry_transcript.extend_from_slice(&suite.hash(&hello));
+        retry_transcript.extend_from_slice(&sh_record);
+        transcript = retry_transcript;
 
-    // ---- 2. ServerHello.
-    let sh_record = read_record_typed(&mut stream, TLS_HANDSHAKE).await?;
+        // The PSK is dropped on the retry: a ticket bound to the first greeting's key share
+        // cannot be proven against a rebuilt one without recomputing the binder over a transcript
+        // that does not exist yet, and a full handshake is correct and cheap next to that.
+        offered_psk = None;
+        group = retry_group;
+        let (new_eph, new_pub) = Ephemeral::generate(group)?;
+        eph = new_eph;
+        eph_pub = new_pub;
+        hello = build(&None, group, &eph_pub, cookie.as_deref())?;
+        transcript.extend_from_slice(&hello);
+        send_client_hello(&mut stream, &hello).await?;
+        let (r, b) = read_one_handshake_record(&mut stream).await?;
+        sh_record = r;
+        sh_body_start = b;
+    }
+    let _ = sh_body_start;
+
     if sh_record.len() < 4 || sh_record[0] != HS_SERVER_HELLO {
         return Err(crypto_err("expected a TLS ServerHello"));
     }
@@ -1589,7 +1658,6 @@ where
     }
     let server_random: [u8; 32] = sh[pos..pos + 32].try_into().expect("32 bytes");
     pos += 32;
-    /// The fixed ServerHello.random that marks a HelloRetryRequest (RFC 8446 §4.1.3).
     const HRR_RANDOM: [u8; 32] = [
         0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
         0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8,
@@ -1622,7 +1690,7 @@ where
     let ext_total = u16::from_be_bytes([sh[pos], sh[pos + 1]]) as usize;
     pos += 2;
     let ext_end = (pos + ext_total).min(sh.len());
-    let mut server_keyshare: Option<[u8; 32]> = None;
+    let mut server_keyshare: Option<Vec<u8>> = None;
     // pre_shared_key in a ServerHello is the server saying it accepted the resumption.
     let mut server_selected_psk = false;
     while pos + 4 <= ext_end {
@@ -1639,28 +1707,28 @@ where
             server_selected_psk = true;
         }
         if etype == 0x0033 {
-            if elen < 36 {
+            if elen < 4 {
                 return Err(crypto_err("short key_share in ServerHello"));
             }
-            let group = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
-            if group != GROUP_X25519 {
+            let peer_group = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+            if peer_group != group {
                 return Err(crypto_err(format!(
-                    "server chose key share group {group:#06x}, which this client did not offer"
+                    "server chose key share group {peer_group:#06x}, but this handshake is for {group:#06x}"
                 )));
             }
-            server_keyshare = Some(
-                sh[pos + 4..pos + 36]
-                    .try_into()
-                    .map_err(|_| crypto_err("bad key_share length"))?,
-            );
+            let klen = u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]) as usize;
+            if elen < 4 + klen {
+                return Err(crypto_err("key_share overruns the extension"));
+            }
+            server_keyshare = Some(sh[pos + 4..pos + 4 + klen].to_vec());
         }
         pos += elen;
     }
     let server_keyshare =
-        server_keyshare.ok_or_else(|| crypto_err("ServerHello carried no x25519 key share"))?;
+        server_keyshare.ok_or_else(|| crypto_err("ServerHello carried no key share"))?;
 
     // ---- 3. Handshake key schedule (RFC 8446 §7.1).
-    let shared = eph.diffie_hellman(&X25519PublicKey::from(server_keyshare));
+    let shared = eph.agree(group, &server_keyshare)?;
     let zeros = vec![0u8; suite.hash_len()];
     let empty_hash = suite.hash(&[]);
     // The early secret is the PSK when one was offered *and* this suite can carry it; a PSK derived
@@ -1681,7 +1749,7 @@ where
         None => suite.hkdf_extract(&zeros, &zeros),
     };
     let derived = suite.derive_secret(&early_secret, "derived", &empty_hash)?;
-    let handshake_secret = suite.hkdf_extract(&derived, shared.as_bytes());
+    let handshake_secret = suite.hkdf_extract(&derived, &shared);
     let ch_sh_hash = suite.hash(&transcript);
     let c_hs_secret = suite.derive_secret(&handshake_secret, "c hs traffic", &ch_sh_hash)?;
     let s_hs_secret = suite.derive_secret(&handshake_secret, "s hs traffic", &ch_sh_hash)?;
@@ -1929,6 +1997,12 @@ async fn read_record_body<S: AsyncRead + Unpin>(
     Ok(body)
 }
 
+/// Reads one record of an expected type.
+///
+/// Unused since the greeting moved to `read_one_handshake_record`, which also skips the
+/// compatibility CCS and names alerts; kept because the encrypted flight still uses the same
+/// shape and deleting it would mean re-deriving it.
+#[allow(dead_code)]
 async fn read_record_typed<S: AsyncRead + Unpin>(
     stream: &mut S,
     expect: u8,
@@ -2492,7 +2566,7 @@ pub(crate) fn build_client_hello_with_psk(
     server_name: &str,
     alpn: &[&[u8]],
     random: &[u8; 32],
-    eph_pub: &[u8; 32],
+    eph_pub: &[u8],
     ticket: &crate::resumption::StoredTicket,
 ) -> FluxResult<(Vec<u8>, usize, usize)> {
     let binder_len = ticket.suite.hash_len();
@@ -2717,7 +2791,8 @@ mod resumption_tests {
     /// so only the `resumed` flag proves the feature works.
     #[tokio::test]
     async fn the_second_handshake_resumes() {
-        crate::resumption::clear();
+        // No global `clear()`: it wipes tickets other tests are relying on. Distinct names
+        // keep these tests independent, which is cheaper than serialising them.
         crate::tls::init_crypto_provider();
         let name = "resume.test";
         let (acceptor, ca_pem) = connect_tests::server_for(name);
@@ -2767,14 +2842,12 @@ mod resumption_tests {
             second.resumed,
             "the server stored a ticket and we offered it back; this handshake must be a resumption"
         );
-        crate::resumption::clear();
     }
 
     /// A ticket the server does not recognise must not stop the connection: the handshake falls
     /// back to a full one, which is what every client does when a server has restarted.
     #[tokio::test]
     async fn a_rejected_ticket_still_connects() {
-        crate::resumption::clear();
         crate::tls::init_crypto_provider();
         let name = "reject.test";
         let (acceptor, ca_pem) = connect_tests::server_for(name);
@@ -2813,6 +2886,286 @@ mod resumption_tests {
             .await
             .expect("a rejected ticket must still connect");
         assert!(!client.resumed, "the server did not accept the ticket");
-        crate::resumption::clear();
+    }
+}
+
+/// An ephemeral key pair for one of the groups this client offers.
+///
+/// TLS 1.3 lets a server answer the first ClientHello with a HelloRetryRequest naming a different
+/// group; a client that only knows x25519 has to hang up at that point, which is why this exists.
+/// The NIST curves go through `ring`'s ECDH, which is already a dependency of the record layer.
+pub(crate) enum Ephemeral {
+    X25519(x25519_dalek::StaticSecret),
+    Nist(Box<ring::agreement::EphemeralPrivateKey>),
+}
+
+impl Ephemeral {
+    /// Generates a key pair for `group`, returning it with the public bytes to send.
+    pub(crate) fn generate(group: u16) -> FluxResult<(Self, Vec<u8>)> {
+        match group {
+            GROUP_X25519 => {
+                let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+                let public = x25519_dalek::PublicKey::from(&secret);
+                let bytes = public.as_bytes().to_vec();
+                Ok((Self::X25519(secret), bytes))
+            }
+            GROUP_SECP256R1 | GROUP_SECP384R1 => {
+                let alg = if group == GROUP_SECP256R1 {
+                    &ring::agreement::ECDH_P256
+                } else {
+                    &ring::agreement::ECDH_P384
+                };
+                let key = ring::agreement::EphemeralPrivateKey::generate(
+                    alg,
+                    &ring::rand::SystemRandom::new(),
+                )
+                .map_err(|_| crypto_err("cannot generate an ephemeral key"))?;
+                let public = key
+                    .compute_public_key()
+                    .map_err(|_| crypto_err("cannot compute the ephemeral public key"))?;
+                Ok((Self::Nist(Box::new(key)), public.as_ref().to_vec()))
+            }
+            other => Err(crypto_err(format!(
+                "this client cannot generate a key share for group {other:#06x}"
+            ))),
+        }
+    }
+
+    /// Completes the exchange against the peer's public bytes and returns the shared secret.
+    ///
+    /// The peer's point is checked by `ring`; a point not on the curve is refused there rather
+    /// than producing a secret from an attacker-chosen subgroup.
+    pub(crate) fn agree(self, group: u16, peer: &[u8]) -> FluxResult<Vec<u8>> {
+        match self {
+            Self::X25519(secret) => {
+                let peer: [u8; 32] = peer
+                    .try_into()
+                    .map_err(|_| crypto_err("x25519 peer key must be 32 bytes"))?;
+                let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from(peer));
+                Ok(shared.as_bytes().to_vec())
+            }
+            Self::Nist(key) => {
+                let alg = if group == GROUP_SECP256R1 {
+                    &ring::agreement::ECDH_P256
+                } else {
+                    &ring::agreement::ECDH_P384
+                };
+                let peer = ring::agreement::UnparsedPublicKey::new(alg, peer);
+                ring::agreement::agree_ephemeral(*key, &peer, |secret| secret.to_vec()).map_err(
+                    |_| crypto_err("the server's key share is not a valid point on the curve"),
+                )
+            }
+        }
+    }
+}
+
+/// Sends one ClientHello record, with the compatibility change_cipher_spec that follows it.
+async fn send_client_hello<S: AsyncWrite + Unpin>(stream: &mut S, hello: &[u8]) -> FluxResult<()> {
+    use flux_types::FluxError;
+    use tokio::io::AsyncWriteExt;
+    let mut record = Vec::with_capacity(5 + hello.len() + 6);
+    record.push(TLS_HANDSHAKE);
+    record.extend_from_slice(&[0x03, 0x01]); // legacy_record_version, as browsers send it
+    record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+    record.extend_from_slice(hello);
+    record.extend_from_slice(&[TLS_CCS, 0x03, 0x03, 0x00, 0x01, 0x01]);
+    stream.write_all(&record).await.map_err(FluxError::Io)?;
+    stream.flush().await.map_err(FluxError::Io)
+}
+
+/// Reads records until a handshake one arrives, skipping the compatibility CCS and refusing an
+/// alert by reporting what it said.
+async fn read_one_handshake_record<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> FluxResult<(Vec<u8>, usize)> {
+    loop {
+        let hdr = read_record_header(stream).await?;
+        let body = read_record_body(stream, &hdr).await?;
+        match hdr[0] {
+            TLS_CCS => continue,
+            TLS_HANDSHAKE => return Ok((body, 0)),
+            TLS_ALERT => {
+                let (level, desc) = (
+                    body.first().copied().unwrap_or(2),
+                    body.get(1).copied().unwrap_or(0),
+                );
+                let name = match desc {
+                    40 => "handshake_failure",
+                    47 => "illegal_parameter",
+                    // Alert 70 is how a server that cannot do TLS 1.3 refuses the greeting; the
+                    // marker is what lets the dial path retry with our TLS 1.2 client.
+                    70 => "protocol_version; not-tls13",
+                    80 => "internal_error",
+                    100 => "no_renegotiation",
+                    _ => "unrecognised",
+                };
+                return Err(crypto_err(format!(
+                    "the server refused the handshake before 22 (level {level}, {name}, description {desc})"
+                )));
+            }
+            other => {
+                return Err(crypto_err(format!(
+                    "unexpected record type {other} from the server before its greeting"
+                )));
+            }
+        }
+    }
+}
+
+/// Whether a ServerHello is really a HelloRetryRequest.
+pub(crate) fn is_hello_retry_request(sh: &[u8]) -> bool {
+    sh.len() >= 4 + 2 + 32 && sh[4 + 2..4 + 2 + 32] == HRR_RANDOM
+}
+
+/// Extracts what a HelloRetryRequest asks for: a group, an optional cookie, and its cipher suite
+/// (needed because the retry transcript is hashed with that suite's hash).
+pub(crate) fn parse_hello_retry_request(sh: &[u8]) -> FluxResult<(u16, Option<Vec<u8>>, u16)> {
+    let mut pos = 4 + 2 + 32;
+    if sh.len() < pos + 1 {
+        return Err(crypto_err("short HelloRetryRequest"));
+    }
+    let sid_len = sh[pos] as usize;
+    pos += 1 + sid_len;
+    if sh.len() < pos + 3 {
+        return Err(crypto_err("short HelloRetryRequest (suite)"));
+    }
+    let suite_id = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+    pos += 3; // suite and compression method
+    let mut group = None;
+    let mut cookie = None;
+    if sh.len() >= pos + 2 {
+        let total = u16::from_be_bytes([sh[pos], sh[pos + 1]]) as usize;
+        pos += 2;
+        let end = (pos + total).min(sh.len());
+        while pos + 4 <= end {
+            let ty = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+            let len = u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]) as usize;
+            pos += 4;
+            if pos + len > end {
+                return Err(crypto_err(
+                    "HelloRetryRequest extension overruns the message",
+                ));
+            }
+            match ty {
+                0x0033 => {
+                    if len < 2 {
+                        return Err(crypto_err("short key_share in HelloRetryRequest"));
+                    }
+                    group = Some(u16::from_be_bytes([sh[pos], sh[pos + 1]]));
+                }
+                0x002c => {
+                    if len < 2 {
+                        return Err(crypto_err("short cookie in HelloRetryRequest"));
+                    }
+                    let n = u16::from_be_bytes([sh[pos], sh[pos + 1]]) as usize;
+                    if pos + 2 + n > end {
+                        return Err(crypto_err("cookie overruns the extension"));
+                    }
+                    cookie = Some(sh[pos + 2..pos + 2 + n].to_vec());
+                }
+                _ => {}
+            }
+            pos += len;
+        }
+    }
+    let group = group.ok_or_else(|| {
+        crypto_err("the HelloRetryRequest asked for nothing this client can send")
+    })?;
+    Ok((group, cookie, suite_id))
+}
+
+#[cfg(test)]
+mod hrr_tests {
+    use crate::tls13::*;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that accepts **only** P-384, so the first greeting — which offers an x25519 key
+    /// share — must be answered with a HelloRetryRequest. Without HRR support the connection dies
+    /// here, which is what this test exists to detect.
+    fn p384_only_server(name: &str) -> (tokio_rustls::TlsAcceptor, String) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        crate::tls::init_crypto_provider();
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params = CertificateParams::new(vec![name.to_string()]).expect("leaf");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf");
+
+        let mut provider = tokio_rustls::rustls::crypto::ring::default_provider();
+        provider.kx_groups = vec![tokio_rustls::rustls::crypto::ring::kx_group::SECP384R1];
+        let cfg = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls_pki_types::CertificateDer::from(leaf.der().to_vec())],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            )
+            .expect("server config");
+        (tokio_rustls::TlsAcceptor::from(Arc::new(cfg)), ca.pem())
+    }
+
+    /// **HelloRetryRequest, end to end.** The server asks for a group we did not send a share for;
+    /// the client must honour it, resend with the cookie and the right key, and hash the retry
+    /// transcript as `message_hash ‖ HRR ‖ ClientHello2`.
+    #[tokio::test]
+    async fn a_hello_retry_request_is_honoured() {
+        let name = "hrr.test";
+        let (acceptor, ca_pem) = p384_only_server(name);
+        let (client_raw, server_raw) = tokio::io::duplex(256 * 1024);
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let expect = payload.clone();
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acceptor.accept(server_raw).await {
+                let mut got = vec![0u8; expect.len()];
+                if srv.read_exact(&mut got).await.is_ok() {
+                    assert_eq!(got, expect, "the server did not receive what was sent");
+                    let _ = srv.write_all(&expect).await;
+                }
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let mut b = [0u8; 1];
+                    let _ = srv.read(&mut b).await;
+                })
+                .await;
+            }
+        });
+
+        let mut trust = verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = ClientHelloConfig {
+            server_name: name,
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut client = connect(client_raw, &cfg)
+            .await
+            .expect("a HelloRetryRequest must be honoured, not refused");
+        client.write_all(&payload).await.expect("write");
+        client.flush().await.expect("flush");
+        let mut back = vec![0u8; payload.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.read_exact(&mut back),
+        )
+        .await
+        .expect("the retry handshake must carry data")
+        .expect("read");
+        assert_eq!(back, payload, "the retried handshake corrupted the payload");
+    }
+
+    /// A group we cannot do at all is still refused, and the error says which.
+    #[test]
+    fn an_unsupported_group_is_named() {
+        let err = match Ephemeral::generate(0x0100) {
+            Ok(_) => panic!("group 0x0100 is not one we offer"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("0100"), "the error must name the group: {err}");
     }
 }
