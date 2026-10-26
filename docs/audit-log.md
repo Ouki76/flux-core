@@ -9792,3 +9792,43 @@ the pairing.
 
 Progress across five cycles: substrate proved → one real bug found (`ResponseFuture` drop resets the
 stream) → pairing proved by a passing hand-written test → fault localised to the client's write path.
+
+### C7.6 — the deadlock, found by reading the order of two awaits
+
+C7.5 localised the fault to "the upload never arrives". This cycle found why, and it is an ordering
+deadlock, not a broken write path:
+
+```
+server: accept POST → accept GET → build the download response → await the upload body
+client: connect_stream_up → await the download response → [only then] write the upload
+```
+
+**The client cannot write until the download response arrives, and the server does not flush that
+response until it has read the upload.** Each waits for the other. The 5 s timeout in
+`client_against_raw_server` is that deadlock expiring, and the `broken pipe` afterwards is the server
+task dying when the timeout fired.
+
+The write path in `H2Stream::poll_write` is correct — `reserve_capacity` then `poll_capacity` then
+`send_data`, with a proper `BrokenPipe` for a stream that can never accept data. Suspecting it was
+the wrong turn C7.5 pointed at.
+
+**The fix is known and small:** `connect_stream_up` must not await the download response before
+returning. It must return an `H2Stream` whose receive half is still pending, which this type already
+supports — `H2RecvState::Pending(h2::client::ResponseFuture)` (`h2.rs:14`) is exactly the state
+`new_client_pending` uses, and a constructor that takes the upload's `SendStream` with a pending
+download future is all that is missing:
+
+```rust
+H2Stream { send: upload, recv: H2RecvState::Pending(download_response) }
+```
+
+Then the caller writes immediately, the server's read completes, its download response flushes, and
+the client's first read resolves the future — no ordering constraint between the two directions at
+all, which is the whole point of `stream-up`.
+
+**Not implemented:** the constructor is private state on `H2Stream` and adding it means touching that
+type plus the mode plumbing, the config relaxation, and the interop run. Reverted as before;
+`stream-up` remains refused by name.
+
+**Where the next cycle starts, exactly:** add `H2Stream::new_client_split(upload, download_response)`,
+have `connect_stream_up` use it, and the deadlock is gone by construction.
