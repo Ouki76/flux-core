@@ -1032,6 +1032,10 @@ where
                 "the server resumed under a different cipher suite than the stored session",
             ));
         }
+        tracing::debug!(
+            "TLS 1.2 resumption: the server accepted the stored session ({} bytes of certificate and key exchange skipped)",
+            "an entire flight"
+        );
         let master = session.master_secret.clone();
         let block = suite.key_block(&master, &client_random, &server_random);
         let mut client_keys = RecordKeys::new(&block.client_key, block.client_iv.clone())?;
@@ -1203,6 +1207,12 @@ where
 
     // Either kind of session is worth keeping: a ticket if the server issued one, a session id
     // if it did not. rustls resumes with the id, sing-box and xray with tickets.
+    tracing::debug!(
+        "TLS 1.2 session stored: id {} bytes, ticket {} bytes, suite {:?}",
+        server_session_id.len(),
+        session_ticket.as_ref().map(|t| t.len()).unwrap_or(0),
+        suite
+    );
     if !server_session_id.is_empty() || session_ticket.is_some() {
         store_session(
             cfg.server_name,
