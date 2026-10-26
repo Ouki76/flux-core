@@ -9339,3 +9339,38 @@ starts there, with the interop suite run against WireGuard, TUIC and Hysteria2 a
 
 Nothing in this objective produced a speedup, and this entry says so plainly rather than dressing
 five nulls as insight.
+
+### C5.7 — the finding that reframes the objective: our UDP advantage is cores, not efficiency
+
+`bench_udp` on the whole machine, and the same run under `taskset -c 0,1`:
+
+| limit | flux-core | sing-box | margin |
+|---|---|---|---|
+| 24 cores | 99 656 pps | 75 440 | **+32%** |
+| **2 cores** | **64 860 pps** | **63 149** | **+2.7%** |
+
+**Our throughput falls 35% when restricted to two cores; sing-box falls 16%.** On a constrained
+machine the two are within 3% of each other.
+
+That explains everything the last seven cycles were circling:
+
+1. the 48 µs of CPU per datagram measured in C5.4 is real — this relay is genuinely CPU-hungry;
+2. it still wins on this host because this host has 24 cores to spend;
+3. every cheap knob failed (five nulls) because the cost is not in one knob — it is the whole
+   per-datagram path being expensive, and shrinking one part of it changes nothing measurable.
+
+So the honest reading of C4.3's "27–29 CPU s/GiB for UDP" is not "UDP is expensive because UDP" but
+**"this implementation spends a lot of CPU per datagram and buys throughput with cores."** A machine
+with 2–4 cores gets almost none of the advertised advantage.
+
+### What this means for the optimisation
+
+The target is now unambiguous and testable: **halve the per-datagram CPU**, and the two-core figure
+should move from +2.7% to roughly +50%. That is a benchmark the objective can be judged against, and
+it is a much better one than a throughput number measured with 24 cores idle.
+
+The change that would do it is still batching (one channel message per batch, amortising the whole
+hop), and it is still a shared-API change across four UDP protocols.
+
+**This cycle produced no speedup either.** It produced the measurement that makes the next one
+worth doing — and the admission that the headline number was flattering the hardware, not the code.
