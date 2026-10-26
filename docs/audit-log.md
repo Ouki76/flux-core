@@ -8463,3 +8463,30 @@ real data through a real peer.
 
 That is the lesson this objective leaves behind, and it cost six cycles to learn once and never
 again: **a measurement produced by the same implementation it measures proves nothing.**
+
+---
+
+## C3.1 — HelloRetryRequest, and the group the server names
+
+A TLS 1.3 server may answer the first greeting with a HelloRetryRequest asking for a different key
+exchange group. Our client refused here — *"this client always offers an x25519 key share"* — which
+made any server configured for P-256 or P-384 unreachable, however modern.
+
+| piece | what it does |
+|---|---|
+| `Ephemeral` | one abstraction over x25519 and the NIST curves (through `ring`'s ECDH), so a share can be generated for whichever group the server names |
+| the retry | parse the HRR (group, cookie, cipher suite), regenerate, rebuild the greeting with the cookie, resend |
+| the transcript rule | RFC 8446 §4.4.1: `message_hash ‖ HelloRetryRequest ‖ ClientHello2`, where `message_hash` is a synthetic handshake header carrying `Hash(ClientHello1)` |
+
+That transcript rule is the part that fails silently: getting it wrong yields a Finished the server
+rejects with no other symptom, which is the same shape as the `"res master"` bug in C2.16.
+
+**Proved by forcing it:** the test server accepts only P-384, so a retry is unavoidable; 4 KiB
+crosses the tunnel both ways. Disabling the handling reproduces the old refusal.
+
+A regression caught on the way: the new greeting reader had dropped the `not-tls13` marker that
+alert 70 carries, which is exactly what the TLS 1.2 fallback keys on. The existing 1.2 test found it
+within one run — which is the argument for keeping a test that asserts on a *string* whose absence
+is otherwise silent.
+
+1156 tests pass, clippy clean.
