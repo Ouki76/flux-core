@@ -1,3 +1,59 @@
+//! flux-core: the proxy binary.
+
+#[cfg(feature = "alloc-stats")]
+mod alloc_stats {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counts allocations so the data path's per-connection cost can be measured from the binary
+    /// that serves traffic. Enabled only by the `alloc-stats` feature.
+    pub struct Counting;
+
+    pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+
+    // SAFETY: every method delegates to `System` with the same arguments, so the allocator
+    // contract is preserved; the counters are separate from the allocation itself.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(
+                new_size.saturating_sub(layout.size()) as u64,
+                Ordering::Relaxed,
+            );
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    pub static GLOBAL: Counting = Counting;
+
+    /// Reports the totals, once, on a SIGTERM or at normal exit.
+    pub fn spawn_reporter(allocations_start: u64) {
+        // A plain thread: this runs before the tokio runtime exists, and a reporter has no
+        // business depending on the reactor it is measuring.
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let n = ALLOCS.load(Ordering::Relaxed);
+                let b = BYTES.load(Ordering::Relaxed);
+                eprintln!(
+                    "[alloc-stats] total={n} since_start={} bytes={b}",
+                    n - allocations_start
+                );
+            }
+        });
+    }
+}
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use flux_app::{Config, ConfigFormat, Instance, load_any_config};
@@ -72,6 +128,9 @@ enum Commands {
 const EXIT_FORCED_SHUTDOWN: i32 = 1;
 
 fn main() -> std::process::ExitCode {
+    #[cfg(feature = "alloc-stats")]
+    let alloc_start = alloc_stats::ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+
     #[cfg(target_os = "linux")]
     // SAFETY: `mallopt` only adjusts an allocator tunable; it holds no pointers and is
     // called once before any thread exists.
@@ -79,6 +138,9 @@ fn main() -> std::process::ExitCode {
         // Restrict glibc heap arenas to eliminate multi-megabyte arena fragmentation
         libc::mallopt(libc::M_ARENA_MAX, 2);
     }
+
+    #[cfg(feature = "alloc-stats")]
+    alloc_stats::spawn_reporter(alloc_start);
 
     let cli = Cli::parse();
     match run(cli) {

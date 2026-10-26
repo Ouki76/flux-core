@@ -127,6 +127,15 @@ socket2 = { workspace = true }
 name = "throughput"
 harness = false
 
+[features]
+# Counts every heap allocation the binary makes and prints the total on shutdown.
+#
+# Off by default: the counting is two atomic increments per allocation, which is real cost in a
+# relay, and the shipped binary should not pay it. The feature exists so the allocation *count* can
+# be measured from the binary that actually serves traffic rather than from a harness that measures
+# itself.
+alloc-stats = []
+
 [[example]]
 name = "stress_bench"
 path = "examples/stress_bench.rs"

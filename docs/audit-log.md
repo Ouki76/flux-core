@@ -9003,3 +9003,55 @@ decision, which is why I stopped rather than shipping a harness that measures it
 
 **Recorded as a gap, not as a result.** If the allocation count is wanted, the honest way is the
 counter in the binary behind a feature flag, and that is a change to what ships.
+
+### C4.6 — the allocation axis, measured from the binary itself
+
+C4.5 recorded this as a gap because a counter in the harness counts the harness. The answer was a
+counter in the **binary**, behind a feature so the shipped build pays nothing:
+
+```toml
+alloc-stats = []
+```
+
+With `--features alloc-stats` the binary reports every five seconds; the run below made **50 short
+connections** (SOCKS, CONNECT, 1 KB each way, close) through the client:
+
+| reading | allocations since start | bytes |
+|---|---|---|
+| before the 50 connections | 3 298 | 951 380 |
+| after | 4 837 | 1 478 608 |
+| **difference** | **1 539** | **527 228** |
+
+**31 allocations and ~10.5 KB of cumulative allocation per connection** on the client side of a
+VLESS/TCP tunnel. That is the whole of the per-connection allocation cost: a handful of buffers, a
+task, a few address strings — and it is consistent with the 20 KB RSS measured in C4.1, since most
+of that memory is retained rather than freed.
+
+**What this means for the speedup question:** 31 allocations per connection is not a bottleneck. A
+relay doing 12 887 connections per second (bench_rps) is asking the allocator for ~400 000 small
+allocations per second, which is well inside what glibc's arena allocator handles — and the profile
+in C4.1 put 0.15% of samples in the userspace path with none in the allocator. Reducing 31 to 20
+would not move a number that is 98% kernel.
+
+The feature stays in the tree, off by default, so the measurement is reproducible by anyone:
+
+```
+cargo build --release --features alloc-stats --bin flux-core
+FLUX... ./target/release/flux-core run -c config.json
+```
+
+### The objective is complete
+
+| axis the objective named | measured | result |
+|---|---|---|
+| CPU time per GiB | yes | 1.52 (VLESS/TCP) vs 3.94 and 5.00 |
+| memory per connection | yes | 20 KB vs 84 and 115 |
+| allocations | **yes** (this entry) | 31 per connection, ~10.5 KB total |
+| syscalls | yes | 1 per ~63 KB |
+| latency percentiles | yes | median 2.09 ms, p99 15.6 ms |
+| per-protocol breakdown | yes | C4.3, fifteen rows |
+
+And the answer to "can it be faster", with every candidate bounded: **no, not materially, and the
+bounds are measured** — 13% (splice), 7% (copies), 0% (user code, syscalls, allocator). The core is
+at the practical limit of a userspace relay while being fastest on every axis against both
+references.
