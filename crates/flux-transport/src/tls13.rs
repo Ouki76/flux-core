@@ -59,7 +59,7 @@ pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
 /// shipping it half-right would turn a working full handshake into a failed connection on every
 /// reconnect. The machinery behind it is complete and tested; this switch is what stands between
 /// it and real traffic.
-pub(crate) const PSK_OFFER_ENABLED: bool = false;
+pub(crate) const PSK_OFFER_ENABLED: bool = true;
 #[allow(dead_code)]
 pub(crate) const MAX_TLS_RECORD: usize = 16384;
 
@@ -1539,7 +1539,7 @@ where
                 ticket,
             )?;
             let key = crate::resumption::binder_key(ticket.suite, &ticket.psk)?;
-            let binder = crate::resumption::binder(ticket.suite, &key, &hello[..truncate_at]);
+            let binder = crate::resumption::binder(ticket.suite, &key, &hello[..truncate_at])?;
             hello[binder_at..binder_at + binder.len()].copy_from_slice(&binder);
             hello
         }
@@ -1782,7 +1782,12 @@ where
                 .as_secs();
             rustls_pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(secs))
         };
-        verify::verify_server_chain(cfg.trust, &chain, cfg.server_name, now)?;
+        // A resumption carries no certificate: the PSK authenticates the server, and the server's
+        // Finished — verified below against keys derived from that PSK — is what proves it is the
+        // entity the ticket was issued to. Requiring a chain here would reject every resumption.
+        if !server_selected_psk {
+            verify::verify_server_chain(cfg.trust, &chain, cfg.server_name, now)?;
+        }
     }
 
     // ---- 6. Application traffic secrets and the client's Finished.
@@ -1832,7 +1837,11 @@ where
         //   Transcript-Hash(ClientHello … client Finished), Hash.length).
         resumption_master_secret: Some(suite.hkdf_expand_label(
             &master_secret,
-            "resmaster",
+            // RFC 8446 §7.1 spells this label **"res master"**, with a space. Writing
+            // "resmaster" produces a resumption secret that is internally consistent, matches
+            // every test we wrote against ourselves, and is silently wrong against every real
+            // implementation — which is exactly what `decrypt_error` had been reporting.
+            "res master",
             &suite.hash(&transcript),
             suite.hash_len(),
         )?),
@@ -2698,7 +2707,6 @@ mod resumption_tests {
     /// **The point of the whole gap:** the second connection to the same server must resume.
     /// A client that offers a ticket and is silently declined still completes a full handshake,
     /// so only the `resumed` flag proves the feature works.
-    #[ignore = "extension and transcript bugs fixed; the binder still mismatches (decrypt_error)"]
     #[tokio::test]
     async fn the_second_handshake_resumes() {
         crate::resumption::clear();

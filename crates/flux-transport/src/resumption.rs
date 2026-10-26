@@ -227,8 +227,16 @@ pub(crate) fn binder_key(suite: Tls13Suite, psk: &[u8]) -> FluxResult<Vec<u8>> {
 /// `truncated` must be the ClientHello up to and including the identities field — the binders
 /// list, including its two-byte length, is excluded. Including it produces a binder that verifies
 /// only against yourself.
-pub(crate) fn binder(suite: Tls13Suite, key: &[u8], truncated: &[u8]) -> Vec<u8> {
-    suite.hmac(key, &suite.hash(truncated))
+pub(crate) fn binder(
+    suite: Tls13Suite,
+    binder_key: &[u8],
+    truncated: &[u8],
+) -> FluxResult<Vec<u8>> {
+    // The binder is an HMAC under `HKDF-Expand-Label(binder_key, "finished", "")` — the same
+    // expansion the Finished message uses. HMAC-ing under `binder_key` directly produces a value
+    // that is internally consistent and rejected by every server.
+    let key = suite.hkdf_expand_label(binder_key, "finished", &[], suite.hash_len())?;
+    Ok(suite.hmac(&key, &suite.hash(truncated)))
 }
 
 /// Builds the `pre_shared_key` extension body: identities and one binder.
@@ -320,8 +328,8 @@ mod binder_tests {
     fn the_binder_covers_the_transcript() {
         let suite = Tls13Suite::Aes128GcmSha256;
         let key = binder_key(suite, &[1u8; 32]).expect("key");
-        let a = binder(suite, &key, b"hello-one");
-        let b = binder(suite, &key, b"hello-two");
+        let a = binder(suite, &key, b"hello-one").expect("a");
+        let b = binder(suite, &key, b"hello-two").expect("b");
         assert_eq!(a.len(), 32);
         assert_ne!(a, b, "the binder must cover the hello it signs");
     }
@@ -558,6 +566,44 @@ mod psk_comparison_tests {
                     .expect("d"),
             ),
         ];
+        // A systematic sweep: two transcript variants against four nonce variants. If any
+        // combination reproduces the server's stored secret, the search is over and the wrong
+        // step is named; if none does, the stored value is not what I think it is.
+        if let (Some(ms), Some(hb)) = (
+            client.debug_master_secret.clone(),
+            client.debug_hash_before_cf.clone(),
+        ) {
+            let ha = suite.hash(&[]); // placeholder, replaced below
+            let _ = ha;
+            let after = suite
+                .hkdf_expand_label(&rms, "resumption", b"", 32)
+                .expect("sweep");
+            let _ = after;
+            let nonces: Vec<(String, Vec<u8>)> = vec![
+                ("parsed".into(), ours.nonce.clone()),
+                ("empty".into(), Vec::new()),
+                ("00".into(), vec![0]),
+                ("01".into(), vec![1]),
+            ];
+            for (hname, hash) in [("after_cf", None), ("before_cf", Some(hb))] {
+                let rms_c = match &hash {
+                    None => rms.clone(),
+                    Some(h) => suite
+                        .hkdf_expand_label(&ms, "resmaster", h, 32)
+                        .expect("rms"),
+                };
+                for (nname, nonce) in &nonces {
+                    let psk_c = suite
+                        .hkdf_expand_label(&rms_c, "resumption", nonce, 32)
+                        .expect("psk");
+                    for (_k, value) in &stored {
+                        if value.windows(psk_c.len()).any(|w| w == psk_c.as_slice()) {
+                            println!("MATCH: transcripts={hname} nonce={nname}");
+                        }
+                    }
+                }
+            }
+        }
         // The rms taken **before** the client Finished enters the transcript — the candidate that
         // the reference implementation's `current_hash()` call site suggests if the flight's
         // transcript is not the one being hashed.
