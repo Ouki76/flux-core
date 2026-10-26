@@ -396,6 +396,76 @@ mod psk_comparison_tests {
     /// **The measurement the whole gap comes down to.** Our PSK is derived from a ticket; the
     /// server stores its own. If the two differ, every binder we send is wrong and the server
     /// answers `decrypt_error` — which is exactly the symptom.
+    /// Does our application traffic secret match the one the reference implementation logs for
+    /// the same connection? That single comparison validates or breaks the whole master-secret
+    /// chain, which is the input every resumption value is derived from.
+    #[tokio::test]
+    async fn our_application_secret_matches_the_reference() {
+        use std::sync::Mutex as StdMutex;
+        use tokio::io::AsyncReadExt;
+
+        /// Labels and secrets the reference implementation published for this connection.
+        type Logged = Arc<StdMutex<Vec<(String, Vec<u8>)>>>;
+
+        #[derive(Debug)]
+        struct Capture(Logged);
+        impl tokio_rustls::rustls::KeyLog for Capture {
+            fn log(&self, label: &str, _random: &[u8], secret: &[u8]) {
+                if let Ok(mut v) = self.0.lock() {
+                    v.push((label.to_string(), secret.to_vec()));
+                }
+            }
+            fn will_log(&self, _label: &str) -> bool {
+                true
+            }
+        }
+
+        crate::tls::init_crypto_provider();
+        let name = "keylog.test";
+        let (mut server_cfg, ca_pem) = crate::tls13::connect_tests::server_config_for(name);
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        server_cfg.key_log = Arc::new(Capture(seen.clone()));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        let (c, s) = tokio::io::duplex(256 * 1024);
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acceptor.accept(s).await {
+                let mut b = [0u8; 1];
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), srv.read(&mut b)).await;
+            }
+        });
+        let mut trust = crate::tls13::verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = crate::tls13::ClientHelloConfig {
+            server_name: name,
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let client = crate::tls13::connect(c, &cfg).await.expect("handshake");
+        let logged = seen.lock().expect("lock").clone();
+        let reference = logged
+            .iter()
+            .find(|(l, _)| l.contains("CLIENT_TRAFFIC_SECRET_0"))
+            .map(|(_, v)| v.clone());
+        let ours = client.debug_c_ap.clone().expect("c_ap");
+        println!(
+            "labels: {:?}",
+            logged.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>()
+        );
+        println!(
+            "reference c_ap: {}",
+            hex(&reference.clone().unwrap_or_default())
+        );
+        println!("our c_ap      : {}", hex(&ours));
+        assert_eq!(
+            reference.as_deref(),
+            Some(ours.as_slice()),
+            "the application traffic secret must match the reference implementation"
+        );
+    }
+
     #[ignore = "diagnostic: prints our psk and rms next to the server's stored secret"]
     #[tokio::test]
     async fn our_psk_matches_the_secret_the_server_stored() {
@@ -488,6 +558,34 @@ mod psk_comparison_tests {
                     .expect("d"),
             ),
         ];
+        // The rms taken **before** the client Finished enters the transcript — the candidate that
+        // the reference implementation's `current_hash()` call site suggests if the flight's
+        // transcript is not the one being hashed.
+        if let (Some(ms), Some(hb)) = (
+            client.debug_master_secret.clone(),
+            client.debug_hash_before_cf.clone(),
+        ) {
+            let rms_before = suite
+                .hkdf_expand_label(&ms, "resmaster", &hb, 32)
+                .expect("h");
+            let psk_before = suite
+                .hkdf_expand_label(&rms_before, "resumption", &ours.nonce, 32)
+                .expect("i");
+            for (_k, value) in &stored {
+                if value
+                    .windows(psk_before.len())
+                    .any(|w| w == psk_before.as_slice())
+                {
+                    println!("MATCH: rms-before-client-Finished reproduces a stored secret");
+                }
+                if value
+                    .windows(rms_before.len())
+                    .any(|w| w == rms_before.as_slice())
+                {
+                    println!("MATCH: rms-before-client-Finished *is* the stored secret");
+                }
+            }
+        }
         // Is the stored 32 bytes the PSK, or the resumption master secret itself? rustls stores
         // the secret and derives per-ticket PSKs from it, which would make our rms the thing to
         // compare — and the earlier comparison a category error.

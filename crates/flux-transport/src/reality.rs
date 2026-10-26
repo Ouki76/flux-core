@@ -931,6 +931,7 @@ impl Tls13Client {
             resumed: false,
             debug_master_secret: None,
             debug_hash_before_cf: None,
+            debug_c_ap: None,
             closed: false,
         };
         if !verified {
@@ -1514,6 +1515,7 @@ impl Tls13Server {
             resumed: false,
             debug_master_secret: None,
             debug_hash_before_cf: None,
+            debug_c_ap: None,
             closed: false,
         })
     }

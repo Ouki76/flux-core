@@ -491,6 +491,10 @@ pub struct Tls13Stream<S> {
     pub(crate) debug_master_secret: Option<Vec<u8>>,
     #[allow(dead_code)]
     pub(crate) debug_hash_before_cf: Option<Vec<u8>>,
+    /// The client application traffic secret, so a test can compare it with the value the
+    /// reference implementation logs for the same connection.
+    #[allow(dead_code)]
+    pub(crate) debug_c_ap: Option<Vec<u8>>,
     pub(crate) closed: bool,
 }
 
@@ -1788,6 +1792,7 @@ where
     let c_ap = suite.derive_secret(&master_secret, "c ap traffic", &ap_hash)?;
     let s_ap = suite.derive_secret(&master_secret, "s ap traffic", &ap_hash)?;
 
+    let debug_c_ap_value = c_ap.clone();
     let fin_key = suite.hkdf_expand_label(&c_hs_secret, "finished", &[], suite.hash_len())?;
     let fin_hash = suite.hash(&transcript);
     let verify_data = suite.hmac(&fin_key, &fin_hash);
@@ -1835,6 +1840,7 @@ where
         resumed: server_selected_psk,
         debug_master_secret: Some(master_secret.clone()),
         debug_hash_before_cf: Some(hash_before_cf),
+        debug_c_ap: Some(debug_c_ap_value),
         closed: false,
     })
 }
