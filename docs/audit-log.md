@@ -8711,3 +8711,39 @@ rustls's strictness, not theirs.
 This correction was made after the maintainer asked directly whether the other implementations
 support these suites — which is the useful property of being asked a question: it finds the claims
 that were never tested.
+
+### C3.9 — the measurement loopback could not make: ~1 ms saved per connection
+
+Two machines, one real network hop: this host as the client, `192.168.0.105` (Fedora 44, 16 cores)
+as the server, TLS 1.3 with resumption, 100 connections per configuration, each a SOCKS connect, a
+TLS handshake, 4 bytes echoed and a close.
+
+| configuration | median | p90 |
+|---|---|---|
+| resumption **on** | **1.76 ms** | 2.03 ms |
+| resumption **off** | **2.76 ms** | 3.00 ms |
+
+**About 1 ms saved per connection, a third of the setup time.** The p90 moves by the same amount,
+so this is not an artefact of the average.
+
+That is the number C2.17 could not produce. On loopback the same comparison was a measured null
+(8 057 vs 8 194 exchanges/s — *worse*, inside noise), because a loopback round trip costs nothing
+and a self-signed certificate of a few hundred bytes costs nothing to send. Over a network the
+certificate flight and the extra round trip are exactly what a resumption removes, and they show up
+as a millisecond.
+
+**What I did not measure:** the same comparison over a WAN. The LAN figure is a lower bound — a
+longer round trip makes the skipped flight more expensive, not less — but "more on a WAN" is an
+inference from this number, not a measurement of it, and it is written here as an inference.
+
+### How it was run, and what was left behind
+
+The host's firewall refuses the benchmark port, so rather than open it — the machine belongs to the
+maintainer and a firewall rule outlives a benchmark — the traffic went through an SSH tunnel on
+`127.0.0.1:19510`. Nothing was installed, no service was registered, and every file lived in `/tmp`.
+
+Cleaned up and verified: **0 matching files in `/tmp`, 0 processes left running.**
+
+This is also where the earlier failures came from: three attempts produced `n=0` because a
+background process died before the client started, and one because the client config still pointed
+at the blocked port. The run that worked printed `n=100 ошибок=0` before anyone looked at a timing.
