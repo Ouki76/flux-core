@@ -7619,3 +7619,29 @@ question becomes what a TLS 1.2 client owes a Go server that a rustls client doe
 
 This is the kind of fork that a capture creates and that a hypothesis cannot settle, which is why
 the last three cycles went into building one.
+
+### C1.10 — the harness limit, stated plainly
+
+The experiment from C1.9 — keep the tunnel open after the upload and watch whether the alert
+arrives while it is alive — needs three cooperating processes (echo, Xray, client) and a
+foreground driver. Two attempts died because the tool's shell terminates the process tree when the
+call returns, and the last one failed for a simpler reason: the echo server from earlier cycles was
+no longer running (`Connection refused`, os error 111), which produced a SOCKS refusal that looked
+like a TLS failure until the log was read.
+
+So this cycle produced no new evidence either. The honest summary of the last two cycles: **the
+capture tool works when the pieces are alive, and the pieces do not survive the harness.**
+
+**What the next session should do differently**, and this is the useful part:
+
+1. put the echo server, Xray, the client and the driver in **one** foreground script that starts
+   them, runs the transfer, waits, prints the result and only then exits — no `setsid`, no
+   background jobs across tool calls;
+2. verify each listener is up (`ss -tlnp`) before the transfer, so a missing echo cannot again
+   masquerade as a TLS defect;
+3. then the C1.9 fork resolves within one run: alert while the tunnel is open means rejection and
+   its description names the field; no alert means the server is waiting and the question becomes
+   what a TLS 1.2 client owes a Go server that a rustls client does not.
+
+The state of the code is unchanged and green: 1136 tests pass, 8 skipped, clippy clean, and the
+TLS 1.2 interop test remains `#[ignore]`d with its symptom.
