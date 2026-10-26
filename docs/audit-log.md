@@ -8490,3 +8490,33 @@ within one run — which is the argument for keeping a test that asserts on a *s
 is otherwise silent.
 
 1156 tests pass, clippy clean.
+
+### C3.2 — TLS 1.2 resumption, in both forms servers actually use
+
+A repeat TLS 1.2 connection now skips the certificate flight. There are two forms and both are
+needed, because servers differ:
+
+| form | who uses it | how it shows |
+|---|---|---|
+| **session id** | rustls, most servers by default | ServerHello echoes a non-empty id |
+| **session ticket** (RFC 5077) | sing-box, xray | a `NewSessionTicket` before the CCS |
+
+The store keeps whichever arrived, with the master secret, the suite and a timestamp. A resumed
+handshake derives its keys from that secret and the two fresh randoms — no ECDHE, no certificate.
+
+**Detection is a fact, not a hope:** if the record after the ServerHello is a `change_cipher_spec`
+rather than the certificate flight, the server accepted the session. If it answers with a
+certificate, we complete a full handshake and store the new session — which is what happens the
+first time, and what happens again when a server has forgotten us.
+
+The suite is compared with the stored one: a server resuming under a different suite would
+otherwise produce keys that fail at the first record with a far less useful message.
+
+Proved end to end against rustls pinned to TLS 1.2 — first connection stores, second resumes, `two!`
+crosses both ways. Disabling the detection fails with `unexpected record type 20` — the CCS the old
+code did not expect.
+
+**One detail worth recording:** the first attempt only implemented tickets, and the test failed at
+the store assertion because rustls' default is session **ids**. Had the test asserted "the second
+handshake is faster" instead of "a session was stored", the run would have looked successful while
+covering one of the two forms.
