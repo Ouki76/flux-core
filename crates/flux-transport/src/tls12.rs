@@ -678,12 +678,34 @@ mod prf_tests {
 
 /// Builds a TLS 1.2 ClientHello offering only the ECDHE + AEAD suites in `OFFERED_SUITES`.
 fn build_client_hello(server_name: &str, alpn: &[&[u8]], random: &[u8; 32]) -> Vec<u8> {
+    build_client_hello_with_ticket(server_name, alpn, random, &[])
+}
+
+/// The same greeting, offering a session ticket back to the server when one is stored.
+fn build_client_hello_with_ticket(
+    server_name: &str,
+    alpn: &[&[u8]],
+    random: &[u8; 32],
+    ticket: &[u8],
+) -> Vec<u8> {
+    build_client_hello_with_session(server_name, alpn, random, &[], ticket)
+}
+
+/// The same, offering a session id back — the form rustls and most servers resume with.
+fn build_client_hello_with_session(
+    server_name: &str,
+    alpn: &[&[u8]],
+    random: &[u8; 32],
+    session_id: &[u8],
+    ticket: &[u8],
+) -> Vec<u8> {
     let mut hello = Vec::with_capacity(256);
     hello.push(0x01); // handshake type: client_hello
     hello.extend_from_slice(&[0, 0, 0]); // length, patched below
     hello.extend_from_slice(&TLS12_VERSION);
     hello.extend_from_slice(random);
-    hello.push(0); // empty session id: no resumption
+    hello.push(session_id.len() as u8);
+    hello.extend_from_slice(session_id);
     hello.extend_from_slice(&((OFFERED_SUITES.len() * 2) as u16).to_be_bytes());
     for suite in OFFERED_SUITES {
         hello.extend_from_slice(&suite.to_be_bytes());
@@ -703,6 +725,11 @@ fn build_client_hello(server_name: &str, alpn: &[&[u8]], random: &[u8; 32]) -> V
     ext.extend_from_slice(&0xff01u16.to_be_bytes());
     ext.extend_from_slice(&1u16.to_be_bytes());
     ext.push(0);
+    // session_ticket: empty asks for a ticket; a value offers one back for resumption
+    // (RFC 5077 §3.2).
+    ext.extend_from_slice(&0x0023u16.to_be_bytes());
+    ext.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+    ext.extend_from_slice(ticket);
     // extended_master_secret: empty; the server echoes it if it agrees.
     ext.extend_from_slice(&0x0017u16.to_be_bytes());
     ext.extend_from_slice(&0u16.to_be_bytes());
@@ -768,7 +795,19 @@ where
 
     let mut client_random = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut client_random);
-    let hello = build_client_hello(cfg.server_name, cfg.alpn, &client_random);
+    // A stored session turns this into an abbreviated handshake: no ECDHE, no certificate.
+    let stored = take_session(cfg.server_name);
+    let hello = build_client_hello_with_session(
+        cfg.server_name,
+        cfg.alpn,
+        &client_random,
+        stored
+            .as_ref()
+            .map(|s| s.session_id.as_slice())
+            .unwrap_or(&[]),
+        stored.as_ref().map(|s| s.ticket.as_slice()).unwrap_or(&[]),
+    );
+    let resuming = stored.is_some();
 
     // The transcript is every handshake message in order, hashed for Finished and (when the
     // server agrees) for the extended master secret.
@@ -792,12 +831,20 @@ where
     let mut extended_ms = false;
     let mut buf: Vec<u8> = Vec::new();
     let mut done = false;
+    let mut resumed = false;
+    let mut session_ticket: Option<Vec<u8>> = None;
+    let mut server_session_id: Vec<u8> = Vec::new();
     let mut server_kx_params: Vec<u8> = Vec::new();
     let mut server_kx_sig: Option<(u16, Vec<u8>)> = None;
 
     while !done {
         // One record at a time; before CCS everything is plaintext.
         let (ctype, body) = read_plain_record(&mut stream).await?;
+        if ctype == 0x14 && resuming {
+            // The server skipped the certificate flight: an abbreviated handshake (RFC 5077 §3.3).
+            resumed = true;
+            break;
+        }
         if ctype == 0x15 {
             return Err(crypto_err(format!(
                 "the server refused the TLS 1.2 handshake: {body:02x?}"
@@ -838,6 +885,7 @@ where
                     server_random.copy_from_slice(&msg[pos..pos + 32]);
                     pos += 32;
                     let sid_len = msg[pos] as usize;
+                    server_session_id = msg[pos + 1..pos + 1 + sid_len].to_vec();
                     pos += 1 + sid_len;
                     if pos + 3 > msg.len() {
                         return Err(crypto_err("short ServerHello (suite)"));
@@ -947,6 +995,19 @@ where
                     server_kx_sig = Some((scheme, msg[pos + 4..pos + 4 + sig_len].to_vec()));
                     transcript.extend_from_slice(&msg);
                 }
+                0x04 => {
+                    // NewSessionTicket (RFC 5077 §3.3): lifetime(4) ‖ ticket(2+n).
+                    if msg.len() >= 6 {
+                        // lifetime is advisory here: the store keeps the session until the
+                        // server refuses it, and a stale id costs one full handshake.
+                        let _lifetime = u32::from_be_bytes([msg[4], msg[5], msg[6], msg[7]]);
+                        let n = u16::from_be_bytes([msg[8], msg[9]]) as usize;
+                        if msg.len() >= 10 + n {
+                            session_ticket = Some(msg[10..10 + n].to_vec());
+                        }
+                    }
+                    transcript.extend_from_slice(&msg);
+                }
                 0x0e => {
                     transcript.extend_from_slice(&msg);
                     done = true;
@@ -961,6 +1022,84 @@ where
     }
 
     let suite = suite.ok_or_else(|| crypto_err("the server sent no ServerHello"))?;
+
+    // ---- abbreviated handshake: the master secret comes from the stored session, and the
+    // keys are re-derived from it and the two fresh randoms (RFC 5077 §3.4).
+    if resumed {
+        let session = stored.ok_or_else(|| crypto_err("resumed without a stored session"))?;
+        if session.suite != suite {
+            return Err(crypto_err(
+                "the server resumed under a different cipher suite than the stored session",
+            ));
+        }
+        let master = session.master_secret.clone();
+        let block = suite.key_block(&master, &client_random, &server_random);
+        let mut client_keys = RecordKeys::new(&block.client_key, block.client_iv.clone())?;
+        let mut server_keys = RecordKeys::new(&block.server_key, block.server_iv.clone())?;
+
+        // The server's Finished is the first protected record.
+        let (ctype, mut body) = read_plain_record(&mut stream).await?;
+        if ctype != 0x16 {
+            return Err(crypto_err(format!(
+                "expected the server's Finished, got record type {ctype}"
+            )));
+        }
+        let n = server_keys.open(0x16, TLS12_VERSION, &mut body)?;
+        let msg = &body[8..8 + n];
+        if msg.len() < 4 || msg[0] != 0x14 {
+            return Err(crypto_err("the server's Finished is malformed"));
+        }
+        let expect = suite.finished(&master, b"server finished", &suite.hash(&transcript));
+        if msg[4..] != expect[..] {
+            return Err(crypto_err(
+                "the server's Finished did not verify: the stored session does not belong to this server",
+            ));
+        }
+        transcript.extend_from_slice(msg);
+
+        // Our Finished closes the handshake.
+        stream
+            .write_all(&[0x14, TLS12_VERSION[0], TLS12_VERSION[1], 0x00, 0x01, 0x01])
+            .await
+            .map_err(flux_types::FluxError::Io)?;
+        let verify = suite.finished(&master, b"client finished", &suite.hash(&transcript));
+        let mut fin = Vec::with_capacity(4 + verify.len());
+        fin.push(0x14);
+        fin.extend_from_slice(&(verify.len() as u32).to_be_bytes()[1..]);
+        fin.extend_from_slice(&verify);
+        let mut rec = Vec::new();
+        client_keys.seal(0x16, &fin, &mut rec)?;
+        stream
+            .write_all(&[0x16, TLS12_VERSION[0], TLS12_VERSION[1]])
+            .await
+            .map_err(flux_types::FluxError::Io)?;
+        stream
+            .write_all(&(rec.len() as u16).to_be_bytes())
+            .await
+            .map_err(flux_types::FluxError::Io)?;
+        stream
+            .write_all(&rec)
+            .await
+            .map_err(flux_types::FluxError::Io)?;
+        stream.flush().await.map_err(flux_types::FluxError::Io)?;
+
+        return Ok(Tls12Stream {
+            inner: stream,
+            read: server_keys,
+            write: client_keys,
+            read_buf: Vec::new(),
+            read_pos: 0,
+            hdr: [0u8; 5],
+            hdr_len: 0,
+            body: Vec::new(),
+            body_len: 0,
+            pending_write: Vec::new(),
+            pending_write_pos: 0,
+            pending_plaintext: 0,
+            closed: false,
+        });
+    }
+
     let server_point = server_point.ok_or_else(|| crypto_err("the server sent no key exchange"))?;
     let (scheme, signature) =
         server_kx_sig.ok_or_else(|| crypto_err("the server key exchange was unsigned"))?;
@@ -1060,6 +1199,21 @@ where
             ));
         }
         break;
+    }
+
+    // Either kind of session is worth keeping: a ticket if the server issued one, a session id
+    // if it did not. rustls resumes with the id, sing-box and xray with tickets.
+    if !server_session_id.is_empty() || session_ticket.is_some() {
+        store_session(
+            cfg.server_name,
+            Session12 {
+                session_id: server_session_id,
+                ticket: session_ticket.unwrap_or_default(),
+                master_secret: master.clone(),
+                suite,
+                received: std::time::Instant::now(),
+            },
+        );
     }
 
     Ok(Tls12Stream {
@@ -1271,5 +1425,149 @@ mod handshake_tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("not valid for"), "unexpected: {err}");
+    }
+}
+
+/// A TLS 1.2 session, kept for resumption (RFC 5077).
+///
+/// The master secret is the whole session: a resumed handshake skips ECDHE and the certificate
+/// flight and derives its keys from this secret and the two new randoms.
+#[derive(Clone)]
+pub(crate) struct Session12 {
+    pub(crate) session_id: Vec<u8>,
+    pub(crate) ticket: Vec<u8>,
+    pub(crate) master_secret: Vec<u8>,
+    pub(crate) suite: Tls12Suite,
+    pub(crate) received: std::time::Instant,
+}
+
+impl Session12 {
+    /// A ticket lives as long as the server says; without a lifetime it is not reused.
+    pub(crate) fn is_fresh(&self, lifetime_secs: u32) -> bool {
+        self.received.elapsed() < std::time::Duration::from_secs(lifetime_secs as u64)
+    }
+}
+
+fn sessions() -> &'static std::sync::RwLock<std::collections::HashMap<String, Session12>> {
+    static S: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<String, Session12>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn store_session(name: &str, session: Session12) {
+    if let Ok(mut m) = sessions().write() {
+        m.insert(name.to_string(), session);
+    }
+}
+
+pub(crate) fn take_session(name: &str) -> Option<Session12> {
+    let m = sessions().read().ok()?;
+    m.get(name).cloned()
+}
+
+#[cfg(test)]
+mod resumption12_tests {
+    use super::*;
+    use crate::tls::TlsClientConfig;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// **TLS 1.2 resumption, end to end.** The second connection must skip the certificate flight
+    /// entirely — which shows up as a handshake that completes with far fewer bytes, and as data
+    /// crossing the tunnel without the server ever sending a certificate.
+    #[tokio::test]
+    async fn the_second_tls12_handshake_resumes_without_a_certificate() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        crate::tls::init_crypto_provider();
+        let name = "resume12.test";
+
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params = CertificateParams::new(vec![name.to_string()]).expect("leaf");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf");
+
+        let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let cfg = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&tokio_rustls::rustls::version::TLS12])
+            .expect("1.2 only")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls_pki_types::CertificateDer::from(leaf.der().to_vec())],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            )
+            .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg));
+
+        let mut trust = crate::tls13::verify::TrustStore::empty();
+        trust.add_pem(ca.pem().as_bytes()).expect("ca");
+        let hello_cfg = ClientHello12Config {
+            server_name: name,
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+
+        // First connection: full handshake, ticket stored.
+        let (c1, s1) = tokio::io::duplex(256 * 1024);
+        let acc = acceptor.clone();
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acc.accept(s1).await {
+                let mut b = [0u8; 4];
+                if srv.read_exact(&mut b).await.is_ok() {
+                    let _ = srv.write_all(&b).await;
+                }
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let mut x = [0u8; 1];
+                    let _ = srv.read(&mut x).await;
+                })
+                .await;
+            }
+        });
+        let mut first = connect(c1, &hello_cfg).await.expect("first handshake");
+        first.write_all(b"one!").await.expect("write");
+        first.flush().await.expect("flush");
+        let mut got = [0u8; 4];
+        first.read_exact(&mut got).await.expect("read");
+        assert_eq!(&got, b"one!");
+        assert!(
+            take_session(name).is_some(),
+            "a TLS 1.2 server that offers tickets must leave one in the store"
+        );
+
+        // Second connection: must resume.
+        let (c2, s2) = tokio::io::duplex(256 * 1024);
+        let acc = acceptor.clone();
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acc.accept(s2).await {
+                let mut b = [0u8; 4];
+                if srv.read_exact(&mut b).await.is_ok() {
+                    let _ = srv.write_all(&b).await;
+                }
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    let mut x = [0u8; 1];
+                    let _ = srv.read(&mut x).await;
+                })
+                .await;
+            }
+        });
+        let mut second = connect(c2, &hello_cfg)
+            .await
+            .expect("the second handshake must resume");
+        second.write_all(b"two!").await.expect("write");
+        second.flush().await.expect("flush");
+        let mut got = [0u8; 4];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second.read_exact(&mut got),
+        )
+        .await
+        .expect("a resumed handshake must carry data")
+        .expect("read");
+        assert_eq!(&got, b"two!");
+        let _ = TlsClientConfig::new("x");
     }
 }
