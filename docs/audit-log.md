@@ -7749,3 +7749,25 @@ against the implementation you wrote it against is not verified, it is rehearsed
 
 The listener table is printed before every transfer now. It is three lines and it would have saved
 six cycles.
+
+---
+
+## C2.1 — session resumption, first step: the secret that only exists during the handshake
+
+RFC 8446 §7.1 derives the resumption master secret from the master secret and the transcript hash
+through the client's Finished. It is computable **only during the handshake**, so a client that
+does not capture it can never resume — no later cleverness helps.
+
+`Tls13Stream` now carries it, together with the server name a ticket store will key on. REALITY
+keeps it `None` explicitly, because REALITY does not resume and a field that looks like it might is
+worse than one that says it does not.
+
+No behaviour change yet; the fields are `#[allow(dead_code)]` with the reason written next to them,
+because the secret had to be captured in the cycle where the handshake code was open.
+
+**Next:** parse `NewSessionTicket` in the stream's post-handshake branch (the same place KeyUpdate
+is handled), derive `PSK = HKDF-Expand-Label(rms, "resumption", ticket_nonce, Hash.length)`, and
+store it. Then the ClientHello side: `pre_shared_key` as the last extension, `psk_key_exchange_modes`,
+and a binder over the truncated ClientHello. The binder is the part that needs a test which fails
+without it — a wrong transcript truncation produces a PSK the server silently ignores, which looks
+exactly like a server that does not support resumption.
