@@ -7771,3 +7771,36 @@ store it. Then the ClientHello side: `pre_shared_key` as the last extension, `ps
 and a binder over the truncated ClientHello. The binder is the part that needs a test which fails
 without it — a wrong transcript truncation produces a PSK the server silently ignores, which looks
 exactly like a server that does not support resumption.
+
+### C2.2 — the ticket store, and the crash the truncation test found
+
+`NewSessionTicket` is parsed where the stream already handles post-handshake messages, and the PSK
+is derived per RFC 8446 §7.1:
+`HKDF-Expand-Label(resumption_master_secret, "resumption", ticket_nonce, Hash.length)`.
+
+Design decisions worth naming:
+
+- **keyed by server name**, not address: a node's address can change while its certificate — and
+  therefore its ticket — does not;
+- **the suite is stored with the ticket**, because a PSK means nothing under a different suite and
+  a store that drops it looks correct until the first server negotiates something else;
+- **expiry uses the server's declared lifetime**, and the age sent back is obfuscated by
+  `ticket_age_add`, as the RFC requires.
+
+**The truncation test earned its keep on the first run.** It walks cuts at 0, 3, 8, 12 and `len-2`,
+and the parser **panicked on an index out of bounds** — it was reading the nonce length and the
+ticket length without checking they were present. Those bytes come from the peer; that is a crash
+a server could have caused.
+
+| test | what it pins |
+|---|---|
+| different nonces give different PSKs | the PSK is derived, not the ticket itself |
+| an expired ticket is not returned | lifetime is honoured |
+| the reported age is obfuscated by age_add | the age is reversible, not constant |
+| a truncated ticket is refused | **the bounds bug, at five cut points** |
+| a real handshake stores a ticket | the store is actually filled, end to end |
+
+The last one is the one that would have been easy to fake: disabling the ticket branch makes it
+fail with *"a TLS 1.3 server issues tickets; the store must have one"*.
+
+1142 tests pass, clippy clean. The reader — `pre_shared_key` in the ClientHello — is next.
