@@ -8044,3 +8044,42 @@ which is worse than no resumption.
 The lesson, now with three instances in this project: **the instrument must not share code with the
 thing it measures.** A walker written by the same hand as the builder has the same blind spot, and
 the cheaper tool — forty lines of Python — did what three cycles of Rust could not.
+
+### C2.10 — the binder formula is confirmed right; the fault is in the PSK
+
+rustls `msgs/handshake.rs:2794`:
+
+```rust
+pub(crate) fn encoding_for_binder_signing(&self) -> Vec<u8> {
+    let mut ret = self.get_encoding();
+    let ret_len = ret.len().saturating_sub(self.total_binder_length());
+    ret.truncate(ret_len);
+    ret
+}
+```
+
+`get_encoding()` is the **whole handshake message including its four-byte header**, and
+`total_binder_length()` is the encoded binders vector — two-byte length, one-byte entry length,
+binder. For our greeting: 292 − (2 + 1 + 32) = **257**, exactly where `truncate_at` points.
+
+So three things are now confirmed identical to rustls's own arithmetic:
+
+| element | status |
+|---|---|
+| truncation point | 257, by source and by measurement |
+| what the hash covers | the full message including the handshake header |
+| the binder key | `HKDF-Expand-Label(HKDF-Extract(0, PSK), "res binder", "")` |
+
+**That leaves the PSK itself.** If the truncation and the formula both match, a `decrypt_error`
+means the secret we derive from the ticket differs from the one rustls stored in it — and the only
+difference left is the resumption master secret, which is exactly the value whose transcript bug was
+fixed in C2.9 and therefore the value most likely to still be wrong in a second way.
+
+**The next measurement:** print our PSK and the rms for a known ticket, and compare against the
+value rustls computes for the same ticket — obtainable by having rustls' own client resume against
+the same server and observing whether it succeeds, which isolates client-side derivation from
+server-side storage.
+
+The offer stays off. Five cycles on resumption have produced three real bugs (duplicate extension,
+missing Finished, and the earlier identity-length shape) and no working resumption yet; the
+remaining distance is now a single secret.
