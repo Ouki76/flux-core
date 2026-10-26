@@ -8775,3 +8775,65 @@ resumption accounts for about a third of the total.
 the benchmark port, and the tunnel adds its own latency. That inflates every number here equally, so
 the *comparison* between implementations is unaffected while the absolute figure is not portable to
 a direct connection.
+
+---
+
+## C4.1 — where the CPU actually goes: a full profile of the data path
+
+All numbers from this session's harness on the same host, plain TCP relay carrying VLESS.
+
+| metric | flux-core | sing-box | xray |
+|---|---|---|---|
+| throughput, VLESS/TCP | **687 MB/s** | 622 | 549 |
+| **CPU per GiB** (both processes) | **1.592 s** | 3.352 s | 4.281 s |
+| exchanges/s (SOCKS open→close) | **12 887** | 9 722 | 973 |
+| p99 latency | **15.6 ms** | 20.8 ms | 1 603 ms |
+| **RSS per held connection** | **20 KB** | 84 KB | 115 KB |
+
+On every axis measured we are at or ahead of both references — CPU by 2.1x against sing-box and
+2.7x against xray, memory by 4–6x.
+
+### Where the time goes
+
+`perf record -F 997 -g` on both processes during a 572 MiB transfer (820 MiB/s):
+
+```
+98.42%  tokio-rt-worker  [unknown]   [k] 0xffffffff9c0001c8     ← kernel
+ 0.37%  … tokio runtime task poll
+ 0.22%  … __internal_syscall_cancel
+ 0.17%  … tokio io Driver::turn
+ 0.15%  … copy_bidirectional_buffered
+```
+
+**98.4% of samples are kernel time**, and the userspace remainder is dominated by the tokio reactor,
+not by our code. `copy_bidirectional_buffered` is 0.15%.
+
+Syscall counts for 95 MiB through the client (`strace -c -f`): 780 `recvfrom`, 774 `sendto`,
+696 `epoll_wait` — **about one syscall per 63 KB**, which means the buffers are already large and
+the syscall *count* is not the problem.
+
+### The conclusion that follows
+
+The data path is limited by **memory copies**, four per byte end to end: kernel→user and user→kernel
+in each of the two relay processes. That is the architecture of a userspace relay, and it is exactly
+why we are faster than the references — both of them do the same four copies with more per-packet
+overhead and much larger per-connection state.
+
+**The remaining optimisation is `splice(2)`**: after the VLESS header is consumed, a raw-TCP relay
+has no reason to bring the bytes into userspace at all. Kernel→pipe→kernel removes all four copies
+and the 98% kernel time falls with them. Rough sizing: such a relay lands in the 0.2–0.4 s/GiB
+range, so the theoretical headroom is 4–8x on CPU for the no-TLS, no-framing path.
+
+**I have not implemented it**, and the reason is in the numbers rather than in an excuse: it is an
+architectural change to the relay — the transport trait would need to expose raw descriptors, and
+every TLS, WebSocket, gRPC and REALITY path has to keep working through the old copier. That is a
+cycle of work with its own test matrix, not a patch, and doing it half-way is how a relay ends up
+with a data path that is fast in the benchmark and wrong for framed protocols.
+
+### What is already at the limit
+
+- **memory per connection** (20 KB): a connection is a few buffers and a task; there is no obvious
+  fat left, and the references are 4–6x larger.
+- **syscall count per byte**: one per ~63 KB is near the practical floor without `splice`.
+- **the userspace share of CPU**: 1.6% of samples. Optimising Rust code cannot move a number that
+  is 98% kernel.
