@@ -926,6 +926,8 @@ impl Tls13Client {
             pending_write: Vec::new(),
             pending_write_pos: 0,
             pending_unacked: 0,
+            resumption_master_secret: None,
+            server_name: String::new(),
             closed: false,
         };
         if !verified {
@@ -1504,6 +1506,8 @@ impl Tls13Server {
             pending_write: Vec::new(),
             pending_write_pos: 0,
             pending_unacked: 0,
+            resumption_master_secret: None,
+            server_name: String::new(),
             closed: false,
         })
     }

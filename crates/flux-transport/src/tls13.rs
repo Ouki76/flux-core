@@ -462,6 +462,16 @@ pub struct Tls13Stream<S> {
     /// Plaintext bytes whose record is buffered but not yet acknowledged to the
     /// caller (the transport returned `Pending` while writing it).
     pub(crate) pending_unacked: usize,
+    /// The resumption master secret (RFC 8446 §7.1), from which `NewSessionTicket`
+    /// derives a PSK. `None` when the caller does not want to store tickets.
+    ///
+    /// Read by the ticket store, which lands in the next cycle; the secret is captured now
+    /// because it is only computable during the handshake.
+    #[allow(dead_code)]
+    pub(crate) resumption_master_secret: Option<Vec<u8>>,
+    /// The name this connection was made to, used to key stored tickets.
+    #[allow(dead_code)]
+    pub(crate) server_name: String,
     pub(crate) closed: bool,
 }
 
@@ -1705,6 +1715,15 @@ where
         pending_write: Vec::new(),
         pending_write_pos: 0,
         pending_unacked: 0,
+        // resumption_master_secret: HKDF-Expand-Label(master, "resmaster",
+        //   Transcript-Hash(ClientHello … client Finished), Hash.length).
+        resumption_master_secret: Some(suite.hkdf_expand_label(
+            &master_secret,
+            "resmaster",
+            &suite.hash(&transcript),
+            suite.hash_len(),
+        )?),
+        server_name: cfg.server_name.to_string(),
         closed: false,
     })
 }
