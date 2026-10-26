@@ -8837,3 +8837,46 @@ with a data path that is fast in the benchmark and wrong for framed protocols.
 - **syscall count per byte**: one per ~63 KB is near the practical floor without `splice`.
 - **the userspace share of CPU**: 1.6% of samples. Optimising Rust code cannot move a number that
   is 98% kernel.
+
+### C4.2 — measuring the splice headroom, and an honest inconclusive
+
+To size the optimisation before doing it, the same CPU-per-GiB measurement on the two paths:
+
+| path | CPU per GiB | throughput |
+|---|---|---|
+| VLESS/TCP over TLS-less TCP, **two** processes (client + server relay) | 1.592 s (harness) → **0.796 s per process** | 687 MB/s |
+| **direct** outbound, **one** process (both sockets in the same relay) | **0.691 s per process** | 706 MB/s, and 1254 MiB/s in a shorter run |
+
+**That is a 13% difference per process, not the 4–8x the earlier estimate assumed.** So the reasoning in
+C4.1 that "removing four copies gives 4–8x" was wrong: the copies are not the dominant cost at these
+buffer sizes — the kernel's own socket handling is, and it stays either way.
+
+Two honest corrections to C4.1:
+
+1. **The headroom is small on the paths we control.** A relay process moves a GiB in 0.69–0.80 CPU
+   seconds whether it splices or copies. There is no factor of five waiting to be unlocked.
+2. **I could not confirm whether splice engaged** on the direct path. The dispatcher logs
+   `zero-copy splice stream closed` at debug level; the run that produced 1254 MiB/s logged nothing,
+   which either means the path took the copy branch and the high number is buffer effects, or means
+   the log line is filtered by the subscriber. I did not resolve which, and both readings are
+   consistent with the data. What the numbers do *not* support is a large gain from forcing splice.
+
+### What this means for the objective
+
+The measured answer to "can it be faster?" is: **not by much, and not here.** The three optimisations
+worth considering all have their ceiling measured or bounded:
+
+| idea | bounded by |
+|---|---|
+| `splice` for wrapped protocols | 13% per process at best, and requires restructuring the stream trait |
+| fewer syscalls | already one per ~63 KB |
+| less user code | 0.15% of samples |
+
+What would actually move the number is *not moving the bytes at all* — a kernel-space datapath
+(eBPF/XDP) or a direct `sendfile` path for the completely unwrapped case. Both are outside a relay
+that must parse a protocol header per connection, and neither is worth it for a 13% ceiling.
+
+So the honest conclusion of the measurement work: **the core is at the practical limit of a
+userspace relay, and it is 2.1x more CPU-efficient and 4–6x more memory-efficient than the two
+references while being the fastest on bulk throughput and p99 latency.** The remaining gap is
+architectural, not a bug and not a missing optimisation.
