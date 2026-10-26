@@ -8520,3 +8520,32 @@ code did not expect.
 the store assertion because rustls' default is session **ids**. Had the test asserted "the second
 handshake is faster" instead of "a session was stored", the run would have looked successful while
 covering one of the two forms.
+
+### C3.3 — IPv6 did not work, and the test of the transport could not tell
+
+```
+Error: invalid listen addr ::1:19981: invalid socket address syntax
+```
+
+An IPv6 listener **could not start at all**. The transport takes a `SocketAddr` and was always
+v6-capable — so a unit test of `TcpTransport` passes and connects over `[::1]` — while the binary
+built the listen address as `format!("{host}:{port}")`, producing `::1:19981`, which does not parse.
+
+**The same pattern appeared four times in `instance.rs`.** A fix at the first site would have left
+three, and the next configuration shape would have failed again — which is why this became one
+helper, `join_host_port`, that every site goes through.
+
+Verified end to end, not by inspection:
+
+| check | result |
+|---|---|
+| flux server listening on `[::1]:19981` | `слушает: [::1]:19981` |
+| flux client dialling it | tunnel established |
+| transfer through the v6 tunnel | 200 KB at **161 MiB/s** |
+
+Three unit tests: v6 gets brackets, v4 and already-bracketed v6 pass through unchanged, and every
+result parses as a `SocketAddr`.
+
+**The lesson is about where the test lived, not what it checked.** A unit test at the transport
+layer proved the protocol stack speaks v6; nothing proved the *configuration* could express a v6
+address. Both are needed, and only the end-to-end run found the gap between them.
