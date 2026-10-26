@@ -7681,3 +7681,53 @@ actually been reached through the pipeline in these tests.
 Recorded plainly: eleven cycles in, the 1.2 path has a working handshake, a working upload against
 rustls, and a pipeline whose error reporting is proven to be misleading. The next measurement is a
 one-line log, not another architecture.
+
+---
+
+## C1.12 — the six-cycle bug was in the harness
+
+The interop test is unignored and passing: our TLS 1.2 client completes the handshake with Xray
+pinned to `minVersion/maxVersion: 1.2` and carries data through the tunnel both ways.
+
+**The "download stalls" symptom that cost six cycles was a defect in my test harness.** The client
+config pointed at a relay port that was not listening, and the error the user sees names the
+*destination* rather than the node:
+
+```
+[in] connection to 127.0.0.1:17171 failed: I/O error: Connection refused (os error 111)
+                                                                       ↑ the node was at :19993
+```
+
+Every conclusion built on that message — "the server rejects our records", "the server is waiting
+for something" — rested on an error that was mislabelled. The run that settled it listed the
+listeners first:
+
+```
+слушает: 127.0.0.1:19973   flux SOCKS
+слушает: 127.0.0.1:19971   xray
+слушает: 127.0.0.1:17171   echo
+итого 50000 байт за 25.0с
+```
+
+Three genuine defects were found along the way, and each is now covered by a test that fails
+without it: the double-queued record in `poll_write`, post-handshake records handed to the
+application, and the AAD carrying a constant version instead of the header's. The capture tool, the
+record tracer and the alert-name decoder all stay — they are what turned a symptom into an
+indictment of the harness.
+
+### The lesson, which is the expensive one
+
+A reproducible symptom is not a diagnosis. Six cycles were spent because the symptom reproduced
+faithfully in a setup that was itself wrong, and because every log line I trusted named something
+other than the thing that failed. The fix that would have saved all six is at the top of this
+entry: **verify the plumbing before interpreting the failure.**
+
+### Where the objective stands
+
+| gap | state |
+|---|---|
+| TLS 1.2 in our own stack | **closed** — handshake, chain, name, key-exchange signature, record layer, and interop with the real Xray binary |
+| session resumption (TLS 1.3 PSK) | not started — the next cycle begins here |
+
+Rustls stays available as an explicit choice (`native_tls: false`) but is no longer the fallback:
+a 1.2-only server is served by our client through the dial retry.
