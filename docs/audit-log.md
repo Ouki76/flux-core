@@ -7438,3 +7438,28 @@ waiting for something we did not send — the two candidates are the write-side 
 `NewSessionTicket` acknowledgement, which some servers expect before they keep sending.
 
 The interop test stays `#[ignore]`d with the symptom. 1136 tests pass.
+
+### C1.4 — the same client, two real servers, and what that rules out
+
+The Xray symptom needed a control, so the same client was pointed at **sing-box** pinned to TLS 1.2:
+
+| server | handshake | data |
+|---|---|---|
+| rustls (unit test) | completes | 1 MB both ways, byte-exact |
+| sing-box, TLS 1.2 only | completes | **0 bytes**, connection closed at once |
+| Xray, TLS 1.2 only | completes | upload 100 000 B accepted, **download 0**, then one record and silence |
+
+That row is the useful one. Three servers accept our handshake and only the rustls one carries
+traffic, so the handshake is not the problem — **the application records are**, in a way that a
+rustls server tolerates and a Go-based proxy does not.
+
+What that rules out: the ClientHello (three servers parsed it), the key schedule and both Finished
+messages (all three completed), and the chain verification (all three went through it). What is
+left is the record layer's application-data path, and the most likely candidate is the AAD length
+field or the sequence-number accounting after the handshake — both are places where being off by
+one produces a record that decrypts correctly in a unit test and is discarded by a stricter peer.
+
+This is where the next cycle starts, and it starts with a byte-level capture rather than another
+hypothesis: the shape of the mistake is now confined to one function.
+
+1136 tests pass, 8 skipped.
