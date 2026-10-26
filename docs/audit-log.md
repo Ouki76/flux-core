@@ -7411,3 +7411,30 @@ which hid why the retry failed. It now logs the retry's error at `debug` as well
 is almost always the interesting one.
 
 1136 tests pass, 8 skipped, clippy clean.
+
+### C1.3 — the AAD version, and the problem shrinking
+
+TLS 1.2 builds the AEAD's additional data from the **record header's** version as the peer sent
+it. We passed our own constant — correct for every record rustls has ever sent us, and wrong by
+definition for a peer using the compatibility value; the decrypt fails and the connection looks
+silently dead.
+
+Fixed, and a `trace` line now names each record's type, version and length. That line is what
+narrowed the Xray problem from "the download stalls" to something specific:
+
+```
+tls12 record: type 23 version [03, 03] len 26      ← the only record read
+upload=100000 B, download=0 B
+```
+
+One record: 26 bytes = 8 nonce + 2 plaintext + 16 tag, which is the two-byte VLESS response
+header. The handshake is fine, the upload is fine, and the record exchange stops right after the
+server's first message.
+
+**Where the next cycle starts:** after our application record is written, the server sends its
+response header and then nothing. Either our next read never reaches the socket, or Xray is
+waiting for something we did not send — the two candidates are the write-side record boundaries
+(the megabyte test passes against rustls, so this is peer-specific) and a missing
+`NewSessionTicket` acknowledgement, which some servers expect before they keep sending.
+
+The interop test stays `#[ignore]`d with the symptom. 1136 tests pass.
