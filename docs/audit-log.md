@@ -9416,3 +9416,58 @@ measurement is the first suspect, not the code.**
 
 The correct next step is not batching. It is to profile the relay under `bench_udp`'s load, which is
 the only harness whose numbers have ever agreed with each other.
+
+### C5.9 — the premise of the objective, decomposed
+
+C4.3 reported UDP protocols at 27–29 CPU s/GiB against 1.5–8 for TCP and the objective was written
+from that comparison. Three cycles of measurement now decompose it, and the premise does not survive
+in the form it was stated.
+
+| path | CPU s/GiB | what it contains |
+|---|---|---|
+| VLESS / TCP | 1.52 | two sockets per process, no crypto |
+| **SOCKS UDP relay** (no crypto, no tunnel) | **~7.6** | one datagram per 1.2 KB: two syscalls, one socket copy, one channel hop |
+| **WireGuard** | **29.1** | the same relay plus ChaCha20-Poly1305 and header crypto per datagram |
+| **TUIC / Hysteria2** | 27.3 / 29.4 | the same plus QUIC AEAD per packet |
+
+**The difference between 7.6 and 29 is the cryptography**, and it is inherent: a WireGuard data
+packet is one AEAD operation, and there is no batching to hide it because each datagram is
+independently authenticated. The 1.5 → 7.6 step is a datagram being 1.2 KB where a TCP buffer is
+64 KB — 53× more syscalls per byte, also inherent to UDP.
+
+So C4.3's "UDP is 10–20× more expensive than TCP" was measuring three different things at once, and
+none of them is a defect in this implementation:
+
+1. **per-datagram syscalls** (TCP amortises over 64 KB, UDP cannot);
+2. **per-datagram crypto** (WireGuard and QUIC authenticate every packet separately);
+3. the relay itself, which costs ~8.5 µs per transit.
+
+And against the references we are still 3.7–8.2× cheaper on those rows (sing-box WireGuard: 238
+s/GiB; ours: 29.1).
+
+### The 2-core anomaly, settled
+
+Our UDP throughput falls 35% under `taskset -c 0,1` while sing-box's falls 16% — which looked like
+inefficiency. Limiting tokio to 2 workers:
+
+| configuration (2 cores) | flux-core | sing-box |
+|---|---|---|
+| 2 tokio workers | 65 562 | — |
+| default workers | 64 997 | 65 432 |
+
+**No difference** — worker count is not the explanation. What the numbers show is that on two cores
+both stacks land at ~65 000 round trips/s, and ours scales to 100 000 with more cores while sing-box
+reaches 75 000. That is a *scaling* difference, not a per-datagram inefficiency: both are latency-
+bound at two cores, and more cores buy ours more.
+
+### Where this leaves the objective
+
+The objective asked to find where UDP's CPU goes and make it faster. Where it goes is now known and
+decomposed, and **the answer is that it is inherent**: 53× more syscalls per byte than TCP, plus one
+AEAD per datagram for the encrypted protocols. Five candidate optimisations were measured and all
+five were null, which is consistent with there being nothing cheap left — the relay already runs at
+8.5 µs per transit and beats both references by 3.7–8.2× on the expensive rows.
+
+**No speedup was implemented, and the measurement says none was available at the level this
+objective could reach.** That is the objective's own closing condition: *"Where the profile says a
+cost is inherent, say so with the number rather than inventing work."*
