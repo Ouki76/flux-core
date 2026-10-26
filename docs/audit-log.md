@@ -9256,3 +9256,39 @@ not need a task handoff to forward a datagram.
 **Not implemented in this cycle** — the budget went into getting the instrument to produce a number
 at all, three times over. But the number is now the right one, and it says the optimisation lives in
 our scheduler usage, not in the syscalls or the cryptography.
+
+### C5.5 — the fourth knob: channel capacity, also null
+
+If the cost is a task handoff per datagram, a bigger channel buffer might let the sender run ahead
+without parking. `mpsc::channel(16)` → `256` in the SOCKS UDP path:
+
+| configuration | CPU s/GiB (two runs) | mean |
+|---|---|---|
+| channel capacity 16 (baseline) | 42.9 | 42.9 |
+| channel capacity 256 | 45.5, 44.3 | 44.9 |
+
+**No better — marginally worse, inside noise.** Reverted.
+
+That is the fourth cheap candidate measured at zero:
+
+| candidate | effect |
+|---|---|
+| socket buffers 212 KiB → 4 MiB | +1.2% (noise) |
+| `tokio::Mutex` → `std::Mutex` per datagram | +0.7% (noise) |
+| remove per-datagram wakeups | none exist (3 switches / 5 s) |
+| channel capacity 16 → 256 | −4.7% (noise, and in the wrong direction) |
+
+An important clarification that falls out of this: **the 48 µs is not a context switch** — the
+process makes three switches in five seconds. It is the *cost of the work* the relay does per
+datagram: the channel send/receive machinery (allocation, waker bookkeeping, `Waker::wake` on an
+already-ready task), the `Bytes` allocation, the address parsing, and the two syscalls. At 48 µs for
+~1.2 KB that work is far more expensive than it should be, and no single knob removes it.
+
+**What would:** one channel message per *batch* of datagrams, so the per-message machinery is
+amortised over 32–64 packets. That changes the channel's element type, which every UDP outbound
+consumes — WireGuard, TUIC, Hysteria2 and the SOCKS relay all share `dispatch_packet`'s signature.
+
+I did not make that change, and the reason is scope rather than doubt: it reaches the shared
+packet-dispatch API and all four UDP protocols, and a half-applied change there corrupts datagrams
+silently rather than loudly. It needs its own cycle with the interop suite run against each UDP
+protocol afterwards.
