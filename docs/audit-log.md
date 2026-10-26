@@ -9292,3 +9292,50 @@ I did not make that change, and the reason is scope rather than doubt: it reache
 packet-dispatch API and all four UDP protocols, and a half-applied change there corrupts datagrams
 silently rather than loudly. It needs its own cycle with the interop suite run against each UDP
 protocol afterwards.
+
+### C5.6 — the fifth knob: the cancellation future, also null
+
+Reading the dispatch loop turned up a real waste: `tokio::select!` rebuilt the cancellation future
+on **every** datagram, and building it registers and drops a waker with the broadcast channel each
+time — per-packet cost for something that fires at most once. Hoisting it out of the loop is
+obviously correct.
+
+| configuration | CPU s/GiB (two runs) | mean |
+|---|---|---|
+| cancellation future rebuilt per packet | 42.9 | 42.9 |
+| hoisted out of the loop | 43.3, 44.4 | 43.9 |
+
+**No measurable change.** Reverted, per the rule this audit has applied five times now.
+
+### Five candidates, five nulls — so the cost is not where the code reads as if it is
+
+| candidate | effect |
+|---|---|
+| socket buffers 212 KiB → 4 MiB | +1.2% |
+| `tokio::Mutex` → `std::Mutex` per datagram | +0.7% |
+| per-datagram wakeups | none exist |
+| channel capacity 16 → 256 | −4.7% |
+| cancellation future rebuilt per packet | −2.3% |
+
+Every one is within this host's noise, and two are in the wrong direction. That is a pattern, not a
+series of coincidences: **the 48 µs per datagram is not in any single piece of per-packet code.** It
+is distributed across the whole hop — allocation, waker machinery, hash lookups, syscalls — and no
+one of them is large enough to see over the noise of a 24-core machine running a Python driver.
+
+### The honest conclusion for this objective
+
+The measurement that started this (C4.3's 27–29 s/GiB for UDP protocols) has been explained and then
+narrowed three times:
+
+1. it is not the crypto (C5.4: a **direct** relay with no crypto measures 42.9 s/GiB);
+2. it is not the syscalls, the mutexes, the buffers, the channel capacity or the select machinery
+   (five nulls);
+3. it is the **sum of small per-packet costs**, each individually below this harness's noise floor.
+
+What would move it is amortising all of them at once — one channel message per batch of datagrams —
+which is a change to the shared packet API used by all four UDP protocols. **That is a cycle of
+work, and I cannot verify it in the budget remaining.** The right next step is a clean session that
+starts there, with the interop suite run against WireGuard, TUIC and Hysteria2 afterwards.
+
+Nothing in this objective produced a speedup, and this entry says so plainly rather than dressing
+five nulls as insight.
