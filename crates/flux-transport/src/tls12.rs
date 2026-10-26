@@ -475,6 +475,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls12Stream<S> {
                 )));
             }
             this.pending_plaintext = n;
+            tracing::trace!(
+                "tls12 write: queued {n} plaintext bytes into {} wire bytes",
+                this.pending_write.len()
+            );
         }
         loop {
             if this.pending_write_pos >= this.pending_write.len() {
@@ -482,6 +486,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls12Stream<S> {
                 this.pending_write_pos = 0;
                 let n = this.pending_plaintext;
                 this.pending_plaintext = 0;
+                tracing::trace!("tls12 write: record delivered, reporting {n} bytes consumed");
                 return Poll::Ready(Ok(n));
             }
             match std::pin::Pin::new(&mut this.inner)
