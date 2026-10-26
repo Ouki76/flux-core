@@ -250,7 +250,12 @@ impl RecordKeys {
     }
 
     /// Opens one record body, in place, and returns the plaintext range.
-    pub(crate) fn open(&mut self, ctype: u8, body: &mut [u8]) -> FluxResult<usize> {
+    pub(crate) fn open(
+        &mut self,
+        ctype: u8,
+        version: [u8; 2],
+        body: &mut [u8],
+    ) -> FluxResult<usize> {
         if body.len() < 8 + 16 {
             return Err(crypto_err("short TLS 1.2 record"));
         }
@@ -258,7 +263,7 @@ impl RecordKeys {
         nonce[..4].copy_from_slice(&self.fixed_iv);
         nonce[4..].copy_from_slice(&body[..8]);
         let ct_len = body.len() - 8;
-        let aad = self.aad(ctype, TLS12_VERSION, ct_len - 16);
+        let aad = self.aad(ctype, version, ct_len - 16);
         let plain = self
             .key
             .open_in_place(
@@ -419,11 +424,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls12Stream<S> {
             // Handshake records continue after the handshake: NewSessionTicket arrives once the
             // connection is established, and handing its bytes to the application corrupts the
             // stream — a real server sends one, a test server may not.
+            let version = [this.hdr[1], this.hdr[2]];
+            tracing::trace!(
+                "tls12 record: type {ctype} version {version:02x?} len {}",
+                body.len()
+            );
             if ctype == 0x16 {
-                let _ = this.read.open(ctype, &mut body);
+                let _ = this.read.open(ctype, version, &mut body);
                 continue;
             }
-            let n = match this.read.open(ctype, &mut body) {
+            let n = match this.read.open(ctype, version, &mut body) {
                 Ok(n) => n,
                 Err(e) => {
                     return Poll::Ready(Err(std::io::Error::new(
@@ -602,14 +612,14 @@ mod prf_tests {
         let mut wire = Vec::new();
         tx.seal(0x17, b"hello record", &mut wire).expect("seal");
         let mut body = wire.clone();
-        let n = rx.open(0x17, &mut body).expect("open");
+        let n = rx.open(0x17, TLS12_VERSION, &mut body).expect("open");
         assert_eq!(&body[8..8 + n], b"hello record");
 
         let mut tampered = wire;
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
         assert!(
-            rx.open(0x17, &mut tampered).is_err(),
+            rx.open(0x17, TLS12_VERSION, &mut tampered).is_err(),
             "a modified record must not open"
         );
     }
@@ -625,9 +635,13 @@ mod prf_tests {
         let mut wire = Vec::new();
         tx.seal(0x17, b"once", &mut wire).expect("seal");
         let mut first = wire.clone();
-        rx.open(0x17, &mut first).expect("first open");
+        rx.open(0x17, TLS12_VERSION, &mut first)
+            .expect("first open");
         let mut again = wire;
-        assert!(rx.open(0x17, &mut again).is_err(), "a replay must fail");
+        assert!(
+            rx.open(0x17, TLS12_VERSION, &mut again).is_err(),
+            "a replay must fail"
+        );
     }
 }
 
@@ -1007,7 +1021,7 @@ where
                 "unexpected record type {ctype} after the client Finished"
             )));
         }
-        let n = server_keys.open(0x16, &mut body)?;
+        let n = server_keys.open(0x16, TLS12_VERSION, &mut body)?;
         let msg = &body[8..8 + n];
         if msg.len() < 4 || msg[0] != 0x14 {
             return Err(crypto_err("the server's Finished message is malformed"));
