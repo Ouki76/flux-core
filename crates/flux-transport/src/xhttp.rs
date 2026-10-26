@@ -32,6 +32,7 @@ pub async fn connect<S>(
     host: &str,
     path: &str,
     headers: &HashMap<String, String>,
+    xpadding: Option<&str>,
 ) -> FluxResult<H2Stream>
 where
     S: AsyncStream + 'static,
@@ -47,7 +48,7 @@ where
     // Xray validates padding on every request and refuses one without it. The padding
     // goes in the query string (`x_padding`) as base64url, and its purpose is to make the
     // request line's length vary instead of being a fixed signature.
-    let full = format!("{full}?x_padding={}", padding_param());
+    let full = format!("{full}?x_padding={}", padding_param(xpadding));
 
     let mut builder = Request::builder()
         .method("POST")
@@ -179,16 +180,44 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
-/// A random padding parameter, in the length range Xray normalises its own to.
-fn padding_param() -> String {
+/// The encoded length range for `x_padding`: Xray's default, or the configured one.
+///
+/// `xpaddingBytes` is written as `"100-1000"`; a bare number means "exactly that length", which
+/// Xray also accepts. The range bounds the **encoded** value, so the raw entropy is sized to land
+/// inside it after base64's 4/3 expansion.
+fn padding_range(configured: Option<&str>) -> (usize, usize) {
+    let parse = |raw: &str| -> Option<(usize, usize)> {
+        let raw = raw.trim().trim_matches('"');
+        if raw.is_empty() {
+            return None;
+        }
+        match raw.split_once('-') {
+            Some((lo, hi)) => Some((lo.trim().parse().ok()?, hi.trim().parse().ok()?)),
+            None => {
+                let n = raw.parse().ok()?;
+                Some((n, n))
+            }
+        }
+    };
+    configured.and_then(parse).unwrap_or((100, 1000))
+}
+
+/// A random padding parameter inside the configured range.
+fn padding_param(configured: Option<&str>) -> String {
     use rand::RngCore;
-    // Xray validates the length of the *encoded* value against its configured range
-    // (100-1000 by default), so the entropy is sized to land inside it: base64 expands
-    // by 4/3, and a 150..750 byte source encodes to 200..1000 characters.
-    let target = 150 + (rand::random::<u16>() % 601) as usize;
+    let (lo, hi) = padding_range(configured);
+    let (lo, hi) = (lo.max(4), hi.max(lo));
+    let encoded_target = lo + (rand::random::<u16>() as usize % (hi - lo + 1));
+    // base64 expands by 4/3; round **up** so the encoded string is at least the target, then cut
+    // it to exactly the target length. Rounding down and hoping leaves the last few characters
+    // outside a range the server validates, which is how an exact-length configuration such as
+    // `"1000"` produced 1003 and was refused.
+    let target = (encoded_target * 3).div_ceil(4).max(1);
     let mut raw = vec![0u8; target];
     rand::rngs::OsRng.fill_bytes(&mut raw);
-    base64url(&raw)
+    let mut encoded = base64url(&raw);
+    encoded.truncate(encoded_target);
+    encoded
 }
 
 /// base64url without padding, which is what a query parameter can carry unescaped.
@@ -232,7 +261,7 @@ mod tests {
             let _ = s.shutdown().await;
         });
 
-        let mut c = connect(client_io, "example.com", "/tunnel", &HashMap::new())
+        let mut c = connect(client_io, "example.com", "/tunnel", &HashMap::new(), None)
             .await
             .expect("client connect");
         c.write_all(b"hello").await.expect("client write");
@@ -268,7 +297,7 @@ mod tests {
         // range, 100-1000 by default. A value outside it is refused with the length
         // quoted back, which is how this was found the first time.
         for _ in 0..500 {
-            let value = padding_param();
+            let value = padding_param(None);
             assert!(
                 (100..=1000).contains(&value.len()),
                 "padding length {} is outside 100-1000",
@@ -370,5 +399,43 @@ mod tests {
                 .expect("task"),
             "a request outside the base path must be refused"
         );
+    }
+}
+
+#[cfg(test)]
+mod padding_tests {
+    use super::padding_range;
+
+    /// The default is Xray's own: 100–1000 characters of encoded padding.
+    #[test]
+    fn the_default_range_is_xrays() {
+        assert_eq!(padding_range(None), (100, 1000));
+        assert_eq!(padding_range(Some("")), (100, 1000));
+        assert_eq!(padding_range(Some("garbage")), (100, 1000));
+    }
+
+    /// `xpaddingBytes` is honoured, both spellings Xray accepts.
+    #[test]
+    fn a_configured_range_is_used() {
+        assert_eq!(padding_range(Some("500-600")), (500, 600));
+        assert_eq!(padding_range(Some("42")), (42, 42));
+        assert_eq!(padding_range(Some(" 300 - 400 ")), (300, 400));
+    }
+
+    /// The padding a request actually carries stays inside the configured range — the property
+    /// beyond the parse, and the one Xray validates.
+    #[test]
+    fn generated_padding_lands_inside_the_configured_range() {
+        for cfg in ["200-300", "1000"] {
+            let (lo, hi) = padding_range(Some(cfg));
+            for _ in 0..64 {
+                let p = super::padding_param(Some(cfg));
+                assert!(
+                    p.len() >= lo && p.len() <= hi,
+                    "padding of {} chars outside {lo}-{hi} for {cfg}",
+                    p.len()
+                );
+            }
+        }
     }
 }

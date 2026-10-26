@@ -62,6 +62,8 @@ pub enum FramingLayer {
         path: String,
         /// Extra headers.
         headers: HashMap<String, String>,
+        /// Xray's `xpaddingBytes`, as written (`"100-1000"` or a single number).
+        xpadding: Option<String>,
     },
     /// gRPC framing over HTTP/2.
     Grpc {
@@ -207,9 +209,19 @@ impl LayeredTransportPipeline {
         for framing in &self.framings {
             stream = match framing {
                 FramingLayer::Raw => stream,
-                FramingLayer::Xhttp { path, headers } => {
-                    let st =
-                        crate::xhttp::connect(stream, &self.host_header, path, headers).await?;
+                FramingLayer::Xhttp {
+                    path,
+                    headers,
+                    xpadding,
+                } => {
+                    let st = crate::xhttp::connect(
+                        stream,
+                        &self.host_header,
+                        path,
+                        headers,
+                        xpadding.as_deref(),
+                    )
+                    .await?;
                     Box::new(st)
                 }
                 FramingLayer::WebSocket { path, headers } => {

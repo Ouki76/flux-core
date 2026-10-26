@@ -1119,7 +1119,11 @@ fn compile_client_framings(
                 settings
                     .validate("outbound xhttp")
                     .map_err(flux_types::FluxError::Config)?;
-                list.push(flux_transport::pipeline::FramingLayer::Xhttp { path, headers });
+                list.push(flux_transport::pipeline::FramingLayer::Xhttp {
+                    path,
+                    headers,
+                    xpadding: settings.xpadding_bytes.clone(),
+                });
             }
             FramingConfig::WebSocket { path, headers } => {
                 list.push(flux_transport::pipeline::FramingLayer::WebSocket { path, headers });
