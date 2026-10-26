@@ -7891,3 +7891,38 @@ wrong about which extension is last.
 
 The honest reading: the second gap is built but not proven, and the switch is off so that nothing
 in production depends on an unproven path.
+
+### C2.6 — reading rustls instead of guessing, and what it settled
+
+rustls 0.23.25 `server/tls13.rs` defines the binder plaintext as:
+
+```rust
+&encoded.bytes()[..encoded.bytes().len() - parsed.total_binder_length()]
+```
+
+That **confirms our truncation semantics**: the binders vector is removed whole, including its
+two-byte length, which is exactly where `truncate_at` points. And a binder mismatch does not
+produce `illegal_parameter` — it produces a fallback or `decrypt_error`. So the alert we are
+getting comes from a check that runs **before** any binder arithmetic, which rules out the
+key-schedule half of the feature and puts the fault in the encoding of the hello itself.
+
+The checks in that pre-pass that raise `IllegalParameter`, read from the source rather than
+imagined:
+
+| check | source |
+|---|---|
+| `compression_methods` must contain null | `server/hs.rs:672` |
+| SNI must contain exactly one host name | `server/hs.rs:715` |
+| an extension may not repeat | raises `DecodeError`, not our alert |
+
+Our hello passes the first two — a full handshake with the same builder works — so the fault is
+something the PSK path changes about the *shape* of the message: the added extensions shift every
+length field, and one of them is wrong by an amount the eye does not catch.
+
+**Next cycle, precisely:** capture the exact bytes we send when offering a PSK and parse them with
+an independent parser — rustls' own `ClientHelloPayload` if reachable from a test, otherwise a
+hand-written one that walks every length. The layout test we have walks the extension list, but it
+walks a hello produced by the same code that may be wrong about where the list starts.
+
+This is the same lesson as C1.12 in a new place: the instrument has to be independent of the thing
+it measures.
