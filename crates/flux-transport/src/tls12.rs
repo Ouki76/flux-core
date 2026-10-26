@@ -272,8 +272,10 @@ impl RecordKeys {
     }
 }
 
-use crate::tls13::verify::TrustStore;
-use tokio::io::{AsyncRead, AsyncWrite};
+use crate::tls13::verify::{self, TrustStore};
+use flux_types::FluxError;
+use rustls_pki_types::CertificateDer;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Handshake message types that TLS 1.2 uses and TLS 1.3 does not.
 const HS_SERVER_KEY_EXCHANGE: u8 = 12;
@@ -607,5 +609,544 @@ mod prf_tests {
         rx.open(0x17, &mut first).expect("first open");
         let mut again = wire;
         assert!(rx.open(0x17, &mut again).is_err(), "a replay must fail");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The handshake
+// ---------------------------------------------------------------------------
+
+/// Builds a TLS 1.2 ClientHello offering only the ECDHE + AEAD suites in `OFFERED_SUITES`.
+fn build_client_hello(server_name: &str, alpn: &[&[u8]], random: &[u8; 32]) -> Vec<u8> {
+    let mut hello = Vec::with_capacity(256);
+    hello.push(0x01); // handshake type: client_hello
+    hello.extend_from_slice(&[0, 0, 0]); // length, patched below
+    hello.extend_from_slice(&TLS12_VERSION);
+    hello.extend_from_slice(random);
+    hello.push(0); // empty session id: no resumption
+    hello.extend_from_slice(&((OFFERED_SUITES.len() * 2) as u16).to_be_bytes());
+    for suite in OFFERED_SUITES {
+        hello.extend_from_slice(&suite.to_be_bytes());
+    }
+    hello.extend_from_slice(&[0x01, 0x00]); // compression: null only
+
+    let mut ext: Vec<u8> = Vec::with_capacity(160);
+    // server_name
+    let sni = server_name.as_bytes();
+    ext.extend_from_slice(&0x0000u16.to_be_bytes());
+    ext.extend_from_slice(&((5 + sni.len()) as u16).to_be_bytes());
+    ext.extend_from_slice(&((3 + sni.len()) as u16).to_be_bytes());
+    ext.push(0);
+    ext.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+    ext.extend_from_slice(sni);
+    // renegotiation_info: empty, which says "I will not renegotiate".
+    ext.extend_from_slice(&0xff01u16.to_be_bytes());
+    ext.extend_from_slice(&1u16.to_be_bytes());
+    ext.push(0);
+    // extended_master_secret: empty; the server echoes it if it agrees.
+    ext.extend_from_slice(&0x0017u16.to_be_bytes());
+    ext.extend_from_slice(&0u16.to_be_bytes());
+    // supported_groups: x25519 and the two NIST curves.
+    let groups: [u16; 3] = [0x001d, 0x0017, 0x0018];
+    ext.extend_from_slice(&0x000au16.to_be_bytes());
+    ext.extend_from_slice(&((2 + groups.len() * 2) as u16).to_be_bytes());
+    ext.extend_from_slice(&((groups.len() * 2) as u16).to_be_bytes());
+    for g in groups {
+        ext.extend_from_slice(&g.to_be_bytes());
+    }
+    // ec_point_formats: uncompressed.
+    ext.extend_from_slice(&0x000bu16.to_be_bytes());
+    ext.extend_from_slice(&2u16.to_be_bytes());
+    ext.extend_from_slice(&[1, 0]);
+    // signature_algorithms: ECDSA, RSA-PSS and RSA-PKCS1 over SHA-256/384/512, Ed25519 last.
+    let sigalgs: [u16; 9] = [
+        0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0807,
+    ];
+    ext.extend_from_slice(&0x000du16.to_be_bytes());
+    ext.extend_from_slice(&((2 + sigalgs.len() * 2) as u16).to_be_bytes());
+    ext.extend_from_slice(&((sigalgs.len() * 2) as u16).to_be_bytes());
+    for a in sigalgs {
+        ext.extend_from_slice(&a.to_be_bytes());
+    }
+    if !alpn.is_empty() {
+        let list_len: usize = alpn.iter().map(|p| 1 + p.len()).sum();
+        ext.extend_from_slice(&0x0010u16.to_be_bytes());
+        ext.extend_from_slice(&((2 + list_len) as u16).to_be_bytes());
+        ext.extend_from_slice(&(list_len as u16).to_be_bytes());
+        for proto in alpn {
+            ext.push(proto.len() as u8);
+            ext.extend_from_slice(proto);
+        }
+    }
+    hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    hello.extend_from_slice(&ext);
+
+    let len = (hello.len() - 4) as u32;
+    let bytes = len.to_be_bytes();
+    hello[1] = bytes[1];
+    hello[2] = bytes[2];
+    hello[3] = bytes[3];
+    hello
+}
+
+/// Runs a TLS 1.2 handshake and returns a stream carrying application data.
+///
+/// The flow is the one RFC 5246 describes: greeting, ServerHello, certificate, the server's
+/// ephemeral key with its signature, our key, then Finished in both directions. Everything after
+/// the certificate is bound to the two randoms and the transcript, which is what makes the
+/// handshake resistant to a peer that tries to mix parameters from two sessions.
+pub(crate) async fn connect<S>(
+    mut stream: S,
+    cfg: &ClientHello12Config<'_>,
+) -> FluxResult<Tls12Stream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use rand::RngCore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
+
+    let mut client_random = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut client_random);
+    let hello = build_client_hello(cfg.server_name, cfg.alpn, &client_random);
+
+    // The transcript is every handshake message in order, hashed for Finished and (when the
+    // server agrees) for the extended master secret.
+    let mut transcript: Vec<u8> = Vec::with_capacity(1024);
+    transcript.extend_from_slice(&hello);
+
+    // ---- send ClientHello
+    let mut out = Vec::with_capacity(hello.len() + 5);
+    out.push(0x16);
+    out.extend_from_slice(&TLS12_VERSION);
+    out.extend_from_slice(&(hello.len() as u16).to_be_bytes());
+    out.extend_from_slice(&hello);
+    stream.write_all(&out).await.map_err(FluxError::Io)?;
+    stream.flush().await.map_err(FluxError::Io)?;
+
+    // ---- read handshake messages until ServerHelloDone
+    let mut server_random = [0u8; 32];
+    let mut suite: Option<Tls12Suite> = None;
+    let mut chain: Vec<CertificateDer<'static>> = Vec::new();
+    let mut server_point: Option<[u8; 32]> = None;
+    let mut extended_ms = false;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut done = false;
+    let mut server_kx_params: Vec<u8> = Vec::new();
+    let mut server_kx_sig: Option<(u16, Vec<u8>)> = None;
+
+    while !done {
+        // One record at a time; before CCS everything is plaintext.
+        let (ctype, body) = read_plain_record(&mut stream).await?;
+        if ctype == 0x15 {
+            return Err(crypto_err(format!(
+                "the server refused the TLS 1.2 handshake: {body:02x?}"
+            )));
+        }
+        if ctype != 0x16 {
+            return Err(crypto_err(format!(
+                "unexpected record type {ctype} during the TLS 1.2 handshake"
+            )));
+        }
+        buf.extend_from_slice(&body);
+        loop {
+            if buf.len() < 4 {
+                break;
+            }
+            let mtype = buf[0];
+            let mlen = u32::from_be_bytes([0, buf[1], buf[2], buf[3]]) as usize;
+            if buf.len() < 4 + mlen {
+                break;
+            }
+            let msg = buf[..4 + mlen].to_vec();
+            buf.drain(..4 + mlen);
+            match mtype {
+                0x02 => {
+                    // ServerHello
+                    if msg.len() < 4 + 2 + 32 + 1 {
+                        return Err(crypto_err("short ServerHello"));
+                    }
+                    let mut pos = 4;
+                    if msg[pos..pos + 2] != TLS12_VERSION {
+                        return Err(crypto_err(format!(
+                            "the server answered with version {:02x}{:02x}, not TLS 1.2",
+                            msg[pos],
+                            msg[pos + 1]
+                        )));
+                    }
+                    pos += 2;
+                    server_random.copy_from_slice(&msg[pos..pos + 32]);
+                    pos += 32;
+                    let sid_len = msg[pos] as usize;
+                    pos += 1 + sid_len;
+                    if pos + 3 > msg.len() {
+                        return Err(crypto_err("short ServerHello (suite)"));
+                    }
+                    let id = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+                    pos += 2;
+                    pos += 1; // compression
+                    suite = Tls12Suite::from_id(id);
+                    if suite.is_none() {
+                        return Err(crypto_err(format!(
+                            "the server chose cipher suite {id:#06x}, which this client did not offer"
+                        )));
+                    }
+                    // Extensions.
+                    if pos + 2 <= msg.len() {
+                        let total = u16::from_be_bytes([msg[pos], msg[pos + 1]]) as usize;
+                        pos += 2;
+                        let end = (pos + total).min(msg.len());
+                        while pos + 4 <= end {
+                            let ty = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+                            let len = u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]) as usize;
+                            pos += 4;
+                            if pos + len > end {
+                                return Err(crypto_err("extension overruns the ServerHello"));
+                            }
+                            match ty {
+                                0x0017 => extended_ms = true,
+                                0x0010 => {
+                                    // ALPN: the server must choose one we offered.
+                                    if len < 3 {
+                                        return Err(crypto_err("malformed ALPN in ServerHello"));
+                                    }
+                                    let proto = &msg[pos + 3..pos + len];
+                                    if !cfg.alpn.contains(&proto) {
+                                        return Err(crypto_err(
+                                            "the server selected an ALPN protocol this client never offered",
+                                        ));
+                                    }
+                                }
+                                _ => {}
+                            }
+                            pos += len;
+                        }
+                    }
+                    transcript.extend_from_slice(&msg);
+                }
+                0x0b => {
+                    // Certificate: a 3-byte list length, then 3-byte lengths.
+                    if msg.len() < 7 {
+                        return Err(crypto_err("short Certificate"));
+                    }
+                    let list_len = u32::from_be_bytes([0, msg[4], msg[5], msg[6]]) as usize;
+                    if msg.len() < 7 + list_len {
+                        return Err(crypto_err("truncated Certificate list"));
+                    }
+                    let end = 7 + list_len;
+                    let mut pos = 7;
+                    while pos + 3 <= end {
+                        let n =
+                            u32::from_be_bytes([0, msg[pos], msg[pos + 1], msg[pos + 2]]) as usize;
+                        pos += 3;
+                        if pos + n > end {
+                            return Err(crypto_err("certificate overruns the list"));
+                        }
+                        chain.push(CertificateDer::from(msg[pos..pos + n].to_vec()));
+                        pos += n;
+                    }
+                    if chain.is_empty() {
+                        return Err(crypto_err("the server sent no certificate"));
+                    }
+                    transcript.extend_from_slice(&msg);
+                }
+                0x0c => {
+                    // ServerKeyExchange: named curve, point, then a signature over both.
+                    if msg.len() < 8 {
+                        return Err(crypto_err("short ServerKeyExchange"));
+                    }
+                    let mut pos = 4;
+                    let curve_type = msg[pos];
+                    if curve_type != 3 {
+                        return Err(crypto_err(format!(
+                            "the server sent an unsupported key exchange ({curve_type})"
+                        )));
+                    }
+                    let curve = u16::from_be_bytes([msg[pos + 1], msg[pos + 2]]);
+                    if curve != 0x001d {
+                        return Err(crypto_err(format!(
+                            "the server chose curve {curve:#06x}; this client only does x25519"
+                        )));
+                    }
+                    let plen = msg[pos + 3] as usize;
+                    if plen != 32 || msg.len() < pos + 4 + plen + 4 {
+                        return Err(crypto_err("bad server key share length"));
+                    }
+                    server_point = Some(
+                        msg[pos + 4..pos + 4 + plen]
+                            .try_into()
+                            .map_err(|_| crypto_err("bad server point"))?,
+                    );
+                    server_kx_params = msg[4..pos + 4 + plen].to_vec();
+                    pos += 4 + plen;
+                    let scheme = u16::from_be_bytes([msg[pos], msg[pos + 1]]);
+                    let sig_len = u16::from_be_bytes([msg[pos + 2], msg[pos + 3]]) as usize;
+                    if msg.len() < pos + 4 + sig_len {
+                        return Err(crypto_err("truncated ServerKeyExchange signature"));
+                    }
+                    server_kx_sig = Some((scheme, msg[pos + 4..pos + 4 + sig_len].to_vec()));
+                    transcript.extend_from_slice(&msg);
+                }
+                0x0e => {
+                    transcript.extend_from_slice(&msg);
+                    done = true;
+                }
+                other => {
+                    return Err(crypto_err(format!(
+                        "unexpected handshake message {other} during the TLS 1.2 handshake"
+                    )));
+                }
+            }
+        }
+    }
+
+    let suite = suite.ok_or_else(|| crypto_err("the server sent no ServerHello"))?;
+    let server_point = server_point.ok_or_else(|| crypto_err("the server sent no key exchange"))?;
+    let (scheme, signature) =
+        server_kx_sig.ok_or_else(|| crypto_err("the server key exchange was unsigned"))?;
+
+    // ---- chain and key-exchange signature
+    if !cfg.insecure {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| crypto_err("the system clock is before the Unix epoch"))?
+            .as_secs();
+        let now =
+            rustls_pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(secs));
+        verify::verify_server_chain(cfg.trust, &chain, cfg.server_name, now)?;
+
+        // The signature covers both randoms and the server's parameters, so a replay of these
+        // parameters into another session does not verify.
+        let mut signed = Vec::with_capacity(64 + server_kx_params.len());
+        signed.extend_from_slice(&client_random);
+        signed.extend_from_slice(&server_random);
+        signed.extend_from_slice(&server_kx_params);
+        verify::verify_signature_over(&chain[0], scheme, &signed, &signature)
+            .map_err(|e| crypto_err(format!("ServerKeyExchange signature rejected: {e}")))?;
+    }
+
+    // ---- our key and the keys that follow from it
+    let eph = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    let eph_pub = X25519PublicKey::from(&eph);
+    let shared = eph.diffie_hellman(&X25519PublicKey::from(server_point));
+
+    let mut cke = Vec::with_capacity(4 + 33);
+    cke.push(0x10); // client_key_exchange
+    cke.extend_from_slice(&[0, 0, 33]);
+    cke.push(32);
+    cke.extend_from_slice(eph_pub.as_bytes());
+    let mut out = Vec::with_capacity(cke.len() + 5);
+    out.push(0x16);
+    out.extend_from_slice(&TLS12_VERSION);
+    out.extend_from_slice(&(cke.len() as u16).to_be_bytes());
+    out.extend_from_slice(&cke);
+    stream.write_all(&out).await.map_err(FluxError::Io)?;
+    transcript.extend_from_slice(&cke);
+
+    let master = if extended_ms {
+        suite.extended_master_secret(shared.as_bytes(), &suite.hash(&transcript))
+    } else {
+        suite.master_secret(shared.as_bytes(), &client_random, &server_random)
+    };
+    let block = suite.key_block(&master, &client_random, &server_random);
+    let mut client_keys = RecordKeys::new(&block.client_key, block.client_iv.clone())?;
+    let mut server_keys = RecordKeys::new(&block.server_key, block.server_iv.clone())?;
+
+    // ---- change cipher spec and our Finished
+    stream
+        .write_all(&[0x14, TLS12_VERSION[0], TLS12_VERSION[1], 0x00, 0x01, 0x01])
+        .await
+        .map_err(FluxError::Io)?;
+
+    let verify = suite.finished(&master, b"client finished", &suite.hash(&transcript));
+    let mut fin = Vec::with_capacity(4 + verify.len());
+    fin.push(0x14);
+    fin.extend_from_slice(&(verify.len() as u32).to_be_bytes()[1..]);
+    fin.extend_from_slice(&verify);
+    let mut rec = Vec::new();
+    client_keys.seal(0x16, &fin, &mut rec)?;
+    stream
+        .write_all(&[0x16, TLS12_VERSION[0], TLS12_VERSION[1]])
+        .await
+        .map_err(FluxError::Io)?;
+    stream
+        .write_all(&(rec.len() as u16).to_be_bytes())
+        .await
+        .map_err(FluxError::Io)?;
+    stream.write_all(&rec).await.map_err(FluxError::Io)?;
+    stream.flush().await.map_err(FluxError::Io)?;
+    transcript.extend_from_slice(&fin);
+
+    // ---- the server's change cipher spec and Finished
+    loop {
+        let (ctype, mut body) = read_plain_record(&mut stream).await?;
+        if ctype == 0x14 {
+            continue; // change_cipher_spec
+        }
+        if ctype != 0x16 {
+            return Err(crypto_err(format!(
+                "unexpected record type {ctype} after the client Finished"
+            )));
+        }
+        let n = server_keys.open(0x16, &mut body)?;
+        let msg = &body[8..8 + n];
+        if msg.len() < 4 || msg[0] != 0x14 {
+            return Err(crypto_err("the server's Finished message is malformed"));
+        }
+        let expect = suite.finished(&master, b"server finished", &suite.hash(&transcript));
+        if msg[4..] != expect[..] {
+            return Err(crypto_err(
+                "the server's Finished did not verify against the transcript",
+            ));
+        }
+        break;
+    }
+
+    Ok(Tls12Stream {
+        inner: stream,
+        read: server_keys,
+        write: client_keys,
+        read_buf: Vec::new(),
+        read_pos: 0,
+        hdr: [0u8; 5],
+        hdr_len: 0,
+        body: Vec::new(),
+        body_len: 0,
+        pending_write: Vec::new(),
+        pending_write_pos: 0,
+        closed: false,
+    })
+}
+
+/// Reads one plaintext record, refusing anything that claims to be encrypted.
+async fn read_plain_record<S: AsyncRead + Unpin>(stream: &mut S) -> FluxResult<(u8, Vec<u8>)> {
+    let mut hdr = [0u8; 5];
+    stream.read_exact(&mut hdr).await.map_err(FluxError::Io)?;
+    let len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
+    if len > 18432 {
+        return Err(crypto_err("TLS 1.2 record exceeds the maximum size"));
+    }
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).await.map_err(FluxError::Io)?;
+    Ok((hdr[0], body))
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A rustls server pinned to TLS 1.2, with a CA the client will trust.
+    fn server_12(only_12: bool) -> (tokio_rustls::TlsAcceptor, String) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        crate::tls::init_crypto_provider();
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).expect("leaf");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf");
+
+        let versions: &[&'static tokio_rustls::rustls::SupportedProtocolVersion] = if only_12 {
+            &[&tokio_rustls::rustls::version::TLS12]
+        } else {
+            &[
+                &tokio_rustls::rustls::version::TLS12,
+                &tokio_rustls::rustls::version::TLS13,
+            ]
+        };
+        let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let cfg = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .expect("versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls_pki_types::CertificateDer::from(leaf.der().to_vec())],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            )
+            .expect("server config");
+        (
+            tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg)),
+            ca.pem(),
+        )
+    }
+
+    /// **Our TLS 1.2 handshake against a real TLS 1.2 server**, carrying data both ways.
+    #[tokio::test]
+    async fn our_tls12_handshake_carries_data() {
+        let (acceptor, ca_pem) = server_12(true);
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut srv = acceptor.accept(server_raw).await.expect("server handshake");
+            let mut buf = [0u8; 5];
+            srv.read_exact(&mut buf).await.expect("read");
+            assert_eq!(&buf, b"ping!");
+            srv.write_all(b"pong!").await.expect("write");
+            srv.flush().await.expect("flush");
+        });
+
+        let mut trust = TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = ClientHello12Config {
+            server_name: "localhost",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut client = connect(client_raw, &cfg).await.expect("our 1.2 handshake");
+        client.write_all(b"ping!").await.expect("write");
+        client.flush().await.expect("flush");
+        let mut buf = [0u8; 5];
+        client.read_exact(&mut buf).await.expect("read");
+        assert_eq!(&buf, b"pong!");
+        server.await.expect("server task");
+    }
+
+    /// The chain is verified here too: an unknown CA must be refused, exactly as on the 1.3 path.
+    #[tokio::test]
+    async fn an_untrusted_tls12_server_is_refused() {
+        let (acceptor, _ca) = server_12(true);
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = acceptor.accept(server_raw).await;
+        });
+        let trust = TrustStore::empty();
+        let cfg = ClientHello12Config {
+            server_name: "localhost",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let err = match connect(client_raw, &cfg).await {
+            Ok(_) => panic!("an unknown CA must not be trusted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("trust anchors"), "unexpected: {err}");
+    }
+
+    /// A TLS 1.2 server with a certificate for another name must be refused.
+    #[tokio::test]
+    async fn a_tls12_certificate_for_another_name_is_refused() {
+        let (acceptor, ca_pem) = server_12(true);
+        let (client_raw, server_raw) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let _ = acceptor.accept(server_raw).await;
+        });
+        let mut trust = TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = ClientHello12Config {
+            server_name: "elsewhere.test",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let err = match connect(client_raw, &cfg).await {
+            Ok(_) => panic!("the name must be checked"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("not valid for"), "unexpected: {err}");
     }
 }

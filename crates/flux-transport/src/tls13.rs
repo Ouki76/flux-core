@@ -983,6 +983,24 @@ pub(crate) mod verify {
     /// The signed content is the fixed context string, a zero byte, and the transcript hash —
     /// RFC 8446 §4.4.3. Getting this wrong would accept a signature that was never made for
     /// this handshake, so it is spelled out rather than inlined.
+    /// Verifies a signature over arbitrary bytes with the leaf certificate's public key.
+    ///
+    /// TLS 1.2 signs a different construction for `ServerKeyExchange` (client and server random,
+    /// then the parameters) than TLS 1.3 does for `CertificateVerify`, but the verification is
+    /// the same operation — so both go through here rather than through two copies of it.
+    pub(crate) fn verify_signature_over(
+        leaf: &CertificateDer<'_>,
+        scheme: u16,
+        data: &[u8],
+        signature: &[u8],
+    ) -> FluxResult<()> {
+        let alg = scheme_algorithm(scheme)?;
+        let cert = EndEntityCert::try_from(leaf)
+            .map_err(|e| crypto_err(format!("the server certificate is unparseable: {e}")))?;
+        cert.verify_signature(alg, data, signature)
+            .map_err(|e| crypto_err(format!("signature rejected: {e}")))
+    }
+
     pub(crate) fn verify_certificate_verify(
         leaf: &CertificateDer<'_>,
         scheme: u16,
@@ -996,10 +1014,7 @@ pub(crate) mod verify {
         signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
         signed.push(0);
         signed.extend_from_slice(transcript_hash);
-        let alg = scheme_algorithm(scheme)?;
-        let cert = EndEntityCert::try_from(leaf)
-            .map_err(|e| crypto_err(format!("the server certificate is unparseable: {e}")))?;
-        cert.verify_signature(alg, &signed, signature)
+        verify_signature_over(leaf, scheme, &signed, signature)
             .map_err(|e| crypto_err(format!("CertificateVerify rejected: {e}")))
     }
 }
