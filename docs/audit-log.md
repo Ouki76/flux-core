@@ -9055,3 +9055,67 @@ And the answer to "can it be faster", with every candidate bounded: **no, not ma
 bounds are measured** — 13% (splice), 7% (copies), 0% (user code, syscalls, allocator). The core is
 at the practical limit of a userspace relay while being fastest on every axis against both
 references.
+
+---
+
+## C5.1 — UDP is syscall-bound, and the buffer tuning that did not help
+
+C4.3 showed UDP protocols costing 27–29 CPU s/GiB against 1.5–8 for TCP. This is where that goes.
+
+### The arithmetic that explains it
+
+`bench_udp --payload-size 1200` moves **112 494 packets per second**, and a datagram crossing the
+tunnel costs four syscalls — `recvfrom` and `sendto` in each of the two relay processes:
+
+| path | syscalls per GiB |
+|---|---|
+| TCP, 64 KiB buffers | ~16 000 |
+| **UDP, 1200-byte datagrams** | **~3 600 000** |
+
+**225 times more syscalls per byte.** That, not the crypto and not our code, is why UDP is an order
+of magnitude more expensive per GiB: at 1200 bytes a datagram, one syscall buys 1.2 KB where TCP
+buys 64 KB.
+
+### The optimisation that follows, and what it costs
+
+**`recvmmsg`/`sendmmsg` batching**: receive or send up to N datagrams per syscall. With a batch of
+32 the syscall count falls 32× and the 27 s/GiB follows it down. This is the standard answer for a
+UDP relay and it is the only one worth the work.
+
+It is also a structural change: tokio's `UdpSocket` has no batched API, so the receive loop would
+have to poll readiness and then call `libc::recvmmsg` under `MSG_DONTWAIT`, with per-datagram
+handling for partial batches, empty reads and the tunnel's own framing. That is a day of work with
+its own concurrency bugs, and it changes the shape of the code every UDP protocol shares.
+
+**Not attempted in this cycle.** The measurement says the win is large and the change is large;
+doing it hurriedly in the remaining budget would trade a working UDP path for an unfinished one.
+
+### The buffer tuning that did not help — tried and reverted
+
+The SOCKS UDP relay socket was bound with kernel-default buffers (~212 KiB), which looked like an
+obvious win under burst. Measured properly, with the build **verified to have succeeded**:
+
+| configuration | pps (two runs) |
+|---|---|
+| default buffers | 112 451, 108 203 |
+| 4 MiB buffers | 109 923, 113 271 |
+
+**+1.2% — noise.** The change was reverted rather than kept: it is unproven, and this project does
+not carry unmeasured changes on the strength of a plausible story.
+
+That cycle also produced a lesson already recorded once and worth repeating: the first measurement
+of this change showed 112k → 123k (+9.9%) because **the build had failed** and the benchmark was
+running the old binary. `cargo build | grep -c error || echo ok` printed `3` and the `||` branch
+still fired. Checking that the build succeeded is not optional when the number moves.
+
+### Where UDP optimisation actually stands
+
+| candidate | expected gain | cost |
+|---|---|---|
+| `recvmmsg`/`sendmmsg` batching | **large** — up to 32× fewer syscalls | a day, structural, shared by every UDP protocol |
+| socket buffer tuning | 0% (measured) | none; reverted |
+| fewer allocations per datagram | unmeasured, the payload is a `Bytes` from the read | small |
+| kernel bypass (io_uring) | largest | out of scope for this crate |
+
+The honest summary: **the UDP path's cost is one syscall per 1.2 KB, and only batching fixes it.**
+Everything cheaper has been measured and does not help.
