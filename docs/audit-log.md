@@ -9733,3 +9733,33 @@ the mismatch path (dropping the responder resets the stream) or the connection d
 connection while both streams were live. Instrument `accept()` to log which branch it took before
 changing anything else — the two causes look identical from the client side, which is why this cycle
 burned its remaining budget guessing between them.
+
+### C7.4 — stream-up: the first real cause found, and the second one still open
+
+Following C7.3's instruction to instrument rather than guess, the pairing was rebuilt bottom-up on top
+of the working two-request probe, and this cycle found **one genuine bug and two facts**:
+
+**Bug found — dropping a `ResponseFuture` resets its stream.** A first pass at the client held the
+upload's response as `_upload_response` and let it drop. In h2 that discards the stream: the server's
+read of the upload body fails, its task dies, its download `SendStream` is dropped, and the client
+sees the reset **on the download** — three layers from the cause. The fix is to await the future in a
+spawned task, and with that fix the h2-level pairing test passes:
+
+```
+paired_streams_carry_data_both_ways ... ok     (server pairs POST body + GET response, both move data)
+```
+
+**Fact — a `SendStream` must be ended, not dropped.** `send_data(…, false)` followed by dropping the
+stream sends `RST_STREAM CANCEL`; the client's read fails with `Reset(StreamId(3), CANCEL, Remote)`.
+Ending it with `send_data(…, true)` fixes it.
+
+**Fact — the substrate is sound.** `the_server_accepts_two_requests_on_one_connection` passes, so the
+h2 layer carries two concurrent requests, which is the premise `stream-up` stands on.
+
+**Still open:** with both bugs fixed, `connect_stream_up` against `accept` over a real duplex socket
+**still** resets the download, while the hand-written h2-level version of the same exchange passes.
+The difference between the two is now small and specific: the wrapper's `H2Stream` write path, the
+`normalize_path` result used in the session URL, and the order in which `accept` takes the upload body
+relative to answering the POST. That is where the next attempt starts — not from scratch.
+
+**Everything reverted**, including the config relaxation. `stream-up` is still refused by name.
