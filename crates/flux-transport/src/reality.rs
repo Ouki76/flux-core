@@ -928,6 +928,7 @@ impl Tls13Client {
             pending_unacked: 0,
             resumption_master_secret: None,
             server_name: String::new(),
+            resumed: false,
             closed: false,
         };
         if !verified {
@@ -1508,6 +1509,7 @@ impl Tls13Server {
             pending_unacked: 0,
             resumption_master_secret: None,
             server_name: String::new(),
+            resumed: false,
             closed: false,
         })
     }

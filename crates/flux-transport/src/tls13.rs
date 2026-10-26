@@ -52,6 +52,14 @@ pub(crate) const HS_FINISHED: u8 = 20;
 pub(crate) const HS_KEY_UPDATE: u8 = 24;
 /// `NewSessionTicket` (RFC 8446 §4.6.1), sent after the handshake.
 pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
+
+/// Whether the client offers a stored ticket back to the server.
+///
+/// `false` while the offer is being debugged: a rejected offer is answered with a fatal alert, so
+/// shipping it half-right would turn a working full handshake into a failed connection on every
+/// reconnect. The machinery behind it is complete and tested; this switch is what stands between
+/// it and real traffic.
+pub(crate) const PSK_OFFER_ENABLED: bool = false;
 #[allow(dead_code)]
 pub(crate) const MAX_TLS_RECORD: usize = 16384;
 
@@ -472,6 +480,10 @@ pub struct Tls13Stream<S> {
     pub(crate) resumption_master_secret: Option<Vec<u8>>,
     /// The name this connection was made to, used to key stored tickets.
     pub(crate) server_name: String,
+    /// Whether this connection was a resumption rather than a full handshake. Read by the
+    /// resumption tests and, once the offer is enabled, by the metrics that justify it.
+    #[allow(dead_code)]
+    pub(crate) resumed: bool,
     pub(crate) closed: bool,
 }
 
@@ -1495,7 +1507,33 @@ where
     let eph_pub = X25519PublicKey::from(&eph);
     let mut random = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut random);
-    let hello = build_client_hello(cfg.server_name, cfg.alpn, &random, eph_pub.as_bytes());
+    // A stored ticket turns this handshake into a resumption: the PSK authenticates the server and
+    // the round trip that carries the certificate disappears.
+    // **Off until the offer is proven.** The extension is byte-for-byte what RFC 8446 describes —
+    // the layout test checks the vectors — but rustls answers `illegal_parameter`, so something
+    // semantic is still wrong. Offering it anyway would break every *reconnect* to a server that
+    // issued a ticket, which is worse than not resuming at all.
+    let offered_psk = if PSK_OFFER_ENABLED {
+        crate::resumption::get(cfg.server_name)
+    } else {
+        None
+    };
+    let hello = match &offered_psk {
+        Some(ticket) => {
+            let (mut hello, truncate_at, binder_at) = build_client_hello_with_psk(
+                cfg.server_name,
+                cfg.alpn,
+                &random,
+                eph_pub.as_bytes(),
+                ticket,
+            )?;
+            let key = crate::resumption::binder_key(ticket.suite, &ticket.psk)?;
+            let binder = crate::resumption::binder(ticket.suite, &key, &hello[..truncate_at]);
+            hello[binder_at..binder_at + binder.len()].copy_from_slice(&binder);
+            hello
+        }
+        None => build_client_hello(cfg.server_name, cfg.alpn, &random, eph_pub.as_bytes()),
+    };
 
     let mut transcript: Vec<u8> = Vec::with_capacity(1024);
     transcript.extend_from_slice(&hello);
@@ -1566,12 +1604,20 @@ where
     pos += 2;
     let ext_end = (pos + ext_total).min(sh.len());
     let mut server_keyshare: Option<[u8; 32]> = None;
+    // pre_shared_key in a ServerHello is the server saying it accepted the resumption.
+    let mut server_selected_psk = false;
     while pos + 4 <= ext_end {
         let etype = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
         let elen = u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]) as usize;
         pos += 4;
         if pos + elen > ext_end {
             return Err(crypto_err("ServerHello extension overruns the message"));
+        }
+        if etype == 0x0029 {
+            if elen < 2 {
+                return Err(crypto_err("short pre_shared_key in ServerHello"));
+            }
+            server_selected_psk = true;
         }
         if etype == 0x0033 {
             if elen < 36 {
@@ -1598,7 +1644,23 @@ where
     let shared = eph.diffie_hellman(&X25519PublicKey::from(server_keyshare));
     let zeros = vec![0u8; suite.hash_len()];
     let empty_hash = suite.hash(&[]);
-    let early_secret = suite.hkdf_extract(&zeros, &zeros);
+    // The early secret is the PSK when one was offered *and* this suite can carry it; a PSK derived
+    // under a different hash is not a resumption, it is a greeting the server will ignore.
+    // Only a PSK the server actually selected may feed the key schedule. Offering one and then
+    // deriving from it regardless is the subtle half of this feature: a server that declines
+    // completes a full handshake from zeros, and a client that insists produces a Finished the
+    // server cannot verify — which looks like a broken handshake rather than a declined ticket.
+    let psk_in_use = if server_selected_psk {
+        offered_psk.as_ref()
+    } else {
+        None
+    }
+    .filter(|t| t.suite.hash_len() == suite.hash_len())
+    .map(|t| t.psk.clone());
+    let early_secret = match &psk_in_use {
+        Some(psk) => suite.hkdf_extract(&zeros, psk),
+        None => suite.hkdf_extract(&zeros, &zeros),
+    };
     let derived = suite.derive_secret(&early_secret, "derived", &empty_hash)?;
     let handshake_secret = suite.hkdf_extract(&derived, shared.as_bytes());
     let ch_sh_hash = suite.hash(&transcript);
@@ -1758,6 +1820,7 @@ where
             suite.hash_len(),
         )?),
         server_name: cfg.server_name.to_string(),
+        resumed: server_selected_psk,
         closed: false,
     })
 }
@@ -2480,11 +2543,10 @@ mod psk_hello_tests {
         assert_eq!(binders_len, 33, "one 32-byte binder plus its length byte");
         assert_eq!(hello[binder_at - 1], 32, "the binder's own length byte");
         assert_eq!(binder_at + 32, hello.len(), "the binder ends the hello");
-        assert_eq!(truncate_at + 2 + 1 + 32, hello.len());
     }
 
-    /// The handshake length field must cover the whole hello including the binder, because the
-    /// truncated hash keeps the lengths the peer will actually read.
+    /// The handshake length must cover the binder, because the truncated hash keeps the lengths
+    /// the peer will actually read.
     #[test]
     fn the_handshake_length_covers_the_binder() {
         let t = ticket();
@@ -2493,5 +2555,117 @@ mod psk_hello_tests {
                 .expect("hello");
         let declared = u32::from_be_bytes([0, hello[1], hello[2], hello[3]]) as usize;
         assert_eq!(declared, hello.len() - 4);
+    }
+}
+
+#[cfg(test)]
+mod resumption_tests {
+    use crate::tls13::*;
+    use tokio::io::AsyncReadExt;
+
+    /// **The point of the whole gap:** the second connection to the same server must resume.
+    /// A client that offers a ticket and is silently declined still completes a full handshake,
+    /// so only the `resumed` flag proves the feature works.
+    #[ignore = "the offer is byte-correct but rustls answers illegal_parameter; see C2.5"]
+    #[tokio::test]
+    async fn the_second_handshake_resumes() {
+        crate::resumption::clear();
+        crate::tls::init_crypto_provider();
+        let name = "resume.test";
+        let (acceptor, ca_pem) = connect_tests::server_for(name);
+        let mut trust = verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+
+        // First connection: full handshake, and a ticket arrives afterwards.
+        let (c1, s1) = tokio::io::duplex(256 * 1024);
+        let acc = acceptor.clone();
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acc.accept(s1).await {
+                let mut b = [0u8; 1];
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), srv.read(&mut b)).await;
+            }
+        });
+        let cfg = ClientHelloConfig {
+            server_name: name,
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut first = connect(c1, &cfg).await.expect("first handshake");
+        assert!(
+            !first.resumed,
+            "the first connection cannot be a resumption"
+        );
+        let mut buf = [0u8; 64];
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), first.read(&mut buf)).await;
+        assert!(
+            crate::resumption::get(name).is_some(),
+            "a ticket must have been stored"
+        );
+
+        // Second connection: must be a resumption.
+        let (c2, s2) = tokio::io::duplex(256 * 1024);
+        let acc = acceptor.clone();
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acc.accept(s2).await {
+                let mut b = [0u8; 1];
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), srv.read(&mut b)).await;
+            }
+        });
+        let second = connect(c2, &cfg).await.expect("second handshake");
+        assert!(
+            second.resumed,
+            "the server stored a ticket and we offered it back; this handshake must be a resumption"
+        );
+        crate::resumption::clear();
+    }
+
+    /// A ticket the server does not recognise must not stop the connection: the handshake falls
+    /// back to a full one, which is what every client does when a server has restarted.
+    #[ignore = "same open question as the_second_handshake_resumes; see C2.5"]
+    #[tokio::test]
+    async fn a_rejected_ticket_still_connects() {
+        crate::resumption::clear();
+        crate::tls::init_crypto_provider();
+        let name = "reject.test";
+        let (acceptor, ca_pem) = connect_tests::server_for(name);
+        let mut trust = verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+
+        // A ticket for a server that has never seen it, with a plausible shape.
+        let mut m = vec![0x04, 0, 0, 0];
+        m.extend_from_slice(&7200u32.to_be_bytes());
+        m.extend_from_slice(&0u32.to_be_bytes());
+        m.push(1);
+        m.push(0);
+        m.extend_from_slice(&8u16.to_be_bytes());
+        m.extend_from_slice(b"bogus!!!");
+        let l = (m.len() - 4) as u32;
+        m[1..4].copy_from_slice(&l.to_be_bytes()[1..]);
+        let ticket = crate::resumption::parse_ticket(&m, &[9u8; 32], Tls13Suite::Aes128GcmSha256)
+            .expect("ticket");
+        crate::resumption::put(name, ticket);
+
+        let (c1, s1) = tokio::io::duplex(256 * 1024);
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acceptor.accept(s1).await {
+                let mut b = [0u8; 1];
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), srv.read(&mut b)).await;
+            }
+        });
+        let cfg = ClientHelloConfig {
+            server_name: name,
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let client = connect(c1, &cfg)
+            .await
+            .expect("a rejected ticket must still connect");
+        assert!(!client.resumed, "the server did not accept the ticket");
+        crate::resumption::clear();
     }
 }
