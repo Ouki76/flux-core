@@ -7587,3 +7587,35 @@ record contents (decode).
 
 Two of the last three cycles produced a defect or a fact; this one produced a fact worth more than
 either — the problem is not a stall, it is a rejection with a reason we were discarding.
+
+### C1.9 — the alert may be the answer to our goodbye, not the cause
+
+The alert record is captured at position 8, immediately after the application record with the
+VLESS header. That ordering is tempting: it reads as "the server rejected our data". But the client
+trace says something else:
+
+```
+tls12 record: type 23 version [03, 03] len 26      ← the only record the client ever read
+```
+
+Record 8 was **never read by our client**. It exists in the relay's capture because the relay
+forwards bytes regardless of whether the client is still there — and by the time it arrived, the
+test client had timed out and gone, and with it the tunnel.
+
+So two readings remain, and they point in opposite directions:
+
+1. the server rejected our application record and sent a fatal alert, which our client missed
+   because the test harness had already torn the connection down;
+2. the server was waiting for something (a keystroke from our side, a session-ticket
+   acknowledgement, or simply more data) and sent the alert only when we closed.
+
+The second would mean the stall is a **protocol-level deadlock**, not a rejection — our upload
+finished, and the server expects the client to do something it never does.
+
+**Next cycle, precisely:** keep the client connection alive *after* the upload (no read timeout, no
+harness teardown) and see whether the alert arrives while the tunnel is open. If it does, it is a
+rejection and the description names the field. If it does not, the server is waiting, and the
+question becomes what a TLS 1.2 client owes a Go server that a rustls client does not.
+
+This is the kind of fork that a capture creates and that a hypothesis cannot settle, which is why
+the last three cycles went into building one.
