@@ -246,8 +246,11 @@ pub(crate) fn pre_shared_key_extension(
     ext.extend_from_slice(&(ticket.ticket.len() as u16).to_be_bytes());
     ext.extend_from_slice(&ticket.ticket);
     ext.extend_from_slice(&ticket.obfuscated_age_millis().to_be_bytes());
-    // binders<33..2^16-1>
-    ext.extend_from_slice(&((2 + binder.len()) as u16).to_be_bytes());
+    // binders<33..2^16-1>: a one-byte length per entry plus the binder itself. Writing
+    // `2 + binder.len()` here — the shape of the identities field above — produces a hello a
+    // server rejects, because the vector's declared length then includes two bytes that are not
+    // in it.
+    ext.extend_from_slice(&((1 + binder.len()) as u16).to_be_bytes());
     ext.push(binder.len() as u8);
     ext.extend_from_slice(binder);
     Ok(ext)

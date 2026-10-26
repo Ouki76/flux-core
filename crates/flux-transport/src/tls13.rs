@@ -1337,6 +1337,17 @@ pub(crate) fn build_client_hello(
     random: &[u8; 32],
     eph_pub: &[u8; 32],
 ) -> Vec<u8> {
+    build_client_hello_with_extra(server_name, alpn, random, eph_pub, &[])
+}
+
+/// The same greeting with raw extension bytes appended at the end of the extension list.
+pub(crate) fn build_client_hello_with_extra(
+    server_name: &str,
+    alpn: &[&[u8]],
+    random: &[u8; 32],
+    eph_pub: &[u8; 32],
+    extra: &[u8],
+) -> Vec<u8> {
     let mut hello: Vec<u8> = Vec::with_capacity(512);
     hello.extend_from_slice(&[HS_CLIENT_HELLO, 0, 0, 0]); // length patched later
     hello.extend_from_slice(&[0x03, 0x03]); // legacy_version
@@ -1436,6 +1447,7 @@ pub(crate) fn build_client_hello(
     ext.extend_from_slice(&2u16.to_be_bytes());
     ext.extend_from_slice(&[0x01, 0x01]);
 
+    ext.extend_from_slice(extra);
     hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
     hello.extend_from_slice(&ext);
 
@@ -2336,5 +2348,150 @@ mod ticket_store_tests {
             "a TLS 1.3 server issues tickets; the store must have one"
         );
         crate::resumption::clear();
+    }
+}
+
+/// Builds a ClientHello that offers a session ticket, and reports where the bytes that must
+/// *not* be hashed begin (RFC 8446 §4.2.11.2).
+///
+/// Returns `(hello, truncate_at, binder_at)`:
+/// - `truncate_at` is the offset of the binders list, **including its two-byte length**;
+/// - `binder_at` is where the binder bytes live, so the caller patches them in after computing
+///   the HMAC over `hello[..truncate_at]`.
+///
+/// The offsets are found by **walking the finished hello**, not by arithmetic on its parts: the
+/// first version of this computed them from field sizes and was wrong by two bytes — which is
+/// exactly the mistake this extension punishes, since a mis-truncated binder is silently ignored.
+#[allow(dead_code)] // `connect` starts offering tickets in the next step
+pub(crate) fn build_client_hello_with_psk(
+    server_name: &str,
+    alpn: &[&[u8]],
+    random: &[u8; 32],
+    eph_pub: &[u8; 32],
+    ticket: &crate::resumption::StoredTicket,
+) -> FluxResult<(Vec<u8>, usize, usize)> {
+    let binder_len = ticket.suite.hash_len();
+    let ids =
+        crate::resumption::pre_shared_key_extension(ticket, &vec![0u8; binder_len], ticket.suite)?;
+    let modes = crate::resumption::psk_modes_extension();
+
+    let mut extra = Vec::with_capacity(4 + modes.len() + 4 + ids.len());
+    extra.extend_from_slice(&0x002du16.to_be_bytes());
+    extra.extend_from_slice(&(modes.len() as u16).to_be_bytes());
+    extra.extend_from_slice(&modes);
+    extra.extend_from_slice(&0x0029u16.to_be_bytes());
+    extra.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+    extra.extend_from_slice(&ids);
+
+    let hello = build_client_hello_with_extra(server_name, alpn, random, eph_pub, &extra);
+
+    // Walk to pre_shared_key and find where its identities end.
+    let mut pos = 4 + 2 + 32;
+    let sid = hello[pos] as usize;
+    pos += 1 + sid;
+    let suites = u16::from_be_bytes([hello[pos], hello[pos + 1]]) as usize;
+    pos += 2 + suites;
+    let comp = hello[pos] as usize;
+    pos += 1 + comp;
+    let ext_total = u16::from_be_bytes([hello[pos], hello[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = pos + ext_total;
+    while pos + 4 <= ext_end {
+        let ty = u16::from_be_bytes([hello[pos], hello[pos + 1]]);
+        let len = u16::from_be_bytes([hello[pos + 2], hello[pos + 3]]) as usize;
+        if ty == 0x0029 {
+            let ids_len = u16::from_be_bytes([hello[pos + 4], hello[pos + 5]]) as usize;
+            let truncate_at = pos + 4 + 2 + ids_len;
+            let binder_at = truncate_at + 2 + 1;
+            if binder_at + binder_len != hello.len() {
+                return Err(crypto_err(
+                    "the pre_shared_key extension is not where it should be",
+                ));
+            }
+            return Ok((hello, truncate_at, binder_at));
+        }
+        pos += 4 + len;
+    }
+    Err(crypto_err(
+        "the pre_shared_key extension was not found in its own hello",
+    ))
+}
+
+#[cfg(test)]
+mod psk_hello_tests {
+    use super::*;
+    use crate::resumption;
+
+    fn ticket() -> resumption::StoredTicket {
+        let mut m = vec![0x04, 0, 0, 0];
+        m.extend_from_slice(&7200u32.to_be_bytes());
+        m.extend_from_slice(&7u32.to_be_bytes());
+        m.push(1);
+        m.push(0);
+        m.extend_from_slice(&5u16.to_be_bytes());
+        m.extend_from_slice(b"tick!");
+        let l = (m.len() - 4) as u32;
+        m[1..4].copy_from_slice(&l.to_be_bytes()[1..]);
+        resumption::parse_ticket(&m, &[4u8; 32], Tls13Suite::Aes128GcmSha256).expect("ticket")
+    }
+
+    /// `pre_shared_key` must be the **last** extension, or a server ignores it — and a server that
+    /// ignores it completes a full handshake, which looks like success until you measure.
+    #[test]
+    fn pre_shared_key_is_the_last_extension() {
+        let t = ticket();
+        let (hello, _, _) =
+            build_client_hello_with_psk("example.test", &[], &[1u8; 32], &[2u8; 32], &t)
+                .expect("hello");
+        // Walk the hello rather than doing arithmetic on its fields: the first version of this
+        // test hand-computed the offset and was wrong, which is the mistake being guarded against.
+        let mut pos = 4 + 2 + 32;
+        let sid = hello[pos] as usize;
+        pos += 1 + sid;
+        let suites = u16::from_be_bytes([hello[pos], hello[pos + 1]]) as usize;
+        pos += 2 + suites;
+        let comp = hello[pos] as usize;
+        pos += 1 + comp;
+        pos += 2;
+        let mut last = 0u16;
+        while pos + 4 <= hello.len() {
+            let ty = u16::from_be_bytes([hello[pos], hello[pos + 1]]);
+            let len = u16::from_be_bytes([hello[pos + 2], hello[pos + 3]]) as usize;
+            last = ty;
+            pos += 4 + len;
+        }
+        assert_eq!(last, 0x0029, "the last extension must be pre_shared_key");
+        assert_eq!(
+            pos,
+            hello.len(),
+            "the extension list must be exactly consumed"
+        );
+    }
+
+    /// The truncation point must land on the binders list, and the binder bytes must sit inside
+    /// it — the two offsets this function exists to report.
+    #[test]
+    fn the_truncation_point_is_the_binders_list() {
+        let t = ticket();
+        let (hello, truncate_at, binder_at) =
+            build_client_hello_with_psk("example.test", &[], &[1u8; 32], &[2u8; 32], &t)
+                .expect("hello");
+        let binders_len = u16::from_be_bytes([hello[truncate_at], hello[truncate_at + 1]]) as usize;
+        assert_eq!(binders_len, 33, "one 32-byte binder plus its length byte");
+        assert_eq!(hello[binder_at - 1], 32, "the binder's own length byte");
+        assert_eq!(binder_at + 32, hello.len(), "the binder ends the hello");
+        assert_eq!(truncate_at + 2 + 1 + 32, hello.len());
+    }
+
+    /// The handshake length field must cover the whole hello including the binder, because the
+    /// truncated hash keeps the lengths the peer will actually read.
+    #[test]
+    fn the_handshake_length_covers_the_binder() {
+        let t = ticket();
+        let (hello, _, _) =
+            build_client_hello_with_psk("example.test", &[], &[1u8; 32], &[2u8; 32], &t)
+                .expect("hello");
+        let declared = u32::from_be_bytes([0, hello[1], hello[2], hello[3]]) as usize;
+        assert_eq!(declared, hello.len() - 4);
     }
 }
