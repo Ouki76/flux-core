@@ -260,7 +260,9 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false).await.expect("server accept");
+            let mut s = accept(server_io, "/tunnel", false)
+                .await
+                .expect("server accept");
             let mut buf = vec![0u8; 5];
             s.read_exact(&mut buf).await.expect("server read");
             assert_eq!(&buf, b"hello");
@@ -334,7 +336,8 @@ mod tests {
         // implementation does not speak. Answering 200 would leave a client waiting for
         // a download stream that never carries anything.
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(async move { accept(server_io, "/tunnel", false).await.is_err() });
+        let server =
+            tokio::spawn(async move { accept(server_io, "/tunnel", false).await.is_err() });
         let mut client = shared::client_handshake(client_io, "xhttp")
             .await
             .expect("client");
@@ -389,7 +392,8 @@ mod tests {
     #[tokio::test]
     async fn a_path_outside_the_base_is_refused() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(async move { accept(server_io, "/tunnel", false).await.is_err() });
+        let server =
+            tokio::spawn(async move { accept(server_io, "/tunnel", false).await.is_err() });
         let mut client = shared::client_handshake(client_io, "xhttp")
             .await
             .expect("client");
@@ -444,5 +448,105 @@ mod padding_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod two_stream_probe {
+    /// Can this h2 layer carry **two concurrent requests on one connection** at all?
+    ///
+    /// `stream-up` is built on exactly that: an uploading POST and a downloading GET, paired by the
+    /// server. If the substrate cannot do it, no amount of mode code above it will work, and every
+    /// later failure would be misread as a pairing bug.
+    #[tokio::test]
+    async fn the_server_accepts_two_requests_on_one_connection() {
+        use crate::h2::shared;
+        use http::{Request, Response, StatusCode};
+
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut connection = shared::server_handshake(server_io, "probe")
+                .await
+                .expect("server handshake");
+            let (first, mut respond_first) = connection
+                .accept()
+                .await
+                .expect("first request")
+                .expect("first request ok");
+            let first_path = first.uri().path().to_string();
+            let (second, mut respond_second) = connection
+                .accept()
+                .await
+                .expect("second request")
+                .expect("second request ok");
+            let second_path = second.uri().path().to_string();
+
+            // Answer both: the first with an open body, the second with a complete one.
+            let send = respond_first
+                .send_response(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(())
+                        .expect("resp"),
+                    false,
+                )
+                .expect("first response");
+            drop(send);
+            let _ = respond_second.send_response(
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(())
+                    .expect("resp"),
+                true,
+            );
+            shared::spawn_connection_driver(connection, None);
+            (first_path, second_path)
+        });
+
+        let client = tokio::spawn(async move {
+            let mut client = shared::client_handshake(client_io, "probe")
+                .await
+                .expect("client handshake");
+            let (resp_a, _send_a) = client
+                .send_request(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/a")
+                        .body(())
+                        .expect("req"),
+                    false,
+                )
+                .expect("first send");
+            let (resp_b, _send_b) = client
+                .send_request(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/b")
+                        .body(())
+                        .expect("req"),
+                    true,
+                )
+                .expect("second send");
+            let a = tokio::time::timeout(std::time::Duration::from_secs(5), resp_a)
+                .await
+                .expect("first response timed out")
+                .expect("first response");
+            let b = tokio::time::timeout(std::time::Duration::from_secs(5), resp_b)
+                .await
+                .expect("second response timed out")
+                .expect("second response");
+            (a.status(), b.status())
+        });
+
+        let (paths, statuses) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            (server.await.expect("server"), client.await.expect("client"))
+        })
+        .await
+        .expect("two requests on one connection must both complete");
+
+        assert_eq!(paths, ("/a".to_string(), "/b".to_string()));
+        assert_eq!(statuses.0, StatusCode::OK);
+        assert_eq!(statuses.1, StatusCode::OK);
     }
 }
