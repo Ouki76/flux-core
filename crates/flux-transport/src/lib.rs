@@ -38,6 +38,7 @@ pub mod shadowtls;
 pub mod tcp;
 /// TLS with configurable fingerprints and an optional private CA.
 pub mod tls;
+mod tls12;
 mod tls13;
 /// WebSocket framing.
 pub mod websocket;
