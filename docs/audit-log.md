@@ -9210,3 +9210,49 @@ refuse.
 **Reproduce the whole analysis:** `bench_udp --count 200000 --rounds 3 --payload-size 1200`, then
 `/proc/<pid>/status` for the switch counts, then `bench_matrix --only wireguard --rounds 3` for the
 CPU-per-GiB split.
+
+### C5.4 — the measurement that had been missing: 48 µs of CPU per datagram
+
+After three failed instruments (a serialized driver that measured idle CPU, a `pgrep` that matched a
+shell, a pipelined driver that stalled on a full socket buffer), the one that works is two threads —
+one sending, one draining continuously — with a large receive buffer:
+
+```
+датаграмм: 200000 за 6.61с = 30276/с
+CPU 9.59с на 0.2235 ГиБ = 42.9 с/ГиБ; 47.95 мкс/датаграмму
+```
+
+**~48 µs of CPU per datagram**, on the *direct* SOCKS UDP relay — no TLS, no WireGuard, no crypto of
+any kind. 42.9 s/GiB is the same order as the 27–29 s/GiB C4.3 attributed to the encrypted UDP
+protocols, which means **the crypto was never the dominant cost**.
+
+### Where 48 µs can and cannot come from
+
+| component | cost per datagram |
+|---|---|
+| two syscalls (`recvfrom` + `sendto`) in one process | ~2–4 µs |
+| socket-buffer copy of 1.2 KB, twice | ~1 µs |
+| **a channel hop that wakes another task** | **tens of µs** |
+| crypto | zero on this path |
+
+The relay hands every datagram from the receive task to the dispatcher through an `mpsc` channel and
+back through another. Each hop parks one task and unparks another — and at 30 000 datagrams per
+second that is ~60 000 wakeups a second of runtime scheduling work, which is exactly the scale of
+what the CPU counter shows.
+
+**This reframes the objective.** C4.3 said "UDP costs 10–20x TCP per byte, probably crypto and
+syscalls". The measurement says: **it is the per-datagram task handoff**, and it is in our code.
+
+### What to change, concretely
+
+| change | expected | risk |
+|---|---|---|
+| batch datagrams through the channel (`Vec<UdpPacket>` per hop, or a ring) | removes most wakeups; the only lever the numbers support | medium — the dispatcher and every UDP outbound consume packets one at a time |
+| inline the direct outbound (no channel hop at all when the route is a single direct hop) | removes both hops for the simplest case | low for the direct case, and it is the benchmarked one |
+
+The second is the smaller change and the one the measurement points at first: a direct route does
+not need a task handoff to forward a datagram.
+
+**Not implemented in this cycle** — the budget went into getting the instrument to produce a number
+at all, three times over. But the number is now the right one, and it says the optimisation lives in
+our scheduler usage, not in the syscalls or the cryptography.
