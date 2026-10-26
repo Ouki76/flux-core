@@ -7804,3 +7804,25 @@ The last one is the one that would have been easy to fake: disabling the ticket 
 fail with *"a TLS 1.3 server issues tickets; the store must have one"*.
 
 1142 tests pass, clippy clean. The reader — `pre_shared_key` in the ClientHello — is next.
+
+### C2.3 — the binder, and why the tests are the easy half
+
+Implemented, with the parts that fail *silently* pinned by tests:
+
+| piece | the mistake it guards against |
+|---|---|
+| `binder_key` = `HKDF-Expand-Label(HKDF-Extract(0, PSK), "res binder", Hash(""), Hash.length)` | PSK as salt instead of IKM | 
+| `binder` = HMAC over `Hash(truncated ClientHello)` | truncating inside the binders list, so the binder verifies only against yourself |
+| `pre_shared_key_extension` | a wrong-length binder, which a server drops without explanation |
+| `psk_modes_extension` | offering pure PSK and losing forward secrecy for nothing |
+
+Four tests: binder key depends on the PSK; the binder covers the hello it signs; the identity
+carries the obfuscated age; a wrong-length binder is refused locally.
+
+**What these tests cannot catch, and it is the thing that matters:** a binder that is internally
+consistent and wrong. Every one of the four would pass with the truncation boundary off by two
+bytes, because they only compare our binder against our own arithmetic. The test that settles it
+has to be a real server accepting the resumption — which is why the next step is wiring, not more
+unit tests.
+
+Not wired yet: `connect` still computes its early secret with no PSK. 1146 tests pass.
