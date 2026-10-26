@@ -748,6 +748,9 @@ pub enum FramingConfig {
         /// Extra headers sent with the request.
         #[serde(default)]
         headers: HashMap<String, String>,
+        /// Xray's `xhttpSettings`, in full; unsupported fields are rejected at load.
+        #[serde(flatten)]
+        settings: XhttpSettings,
     },
     /// WebSocket framing, RFC 6455.
     #[serde(rename = "ws", alias = "websocket")]
@@ -802,8 +805,90 @@ fn default_hy2_mbps() -> u64 {
     100
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Xray's `xhttpSettings`, in full.
+///
+/// Every field Xray accepts is accepted here, in Xray's own spelling, so a working Xray config is
+/// *understood* rather than silently ignored. Fields this implementation cannot honour are checked
+/// when the config is loaded and rejected with a message naming the field — accepting a setting and
+/// quietly doing something else is worse than refusing it.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XhttpSettings {
+    /// `stream-one` (the only mode implemented), `stream-up`, `packet-up` or `auto`.
+    #[serde(default, alias = "mode")]
+    pub mode: Option<String>,
+    /// Padding added to each request's query string, as a byte range in Xray's notation.
+    #[serde(default, alias = "xpadding_bytes", alias = "xPaddingBytes")]
+    pub xpadding_bytes: Option<String>,
+    /// Suppress the `text/event-stream` content type on the download response.
+    #[serde(
+        default,
+        alias = "no_sse_header",
+        alias = "noSseHeader",
+        alias = "noSSEHeader"
+    )]
+    pub no_sse_header: Option<bool>,
+    /// Largest body accepted in a single POST.
+    #[serde(default, alias = "sc_max_each_post_bytes")]
+    pub sc_max_each_post_bytes: Option<serde_json::Value>,
+    /// Minimum interval between POSTs.
+    #[serde(default, alias = "sc_min_posts_interval_ms")]
+    pub sc_min_posts_interval_ms: Option<u64>,
+    /// How many POSTs may be buffered.
+    #[serde(default, alias = "sc_max_buffered_posts")]
+    pub sc_max_buffered_posts: Option<u64>,
+    /// How long the server keeps an uploading stream open.
+    #[serde(default, alias = "sc_stream_up_server_secs")]
+    pub sc_stream_up_server_secs: Option<u64>,
+    /// Separate settings for the download direction.
+    #[serde(default, alias = "download_settings", alias = "downloadSettings")]
+    pub download_settings: Option<serde_json::Value>,
+    /// Xray's free-form `extra` block.
+    #[serde(default)]
+    pub extra: Option<serde_json::Value>,
+}
+
+impl XhttpSettings {
+    /// Rejects every setting this implementation cannot honour, naming it.
+    ///
+    /// Called once at config load so a user learns at startup rather than from a connection that
+    /// behaves nothing like their Xray setup.
+    pub fn validate(&self, where_: &str) -> Result<(), String> {
+        match self.mode.as_deref() {
+            None | Some("stream-one") | Some("streamone") => {}
+            Some(other) => {
+                return Err(format!(
+                    "{where_}: XHTTP mode '{other}' is not implemented — only 'stream-one' is; \
+                     remove `mode` or set it to 'stream-one'"
+                ));
+            }
+        }
+        for (name, present) in [
+            ("scMaxEachPostBytes", self.sc_max_each_post_bytes.is_some()),
+            (
+                "scMinPostsIntervalMs",
+                self.sc_min_posts_interval_ms.is_some(),
+            ),
+            ("scMaxBufferedPosts", self.sc_max_buffered_posts.is_some()),
+            (
+                "scStreamUpServerSecs",
+                self.sc_stream_up_server_secs.is_some(),
+            ),
+            ("downloadSettings", self.download_settings.is_some()),
+        ] {
+            if present {
+                return Err(format!(
+                    "{where_}: XHTTP setting '{name}' belongs to a mode this implementation does \
+                     not implement (only 'stream-one' is); remove it"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The framing layer an inbound expects under its security.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum InboundFramingConfig {
     /// XHTTP (`splithttp`), stream-one mode.
@@ -812,6 +897,9 @@ pub enum InboundFramingConfig {
         /// Base path; the client appends a per-connection suffix.
         #[serde(default)]
         path: Option<String>,
+        /// Xray's `xhttpSettings`, in full; unsupported fields are rejected at load.
+        #[serde(flatten)]
+        settings: XhttpSettings,
     },
     /// WebSocket framing, RFC 6455.
     #[serde(rename = "ws", alias = "websocket")]
@@ -2707,5 +2795,111 @@ mod unknown_key_tests {
             "outbounds": [{"type": "direct", "tag": "direct"}]
         }"#;
         Config::from_json_str(json).expect("documented keys must parse");
+    }
+}
+
+#[cfg(test)]
+mod xhttp_settings_tests {
+    use super::*;
+
+    fn parse(json: &str) -> XhttpSettings {
+        serde_json::from_str(json).expect("settings must parse")
+    }
+
+    /// A config written for Xray's XHTTP must be **understood**, not silently ignored: every field
+    /// Xray documents parses into the struct rather than vanishing into an unknown-key bucket.
+    #[test]
+    fn every_xray_setting_is_parsed() {
+        let s = parse(
+            r#"{
+                "mode": "stream-one",
+                "xpaddingBytes": "100-1000",
+                "noSSEHeader": true,
+                "scMaxEachPostBytes": 1000000,
+                "scMinPostsIntervalMs": 30,
+                "scMaxBufferedPosts": 30,
+                "scStreamUpServerSecs": 20,
+                "downloadSettings": {"path": "/down"},
+                "extra": {"x": 1}
+            }"#,
+        );
+        assert_eq!(s.mode.as_deref(), Some("stream-one"));
+        assert_eq!(s.xpadding_bytes.as_deref(), Some("100-1000"));
+        assert_eq!(s.no_sse_header, Some(true));
+        assert!(s.sc_max_each_post_bytes.is_some());
+        assert_eq!(s.sc_min_posts_interval_ms, Some(30));
+        assert_eq!(s.sc_max_buffered_posts, Some(30));
+        assert_eq!(s.sc_stream_up_server_secs, Some(20));
+        assert!(s.download_settings.is_some());
+        assert!(s.extra.is_some());
+    }
+
+    /// `stream-one` is what we implement, so it must pass validation.
+    #[test]
+    fn stream_one_and_no_mode_pass() {
+        assert!(parse(r#"{"mode": "stream-one"}"#).validate("test").is_ok());
+        assert!(parse(r#"{}"#).validate("test").is_ok());
+    }
+
+    /// Every other mode is refused with a message that names it — accepting it and quietly doing
+    /// stream-one would give a connection that behaves nothing like the user's Xray setup.
+    #[test]
+    fn the_other_modes_are_refused_by_name() {
+        for mode in ["packet-up", "stream-up", "auto", "bogus"] {
+            let err = parse(&format!(r#"{{"mode": "{mode}"}}"#))
+                .validate("outbound xhttp")
+                .expect_err("must be refused")
+                .to_string();
+            assert!(err.contains(mode), "the error must name the mode: {err}");
+            assert!(
+                err.contains("outbound xhttp"),
+                "and where it came from: {err}"
+            );
+        }
+    }
+
+    /// Settings that belong to modes we do not implement are refused too, rather than accepted and
+    /// ignored — the failure they would otherwise cause is a connection that stalls silently.
+    #[test]
+    fn mode_specific_settings_are_refused() {
+        for json in [
+            r#"{"scMaxEachPostBytes": 1000}"#,
+            r#"{"scMinPostsIntervalMs": 10}"#,
+            r#"{"scMaxBufferedPosts": 5}"#,
+            r#"{"scStreamUpServerSecs": 5}"#,
+            r#"{"downloadSettings": {}}"#,
+        ] {
+            let err = parse(json)
+                .validate("inbound xhttp")
+                .expect_err("must be refused")
+                .to_string();
+            assert!(err.contains("not implement"), "unexpected: {err}");
+        }
+    }
+
+    /// A full Xray-shaped framing block must parse through the enum, which is what a user actually
+    /// writes.
+    #[test]
+    fn a_full_xray_framing_block_parses() {
+        let cfg: FramingConfig = serde_json::from_str(
+            r#"{
+                "type": "xhttp",
+                "path": "/x",
+                "headers": {"User-Agent": "Mozilla/5.0"},
+                "mode": "stream-one",
+                "xpaddingBytes": "100-1000",
+                "noSSEHeader": true
+            }"#,
+        )
+        .expect("a full Xray xhttp block must parse");
+        match cfg {
+            FramingConfig::Xhttp { settings, path, .. } => {
+                assert_eq!(path, "/x");
+                assert_eq!(settings.xpadding_bytes.as_deref(), Some("100-1000"));
+                assert_eq!(settings.no_sse_header, Some(true));
+                assert!(settings.validate("test").is_ok());
+            }
+            _ => panic!("must be an xhttp framing"),
+        }
     }
 }
