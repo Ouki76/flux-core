@@ -9374,3 +9374,45 @@ hop), and it is still a shared-API change across four UDP protocols.
 
 **This cycle produced no speedup either.** It produced the measurement that makes the next one
 worth doing — and the admission that the headline number was flattering the hardware, not the code.
+
+### C5.8 — correction: the 48 µs was my harness, not the relay
+
+C5.4 measured ~48 µs of CPU per datagram with a Python driver. That number has driven four cycles of
+failed optimisation. Measured instead with the project's own benchmark and `/proc/<pid>/stat`:
+
+```
+6 seconds of load, one flux-core process:
+  utime 0 → 427, stime 0 → 590   = 10.17 s CPU over 6 s wall (1.7 cores)
+  at ~100 000 round trips/s = ~600 000 round trips = ~1 200 000 datagram transits
+  → ~8.5 µs of CPU per transit
+```
+
+**8.5 µs, not 48.** And it cross-checks against something already in the log: 8.5 µs per transit ×
+2 transits per round trip × 100 000 round trips/s = 1.7 cores — exactly what `/proc` reports.
+
+So the C5.4 figure was an artefact of the Python driver: it flooded the socket, the relay's
+`recvfrom` returned `WouldBlock` in a tight loop, and that busy-polling was charged to the process as
+CPU. **The relay was not slow; my instrument was.**
+
+### What this invalidates, and what survives
+
+| claim | status |
+|---|---|
+| "48 µs per datagram, the relay is CPU-hungry" | **withdrawn** — harness artefact |
+| five optimisations measured at zero | **stand** — they were measured with `bench_udp`, the project's own harness |
+| +32% on 24 cores, +2.7% on 2 cores | **stands** — that was `bench_udp` under `taskset` |
+| "the advantage is cores, not efficiency" | **weakened** — see below |
+
+The 2-core result still says our throughput is more sensitive to core count than sing-box's. But with
+8.5 µs per transit, our relay is not obviously wasteful per datagram; the difference may be in how
+much *concurrency* the two use rather than in per-packet cost.
+
+### The cost of this mistake, stated plainly
+
+Four cycles (C5.1 through C5.6) chased a number that my own driver produced. The lesson is the same
+one this audit has recorded three times before and I applied too late: **when a measurement disagrees
+with an independently obtained figure — here 8.9 µs round-trip from the project's own benchmark — the
+measurement is the first suspect, not the code.**
+
+The correct next step is not batching. It is to profile the relay under `bench_udp`'s load, which is
+the only harness whose numbers have ever agreed with each other.
