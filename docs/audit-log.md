@@ -8126,3 +8126,46 @@ than a hypothesis away.
 
 The mechanism is complete and the offer is off. Nothing in production depends on an unproven path,
 and the next cycle has a concrete pair of values to compare instead of a theory.
+
+### C2.12 — the measurement: our PSK is not the server's
+
+A `StoresServerSessions` implementation that records what the server puts into a ticket makes the
+comparison direct for the first time:
+
+```
+server stored (two tickets): …1c169cac708596eb06847bf5d23857695305baecc145650f035df11e9b367bc…
+our PSK:                     d4b55d4dfc16a517c3c4f6c684cffcdb8c986f5f69350ef452e3a68e6d8f122f
+```
+
+**They differ, so every binder we send is wrong** — which is exactly the `decrypt_error`.
+
+That is worth more than a success would have been. It converts "somewhere in the resumption path"
+into one value with a three-link chain:
+
+| link | status |
+|---|---|
+| master secret | **proven correct** — the handshake's Finished verifies against it |
+| label and expansion (`"resmaster"`, then `"resumption"` + nonce) | confirmed line by line against rustls source |
+| **transcript hash** | **the only input our code builds itself** |
+
+The transcript is where the next cycle goes, and it now has a shape: our `connect` appends
+`ClientHello`, each server flight message and the client Finished — and rustls's
+`st.transcript.current_hash()` is taken at the same point, which means the difference is in *what
+those messages are*, not in *when* they are hashed. The most likely candidate is a message we append
+that the reference does not, or a length prefix we include twice.
+
+Also fixed on the way: two tests sharing the global ticket store were interfering through `clear()`;
+they now use distinct names and no global wipe.
+
+### The count after twelve cycles on this gap
+
+| metric | value |
+|---|---|
+| real bugs found | 4 — duplicate extension, missing Finished in transcript, identity length shape, and a store shared between tests |
+| the offer | still off |
+| tests | 1152 pass, 9 skipped, clippy clean |
+
+The mechanism is complete and provably reaches the right code path against a real server — the
+alert went from `illegal_parameter` (greeting refused) to `decrypt_error` (binder compared and
+rejected), which means the server now parses our offer, looks up its ticket and computes *its*
+binder. The last step is making ours equal to it.
