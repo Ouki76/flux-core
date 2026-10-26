@@ -7495,3 +7495,35 @@ reconstruct by hand, and they will say whether the server sends anything at all.
 This is the honest position after five cycles on the 1.2 path: the handshake and chain work
 against three implementations, the upload is provably complete, and the return path is unexplained.
 The interop test stays `#[ignore]`d with the symptom so the next session starts from a reproducer.
+
+### C1.6 — the byte counts, and the server really does stop
+
+A TCP relay between our client and Xray, counting bytes in each direction:
+
+```
+up=50 633    down=739
+```
+
+Up is the handshake plus 50 000 bytes of payload in eight records. Down is 739 bytes: Xray's
+entire handshake flight plus the two-byte VLESS response header, and nothing else. **The server is
+not sending the echo back** — this is not a case of us failing to read it.
+
+So the state of the case is now:
+
+| claim | evidence |
+|---|---|
+| our ClientHello is accepted | three servers complete the handshake |
+| our chain verification runs | unknown CA and wrong name are refused, on this path too |
+| our upload arrives | 50 633 bytes counted by a third party, above the tunnel |
+| the server parses the request | Xray logs `accepted tcp:127.0.0.1:17171` |
+| the server answers, then stops | 739 bytes down, of which 26 are the protocol header |
+
+The one question left is what those 739 bytes contain after the handshake flight: if a fatal
+alert is in there, the server is rejecting one of our application records; if not, it is waiting
+for something. The record trace added in C1.5 answers that in one run, and that is where the next
+cycle starts.
+
+Six cycles into the 1.2 path, and this is the honest position: everything up to the first
+application record is verified against three independent implementations, the upload is counted by
+a third party rather than by our own logs, and the return path is still unexplained. The interop
+test stays `#[ignore]`d with the symptom.
