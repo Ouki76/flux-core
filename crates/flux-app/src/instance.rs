@@ -1,3 +1,17 @@
+/// Joins a listen host and a port into something `SocketAddr` can parse.
+///
+/// A bare `format!("{host}:{port}")` produces `::1:8080` for an IPv6 host, which does not parse:
+/// v6 literals need brackets. Doing this in one place means a v6 listener works everywhere one
+/// is accepted by the configuration, rather than in whichever code path remembered the brackets.
+fn join_host_port(host: impl AsRef<str>, port: u16) -> String {
+    let host = host.as_ref();
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 use crate::api::{ApiServer, TrafficMeter};
 use crate::config::{
     CarrierConfig, Config, FlexibleList, FramingConfig, InboundCarrierConfig, InboundConfig,
@@ -456,7 +470,7 @@ impl Instance {
                         users,
                         rate_limit,
                     } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
+                        let addr_str = join_host_port(&listen, listen_port);
                         let addr: SocketAddr = addr_str.parse().map_err(|e| {
                             FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                         })?;
@@ -475,7 +489,7 @@ impl Instance {
                         listen,
                         listen_port,
                     } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
+                        let addr_str = join_host_port(&listen, listen_port);
                         let addr: SocketAddr = addr_str.parse().map_err(|e| {
                             FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                         })?;
@@ -490,7 +504,7 @@ impl Instance {
                         mtu,
                         awg,
                     } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
+                        let addr_str = join_host_port(&listen, listen_port);
                         let addr: SocketAddr = addr_str.parse().map_err(|e| {
                             FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                         })?;
@@ -544,7 +558,7 @@ impl Instance {
                         listen,
                         listen_port,
                     } => {
-                        let addr_str = format!("{}:{}", listen, listen_port);
+                        let addr_str = join_host_port(&listen, listen_port);
                         let addr: SocketAddr = addr_str.parse().map_err(|e| {
                             FluxError::Config(format!("invalid listen address {}: {}", addr_str, e))
                         })?;
@@ -1486,7 +1500,7 @@ fn parse_inbound_carrier(carrier: &InboundCarrierConfig) -> FluxResult<(SocketAd
                 .clone()
                 .or_else(|| listen.clone())
                 .unwrap_or_else(|| "0.0.0.0".to_string());
-            let s = format!("{}:{}", l_str, listen_port.unwrap_or(0));
+            let s = join_host_port(&l_str, listen_port.unwrap_or(0));
             let a = s
                 .parse::<SocketAddr>()
                 .map_err(|e| FluxError::Config(format!("invalid listen addr {}: {}", s, e)))?;
@@ -1504,7 +1518,7 @@ fn parse_inbound_carrier(carrier: &InboundCarrierConfig) -> FluxResult<(SocketAd
                 Ok((a, false))
             } else {
                 let l_str = listen.as_deref().unwrap_or("0.0.0.0");
-                let s = format!("{}:{}", l_str, listen_port.unwrap_or(0));
+                let s = join_host_port(l_str, listen_port.unwrap_or(0));
                 let a = s
                     .parse::<SocketAddr>()
                     .map_err(|e| FluxError::Config(format!("invalid listen addr {}: {}", s, e)))?;
@@ -1523,7 +1537,7 @@ fn parse_inbound_carrier(carrier: &InboundCarrierConfig) -> FluxResult<(SocketAd
                 Ok((a, true))
             } else {
                 let l_str = listen.as_deref().unwrap_or("0.0.0.0");
-                let s = format!("{}:{}", l_str, listen_port.unwrap_or(0));
+                let s = join_host_port(l_str, listen_port.unwrap_or(0));
                 let a = s
                     .parse::<SocketAddr>()
                     .map_err(|e| FluxError::Config(format!("invalid listen addr {}: {}", s, e)))?;
@@ -2525,5 +2539,45 @@ mod lifecycle_tests {
         instance.start().await.expect("restart");
         instance.stop().await.expect("stop");
         assert_eq!(alive_tasks(), baseline, "a restart must be leak-free too");
+    }
+}
+
+#[cfg(test)]
+mod host_port_tests {
+    use super::join_host_port;
+
+    /// A v6 literal needs brackets, and a bare `format!("{host}:{port}")` produces `::1:8080`,
+    /// which does not parse. This was a real defect: an IPv6 listener failed at startup with
+    /// "invalid socket address syntax" in four separate places that all built the address by hand.
+    #[test]
+    fn a_v6_listen_host_gets_brackets() {
+        assert_eq!(join_host_port("::1", 8080), "[::1]:8080");
+        assert_eq!(join_host_port("::", 443), "[::]:443");
+        assert_eq!(join_host_port("fe80::1", 80), "[fe80::1]:80");
+    }
+
+    /// An IPv4 host and a bracketed v6 host are passed through unchanged, so the helper cannot
+    /// double-bracket a value that already has them.
+    #[test]
+    fn v4_and_already_bracketed_hosts_are_unchanged() {
+        assert_eq!(join_host_port("127.0.0.1", 8080), "127.0.0.1:8080");
+        assert_eq!(join_host_port("0.0.0.0", 1), "0.0.0.0:1");
+        assert_eq!(join_host_port("[::1]", 8080), "[::1]:8080");
+    }
+
+    /// And the result parses, which is the property that actually matters.
+    #[test]
+    fn every_result_parses_as_a_socket_address() {
+        for (host, port) in [
+            ("::1", 8080u16),
+            ("::", 0),
+            ("127.0.0.1", 53),
+            ("fe80::abcd", 9),
+        ] {
+            let joined = join_host_port(host, port);
+            joined
+                .parse::<std::net::SocketAddr>()
+                .unwrap_or_else(|e| panic!("{joined} must parse: {e}"));
+        }
     }
 }
