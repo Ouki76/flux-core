@@ -8169,3 +8169,39 @@ The mechanism is complete and provably reaches the right code path against a rea
 alert went from `illegal_parameter` (greeting refused) to `decrypt_error` (binder compared and
 rejected), which means the server now parses our offer, looks up its ticket and computes *its*
 binder. The last step is making ours equal to it.
+
+### C2.13 — the transcript is right, which narrows it to the derivation itself
+
+Verified by reading our own code against the reference's order:
+
+| message | appended in our transcript | in rustls's |
+|---|---|---|
+| ClientHello | yes | yes |
+| ServerHello | yes | yes |
+| EncryptedExtensions | yes (`HS_ENCRYPTED_EXTENSIONS` branch) | yes |
+| Certificate | yes | yes |
+| CertificateVerify | yes | yes |
+| server Finished | yes | yes |
+| client Finished | yes, before the stream is built | yes, `current_hash()` after it is sent |
+
+And the transcript through the **server** Finished is proven correct by something stronger than a
+reading: the server's Finished verifies against it, and so does ours against the server's copy. A
+transcript that verifies both Finished messages cannot differ from the server's in any of those six
+messages.
+
+So the remaining difference is in the derivation step itself — the one input chain that our own
+arithmetic produces and nothing cross-checks:
+
+```
+rms = HKDF-Expand-Label(master_secret, "resmaster", Hash(transcript), Hash.length)
+psk = HKDF-Expand-Label(rms, "resumption", ticket_nonce, Hash.length)
+```
+
+**The next measurement is a two-line test that costs nothing and splits this in half:** take the
+secret the server stored and check whether *any* of our candidate derivations reproduces it —
+`(rms, "resumption", nonce)`, `(master_secret, "resumption", nonce)`, and `(rms, "resumption", "")`
+for an empty nonce. Whichever matches names the wrong step; whichever set matches nothing says the
+input bytes differ, not the formula.
+
+This is where the next cycle starts, and it starts with three candidate values rather than a
+theory — which is the only kind of step this gap has responded to.
