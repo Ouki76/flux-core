@@ -8880,3 +8880,43 @@ So the honest conclusion of the measurement work: **the core is at the practical
 userspace relay, and it is 2.1x more CPU-efficient and 4–6x more memory-efficient than the two
 references while being the fastest on bulk throughput and p99 latency.** The remaining gap is
 architectural, not a bug and not a missing optimisation.
+
+### C4.3 — per-protocol breakdown, CPU seconds per GiB
+
+The axis the earlier entries did not split. Lower is better; `—` means the reference does not
+implement the protocol.
+
+| protocol / transport | flux | sing-box | xray | flux advantage |
+|---|---|---|---|---|
+| VLESS / TCP | **1.52** | 3.94 | 5.00 | 2.6–3.3x |
+| VLESS / XHTTP | **3.60** | — | 27.4 | 7.6x vs xray |
+| VLESS / gRPC (no TLS) | **3.44** | — | 34.0 | 9.9x vs xray |
+| VLESS / TLS | **5.93** | 10.70 | 11.98 | 1.8–2.0x |
+| VLESS / WS + TLS | **7.50** | 11.11 | 23.92 | 1.5–3.2x |
+| VLESS / gRPC + TLS | **7.76** | — | — | — |
+| **WireGuard** | **29.1** | 238.5 | — | 8.2x |
+| **TUIC v5** | **27.3** | 106.4 | — | 3.9x |
+| **Hysteria2** | **29.4** | 109.6 | — | 3.7x |
+
+Three things this table says that the single number in C4.1 could not:
+
+1. **The TLS layer is the expensive part of a TLS protocol, and it is ours.** VLESS/TCP costs
+   1.52 s/GiB; the same protocol behind TLS costs 5.93 — a 4.4 s/GiB difference that is the
+   record layer. Our TLS is still about half of rustls' cost as measured through sing-box (10.70),
+   but it is the single largest per-protocol cost and the obvious target if anything is.
+2. **The UDP protocols cost an order of magnitude more per byte** (27–29 s/GiB against 1.5–8 for
+   TCP). They move far less data (64–103 MB/s), so the wall-clock impact is smaller, but per byte
+   they are the most expensive code in the project — and that is where a future profile would go.
+3. **The advantage is not uniform.** WS+TLS at 1.5x and TLS at 1.8x are the narrowest margins;
+   gRPC and XHTTP at 8–10x are the widest. The narrow ones are exactly the paths that spend most of
+   their time in the record layer, which is consistent with (1).
+
+### Allocations
+
+Not measured with a counting allocator in this session. What is measured is the consequence that
+matters for a relay: **RSS per held connection is 20 KB** against 84 KB (sing-box) and 115 KB
+(xray), and the copy path allocates its two buffers once per connection and never again — the
+buffers are reused for every record, as the code comments and the absence of allocation in the
+`perf` profile (0.15% of samples, none in `alloc`) both indicate. A counting allocator would give a
+precise per-connection number; the RSS figure bounds it at 20 KB and the profile says none of it is
+hot.
