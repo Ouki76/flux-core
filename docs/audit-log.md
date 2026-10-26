@@ -9559,3 +9559,40 @@ All three paths side by side, normalised per GiB:
 
 These are the numbers the objective asked for, and they are reproducible with the scripts described
 above (`perf stat -e instructions,cycles -- <relay>`, load from a driver that only speaks SOCKS).
+
+### C6.3 — what the other XHTTP modes actually are, from Xray's own source
+
+The modes could not be implemented on guesswork, and the guess would have been wrong in a way that
+worked against itself and failed against Xray — the `"res master"` failure mode again. So the
+protocol was looked up:
+
+- the **download** side is a `GET /<path>/?session=<UUID>` — the docs commit for Xray-docs-next
+  describes exactly that, and `hub.go` holds an `httpSession { uploadQueue }` whose comment says the
+  session lives as long as the GET request does;
+- the **upload** side is a POST, and the dialer interface names the two forms:
+  `OpenStream(ctx, url, sessionId, body, uploadOnly)` for `stream-up` and
+  `PostPacket(ctx, url, sessionId, seqStr, body, contentLength)` for `packet-up`;
+- `stream-one` — the mode we implement — is the one with **no session id** in the path, which is
+  why ours works against a real Xray server today.
+
+So the missing pieces are concrete and named:
+
+| mode | upload | download | what we lack |
+|---|---|---|---|
+| `stream-one` | the POST body of one request | the same request's response body | — (implemented) |
+| `stream-up` | one streaming POST | a separate GET, paired by session id | session registry on the server, two concurrent requests on the client, demultiplexing |
+| `packet-up` | many POSTs, each with a sequence number | the same GET | the above plus per-packet POST scheduling and reordering |
+| `auto` | Xray picks between them | | both of the above |
+
+**Not implemented.** Each mode needs a server-side session registry keyed by UUID and a client that
+drives two h2 requests concurrently and joins them into one `AsyncStream`. That is a day of work
+with its own interop matrix, and a half-applied version breaks connections silently — worse than the
+clear rejection we ship today.
+
+What *is* implemented and tested: every Xray setting parses; `stream-one` works against the real
+Xray binary (455.3 MiB/s, +304.9% in the matrix); and every mode we cannot honour is **refused at
+startup with the mode named**, which is the objective's own stated alternative to implementing it.
+
+Sources: [Xray XHTTP internals](https://xray-internals.hidandelion.com/transport/splithttp.html),
+[hub.go](https://github.com/XTLS/Xray-core/blob/0cceea75daacadc2e63ccec2a010ad2b900d1d1e/transport/internet/splithttp/hub.go),
+[client.go](https://github.com/XTLS/Xray-core/blob/1bae46b1c065eeb6b39d50c63697f56993184c5f/transport/internet/splithttp/client.go).
