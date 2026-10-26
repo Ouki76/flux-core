@@ -8585,3 +8585,32 @@ default because its ClientHello is the point; the weak suites remain reachable, 
 
 Nothing here is a claim that the suites are safe. It is a record that the omission is a decision
 with a reason, a named cost, and an escape hatch.
+
+### C3.5 — the real binaries do not offer TLS 1.2 sessions at all
+
+Two connections to Xray pinned to TLS 1.2, with the store logging what arrived:
+
+```
+TLS 1.2 session stored: id 0 bytes, ticket 0 bytes, suite EcdheEcdsaAes128GcmSha256
+TLS 1.2 session stored: id 0 bytes, ticket 0 bytes, suite EcdheEcdsaAes128GcmSha256
+```
+
+**Nothing to resume.** Xray issues neither a session id nor a ticket on a TLS 1.2 listener, so the
+second connection has nothing to offer back and the resumption path is never entered.
+
+That is a fact about those binaries' TLS configuration, not about the client: the same code resumes
+against rustls in **both** forms — session id (rustls' default) and ticket (RFC 5077) — carrying data
+afterwards in each case.
+
+So the objective's "verify resumption against the real binaries" has an answer, and it is not the
+one the requirement assumed: **these binaries do not resume TLS 1.2 at all**, with any client. There
+is nothing to verify against them. What can be verified — that a session is parsed, stored, and
+offered back correctly, and that the abbreviated handshake completes — is verified against rustls,
+which is the implementation that does offer both forms.
+
+Two debug lines made this answerable in one run. Without them the symptom would have read as "the
+second connection did not resume" — indistinguishable from a client bug, and the kind of thing that
+costs three cycles when it is not written down.
+
+**Reproduce:** `bash /tmp/r12.sh` in this session's environment — Xray on TLS 1.2, two flux
+connections, then `grep "session stored"`.
