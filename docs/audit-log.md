@@ -9661,3 +9661,39 @@ pays it once for encryption and once for decryption; that is what encryption is.
 
 **Rejected optimisation, with the reason:** "splice for wrapped protocols" cannot be built. The only
 splice-eligible paths already use it.
+
+### C7.2 — what the three modes need, and what the h2 layer already gives us
+
+Item B is closed (C7.1: splice cannot apply to wrapped protocols). Item A — `stream-up`,
+`packet-up`, `auto` — is **not implemented**, and this entry records the exact footing a session
+needs so it does not start by re-reading the codebase.
+
+**What already exists and is sufficient:**
+
+| need | available today |
+|---|---|
+| multiple concurrent h2 streams on one connection | `h2::client::SendRequest::send_request(&mut self, req, end_of_stream)` — takes `&mut`, usable repeatedly |
+| a stream whose response has not arrived yet | `H2Stream::new_client_pending(send, response_fut)` (`h2.rs:38`) |
+| a stream from an already-received request/response pair | `H2Stream::new(send, recv)` (`h2.rs:28`) |
+| server accepting a second request on a connection | `connection.accept()` on the `h2::server::Connection` already retained by `xhttp::accept` |
+
+**What `stream-up` therefore needs, concretely:**
+
+1. client: `send_request(POST ?session=<uuid>, end_of_stream=false)` → keep the `SendStream` as the
+   uplink; then `send_request(GET ?session=<uuid>, end_of_stream=true)` → await the response and keep
+   its `RecvStream` as the downlink; join them with `H2Stream::new(uplink, downlink)`;
+2. server: accept the first request, read its `?session=`; accept the second, match the session, and
+   answer the GET with an octet-stream body fed from the POST's body — the mirror image;
+3. session lifetime: a GET may arrive before or after its POST, so the registry must tolerate both
+   orders and expire an unmatched session rather than leaking it.
+
+**`packet-up` adds:** each POST carries a sequence number and its own body; the server reassembles in
+order. That is a `BTreeMap<u64, Bytes>` draining from the next expected index, plus a bound on
+out-of-order buffering (`scMaxBufferedPosts` is exactly that bound, which is why the setting exists).
+
+**`auto`** is a client-side choice between the two, so it can only be implemented after both.
+
+**Why it is not done:** each mode needs a matched pair of implementations plus an interop run against
+the real xray binary in that mode, and a half-applied version does not fail loudly — it connects and
+corrupts. The config refuses these modes by name today, which is the objective's stated alternative
+to shipping them half-done.
