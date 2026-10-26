@@ -1936,7 +1936,7 @@ async fn read_record_typed<S: AsyncRead + Unpin>(
 }
 
 #[cfg(test)]
-mod connect_tests {
+pub(crate) mod connect_tests {
     use super::*;
     use crate::tls::TlsTransport;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1948,7 +1948,7 @@ mod connect_tests {
     }
 
     /// The same, for a chosen name — a ticket store keyed by name needs a name to key on.
-    pub(super) fn server_for(name: &str) -> (tokio_rustls::TlsAcceptor, String) {
+    pub(crate) fn server_for(name: &str) -> (tokio_rustls::TlsAcceptor, String) {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
         let ca_key = KeyPair::generate().expect("ca key");
         let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
@@ -1966,6 +1966,33 @@ mod connect_tests {
         )
         .expect("acceptor");
         (acceptor, ca.pem())
+    }
+
+    /// The same server, but the `ServerConfig` itself — a test that wants to change its session
+    /// storage has to build it before it becomes an acceptor.
+    pub(crate) fn server_config_for(name: &str) -> (tokio_rustls::rustls::ServerConfig, String) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        crate::tls::init_crypto_provider();
+        let ca_key = KeyPair::generate().expect("ca key");
+        let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+        let leaf_key = KeyPair::generate().expect("leaf key");
+        let leaf_params = CertificateParams::new(vec![name.to_string()]).expect("leaf");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .expect("leaf");
+        let provider = std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+        let cfg = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls_pki_types::CertificateDer::from(leaf.der().to_vec())],
+                rustls_pki_types::PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+            )
+            .expect("server config");
+        (cfg, ca.pem())
     }
 
     /// The whole point of B3: our handshake, no rustls, against a real TLS 1.3 server.
@@ -2386,7 +2413,6 @@ mod ticket_store_tests {
     /// exactly like a server that does not issue tickets.
     #[tokio::test]
     async fn a_real_handshake_stores_a_ticket() {
-        crate::resumption::clear();
         crate::tls::init_crypto_provider();
         let name = "ticketstore.test";
         let (acceptor, ca_pem) = connect_tests::server_for(name);
@@ -2414,7 +2440,6 @@ mod ticket_store_tests {
             crate::resumption::get(name).is_some(),
             "a TLS 1.3 server issues tickets; the store must have one"
         );
-        crate::resumption::clear();
     }
 }
 

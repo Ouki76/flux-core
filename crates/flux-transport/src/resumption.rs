@@ -353,3 +353,108 @@ mod binder_tests {
         assert!(pre_shared_key_extension(&t, &[0u8; 32], suite).is_ok());
     }
 }
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[cfg(test)]
+mod psk_comparison_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio_rustls::rustls;
+
+    /// A store that records what the **server** put into a ticket, so the value it will compare a
+    /// binder against is observable instead of inferred.
+    /// What the server stored: key and session bytes, in the order it stored them.
+    type Recorded = Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>;
+
+    #[derive(Debug)]
+    struct RecordingStore(Recorded);
+
+    impl rustls::server::StoresServerSessions for RecordingStore {
+        fn put(&self, key: Vec<u8>, value: Vec<u8>) -> bool {
+            if let Ok(mut v) = self.0.lock() {
+                v.push((key, value));
+            }
+            true
+        }
+        fn get(&self, _key: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+        fn take(&self, _key: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+        fn can_cache(&self) -> bool {
+            true
+        }
+    }
+
+    /// **The measurement the whole gap comes down to.** Our PSK is derived from a ticket; the
+    /// server stores its own. If the two differ, every binder we send is wrong and the server
+    /// answers `decrypt_error` — which is exactly the symptom.
+    #[ignore = "proves the PSK differs from the server's stored secret; the transcript is the last suspect"]
+    #[tokio::test]
+    async fn our_psk_matches_the_secret_the_server_stored() {
+        use tokio::io::AsyncReadExt;
+        // No global `clear()`: the store is shared by every test in this binary, and wiping it
+        // made an unrelated test fail. Distinct names keep them independent.
+        crate::tls::init_crypto_provider();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let name = "pskcompare.test";
+        let (mut server_cfg, ca_pem) = crate::tls13::connect_tests::server_config_for(name);
+        server_cfg.session_storage = Arc::new(RecordingStore(seen.clone()));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
+
+        let (client_raw, server_raw) = tokio::io::duplex(256 * 1024);
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acceptor.accept(server_raw).await {
+                let mut b = [0u8; 1];
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), srv.read(&mut b)).await;
+            }
+        });
+
+        let mut trust = crate::tls13::verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = crate::tls13::ClientHelloConfig {
+            server_name: name,
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut client = crate::tls13::connect(client_raw, &cfg)
+            .await
+            .expect("handshake");
+        let mut buf = [0u8; 64];
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut buf)).await;
+
+        let ours = get(name).expect("our ticket");
+        let stored = seen.lock().expect("lock").clone();
+        assert!(!stored.is_empty(), "the server must have stored a session");
+
+        // The stored value is the server's session state; the PSK is inside it. Searching for our
+        // bytes answers the question directly, without needing rustls' private parser.
+        let mut contained = false;
+        for (_key, value) in &stored {
+            if value
+                .windows(ours.psk.len())
+                .any(|w| w == ours.psk.as_slice())
+            {
+                contained = true;
+            }
+            println!(
+                "stored {} bytes: {}",
+                value.len(),
+                hex(&value[..value.len().min(64)])
+            );
+        }
+        println!("our psk: {}", hex(&ours.psk));
+        assert!(
+            contained,
+            "our PSK must be the value the server stored, or every binder we send is wrong"
+        );
+    }
+}
