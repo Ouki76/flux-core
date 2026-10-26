@@ -7926,3 +7926,44 @@ walks a hello produced by the same code that may be wrong about where the list s
 
 This is the same lesson as C1.12 in a new place: the instrument has to be independent of the thing
 it measures.
+
+### C2.7 — the greeting is structurally valid, which is itself the finding
+
+An independent walk of every length field in the hello we send — handshake length, version, session
+id, cipher suites, compression, extension length, and each extension's own length:
+
+```
+тест every_length_in_the_psk_hello_agrees ... ok
+```
+
+All lengths agree, `pre_shared_key` appears once and is last, and the extension list reaches
+exactly the end of the message.
+
+So `illegal_parameter` is **not** a malformed-length problem. That removes the class of bug I had
+spent two cycles looking for and moves the question somewhere rustls checks that has nothing to do
+with lengths.
+
+**Ruled out so far, each by evidence rather than argument:**
+
+| candidate | ruled out by |
+|---|---|
+| binder arithmetic wrong (key schedule, truncation) | rustls source: a mismatch gives a fallback, not this alert (C2.6) |
+| truncation boundary | rustls defines it as `len - total_binder_length()`, which is where `truncate_at` points (C2.6) |
+| a length field wrong by a byte or two | independent walk of every length (this cycle) |
+| `pre_shared_key` not last, or duplicated | same walk |
+| compression or SNI | a full handshake with the same builder works |
+
+**What is left:** the binder length against the suite the server finally negotiates — 32 bytes for
+SHA-256, 48 for SHA-384 — which a client gets right only if the ticket's suite is among those it
+offers; and the ticket identity itself in some state rustls treats as the peer's fault.
+
+**The next measurement** is therefore narrow: log the suite the first handshake negotiated, the
+suite the store recorded, and the binder length we send, then compare. If the first handshake
+negotiated a SHA-384 suite while our hello's preferred suite is SHA-256, that is the whole bug and
+it is a two-line fix.
+
+Three cycles have produced no working resumption, and this entry says so plainly. What they
+produced instead is a short list of ruled-out causes, each with the evidence that removed it — the
+opposite of the cycle that produced a hypothesis and called it progress.
+
+1150 tests pass, 9 skipped, clippy clean. The offer remains off.
