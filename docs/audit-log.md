@@ -7826,3 +7826,24 @@ has to be a real server accepting the resumption — which is why the next step 
 unit tests.
 
 Not wired yet: `connect` still computes its early secret with no PSK. 1146 tests pass.
+
+### C2.4 — the greeting offers a ticket; two silent bugs found by its own tests
+
+`psk_key_exchange_modes` and `pre_shared_key` (last, as RFC 8446 §4.2.11 requires) are in the
+ClientHello, and the function reports the two offsets the binder needs.
+
+**Both bugs in this one function were the silent kind:**
+
+| bug | how it would have failed |
+|---|---|
+| offsets computed by arithmetic on field sizes | off by two bytes; the truncation probe caught it immediately (`left: 11892, right: 33`) |
+| binders vector declared `2 + binder.len()` instead of `1 + binder.len()` | the shape of the *identities* field above it, copied by accident — a server rejects it without saying why |
+
+The second one is the pattern of this whole gap: correct-looking code, no error, no resumption.
+The offsets are now found by **walking the finished hello**, so the layout has one implementation
+rather than two that can disagree.
+
+Three structural tests: `pre_shared_key` is last and the extension list is exactly consumed; the
+truncation point lands on the binders list; the handshake length covers the binder.
+
+Still not wired: `connect` computes its early secret without a PSK. 1149 tests pass.
