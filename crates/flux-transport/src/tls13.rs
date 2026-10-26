@@ -50,6 +50,8 @@ pub(crate) const HS_CERTIFICATE_VERIFY: u8 = 15;
 pub(crate) const HS_FINISHED: u8 = 20;
 #[allow(dead_code)]
 pub(crate) const HS_KEY_UPDATE: u8 = 24;
+/// `NewSessionTicket` (RFC 8446 §4.6.1), sent after the handshake.
+pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
 #[allow(dead_code)]
 pub(crate) const MAX_TLS_RECORD: usize = 16384;
 
@@ -467,10 +469,8 @@ pub struct Tls13Stream<S> {
     ///
     /// Read by the ticket store, which lands in the next cycle; the secret is captured now
     /// because it is only computable during the handshake.
-    #[allow(dead_code)]
     pub(crate) resumption_master_secret: Option<Vec<u8>>,
     /// The name this connection was made to, used to key stored tickets.
-    #[allow(dead_code)]
     pub(crate) server_name: String,
     pub(crate) closed: bool,
 }
@@ -575,6 +575,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Tls13Stream<S> {
                             ]) as usize;
                             if pos + 4 + mlen > plain.len() {
                                 break;
+                            }
+                            if mtype == HS_NEW_SESSION_TICKET {
+                                // The ticket store consumes the resumption secret captured at
+                                // the end of the handshake; without it a ticket is undecodable.
+                                if let Some(rms) = &self.resumption_master_secret {
+                                    match crate::resumption::parse_ticket(
+                                        &plain[pos..pos + 4 + mlen],
+                                        rms,
+                                        self.suite,
+                                    ) {
+                                        Ok(ticket) => {
+                                            crate::resumption::put(&self.server_name, ticket)
+                                        }
+                                        Err(e) => {
+                                            // A malformed ticket costs a resumption, not the
+                                            // connection: the stream keeps working.
+                                            tracing::debug!(
+                                                "ignoring an unusable session ticket: {e}"
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             if mtype == HS_KEY_UPDATE && mlen >= 1 {
                                 self.read_state.update().map_err(|e| {
@@ -1843,13 +1865,18 @@ mod connect_tests {
     /// A CA and a leaf it signed for `localhost`, as a rustls server acceptor plus the PEM the
     /// client will trust.
     fn server_and_ca() -> (tokio_rustls::TlsAcceptor, String) {
+        server_for("localhost")
+    }
+
+    /// The same, for a chosen name — a ticket store keyed by name needs a name to key on.
+    pub(super) fn server_for(name: &str) -> (tokio_rustls::TlsAcceptor, String) {
         use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
         let ca_key = KeyPair::generate().expect("ca key");
         let mut ca_params = CertificateParams::new(vec![]).expect("ca params");
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         let ca = ca_params.self_signed(&ca_key).expect("ca");
         let leaf_key = KeyPair::generate().expect("leaf key");
-        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).expect("leaf");
+        let leaf_params = CertificateParams::new(vec![name.to_string()]).expect("leaf");
         let leaf = leaf_params
             .signed_by(&leaf_key, &ca, &ca_key)
             .expect("leaf");
@@ -2267,5 +2294,47 @@ mod tls12_trigger_tests {
         let mut buf = [0u8; 4];
         client.read_exact(&mut buf).await.expect("read");
         assert_eq!(&buf, b"hi12");
+    }
+}
+
+#[cfg(test)]
+mod ticket_store_tests {
+    use crate::tls13::*;
+    use tokio::io::AsyncReadExt;
+
+    /// A real handshake with a real TLS 1.3 server must end with a ticket in the store — that is
+    /// the whole point of parsing `NewSessionTicket`, and a store that is never filled looks
+    /// exactly like a server that does not issue tickets.
+    #[tokio::test]
+    async fn a_real_handshake_stores_a_ticket() {
+        crate::resumption::clear();
+        crate::tls::init_crypto_provider();
+        let name = "ticketstore.test";
+        let (acceptor, ca_pem) = connect_tests::server_for(name);
+        let (client_raw, server_raw) = tokio::io::duplex(256 * 1024);
+        tokio::spawn(async move {
+            if let Ok(mut srv) = acceptor.accept(server_raw).await {
+                let mut b = [0u8; 1];
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), srv.read(&mut b)).await;
+            }
+        });
+        let mut trust = verify::TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = ClientHelloConfig {
+            server_name: name,
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut client = connect(client_raw, &cfg).await.expect("handshake");
+        let mut buf = [0u8; 64];
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut buf)).await;
+        assert!(
+            crate::resumption::get(name).is_some(),
+            "a TLS 1.3 server issues tickets; the store must have one"
+        );
+        crate::resumption::clear();
     }
 }

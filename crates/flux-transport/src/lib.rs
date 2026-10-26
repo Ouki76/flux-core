@@ -32,6 +32,7 @@ pub mod quic_obfs;
 /// REALITY: TLS that cannot be attributed to this server.
 pub mod reality;
 
+mod resumption;
 /// ShadowTLS: a TLS handshake forwarded to a real site, then hijacked.
 pub mod shadowtls;
 /// The TCP carrier.
