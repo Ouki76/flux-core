@@ -7731,3 +7731,21 @@ entry: **verify the plumbing before interpreting the failure.**
 
 Rustls stays available as an explicit choice (`native_tls: false`) but is no longer the fallback:
 a 1.2-only server is served by our client through the dial retry.
+
+### C1.13 — both real binaries, pinned to 1.2
+
+Same client, same driver, two servers, each pinned to TLS 1.2 by its own configuration key
+(`minVersion`/`maxVersion` for Xray, `min_version`/`max_version` for sing-box):
+
+| server | listens | result |
+|---|---|---|
+| Xray 26.3.27 | 19971 | `итого 50000 байт` |
+| sing-box 1.1.4 | 19975 | `получено ... всего 50000` |
+
+Both carry the full payload back through the tunnel with our handshake. Together with the rustls
+2.1 MB unit test, the TLS 1.2 client is now verified against three independent implementations —
+which is what the objective asked for, and the reason it asked for it: a handshake that only works
+against the implementation you wrote it against is not verified, it is rehearsed.
+
+The listener table is printed before every transfer now. It is three lines and it would have saved
+six cycles.
