@@ -929,6 +929,8 @@ impl Tls13Client {
             resumption_master_secret: None,
             server_name: String::new(),
             resumed: false,
+            debug_master_secret: None,
+            debug_hash_before_cf: None,
             closed: false,
         };
         if !verified {
@@ -1510,6 +1512,8 @@ impl Tls13Server {
             resumption_master_secret: None,
             server_name: String::new(),
             resumed: false,
+            debug_master_secret: None,
+            debug_hash_before_cf: None,
             closed: false,
         })
     }

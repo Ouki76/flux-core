@@ -484,6 +484,13 @@ pub struct Tls13Stream<S> {
     /// resumption tests and, once the offer is enabled, by the metrics that justify it.
     #[allow(dead_code)]
     pub(crate) resumed: bool,
+    /// Intermediates kept for the resumption diagnostics: the master secret and the transcript
+    /// hash with and without the client Finished. A PSK that does not match the server's is a
+    /// difference in one of these three, and nothing else can tell them apart.
+    #[allow(dead_code)]
+    pub(crate) debug_master_secret: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    pub(crate) debug_hash_before_cf: Option<Vec<u8>>,
     pub(crate) closed: bool,
 }
 
@@ -1797,6 +1804,7 @@ where
     // RFC 8446 §7.1: the resumption master secret covers the transcript through the **client's**
     // Finished. Leaving it out produces a PSK that differs from the server's by one hash, which a
     // server answers with `decrypt_error` — a binder problem that is really a transcript problem.
+    let hash_before_cf = suite.hash(&transcript);
     transcript.extend_from_slice(&fin_msg);
 
     let _ = alpn;
@@ -1825,6 +1833,8 @@ where
         )?),
         server_name: cfg.server_name.to_string(),
         resumed: server_selected_psk,
+        debug_master_secret: Some(master_secret.clone()),
+        debug_hash_before_cf: Some(hash_before_cf),
         closed: false,
     })
 }
