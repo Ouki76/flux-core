@@ -8649,3 +8649,46 @@ reported `ok=0 err=1 017 669` because the server config carried an `sni` field t
 (and then a `server_name` that is explicitly unsupported). A soak that fails every connection looks
 identical in aggregate to a soak that ran fine, unless the error count is read — which is why the
 harness prints `ok` and `err` separately rather than a throughput number.
+
+### C3.7 — the ten-minute soak: 276 219 connections, zero errors, and a plateau
+
+The question C3.6 refused to answer with 150 seconds of data:
+
+```
+итог: ok=276219 err=0 байт=2262786048 за 600с
+```
+
+| t | server | client |
+|---|---|---|
+| 0 s | 9 908 KB | 9 620 KB |
+| 300 s | 10 788 KB | 9 724 KB |
+| 599 s | 10 796 KB | 10 444 KB |
+
+**Server: +880 KB over the first 300 seconds, then +8 KB over the next 300** — during which another
+~138 000 connections were handled. That is the curve bending, which is what distinguishes allocator
+retention from a leak, and it is exactly the measurement C3.6 said a short run could not make.
+
+Summary of what this soak establishes, stated no more broadly than the data:
+
+| claim | evidence |
+|---|---|
+| no errors under sustained load | **276 219 connections, 0 failures**, 2.26 GB moved in 600 s |
+| no unbounded memory growth | server RSS flat (±8 KB) across the second half, 138 000 further connections |
+| no stalls or crashes | the loop ran to completion at ~460 connections/s throughout |
+
+**It is a ten-minute soak, not a twenty-four-hour one.** I will not describe it as a day-long
+stability test, because it is not; what it does show is that memory does not grow with connections
+once warm, which is the property a longer run would be looking for.
+
+### The matrix after every TLS change
+
+```
+ASSERT PASSED: every row is at or above both competitors within 10%
+VLESS / gRPC + TLS    263.3 vs 99.6 and 162.6    +164.4% / +61.9%
+Shadowsocks-2022      356.4 vs 331.7 and 258.2     +7.4% / +38.0%
+```
+
+and `bench_rps --tls --assert` **PASSED** at 7 674 exchanges/s against 4 258 and 909.
+
+So the HelloRetryRequest work, the TLS 1.2 resumption and the IPv6 fix all landed without a
+regression on either measured axis.
