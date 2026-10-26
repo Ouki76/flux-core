@@ -8205,3 +8205,43 @@ input bytes differ, not the formula.
 
 This is where the next cycle starts, and it starts with three candidate values rather than a
 theory — which is the only kind of step this gap has responded to.
+
+### C2.14 — what the key log can and cannot show
+
+Checked whether rustls' `KeyLog` could settle the rms comparison directly: `derive_logged_secret`
+(`tls13/key_schedule.rs:697`) logs every `SecretKind` that has a `log_label()`. The traffic secrets
+do; **the resumption master secret is derived by `ks.derive()` and is not logged**. So the one value
+in question is the one the reference implementation does not publish.
+
+That leaves the comparison requiring either a patched dependency — not acceptable — or a
+reconstruction. And the reconstruction is blocked by a contradiction worth stating plainly:
+
+1. the transcript through the **server** Finished is provably correct, because both Finished
+   messages verify;
+2. our transcript after the client Finished appends the exact bytes we sent, which the server also
+   appended;
+3. therefore our rms input should equal rustls's;
+4. yet neither our PSK nor our rms appears in the value the server stored.
+
+**Something in that chain is false, and I do not yet know which link.** The two candidates are that
+the value the server stores is neither the PSK nor the rms (a third thing I have assumed away), and
+that our `master_secret` differs despite the traffic keys working — the latter would only be
+possible if the app keys are derived from a different variable than I think.
+
+**Next cycle, concretely:** print rustls' logged `CLIENT_TRAFFIC_SECRET_0` for the same connection
+and compare it with our `c_ap`. That costs nothing — the key log is public API — and it either
+confirms our master secret chain end to end or breaks it, which is the difference between chasing
+the transcript and chasing the key schedule.
+
+### Honest position after fourteen cycles on this gap
+
+| item | state |
+|---|---|
+| TLS 1.2 gap | closed, verified against three implementations |
+| resumption mechanism | complete: tickets, store, expiry, PSK, binder, greeting |
+| resumption enabled | **no** — rejected with `decrypt_error`, and the difference is one value |
+| bugs found | 4 |
+| tests | 1152 pass, 9 skipped, clippy clean |
+
+The offer stays off, and the binary is unaffected by any of this: a user who does not enable it gets
+the same TLS 1.3 handshake as before this work started.
