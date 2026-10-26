@@ -8281,3 +8281,55 @@ questions at once, and no amount of my own arithmetic could have.
 The rule that keeps proving true in this project: **compare against the reference implementation's
 output, not against your own consistency.** Every cycle where I did the second cost three; every
 cycle where I did the first moved the work forward.
+
+### C2.16 — resumption works: three defects, and the label that had a space in it
+
+Six cycles of `decrypt_error`, and the cause was **one character**:
+
+```rust
+// rustls, tls13/key_schedule.rs:1016
+ResumptionMasterSecret => b"res master",
+```
+
+RFC 8446 §7.1 spells the label **`"res master"`**. We had `"resmaster"`. A secret derived under a
+one-character-off label is internally consistent, passes every test written against ourselves, and
+is rejected by every real implementation — which is precisely what `decrypt_error` had been saying
+since C2.5.
+
+Two more defects were stacked behind it, and each only became visible once the one before it was
+fixed:
+
+| order | defect | how it showed |
+|---|---|---|
+| 1 | `"resmaster"` → `"res master"` | PSK finally equals the secret the server stored (`MATCH: rms+nonce`) |
+| 2 | binder key needs `HKDF-Expand-Label(key, "finished", "")` before the HMAC | alert cleared; server accepted the binder |
+| 3 | a resumption sends no certificate, and we demanded one | second handshake completed |
+
+Verification, in the order it arrived:
+
+| check | result |
+|---|---|
+| our PSK vs the server's stored secret | **identical** |
+| second handshake | **`resumed == true`** |
+| unrecognised ticket | full handshake, connection succeeds |
+| suite | **1154 pass, 0 failed**, 8 skipped, clippy clean |
+
+### What actually found it
+
+Not reasoning, and not any of my own instruments. Three things did:
+
+1. **Python parsing our greeting** — found the duplicate extension (C2.9);
+2. **rustls's `KeyLog`** — proved the master secret and transcript identical in one comparison
+   (C2.15), which left exactly one value unexplained;
+3. **`SecretKind::label()` in rustls's source** — showed the space.
+
+Each of those is the same move: **compare against the reference implementation's output**, never
+against my own consistency. Every cycle where I did the second cost three; every cycle where I did
+the first moved the work.
+
+### The gap is closed
+
+`PSK_OFFER_ENABLED` is `true`. A repeat connection to a server that issued a ticket no longer pays
+for a full handshake: no certificate flight, no CertificateVerify, and — measurably — fewer bytes
+and less CPU per connection. The one thing left is to measure that on the connection-rate axis and
+record the number, which is the next cycle.
