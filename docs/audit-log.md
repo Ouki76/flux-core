@@ -9517,3 +9517,45 @@ copied VLESS path is two orders of magnitude**, and it means making the splice p
 wrapped protocols (TLS, XHTTP, WS, gRPC) is worth far more work than this audit previously said.
 
 That is the concrete next optimisation, and it now has a number behind it rather than a hypothesis.
+
+### C6.2 — the instruction profile is complete: TCP, TLS and UDP
+
+The TLS leg, measured the same way (`perf stat` with the relay as perf's child, a driver that does
+not spawn its own):
+
+```
+286.1 MiB in 1.00 s (285.6 MiB/s)
+1 401 207 482 instructions, 762 938 564 cycles, IPC 1.84
+```
+
+All three paths side by side, normalised per GiB:
+
+| path | instructions/GiB | cycles/GiB | seconds/GiB @3.1 GHz | IPC |
+|---|---|---|---|---|
+| **TCP, direct (splice)** | 27 M | 0.04 G | **0.013** | 0.65 |
+| **TLS, client** | 5.0 G | 2.73 G | **0.88** | **1.84** |
+| **UDP, SOCKS relay** | 11.6 G | 19.0 G | **6.13** | 0.61 |
+
+### What the three rows say
+
+1. **`splice` is not a 13% trick, it is a 68× difference.** 0.013 s/GiB against 0.88 for TLS and
+   6.13 for UDP. The earlier "13%" conclusion (C4.2) came from `/proc` numbers polluted by the relay
+   waiting on a slow driver — recorded as a correction in C6.1 and now quantified against two other
+   paths.
+2. **TLS costs 67× more than the spliced path and 7× less than UDP per byte.** Its IPC of 1.84 is
+   the highest of the three, which is the signature of AES-NI doing many bytes per instruction: the
+   cipher is efficient, there is simply a lot of it.
+3. **UDP is the most expensive path per byte by a wide margin — 437× the spliced path**, and its IPC
+   of 0.61 says the CPU is stalled rather than computing: syscall and cache-miss bound, exactly the
+   shape of one message per 1200 bytes.
+
+### The objective's second half is done
+
+| path | instructions | cycles | per GiB | per unit |
+|---|---|---|---|---|
+| TCP | ✓ | ✓ | ✓ | per byte |
+| TLS | ✓ | ✓ | ✓ | per byte |
+| UDP | ✓ | ✓ | ✓ | **per datagram**: 12 954 instructions, 21 229 cycles |
+
+These are the numbers the objective asked for, and they are reproducible with the scripts described
+above (`perf stat -e instructions,cycles -- <relay>`, load from a driver that only speaks SOCKS).
