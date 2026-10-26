@@ -76,6 +76,87 @@ where
     Ok(H2Stream::new_client_pending(send, response))
 }
 
+/// Client half of `stream-up`: an uploading POST and a downloading GET, joined into one stream.
+///
+/// Xray splits the directions in this mode. The upload is a POST whose body streams for the life of
+/// the session; the download is a separate GET answered as an event stream. Both carry the same
+/// `session` value — which is how the server pairs them — and both travel on one HTTP/2 connection.
+///
+/// The returned stream's receive half is **still pending** when this returns, which is what makes
+/// the mode work: a peer that answers the GET only after reading the POST would otherwise deadlock
+/// against a client that waits for the response before writing.
+pub async fn connect_stream_up<S>(
+    stream: S,
+    host: &str,
+    path: &str,
+    headers: &HashMap<String, String>,
+    xpadding: Option<&str>,
+) -> FluxResult<H2Stream>
+where
+    S: AsyncStream + 'static,
+{
+    let mut client = shared::client_handshake(stream, "xhttp").await?;
+    let session = session_id();
+    let url = format!(
+        "{base}?session={session}&x_padding={padding}",
+        base = normalize_path(path),
+        padding = padding_param(xpadding)
+    );
+    let build = |method: &'static str| -> FluxResult<Request<()>> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(url.as_str())
+            .header("Host", host)
+            .header("content-type", "application/octet-stream");
+        for (k, v) in headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        builder.body(()).map_err(|e| FluxError::Protocol {
+            protocol: "xhttp",
+            message: format!("failed to build the XHTTP {method} request: {e}"),
+        })
+    };
+    let (upload_response, upload) =
+        client
+            .send_request(build("POST")?, false)
+            .map_err(|e| FluxError::Protocol {
+                protocol: "xhttp",
+                message: format!("failed to send the XHTTP upload: {e}"),
+            })?;
+    // Awaiting, not dropping: dropping a `ResponseFuture` resets its stream.
+    tokio::spawn(async move {
+        let _ = upload_response.await;
+    });
+    let (download_response, _) =
+        client
+            .send_request(build("GET")?, true)
+            .map_err(|e| FluxError::Protocol {
+                protocol: "xhttp",
+                message: format!("failed to send the XHTTP download: {e}"),
+            })?;
+    Ok(H2Stream::new_client_split(upload, download_response))
+}
+
+/// A session identifier; opaque to Xray, 16 random bytes in hex.
+fn session_id() -> String {
+    use rand::RngCore;
+    let mut raw = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The value of a query parameter. Both values this transport reads are opaque ASCII.
+fn query_param(uri: &http::Uri, name: &str) -> Option<String> {
+    for pair in uri.query()?.split('&') {
+        if let Some((k, v)) = pair.split_once('=')
+            && k == name
+        {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
 /// Server half: accepts one bidirectional request and returns it as a stream.
 ///
 /// `path` is the configured base path. Anything under it is accepted, because the client
@@ -100,6 +181,65 @@ where
 
     let uri_path = request.uri().path().to_string();
     let under_base = is_under_base(path, &uri_path);
+    if let Some(session) = query_param(request.uri(), "session")
+        && request.method() == Method::POST
+        && under_base
+    {
+        let (download, mut download_respond) = match connection.accept().await {
+            Some(Ok(pair)) => pair,
+            _ => {
+                return Err(FluxError::Protocol {
+                    protocol: "xhttp",
+                    message: format!("the {session} upload closed before its download arrived"),
+                });
+            }
+        };
+        if download.method() != Method::GET
+            || query_param(download.uri(), "session").as_deref() != Some(session.as_str())
+        {
+            let refusal = Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(())
+                .expect("static refusal response");
+            let _ = download_respond.send_response(refusal, true);
+            shared::spawn_connection_driver(
+                connection,
+                Some(std::time::Duration::from_millis(250)),
+            );
+            return Err(FluxError::Protocol {
+                protocol: "xhttp",
+                message: format!("the download for session {session} did not match its upload"),
+            });
+        }
+        let recv: RecvStream = request.into_body();
+        let ack = Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .expect("static ack response");
+        let _ = respond.send_response(ack, true);
+        let body_type = if no_sse_header {
+            "application/octet-stream"
+        } else {
+            "text/event-stream"
+        };
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", body_type)
+            .body(())
+            .map_err(|e| FluxError::Protocol {
+                protocol: "xhttp",
+                message: format!("failed to build the XHTTP download response: {e}"),
+            })?;
+        let send: SendStream<Bytes> =
+            download_respond
+                .send_response(response, false)
+                .map_err(|e| FluxError::Protocol {
+                    protocol: "xhttp",
+                    message: format!("failed to send the XHTTP download response: {e}"),
+                })?;
+        shared::spawn_connection_driver(connection, None);
+        return Ok(H2Stream::new(send, recv));
+    }
 
     // Xray only ever uses POST for a streaming upload; anything else is not this
     // transport and gets a plain 404 rather than a stream that would never work.
@@ -548,5 +688,68 @@ mod two_stream_probe {
         assert_eq!(paths, ("/a".to_string(), "/b".to_string()));
         assert_eq!(statuses.0, StatusCode::OK);
         assert_eq!(statuses.1, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod stream_up_end_to_end {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// `connect_stream_up` against `accept`, over one real duplex socket.
+    ///
+    /// This is the test that failed before `H2Stream::new_client_split`: the client waited for the
+    /// download response before writing, the server waited for the upload before flushing it, and
+    /// the two deadlocked.
+    #[tokio::test]
+    async fn stream_up_moves_bytes_both_ways() {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut s = accept(server_io, "/tunnel", false)
+                .await
+                .expect("server must pair the session");
+            let mut buf = vec![0u8; 64];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf))
+                .await
+                .expect("server read timed out")
+                .expect("server read");
+            assert_eq!(&buf[..n], b"ping");
+            s.write_all(b"pong").await.expect("server write");
+            // `shutdown` ends the stream with END_STREAM. Dropping it instead sends RST_STREAM
+            // CANCEL, and the reader loses the bytes that were queued: the same cancel-on-drop
+            // that C7.4 recorded.
+            s.shutdown().await.expect("server shutdown");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut c =
+                connect_stream_up(client_io, "example.com", "/tunnel", &HashMap::new(), None)
+                    .await
+                    .expect("client stream-up");
+            c.write_all(b"ping").await.expect("client write");
+            c.flush().await.expect("client flush");
+            let mut buf = vec![0u8; 64];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), c.read(&mut buf))
+                .await
+                .expect("client read timed out")
+                .expect("client read");
+            assert_eq!(&buf[..n], b"pong");
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            server.await.expect("server task");
+            client.await.expect("client task");
+        })
+        .await
+        .expect("stream-up must move data in both directions");
+    }
+
+    #[test]
+    fn session_ids_are_unique_and_hex() {
+        let (a, b) = (session_id(), session_id());
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }

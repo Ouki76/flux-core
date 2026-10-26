@@ -34,6 +34,24 @@ impl H2Stream {
         }
     }
 
+    /// A client stream whose **send** half is already open and whose **receive** half is still a
+    /// pending response.
+    ///
+    /// This exists for transports that split the directions into two requests — XHTTP `stream-up`
+    /// and `packet-up` — where the upload is a POST whose body opens immediately and the download is
+    /// a separate GET whose response has not arrived yet. Awaiting that response before handing the
+    /// stream back would deadlock against a peer that answers the GET only after reading the POST:
+    /// each side would wait for the other. With a pending receive half the caller can write at once,
+    /// and the response resolves on the first read.
+    pub fn new_client_split(send: SendStream<Bytes>, download: h2::client::ResponseFuture) -> Self {
+        Self {
+            send,
+            recv: H2RecvState::Pending(download),
+            read_buf: Bytes::new(),
+            read_pos: 0,
+        }
+    }
+
     /// Builds a client stream whose request completes later.
     pub fn new_client_pending(
         send: SendStream<Bytes>,

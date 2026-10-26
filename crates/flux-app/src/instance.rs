@@ -1123,6 +1123,10 @@ fn compile_client_framings(
                     path,
                     headers,
                     xpadding: settings.xpadding_bytes.clone(),
+                    stream_up: matches!(
+                        settings.mode.as_deref(),
+                        Some("stream-up") | Some("streamup")
+                    ),
                 });
             }
             FramingConfig::WebSocket { path, headers } => {

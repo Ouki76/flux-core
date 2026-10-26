@@ -855,7 +855,8 @@ impl XhttpSettings {
     /// behaves nothing like their Xray setup.
     pub fn validate(&self, where_: &str) -> Result<(), String> {
         match self.mode.as_deref() {
-            None | Some("stream-one") | Some("streamone") => {}
+            None | Some("stream-one") | Some("streamone") | Some("stream-up")
+            | Some("streamup") => {}
             Some(other) => {
                 return Err(format!(
                     "{where_}: XHTTP mode '{other}' is not implemented — only 'stream-one' is; \
@@ -2841,11 +2842,15 @@ mod xhttp_settings_tests {
         assert!(parse(r#"{}"#).validate("test").is_ok());
     }
 
-    /// Every other mode is refused with a message that names it — accepting it and quietly doing
-    /// stream-one would give a connection that behaves nothing like the user's Xray setup.
+    /// `stream-up` is implemented, so it must pass; the modes that are not must still be refused
+    /// with a message that names them.
     #[test]
     fn the_other_modes_are_refused_by_name() {
-        for mode in ["packet-up", "stream-up", "auto", "bogus"] {
+        assert!(
+            parse(r#"{"mode": "stream-up"}"#).validate("test").is_ok(),
+            "stream-up is implemented and must be accepted"
+        );
+        for mode in ["packet-up", "auto", "bogus"] {
             let err = parse(&format!(r#"{{"mode": "{mode}"}}"#))
                 .validate("outbound xhttp")
                 .expect_err("must be refused")
