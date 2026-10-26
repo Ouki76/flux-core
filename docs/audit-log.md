@@ -9763,3 +9763,32 @@ The difference between the two is now small and specific: the wrapper's `H2Strea
 relative to answering the POST. That is where the next attempt starts — not from scratch.
 
 **Everything reverted**, including the config relaxation. `stream-up` is still refused by name.
+
+### C7.5 — the fault is localised: the upload never arrives
+
+C7.4 narrowed the `stream-up` failure to three places. This cycle eliminated two of them.
+
+`connect_stream_up` was tested against a **hand-written h2 server** that does exactly what `accept`
+intends (accept POST, accept GET, read the upload body, answer the download). The result:
+
+```
+up timeout: Elapsed(())                 ← the server never received the upload
+client: Protocol { "the XHTTP download was refused: stream closed because of a broken pipe" }
+```
+
+**The pairing works and the download response is built; what fails is that the client's write never
+reaches the server.** The upload body times out at 5 s with the connection still open — so this is not
+a reset (C7.4's cause), not a pairing mismatch, and not a path-normalisation problem. All three of
+C7.4's suspects are cleared except one: **the write path of `H2Stream` on a joined stream.**
+
+That is now the single thing to examine: `H2Stream::new(upload, recv)` holds a raw `SendStream`, and
+`write_all` on it returns `Ok` while nothing arrives — which means the data is being accepted above
+the point where it must be queued to the connection, or the send is waiting on a state that the
+absence of a response future never satisfies.
+
+**Reverted**; `stream-up` remains refused by name. The next attempt should start at `H2Stream`'s
+`poll_write` and ask where the `SendStream` it holds came from — the wrapper's own constructor, not
+the pairing.
+
+Progress across five cycles: substrate proved → one real bug found (`ResponseFuture` drop resets the
+stream) → pairing proved by a passing hand-written test → fault localised to the client's write path.
