@@ -8614,3 +8614,38 @@ costs three cycles when it is not written down.
 
 **Reproduce:** `bash /tmp/r12.sh` in this session's environment — Xray on TLS 1.2, two flux
 connections, then `grep "session stored"`.
+
+### C3.6 — soak: 73 278 connections, zero errors, and one number I will not overclaim
+
+Two runs of the real binary pair over TLS 1.3 with resumption enabled, 8 KiB per connection:
+
+| run | connections | errors | bytes | duration |
+|---|---|---|---|---|
+| 1 | 55 556 | **0** | 455 MB | 120 s |
+| 2 | 73 278 | **0** | 600 MB | 150 s |
+
+That is ~490 connections per second sustained, each one a full SOCKS request, a TLS handshake
+(mostly resumed), 8 KiB echoed back, and a clean close.
+
+**Memory, stated exactly as measured:**
+
+| process | start | end | change |
+|---|---|---|---|
+| server | 10 116 KB | 11 000 KB | +884 KB |
+| client | 10 316 KB | 11 252 KB | +936 KB |
+
+~900 KB per process over 73 278 connections, about 13 bytes per connection. **I am not calling
+this a leak and I am not calling it flat.** Thirteen bytes per connection is what allocator
+retention looks like after a warm-up, and it is also what a small per-connection leak looks like;
+telling them apart needs a run long enough to see the curve bend, which a 150-second soak cannot
+show.
+
+**What the soak does establish:** no errors, no stalls, no growth in file descriptors, no crash —
+over a quarter of a million bytes of traffic per second for two and a half minutes. That is a
+narrower claim than "stable for a day" and it is the one the data supports.
+
+**Two failed attempts first**, recorded because they are the same lesson as C1.12: the first soak
+reported `ok=0 err=1 017 669` because the server config carried an `sni` field that does not exist
+(and then a `server_name` that is explicitly unsupported). A soak that fails every connection looks
+identical in aggregate to a soak that ran fine, unless the error count is read — which is why the
+harness prints `ok` and `err` separately rather than a throughput number.
