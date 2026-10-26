@@ -112,6 +112,13 @@ pub(crate) fn parse_ticket(msg: &[u8], rms: &[u8], suite: Tls13Suite) -> FluxRes
     }
 
     let psk = suite.hkdf_expand_label(rms, "resumption", nonce, suite.hash_len())?;
+    tracing::trace!(
+        "ticket: suite {:?} nonce {} rms {} psk {}",
+        suite,
+        nonce.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        rms.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        psk.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+    );
     Ok(StoredTicket {
         psk,
         ticket,
