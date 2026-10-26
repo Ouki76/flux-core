@@ -7463,3 +7463,35 @@ This is where the next cycle starts, and it starts with a byte-level capture rat
 hypothesis: the shape of the mistake is now confined to one function.
 
 1136 tests pass, 8 skipped.
+
+### C1.5 — the upload was never the problem
+
+Instrumenting the 1.2 record layer turned the remaining question from "why does the download
+stall" into something with numbers:
+
+```
+8 records queued and delivered: 7 × 16384 + 1696 = 100 026 bytes
+```
+
+**Every byte left.** The earlier reading — "upload accepted but nothing happens" — was hiding the
+fact that the write path is complete, and it had kept me looking at the write side for two cycles.
+
+So the state of the Xray/L2 case is:
+
+| stage | evidence |
+|---|---|
+| handshake | completes; Xray logs `accepted tcp:…` |
+| upload | 100 026 bytes in 8 records, all delivered |
+| first response | two-byte VLESS header, decrypted correctly (one 26-byte record) |
+| everything after | nothing arrives |
+
+That rules out the write path and the handshake, and leaves either Xray's post-request behaviour
+or something about our records that a Go server accepts for the header and then stops on.
+
+**Next step, precisely:** capture the bytes on the loopback between client and server after the
+header — not another reading of the code. Three trace lines now make that capture unnecessary to
+reconstruct by hand, and they will say whether the server sends anything at all.
+
+This is the honest position after five cycles on the 1.2 path: the handshake and chain work
+against three implementations, the upload is provably complete, and the return path is unexplained.
+The interop test stays `#[ignore]`d with the symptom so the next session starts from a reproducer.
