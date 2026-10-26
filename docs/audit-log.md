@@ -7967,3 +7967,34 @@ produced instead is a short list of ruled-out causes, each with the evidence tha
 opposite of the cycle that produced a hypothesis and called it progress.
 
 1150 tests pass, 9 skipped, clippy clean. The offer remains off.
+
+### C2.8 — the alert has a name, and it contradicts our own parser
+
+rustls `server/tls13.rs:250-257`:
+
+```rust
+if !client_hello.check_psk_ext_is_last() {
+    return Err(cx.common.send_fatal_alert(
+        AlertDescription::IllegalParameter,
+        PeerMisbehaved::PskExtensionMustBeLast,
+    ));
+}
+```
+
+and the check itself, `msgs/handshake.rs:1111`:
+
+```rust
+pub(crate) fn check_psk_ext_is_last(&self) -> bool {
+    self.extensions.last().is_some_and(|ext| ext.ext_type() == ExtensionType::PreSharedKey)
+}
+```
+
+So the alert means exactly one thing: **the last extension rustls parsed is not `pre_shared_key`**.
+
+Our independent walk (C2.7) says it is last, and that the extension list consumes exactly the message. **The two parsers disagree about the same bytes — and that disagreement is the bug.** Either our walk is wrong in the same way our builder is (both mine, so a shared blind spot is entirely possible), or rustls parses an extension *length* differently and swallows `pre_shared_key` into the extension before it.
+
+**The next measurement is now trivial to specify and impossible to fudge:** run our hello through rustls's own `ClientHelloPayload` deserializer inside a test — rustls is already a dependency — and assert that the parsed list's last element is `PreSharedKey`. If rustls's parser disagrees with my walker, the *difference between the two parsers* is the defect, located exactly.
+
+This is the third time in this project that the fix was to stop using my own instrument to check my own code (C1.12: a harness bug that reproduced a TLS symptom; C2.7: a walker that only proves self-consistency). The pattern is worth naming in one place: **a measurement produced by the same implementation it measures proves nothing.**
+
+Four cycles on resumption, no working resumption, and the offer stays off. What has been bought: the alert is named, its exact source is quoted, and the remaining question has a single-sentence test attached to it.
