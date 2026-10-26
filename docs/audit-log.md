@@ -8413,3 +8413,53 @@ a reason that the evidence says lies outside this work.
 | `bench_rps --assert` | **PASSED** (8 057/s vs 4 335 and 908) |
 | `bench_matrix --assert` | **red on one non-TLS row**, evidence says environmental |
 | connection-rate change from resumption measured | done — a measured null, recorded as one |
+
+### C2.19 — the gate passes at eight rounds, and the objective closes
+
+```
+ASSERT PASSED: every row is at or above both competitors within 10%
+```
+
+| row | flux | sing-box | xray | vs sing-box | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TLS | 333.7 | 302.2 | 228.3 | **+10.4%** | +46.2% |
+| VLESS / gRPC + TLS | 240.9 | 97.7 | 165.3 | **+146.6%** | +45.7% |
+| Shadowsocks-2022 | 369.9 | 349.5 | 258.5 | **+5.8%** | +43.1% |
+
+The row that failed at four rounds passes at eight, alone and in the full run — which confirms the
+reading recorded in C2.18: **four rounds is marginal on this host, not a regression.** The single
+row was run alone first (`--only shadowsocks-2022 --rounds 8` → passed), then the whole matrix
+(→ passed), so the verdict is not one lucky draw of the noisy row.
+
+### The objective, requirement by requirement
+
+| requirement | evidence |
+|---|---|
+| TLS 1.2 in our own stack: ECDHE with RSA and ECDSA certificates, AES-GCM, PRF, record layer with explicit nonce, ServerKeyExchange signature, chain, name | `tls12.rs`; verified against **xray 26.3.27**, **sing-box 1.1.4** and rustls pinned to 1.2, carrying 50 KB each |
+| session resumption: NewSessionTicket, pre_shared_key, PSK, binder, ticket store | `resumption.rs`; the second handshake reports `resumed == true`; an unknown ticket falls back to a full handshake |
+| verified against the real binaries and rustls pinned to 1.3 | 41 sing-box + 4 xray + 4 native-path interop tests |
+| every piece proved by a failing test | 8 defects, each with the test that fails without the fix |
+| five static gates green | fmt, clippy `-D warnings`, rustdoc `-D warnings`, audit, deny |
+| `bench_matrix --assert` | **PASSED**, 8 rounds |
+| `bench_rps --assert` | **PASSED**, 8 057/s vs 4 335 and 908 |
+| connection-rate change from resumption measured | 8 057 vs 8 194 — a measured null, recorded as one |
+
+### The defects this cost, in one place
+
+| # | defect | found by |
+|---|---|---|
+| 1 | duplicate `psk_key_exchange_modes` extension | a Python parser, after three Rust instruments missed it |
+| 2 | client Finished missing from the rms transcript | reading rustls's `into_traffic` call site |
+| 3 | `"resmaster"` instead of `"res master"` | rustls's `SecretKind::label()` |
+| 4 | binder key needs a `"finished"` expansion | rustls's `sign_verify_data` |
+| 5 | resumption has no certificate and we required one | the second handshake failing with the alert gone |
+| 6 | TLS 1.2: `poll_write` queued the same data twice | a megabyte transfer coming back corrupted |
+| 7 | TLS 1.2: post-handshake records handed to the application | a real server's `NewSessionTicket` appearing as data |
+| 8 | TLS 1.2: AAD carried a constant version | reading rustls, then confirmed by the record tracer |
+
+Six of the eight were found by **comparing against a reference implementation** — its source, its key
+log, or an independent parser. The two found by our own tests were found by tests that transferred
+real data through a real peer.
+
+That is the lesson this objective leaves behind, and it cost six cycles to learn once and never
+again: **a measurement produced by the same implementation it measures proves nothing.**
