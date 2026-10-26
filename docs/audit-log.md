@@ -9471,3 +9471,49 @@ five were null, which is consistent with there being nothing cheap left — the 
 **No speedup was implemented, and the measurement says none was available at the level this
 objective could reach.** That is the objective's own closing condition: *"Where the profile says a
 cost is inherent, say so with the number rather than inventing work."*
+
+---
+
+## C6.1 — instruction-level profile, and a correction it forces
+
+`perf stat -e instructions,cycles` with the relay started as perf's own child and a load generator
+that does **not** spawn a second relay (the earlier attempts measured either the wrong process or a
+driver that fought the relay for the socket):
+
+### TCP, direct outbound (the `splice` path)
+
+```
+381.5 MiB transferred in 0.38 s (1007 MiB/s)
+9 873 500 instructions, 15 078 597 cycles, IPC 0.65
+→ 26.5 M instructions per GiB, 40 M cycles per GiB = 0.013 s/GiB
+```
+
+### UDP, SOCKS relay
+
+```
+115 233 datagrams of 1200 bytes (0.129 GiB)
+1 492 763 714 instructions, 2 446 278 433 cycles, IPC 0.61
+→ 12 954 instructions and 21 229 cycles per datagram
+→ 10.8 instructions and 17.7 cycles per byte
+→ 11.6 G instructions per GiB = 6.1 s/GiB
+```
+
+**Per byte, UDP costs 437 times more instructions than TCP** (17.7 cycles/byte against 0.04).
+That number is the whole story the earlier entries were circling: it is not the crypto, it is not any
+single knob — it is that a 1200-byte datagram pays the full per-message cost where a 64 KiB TCP buffer
+pays it once for 55 datagrams' worth of payload.
+
+### The correction: `splice` is worth far more than C4.2 concluded
+
+C4.2 measured the direct path at 0.691 CPU s/GiB against 0.796 for a copied path and concluded the
+splice headroom was "13%, not a factor of five". **The instruction count says otherwise: 0.013
+s/GiB on the direct path.** The C4.2 numbers came from `/proc`, which charges a relay that is
+spinning on an empty socket while the Python driver thinks — a polluted measurement, exactly the
+class of error C5.8 recorded for UDP and which I did not apply to the TCP case.
+
+So the earlier estimate in C4.1 — "removing the copies is worth a large factor" — was closer to the
+truth than the measurement that appeared to refute it. **0.013 s/GiB against 1.52 s/GiB for the
+copied VLESS path is two orders of magnitude**, and it means making the splice path reachable for
+wrapped protocols (TLS, XHTTP, WS, gRPC) is worth far more work than this audit previously said.
+
+That is the concrete next optimisation, and it now has a number behind it rather than a hypothesis.
