@@ -413,10 +413,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls12Stream<S> {
             match ctype {
                 0x14 => continue, // change_cipher_spec carries no application data
                 0x15 => {
+                    // The alert is encrypted like any other record; decrypting it turns "the
+                    // connection closed" into a reason, which is the difference between a
+                    // diagnosable failure and an afternoon.
                     this.closed = true;
+                    let (level, desc) =
+                        match this.read.open(ctype, [this.hdr[1], this.hdr[2]], &mut body) {
+                            Ok(n) if n >= 2 => (body[8], body[9]),
+                            _ => (0, 0),
+                        };
+                    let name = match desc {
+                        20 => "bad_record_mac",
+                        40 => "handshake_failure",
+                        47 => "illegal_parameter",
+                        50 => "decode_error",
+                        51 => "decrypt_error",
+                        70 => "protocol_version",
+                        80 => "internal_error",
+                        90 => "user_canceled",
+                        100 => "no_renegotiation",
+                        _ => "unrecognised",
+                    };
                     return Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "TLS 1.2 alert received",
+                        format!(
+                            "TLS 1.2 alert from the server: {name} (level {level}, description {desc})"
+                        ),
                     )));
                 }
                 _ => {}
