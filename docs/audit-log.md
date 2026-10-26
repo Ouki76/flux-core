@@ -8083,3 +8083,46 @@ server-side storage.
 The offer stays off. Five cycles on resumption have produced three real bugs (duplicate extension,
 missing Finished, and the earlier identity-length shape) and no working resumption yet; the
 remaining distance is now a single secret.
+
+### C2.11 — four of five elements confirmed against rustls's own source
+
+Reading the client half of rustls settled the last structural question:
+
+```rust
+// client/tls13.rs:1455 — the comment above `into_traffic` says it all:
+key_schedule_pre_finished.into_traffic(cx.common, st.transcript.current_hash());
+```
+
+The resumption master secret is derived from the transcript hash **taken after the client Finished
+is sent** — which is precisely what C2.9 fixed. So the rms transcript is now right by rustls's own
+definition, not by my reading of the RFC.
+
+What is now confirmed identical to a reference implementation:
+
+| element | confirmed by |
+|---|---|
+| truncation point (257) | `encoding_for_binder_signing`, read from source |
+| what the hash covers | the whole handshake message including its header |
+| binder key | `KeyScheduleEarly::new(suite, psk)` then `"res binder"` |
+| rms transcript | the `into_traffic` call site |
+| PSK expansion | `hkdf_expand_label_block(expander, b"resumption", nonce)` — same as ours |
+
+**And it still does not verify.** Which means the difference is in a *value*, not a *procedure*: the
+rms itself, or the nonce we pair with the ticket we send.
+
+`parse_ticket` now logs all three inputs at `trace` — suite, nonce, rms — plus the derived PSK. The
+comparison against rustls's stored secret is the next measurement, and it is a print away rather
+than a hypothesis away.
+
+### The honest count, eleven cycles into resumption
+
+| what | state |
+|---|---|
+| ticket parsing, store, expiry, obfuscated age | done, 5 tests |
+| binder and PSK derivation | done, matches rustls source line for line |
+| greeting with the offer | done, structurally verified by an external parser |
+| offered to a real server | **rejected at the binder (`decrypt_error`)** |
+| bugs found on the way | 3 (duplicate extension, missing Finished, identity length shape) |
+
+The mechanism is complete and the offer is off. Nothing in production depends on an unproven path,
+and the next cycle has a concrete pair of values to compare instead of a theory.
