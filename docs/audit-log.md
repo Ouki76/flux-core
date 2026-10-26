@@ -7527,3 +7527,22 @@ Six cycles into the 1.2 path, and this is the honest position: everything up to 
 application record is verified against three independent implementations, the upload is counted by
 a third party rather than by our own logs, and the return path is still unexplained. The interop
 test stays `#[ignore]`d with the symptom.
+
+### C1.7 — a cycle spent on tooling, and saying so
+
+Building a TCP relay that records the whole server-to-client stream was one task; getting it to
+run under this harness was another. The script works when run directly (`timeout` returned 124,
+meaning it was still listening as designed), but the background invocations inside the tool's
+shell died before writing their dump, so three attempts produced no data.
+
+This cycle produced **no new information about the TLS 1.2 return path**. What it produced is a
+working capture script and the knowledge that detached children do not survive the way the earlier
+`setsid` usage suggested.
+
+**The next cycle starts here**, with the relay and the client inside a single foreground command so
+the dump is written before the shell exits. The question it answers is narrow: are the 739 bytes
+after the handshake a fatal alert, or silence? An alert means the server rejected one of our
+application records; silence means it is waiting for something we never sent.
+
+Recorded rather than glossed: seven cycles into the 1.2 path, the handshake is verified against
+three implementations and the return path is still unexplained.
