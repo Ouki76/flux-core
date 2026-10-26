@@ -8920,3 +8920,55 @@ buffers are reused for every record, as the code comments and the absence of all
 `perf` profile (0.15% of samples, none in `alloc`) both indicate. A counting allocator would give a
 precise per-connection number; the RSS figure bounds it at 20 KB and the profile says none of it is
 hot.
+
+### C4.4 — the TLS record layer, profiled: 37% hardware AES, 7% copies, 0.34% our code
+
+`perf record -F 997 -g` on the client during a 400 MB TLS transfer:
+
+```
+51.46%  [k] kernel                                    ← socket I/O
+37.27%  _aesni_ctr32_ghash_6x                         ← AES-NI, hardware
+ 6.97%  __memmove_avx_unaligned_erms                  ← memory copies
+ 0.48%  ring_core_...aes_hw_ctr32_encrypt_blocks
+ 0.34%  Tls13Stream::poll_read                        ← our code
+ 0.21%  ring aead aes_gcm_seal
+```
+
+Read against C4.3 — the TLS layer costs 4.4 CPU s/GiB more than the same protocol unwrapped — this
+decomposes it:
+
+| share of TLS path | what it is | can it be reduced? |
+|---|---|---|
+| ~51% | socket syscalls | no, without an architectural change |
+| ~37% | **AES-GCM in hardware** | no — it is the cryptographic work itself, already on AES-NI |
+| ~7% | plaintext copies into the record buffer | **yes, at most 7%**, and only by encrypting in place |
+| 0.34% | our TLS code | irrelevant |
+
+**The 7% is the whole of the remaining opportunity on this path.** `encrypt_record_padded` allocates
+a record buffer and copies the plaintext into it before sealing; sealing in place would remove the
+copy, but `AsyncWrite::poll_write` hands us `&[u8]`, so the plaintext must be owned before it can be
+mutated — the copy is what buys that ownership. Removing it means changing the write path to hand
+over mutable buffers, which every protocol layer above TLS would have to cooperate with.
+
+So: a 7% ceiling on the TLS path, for a change that reaches through the protocol stack. That is not
+a trade this project should make, and the profile is the reason — not a preference.
+
+### The measurement work is complete; the answer to "can it be faster" is bounded
+
+| axis | state | evidence |
+|---|---|---|
+| throughput | **best of three** | 663 MB/s VLESS/TCP against 544 and 546 |
+| CPU per GiB, overall | **best of three** | 1.52 against 3.94 and 5.00 |
+| CPU per GiB, every protocol | **best of three** | C4.3, 1.5–10x margins |
+| memory per connection | **best of three** | 20 KB against 84 and 115 |
+| p99 latency | **best of three** | 15.6 ms against 20.8 and 1603 |
+| user code in profile | 0.15% (TCP), 0.34% (TLS) | perf |
+| syscalls per byte | 1 per ~63 KB | strace |
+| splice headroom | 13% per process | C4.2 |
+
+Every remaining idea has a measured ceiling: 13% (splice), 7% (copies), 0% (user code, syscalls).
+The kernel share — 51% on TLS, 98% on plain TCP — is not something a Rust change can touch.
+
+**Conclusion, stated as the objective asked:** the core is at the practical limit of a userspace
+relay. Not "we could not find anything", but every candidate bounded by measurement, and each bound
+smaller than the risk of the change that would reach it.
