@@ -7998,3 +7998,49 @@ Our independent walk (C2.7) says it is last, and that the extension list consume
 This is the third time in this project that the fix was to stop using my own instrument to check my own code (C1.12: a harness bug that reproduced a TLS symptom; C2.7: a walker that only proves self-consistency). The pattern is worth naming in one place: **a measurement produced by the same implementation it measures proves nothing.**
 
 Four cycles on resumption, no working resumption, and the offer stays off. What has been bought: the alert is named, its exact source is quoted, and the remaining question has a single-sentence test attached to it.
+
+### C2.9 — a Python parser broke the deadlock, and found two bugs
+
+Three cycles of Rust-side instruments could not see it. A 40-line Python parse of the same bytes
+printed the extension list and the answer was in it:
+
+```
+0x1a1a, 0x17, 0xff01, 0x0, 0x2b, 0xb, 0x23, 0xa, 0x33, 0xd, 0x2d, 0x2d, 0x29
+                                                            ^^^^^^ ^^^^^^
+```
+
+**`psk_key_exchange_modes` was in the list twice.** The base greeting already advertises it; the
+PSK path appended a second. A duplicate extension is a protocol violation and every implementation
+refuses it before it looks at the key schedule — which is exactly what `illegal_parameter` had been
+saying for three cycles. My walker could not see it because the walker was mine, and my reasoning
+could not see it because the reasoning was mine.
+
+**The second bug**, found while fixing the first: **the client's Finished was never appended to the
+transcript** from which the resumption master secret is derived. RFC 8446 §7.1 covers the
+transcript *through* the client Finished. Leaving it out produced a PSK one hash away from the
+server's — and it went unnoticed because nothing in the codebase read that secret until this cycle.
+
+Both fixed, both with tests that fail without them, and the walker now asserts that **no extension
+repeats** — the check that would have caught the first bug in C2.4 rather than C2.9.
+
+The alert moved:
+
+| before | after |
+|---|---|
+| `illegal_parameter` (extension list) | `decrypt_error` (binder stage) |
+
+So the greeting is now accepted and the remaining fault is in the PSK or binder arithmetic. The
+offer stays off until that verifies; a binder that fails is a failed connection on every reconnect,
+which is worse than no resumption.
+
+| cycle | outcome |
+|---|---|
+| C2.5 | wired, off — `illegal_parameter` |
+| C2.6 | ruled out the key schedule by reading rustls |
+| C2.7 | ruled out every length field, with my own walker |
+| C2.8 | named the alert, quoted its source |
+| **C2.9** | **found the cause: a duplicate extension, invisible to my own instruments** |
+
+The lesson, now with three instances in this project: **the instrument must not share code with the
+thing it measures.** A walker written by the same hand as the builder has the same blind spot, and
+the cheaper tool — forty lines of Python — did what three cycles of Rust could not.
