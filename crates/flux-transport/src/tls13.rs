@@ -1794,6 +1794,10 @@ where
         .await
         .map_err(flux_types::FluxError::Io)?;
     stream.flush().await.map_err(flux_types::FluxError::Io)?;
+    // RFC 8446 §7.1: the resumption master secret covers the transcript through the **client's**
+    // Finished. Leaving it out produces a PSK that differs from the server's by one hash, which a
+    // server answers with `decrypt_error` — a binder problem that is really a transcript problem.
+    transcript.extend_from_slice(&fin_msg);
 
     let _ = alpn;
     Ok(Tls13Stream {
@@ -2436,12 +2440,13 @@ pub(crate) fn build_client_hello_with_psk(
     let binder_len = ticket.suite.hash_len();
     let ids =
         crate::resumption::pre_shared_key_extension(ticket, &vec![0u8; binder_len], ticket.suite)?;
-    let modes = crate::resumption::psk_modes_extension();
 
-    let mut extra = Vec::with_capacity(4 + modes.len() + 4 + ids.len());
-    extra.extend_from_slice(&0x002du16.to_be_bytes());
-    extra.extend_from_slice(&(modes.len() as u16).to_be_bytes());
-    extra.extend_from_slice(&modes);
+    let mut extra = Vec::with_capacity(4 + ids.len());
+    // `psk_key_exchange_modes` is already in the base greeting; adding it again would duplicate
+    // an extension, which every TLS implementation refuses. This was the defect behind
+    // `illegal_parameter` for three cycles: the extension list read `0x2d, 0x2d, 0x29`.
+    // The base greeting already advertises `psk_key_exchange_modes`; adding it again would
+    // duplicate an extension, and every implementation refuses that outright.
     extra.extend_from_slice(&0x0029u16.to_be_bytes());
     extra.extend_from_slice(&(ids.len() as u16).to_be_bytes());
     extra.extend_from_slice(&ids);
@@ -2603,6 +2608,32 @@ mod psk_hello_tests {
             seen.iter().filter(|t| **t == 0x0029).count() == 1,
             "pre_shared_key must appear once"
         );
+        // No extension may repeat: a duplicate is a protocol violation that a server answers with
+        // an alert long before it looks at the PSK. This check is why the bug above is now caught
+        // here instead of costing another three cycles.
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            seen.len(),
+            "no extension may repeat: {seen:04x?}"
+        );
+    }
+
+    /// Prints the greeting as hex so an **external** parser can check it. The point is that the
+    /// checker must not share code with the thing it checks.
+    #[test]
+    fn print_psk_hello_for_external_parsing() {
+        let t = ticket();
+        let (hello, truncate_at, binder_at) =
+            build_client_hello_with_psk("example.test", &[], &[1u8; 32], &[2u8; 32], &t)
+                .expect("hello");
+        println!(
+            "HEX={}",
+            hello.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        println!("TRUNCATE={truncate_at} BINDER={binder_at}");
     }
 
     /// The handshake length must cover the binder, because the truncated hash keeps the lengths
@@ -2626,7 +2657,7 @@ mod resumption_tests {
     /// **The point of the whole gap:** the second connection to the same server must resume.
     /// A client that offers a ticket and is silently declined still completes a full handshake,
     /// so only the `resumed` flag proves the feature works.
-    #[ignore = "the offer is byte-correct but rustls answers illegal_parameter; see C2.5"]
+    #[ignore = "extension and transcript bugs fixed; the binder still mismatches (decrypt_error)"]
     #[tokio::test]
     async fn the_second_handshake_resumes() {
         crate::resumption::clear();
@@ -2684,7 +2715,6 @@ mod resumption_tests {
 
     /// A ticket the server does not recognise must not stop the connection: the handshake falls
     /// back to a full one, which is what every client does when a server has restarted.
-    #[ignore = "same open question as the_second_handshake_resumes; see C2.5"]
     #[tokio::test]
     async fn a_rejected_ticket_still_connects() {
         crate::resumption::clear();
