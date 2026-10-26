@@ -8366,3 +8366,50 @@ host produces at two rounds, which the log has recorded before. SS-2022 carries 
 cannot be affected by a TLS change; the number moving with the round count is the evidence.
 
 1154 tests pass, 8 skipped, fmt and clippy clean.
+
+### C2.18 — the one thing still red, with the evidence around it
+
+The definitive matrix run (4 rounds, 150 MB, `--assert 0.10`):
+
+```
+ASSERT FAILED (tolerance 10%):
+  Shadowsocks-2022 / blake3-aes-128-gcm vs sing-box: 340.0 < 387.0 MB/s (-12.1%)
+```
+
+Every TLS row is where it should be — `gRPC + TLS` at **+107.2%** against sing-box — and the failing
+row carries **no TLS at all**.
+
+| evidence | value |
+|---|---|
+| files changed by this objective | `tls.rs`, `tls12.rs`, `tls13.rs`, `resumption.rs`, `pipeline.rs`, `reality.rs`, `lib.rs` |
+| shadowsocks/obfs files changed | **none** |
+| flux SS-2022 across recent runs | 329.2, 338.2, 340.0 |
+| sing-box SS-2022 across the same runs | 332.0, 356.3, **387.0** |
+
+Our side is flat within 3%; the competitor's number swings by 17% between runs, and the assert fails
+exactly when it swings up. The honest conclusion is that this row is measuring the host's variance
+and the competitor's luck, not a regression — but **the assert is red, and I will not call the
+objective complete while it is**.
+
+**Next cycle, in order:**
+
+1. raise `--rounds` to 8 for the SS-2022 rows (the log has recorded before that two rounds are
+   undersampled and four are marginal on this host);
+2. if it still fails at eight rounds, run the same binary from before this objective (`31c3386`) and
+   compare that row directly — a regression would show as a drop in *our* number, and our number is
+   the one that has been flat.
+
+Until then: both gaps are closed and verified, 1154 tests pass, and one measurement gate is red for
+a reason that the evidence says lies outside this work.
+
+### Where this leaves the objective
+
+| requirement | state |
+|---|---|
+| TLS 1.2 in our own stack, verified on xray + sing-box + rustls | **done** |
+| TLS 1.3 resumption (PSK, tickets, store) | **done, enabled** |
+| every fix proved by a failing test | done — 7 defects, each with its test |
+| five static gates green | done |
+| `bench_rps --assert` | **PASSED** (8 057/s vs 4 335 and 908) |
+| `bench_matrix --assert` | **red on one non-TLS row**, evidence says environmental |
+| connection-rate change from resumption measured | done — a measured null, recorded as one |
