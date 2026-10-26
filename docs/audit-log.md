@@ -7645,3 +7645,39 @@ capture tool works when the pieces are alive, and the pieces do not survive the 
 
 The state of the code is unchanged and green: 1136 tests pass, 8 skipped, clippy clean, and the
 TLS 1.2 interop test remains `#[ignore]`d with its symptom.
+
+### C1.11 — three listeners up, and still `ECONNREFUSED`
+
+The one-script approach from C1.10 was implemented as a shell script that starts the echo server,
+Xray and the client in one process tree. For the first time the setup was verified rather than
+assumed:
+
+```
+слушает: 127.0.0.1:19973   flux SOCKS
+слушает: 127.0.0.1:19971   xray
+слушает: 127.0.0.1:17171   echo
+```
+
+All three up — and the client still reports:
+
+```
+[in] connection to 127.0.0.1:17171 failed: I/O error: Connection refused (os error 111)
+```
+
+That message names the **destination**, but the connection that was refused is not the destination:
+Xray dials 17171, which is listening. So the refused dial is one of the client's own — either to
+the node (19971, also listening) or the second attempt's re-dial.
+
+**This is the finding of the cycle, and it reframes the 1.2 symptom:** the error surfaced to the
+user names a connection the client never makes. Everything built on top of it — "the server
+rejects us", "the server is waiting" — rests on an error message that is mislabelled.
+
+**Next cycle starts here:** instrument `dial_with` to log the address it is dialling and the result
+of each attempt, and check whether the second attempt re-dials the node at all after the first
+attempt's alert. If the retry reuses a connection the first attempt already tore down, that alone
+explains a refused dial on a listening port — and it would mean the TLS 1.2 client has never
+actually been reached through the pipeline in these tests.
+
+Recorded plainly: eleven cycles in, the 1.2 path has a working handshake, a working upload against
+rustls, and a pipeline whose error reporting is proven to be misleading. The next measurement is a
+one-line log, not another architecture.
