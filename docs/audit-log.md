@@ -8245,3 +8245,39 @@ the transcript and chasing the key schedule.
 
 The offer stays off, and the binary is unaffected by any of this: a user who does not enable it gets
 the same TLS 1.3 handshake as before this work started.
+
+### C2.15 — the key log settles four suspects at once
+
+A `KeyLog` on the test server publishes what rustls derives, and our value is **byte-identical**:
+
+```
+reference c_ap: f2bc5dbc3797f01d3f951cac59f2b14f4ac89f9055d5c424e918ce07fd40bf1d
+our c_ap      : f2bc5dbc3797f01d3f951cac59f2b14f4ac89f9055d5c424e918ce07fd40bf1d
+```
+
+That is one comparison and four verdicts:
+
+| suspect | verdict |
+|---|---|
+| master secret | **identical** |
+| transcript hash through the server Finished | **identical** (the app keys derive from it) |
+| `HKDF-Expand-Label` implementation | **identical** |
+| cipher suite and hash choice | **identical** |
+
+`server/tls13.rs:1303` also settles what a ticket holds:
+`let secret = resumption.derive_ticket_psk(nonce);` — the PSK, not the rms. So C2.12 compared the
+right two values, and the earlier "132 bytes" question is closed.
+
+**What is left is one message:** the client Finished as it enters the transcript. Four bytes of
+header, 32 of verify data, and it is the only input to the resumption master secret that is not now
+proven against the reference.
+
+### The instrument that finally worked
+
+Three Rust-side instruments failed to see the duplicate extension; Python found it in one run.
+Here the opposite: a Rust `KeyLog` — the reference implementation's own output — settled five
+questions at once, and no amount of my own arithmetic could have.
+
+The rule that keeps proving true in this project: **compare against the reference implementation's
+output, not against your own consistency.** Every cycle where I did the second cost three; every
+cycle where I did the first moved the work forward.
