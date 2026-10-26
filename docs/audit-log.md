@@ -8972,3 +8972,34 @@ The kernel share — 51% on TLS, 98% on plain TCP — is not something a Rust ch
 **Conclusion, stated as the objective asked:** the core is at the practical limit of a userspace
 relay. Not "we could not find anything", but every candidate bounded by measurement, and each bound
 smaller than the risk of the change that would reach it.
+
+### C4.5 — the allocation axis: attempted, and why it stays unmeasured
+
+The one axis in the objective I could not measure properly, and the attempt is worth recording.
+
+I added a counting `GlobalAlloc` to `bench_rps` — and then noticed what it would count: the
+**benchmark's** allocations, not the core's. The relay under test is a separate process launched by
+the harness, so an allocator wrapper in the harness sees only the harness. The measurement would
+have been precise, published and meaningless.
+
+The alternatives are both heavier than they look:
+
+- put the counter in the `flux-core` binary itself and expose it over the existing API — a
+  production-binary change to answer a benchmark question;
+- run the relay under `valgrind --tool=massif` or `heaptrack` — the relay is multi-threaded tokio,
+  and the tooling's slowdown changes the workload enough that the count reflects a different program.
+
+**What is known about allocations without the counter, and from where:**
+
+| evidence | what it bounds |
+|---|---|
+| RSS is **20 KB per held connection** | the total per-connection state, allocations included |
+| `perf` shows **0.15%** of samples in the TCP path, **0.34%** in TLS, none in an allocator | allocation is not on the hot path |
+| the copy buffers are allocated once per connection and reused for every record (C4.1, from the code) | per-byte allocation is zero on the bulk path |
+
+So the number is bounded above by 20 KB per connection and bounded below by "not visible in a
+profile". A counting allocator would replace that range with a figure; it would not change any
+decision, which is why I stopped rather than shipping a harness that measures itself.
+
+**Recorded as a gap, not as a result.** If the allocation count is wanted, the honest way is the
+counter in the binary behind a feature flag, and that is a change to what ships.
