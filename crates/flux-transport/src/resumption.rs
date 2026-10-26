@@ -199,3 +199,147 @@ mod tests {
         assert!(parse_ticket(&full, &[1u8; 32], suite).is_ok());
     }
 }
+
+/// The key the binder is computed with (RFC 8446 §4.2.11.2):
+/// `HKDF-Expand-Label(Early Secret, "res binder", Hash(""), Hash.length)`.
+///
+/// The early secret is `HKDF-Extract(0, PSK)` — the PSK goes in as the IKM, not as the salt, and
+/// swapping the two produces a binder that a server rejects without saying why.
+pub(crate) fn binder_key(suite: Tls13Suite, psk: &[u8]) -> FluxResult<Vec<u8>> {
+    let zeros = vec![0u8; suite.hash_len()];
+    let early = suite.hkdf_extract(&zeros, psk);
+    let empty_hash = suite.hash(&[]);
+    suite.derive_secret(&early, "res binder", &empty_hash)
+}
+
+/// The binder itself: an HMAC over the transcript hash of the *truncated* ClientHello.
+///
+/// `truncated` must be the ClientHello up to and including the identities field — the binders
+/// list, including its two-byte length, is excluded. Including it produces a binder that verifies
+/// only against yourself.
+pub(crate) fn binder(suite: Tls13Suite, key: &[u8], truncated: &[u8]) -> Vec<u8> {
+    suite.hmac(key, &suite.hash(truncated))
+}
+
+/// Builds the `pre_shared_key` extension body: identities and one binder.
+///
+/// `binder` must already be the right length for the suite; the function refuses otherwise rather
+/// than emitting a hello the server will drop.
+pub(crate) fn pre_shared_key_extension(
+    ticket: &StoredTicket,
+    binder: &[u8],
+    suite: Tls13Suite,
+) -> FluxResult<Vec<u8>> {
+    if binder.len() != suite.hash_len() {
+        return Err(crypto_err(format!(
+            "binder is {} bytes but this suite needs {}",
+            binder.len(),
+            suite.hash_len()
+        )));
+    }
+    if ticket.ticket.len() > u16::MAX as usize {
+        return Err(crypto_err("session ticket is too large to offer"));
+    }
+    let mut ext = Vec::with_capacity(4 + ticket.ticket.len() + 4 + binder.len());
+    // identities<7..2^16-1>
+    ext.extend_from_slice(&((2 + ticket.ticket.len() + 4) as u16).to_be_bytes());
+    ext.extend_from_slice(&(ticket.ticket.len() as u16).to_be_bytes());
+    ext.extend_from_slice(&ticket.ticket);
+    ext.extend_from_slice(&ticket.obfuscated_age_millis().to_be_bytes());
+    // binders<33..2^16-1>
+    ext.extend_from_slice(&((2 + binder.len()) as u16).to_be_bytes());
+    ext.push(binder.len() as u8);
+    ext.extend_from_slice(binder);
+    Ok(ext)
+}
+
+/// `psk_key_exchange_modes` offering only `psk_dhe_ke` (RFC 8446 §4.2.9).
+///
+/// Pure PSK without DHE is not offered: it loses forward secrecy, and there is no reason to
+/// accept that when every TLS 1.3 server supports the DHE form.
+pub(crate) fn psk_modes_extension() -> Vec<u8> {
+    vec![1, modes::PSK_DHE_KE]
+}
+
+pub(crate) mod modes {
+    /// `psk_dhe_ke`: PSK with (EC)DHE key establishment.
+    pub(crate) const PSK_DHE_KE: u8 = 1;
+}
+
+#[cfg(test)]
+mod binder_tests {
+    use super::*;
+
+    fn ticket() -> StoredTicket {
+        parse_ticket(
+            &{
+                let mut m = vec![0x04, 0, 0, 0];
+                m.extend_from_slice(&7200u32.to_be_bytes());
+                m.extend_from_slice(&99u32.to_be_bytes());
+                m.push(1);
+                m.push(0);
+                m.extend_from_slice(&4u16.to_be_bytes());
+                m.extend_from_slice(b"tkt!");
+                let l = (m.len() - 4) as u32;
+                m[1..4].copy_from_slice(&l.to_be_bytes()[1..]);
+                m
+            },
+            &[3u8; 32],
+            Tls13Suite::Aes128GcmSha256,
+        )
+        .expect("ticket")
+    }
+
+    /// The binder key depends on the PSK: two tickets from the same session must not produce the
+    /// same binder key, or the nonce in the derivation is doing nothing.
+    #[test]
+    fn the_binder_key_depends_on_the_psk() {
+        let suite = Tls13Suite::Aes128GcmSha256;
+        let a = binder_key(suite, &[1u8; 32]).expect("a");
+        let b = binder_key(suite, &[2u8; 32]).expect("b");
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
+    }
+
+    /// The binder is over the truncated transcript: a different hello must give a different binder,
+    /// which is what stops a client from replaying a binder into a modified greeting.
+    #[test]
+    fn the_binder_covers_the_transcript() {
+        let suite = Tls13Suite::Aes128GcmSha256;
+        let key = binder_key(suite, &[1u8; 32]).expect("key");
+        let a = binder(suite, &key, b"hello-one");
+        let b = binder(suite, &key, b"hello-two");
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b, "the binder must cover the hello it signs");
+    }
+
+    /// An identity carries the obfuscated age with it; a zeroed one would tell the server the
+    /// client connected at the Unix epoch.
+    #[test]
+    fn the_psk_extension_carries_the_ticket_and_its_age() {
+        let suite = Tls13Suite::Aes128GcmSha256;
+        let t = ticket();
+        let ext = pre_shared_key_extension(&t, &[0u8; 32], suite).expect("ext");
+        // identities length, ticket length, ticket, age, binders length, binder length, binder.
+        let ids_len = u16::from_be_bytes([ext[0], ext[1]]) as usize;
+        assert_eq!(ids_len, 2 + t.ticket.len() + 4);
+        assert_eq!(&ext[4..4 + t.ticket.len()], b"tkt!");
+        let age = u32::from_be_bytes([
+            ext[4 + t.ticket.len()],
+            ext[5 + t.ticket.len()],
+            ext[6 + t.ticket.len()],
+            ext[7 + t.ticket.len()],
+        ]);
+        assert!(age >= 99, "the age must include the server's offset: {age}");
+    }
+
+    /// A binder of the wrong length is refused here rather than by a server that silently
+    /// ignores the extension.
+    #[test]
+    fn a_wrong_length_binder_is_refused() {
+        let suite = Tls13Suite::Aes128GcmSha256;
+        let t = ticket();
+        assert!(pre_shared_key_extension(&t, &[0u8; 16], suite).is_err());
+        assert!(pre_shared_key_extension(&t, &[0u8; 32], suite).is_ok());
+    }
+}
