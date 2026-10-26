@@ -59,7 +59,15 @@ pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
 /// shipping it half-right would turn a working full handshake into a failed connection on every
 /// reconnect. The machinery behind it is complete and tested; this switch is what stands between
 /// it and real traffic.
-pub(crate) const PSK_OFFER_ENABLED: bool = true;
+pub(crate) fn psk_offer_enabled() -> bool {
+    // Read once: a per-connection environment lookup would show up in the connection-rate
+    // benchmark this exists to measure.
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("FLUX_TLS_RESUMPTION") {
+        Ok(v) => !matches!(v.as_str(), "0" | "off" | "false"),
+        Err(_) => true,
+    })
+}
 #[allow(dead_code)]
 pub(crate) const MAX_TLS_RECORD: usize = 16384;
 
@@ -1524,7 +1532,7 @@ where
     // the layout test checks the vectors — but rustls answers `illegal_parameter`, so something
     // semantic is still wrong. Offering it anyway would break every *reconnect* to a server that
     // issued a ticket, which is worse than not resuming at all.
-    let offered_psk = if PSK_OFFER_ENABLED {
+    let offered_psk = if psk_offer_enabled() {
         crate::resumption::get(cfg.server_name)
     } else {
         None

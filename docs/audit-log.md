@@ -8333,3 +8333,36 @@ the first moved the work.
 for a full handshake: no certificate flight, no CertificateVerify, and — measurably — fewer bytes
 and less CPU per connection. The one thing left is to measure that on the connection-rate axis and
 record the number, which is the next cycle.
+
+### C2.17 — measured: resumption changes the connection rate by nothing, and why
+
+The objective asked for the connection-rate change from resumption, so here it is:
+
+| configuration | exchanges/s | median |
+|---|---|---|
+| resumption **on** | 8 057 | 3 465 µs |
+| resumption **off** | 8 194 | 3 524 µs |
+
+**No measurable difference** — the on-run is 1.7% *lower*, which is inside this host's ±10–15%
+run-to-run spread. The honest reading is "no change", not "a small gain".
+
+The reason is structural rather than mysterious: the benchmark server presents a self-signed
+certificate a few hundred bytes long over loopback. A full handshake therefore costs one extra round
+trip and one small flight, which is nothing next to the exchange itself. Resumption removes a cost
+that is not there.
+
+**Where it will show:** a real certificate chain (2–4 KiB, four flights), a network round trip, and
+a handshake-heavy workload. None of those exist in this harness, and inventing a number for them
+would be the kind of claim this audit exists to avoid.
+
+The mechanism is enabled, tested and correct; the performance claim is a measured null, and it is
+recorded as one.
+
+### Matrix check after enabling resumption
+
+Two rounds reported `ASSERT FAILED` on Shadowsocks-2022 (−11.8% against sing-box). Four rounds on the
+same binary reported **−5.1%**, inside the 10% tolerance — so the first reading was the noise this
+host produces at two rounds, which the log has recorded before. SS-2022 carries no TLS at all and
+cannot be affected by a TLS change; the number moving with the round count is the evidence.
+
+1154 tests pass, 8 skipped, fmt and clippy clean.
