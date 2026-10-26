@@ -7847,3 +7847,47 @@ Three structural tests: `pre_shared_key` is last and the extension list is exact
 truncation point lands on the binders list; the handshake length covers the binder.
 
 Still not wired: `connect` computes its early secret without a PSK. 1149 tests pass.
+
+### C2.5 — wired, and switched off on purpose
+
+The PSK is offered, the early secret is fed from it, the ServerHello's `pre_shared_key` is
+detected, and the stream reports `resumed`.
+
+**Two decisions in the wiring:**
+
+1. **Only a selected PSK feeds the key schedule.** Offering one and deriving from it regardless is
+   the subtle half of this feature: a server that declines completes a full handshake from zeros,
+   and a client that insists produces a Finished the server cannot verify. That failure reads as a
+   broken handshake rather than a declined ticket — the same shape of misdiagnosis that cost six
+   cycles on the 1.2 path.
+2. **`PSK_OFFER_ENABLED = false`.** The extension is byte-correct — the layout test checks it:
+   identities `0x000b` = 2 + 5 + 4, binders `0x0021` = 1 + 32, `pre_shared_key` last — and rustls
+   still answers **`illegal_parameter`**. Something semantic is wrong that I have not found.
+
+Shipping it while that is true would break every *reconnect* to a server that issued a ticket:
+strictly worse than not resuming at all. So the switch stays off, the two tests that would prove
+resumption are `#[ignore]`d with the symptom, and the mechanism sits complete behind one line.
+
+**Where the next cycle starts — with the candidates ordered by what would produce exactly this
+alert:**
+
+| candidate | why it would give `illegal_parameter` |
+|---|---|
+| the ClientHello changed between hashing and sending | the binder is over a different hello than the one that left |
+| `obfuscated_ticket_age` outside the server's tolerance | rustls validates the age against the ticket lifetime |
+| the GREASE extension shifting positions | `pre_shared_key` must be last *after* every other extension, GREASE included |
+
+The third is worth trying first because it is the one this audit has already been bitten by: the
+greeting has a GREASE extension, and the ordering guarantee is asserted by a test that walks the
+final hello — which is the right check, but it walks a hello built by the same code that may be
+wrong about which extension is last.
+
+### Where the objective stands
+
+| gap | state |
+|---|---|
+| TLS 1.2 in our own stack | **closed and verified** against Xray, sing-box and rustls |
+| session resumption | mechanism complete, **not enabled** — the offer is rejected with a fatal alert |
+
+The honest reading: the second gap is built but not proven, and the switch is off so that nothing
+in production depends on an unproven path.
