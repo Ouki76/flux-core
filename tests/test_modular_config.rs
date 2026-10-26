@@ -455,3 +455,63 @@ fn the_include_alias_is_not_a_typo() {
         "$include is an accepted alias, not an unknown key"
     );
 }
+
+/// A config written for Xray's XHTTP with a mode we do not implement must fail at **startup** with
+/// a message naming the mode — not connect and quietly behave like stream-one.
+///
+/// This is the end-to-end version of the unit test in `config.rs`: it proves the rejection reaches
+/// the operator through the same path a real configuration takes, including the error's wording.
+#[tokio::test]
+async fn an_unsupported_xhttp_mode_is_refused_at_startup() {
+    let cfg_json = r#"{
+        "log": {"level": "error"},
+        "inbounds": [{
+            "tag": "in",
+            "carrier": {"type": "tcp", "listen": "127.0.0.1", "listen_port": 0},
+            "protocol": {"type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}
+        }],
+        "outbounds": [{
+            "tag": "node",
+            "carrier": {"type": "tcp", "address": "127.0.0.1:1"},
+            "framing": {"type": "xhttp", "path": "/x", "mode": "packet-up"},
+            "protocol": {"type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}
+        }],
+        "route": {"final": "node"}
+    }"#;
+    let cfg = flux_app::Config::from_json_str(cfg_json).expect("the JSON itself must parse");
+    let err = match flux_app::Instance::new(cfg) {
+        Ok(_) => panic!("an unsupported XHTTP mode must be refused, not accepted"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("packet-up"),
+        "the error must name the mode the user wrote: {err}"
+    );
+    assert!(
+        err.contains("stream-one"),
+        "and must say what is supported instead: {err}"
+    );
+}
+
+/// The same block with the implemented mode must be accepted, so the refusal above is about the
+/// mode and not about the block.
+#[tokio::test]
+async fn the_stream_one_mode_is_accepted() {
+    let cfg_json = r#"{
+        "log": {"level": "error"},
+        "inbounds": [{
+            "tag": "in",
+            "carrier": {"type": "tcp", "listen": "127.0.0.1", "listen_port": 0},
+            "protocol": {"type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}
+        }],
+        "outbounds": [{
+            "tag": "node",
+            "carrier": {"type": "tcp", "address": "127.0.0.1:1"},
+            "framing": {"type": "xhttp", "path": "/x", "mode": "stream-one", "xpaddingBytes": "100-1000"},
+            "protocol": {"type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}
+        }],
+        "route": {"final": "node"}
+    }"#;
+    let cfg = flux_app::Config::from_json_str(cfg_json).expect("config must parse");
+    flux_app::Instance::new(cfg).expect("stream-one with xpaddingBytes must be accepted");
+}
