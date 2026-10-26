@@ -9697,3 +9697,39 @@ out-of-order buffering (`scMaxBufferedPosts` is exactly that bound, which is why
 the real xray binary in that mode, and a half-applied version does not fail loudly — it connects and
 corrupts. The config refuses these modes by name today, which is the objective's stated alternative
 to shipping them half-done.
+
+### C7.3 — stream-up attempted, and why it was reverted
+
+I implemented both halves of `stream-up` this cycle:
+
+- **client** (`connect_stream_up`): `send_request(POST ?session=…, end_of_stream=false)` for the
+  uplink, then `send_request(GET ?session=…, end_of_stream=true)` for the downlink, joined with
+  `H2Stream::new(upload, response.into_body())`;
+- **server**: on a POST carrying `?session=`, accept the second request on the same connection, check
+  it is a GET naming the same session, acknowledge the POST, and answer the GET with the download
+  body.
+
+It compiles and the pairing logic is what Xray's `hub.go` describes. **It does not work.** The test
+that drives both halves over one duplex socket fails:
+
+```
+client read: Custom { kind: ConnectionReset, error: "stream error received: stream no longer needed" }
+```
+
+The peer resets the download stream. Reordering the acknowledgement so the upload body is taken
+before the POST is answered — a real hazard, and worth fixing — did not change it, so the reset has
+another cause that I did not isolate.
+
+**Reverted entirely**, including the relaxation of the config check. `stream-up` is still refused by
+name at startup.
+
+The rule this respects is the objective's own: *a mode must not be accepted until it works.* Shipping
+a `stream-up` that compiles, connects, and resets the download stream would be strictly worse than
+the refusal — the user would see a tunnel that establishes and then carries nothing, with no message
+saying why.
+
+**For the next attempt:** the reset is on the GET's response body, which means either the server took
+the mismatch path (dropping the responder resets the stream) or the connection driver ended the
+connection while both streams were live. Instrument `accept()` to log which branch it took before
+changing anything else — the two causes look identical from the client side, which is why this cycle
+burned its remaining budget guessing between them.
