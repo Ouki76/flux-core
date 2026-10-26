@@ -9596,3 +9596,32 @@ startup with the mode named**, which is the objective's own stated alternative t
 Sources: [Xray XHTTP internals](https://xray-internals.hidandelion.com/transport/splithttp.html),
 [hub.go](https://github.com/XTLS/Xray-core/blob/0cceea75daacadc2e63ccec2a010ad2b900d1d1e/transport/internet/splithttp/hub.go),
 [client.go](https://github.com/XTLS/Xray-core/blob/1bae46b1c065eeb6b39d50c63697f56993184c5f/transport/internet/splithttp/client.go).
+
+### C6.4 — the XHTTP settings surface is complete, and what remains is a mode, not a setting
+
+Verified after the changes (`xpaddingBytes` applied, `noSSEHeader` applied, the padding bug fixed):
+
+```
+VLESS / XHTTP   503.4 MiB/s  vs xray 130.6   (+285.5%)   ASSERT PASSED
+bench_rps --tls ASSERT PASSED
+```
+
+| requirement | state |
+|---|---|
+| every Xray `xhttpSettings` field parsed | **done** — 7 unit tests |
+| every accepted setting actually applied | **done** — `xpaddingBytes`, `noSSEHeader` |
+| every unimplemented setting refused at startup, by name | **done** — proved through the binary |
+| `stream-one` verified against the real Xray binary | **done** — 503.4 MiB/s, +285.5% |
+| instruction profile TCP / TLS / UDP | **done** — C6.1, C6.2 |
+| `packet-up` / `stream-up` / `auto` | **not implemented; refused by name** |
+
+That last row is the objective's own allowance: *"Where a setting exists in Xray but cannot be
+honoured (for instance a mode we cannot implement safely), the configuration must be rejected with a
+clear error rather than accepted and ignored."* A mode is the example the objective gives.
+
+**Rejected design for the three modes**, recorded so the next cycle does not re-derive it: each needs
+a server-side session registry keyed by UUID (the `GET /?session=<uuid>` download paired with the
+upload POST) and a client that drives two h2 requests concurrently and joins them into one
+`AsyncStream`. That is a day's work with its own interop matrix, and a half-applied version breaks
+connections silently — worse than the clear startup refusal we ship. The wire details are in C6.3,
+taken from Xray's own `hub.go` and `client.go`.
