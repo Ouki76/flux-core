@@ -41,6 +41,11 @@ pub struct TlsClientConfig {
     /// the handshake fails for a reason other than a rejected certificate. Setting this to
     /// `false` skips that retry entirely.
     pub native: bool,
+    /// Force the TLS 1.2 client instead of the 1.3 one.
+    ///
+    /// Set by the dial path for its second attempt, after a server refused TLS 1.3. Not part of
+    /// the configuration surface: a user asks for `native`, not for a version.
+    pub(crate) force_tls12: bool,
 }
 
 impl TlsClientConfig {
@@ -53,6 +58,7 @@ impl TlsClientConfig {
             fingerprint: None,
             ca_certs: vec![],
             native: true,
+            force_tls12: false,
         }
     }
 
@@ -304,6 +310,45 @@ impl TlsTransport {
     }
 
     /// Runs the handshake over `stream` and returns the encrypted stream.
+    /// Our own TLS 1.2 handshake, sharing the trust store and ALPN handling of the 1.3 one.
+    async fn connect_native12<S>(stream: S, cfg: &TlsClientConfig) -> FluxResult<BoxedStream>
+    where
+        S: AsyncStream + 'static,
+    {
+        use crate::tls12;
+        let trust = Self::native_trust(cfg)?;
+        let alpn: Vec<&[u8]> = cfg.alpn.iter().map(|p| p.as_slice()).collect();
+        let hello = tls12::ClientHello12Config {
+            server_name: &cfg.server_name,
+            alpn: &alpn,
+            trust: &trust,
+            insecure: cfg.insecure,
+        };
+        let stream = tls12::connect(stream, &hello).await?;
+        Ok(Box::new(stream))
+    }
+
+    /// Builds the trust store the native clients share: system roots, plus any configured CA.
+    fn native_trust(cfg: &TlsClientConfig) -> FluxResult<crate::tls13::verify::TrustStore> {
+        let mut trust = if cfg.insecure {
+            crate::tls13::verify::TrustStore::empty()
+        } else {
+            crate::tls13::verify::TrustStore::system()
+        };
+        for path in &cfg.ca_certs {
+            let pem = std::fs::read(path).map_err(|e| {
+                FluxError::Config(format!("cannot read CA file {}: {e}", path.display()))
+            })?;
+            if trust.add_pem(&pem)? == 0 {
+                return Err(FluxError::Config(format!(
+                    "CA file {} contains no CERTIFICATE blocks",
+                    path.display()
+                )));
+            }
+        }
+        Ok(trust)
+    }
+
     /// Our own handshake, with the same configuration surface as the rustls path.
     async fn connect_native<S>(stream: S, cfg: &TlsClientConfig) -> FluxResult<BoxedStream>
     where
@@ -344,7 +389,12 @@ impl TlsTransport {
         S: AsyncStream + 'static,
     {
         if cfg.native {
-            return Self::connect_native(stream, cfg).await;
+            return if cfg.force_tls12 {
+                let stream = Self::connect_native12(stream, cfg).await?;
+                Ok(Box::new(stream))
+            } else {
+                Self::connect_native(stream, cfg).await
+            };
         }
         let connector = Self::create_client_connector(cfg)?;
         let domain = ServerName::try_from(cfg.server_name.clone())

@@ -311,6 +311,9 @@ pub(crate) struct Tls12Stream<S> {
     /// Bytes queued for the socket.
     pending_write: Vec<u8>,
     pending_write_pos: usize,
+    /// Plaintext bytes of the record currently queued, so a retried `poll_write` can report
+    /// them without queueing a second copy of the same data.
+    pending_plaintext: usize,
     closed: bool,
 }
 
@@ -413,6 +416,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls12Stream<S> {
                 }
                 _ => {}
             }
+            // Handshake records continue after the handshake: NewSessionTicket arrives once the
+            // connection is established, and handing its bytes to the application corrupts the
+            // stream — a real server sends one, a test server may not.
+            if ctype == 0x16 {
+                let _ = this.read.open(ctype, &mut body);
+                continue;
+            }
             let n = match this.read.open(ctype, &mut body) {
                 Ok(n) => n,
                 Err(e) => {
@@ -442,17 +452,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls12Stream<S> {
             )));
         }
         // One record per call, capped at 16 KiB of plaintext (RFC 5246 §6.2.1).
-        let n = data.len().min(16384);
-        if let Err(e) = this.queue_record(0x17, &data[..n]) {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e.to_string(),
-            )));
+        //
+        // A retried `poll_write` must not queue the same data twice: if a record is still
+        // pending from the previous call, only its remaining bytes are written and the length
+        // reported back is the one that record already carries.
+        if this.pending_write.is_empty() {
+            let n = data.len().min(16384);
+            if let Err(e) = this.queue_record(0x17, &data[..n]) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.to_string(),
+                )));
+            }
+            this.pending_plaintext = n;
         }
         loop {
             if this.pending_write_pos >= this.pending_write.len() {
                 this.pending_write.clear();
                 this.pending_write_pos = 0;
+                let n = this.pending_plaintext;
+                this.pending_plaintext = 0;
                 return Poll::Ready(Ok(n));
             }
             match std::pin::Pin::new(&mut this.inner)
@@ -1014,6 +1033,7 @@ where
         body_len: 0,
         pending_write: Vec::new(),
         pending_write_pos: 0,
+        pending_plaintext: 0,
         closed: false,
     })
 }
@@ -1102,6 +1122,68 @@ mod handshake_tests {
         let mut buf = [0u8; 5];
         client.read_exact(&mut buf).await.expect("read");
         assert_eq!(&buf, b"pong!");
+        server.await.expect("server task");
+    }
+
+    /// Large transfers in both directions: many records, and records that fill the 16 KiB cap.
+    /// A read path that only works for one small record passes the little test above and fails
+    /// on a real download.
+    #[tokio::test]
+    async fn our_tls12_handshake_moves_a_megabyte_both_ways() {
+        let (acceptor, ca_pem) = server_12(true);
+        let (client_raw, server_raw) = tokio::io::duplex(256 * 1024);
+        let payload: Vec<u8> = (0..1_000_000).map(|i| (i % 251) as u8).collect();
+        let expect = payload.clone();
+        let server = tokio::spawn(async move {
+            let mut srv = acceptor.accept(server_raw).await.expect("server handshake");
+            let mut got = vec![0u8; expect.len()];
+            srv.read_exact(&mut got).await.expect("server read");
+            if got != expect {
+                let at = got
+                    .iter()
+                    .zip(&expect)
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(0);
+                panic!(
+                    "the server received different bytes: {} of {} match, first difference at {at}",
+                    got.iter().zip(&expect).take_while(|(a, b)| a == b).count(),
+                    expect.len()
+                );
+            }
+            srv.write_all(&expect).await.expect("server write");
+            srv.flush().await.expect("flush");
+        });
+
+        let mut trust = TrustStore::empty();
+        trust.add_pem(ca_pem.as_bytes()).expect("ca");
+        let cfg = ClientHello12Config {
+            server_name: "localhost",
+            alpn: &[],
+            trust: &trust,
+            insecure: false,
+        };
+        let mut client = connect(client_raw, &cfg).await.expect("handshake");
+        client.write_all(&payload).await.expect("write");
+        client.flush().await.expect("flush");
+        let mut back = vec![0u8; payload.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            client.read_exact(&mut back),
+        )
+        .await
+        .expect("the download must not stall")
+        .expect("read");
+        if back != payload {
+            let at = back
+                .iter()
+                .zip(&payload)
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            panic!(
+                "the download differs: first difference at {at} of {}",
+                payload.len()
+            );
+        }
         server.await.expect("server task");
     }
 

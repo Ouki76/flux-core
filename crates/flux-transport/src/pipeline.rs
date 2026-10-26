@@ -154,7 +154,7 @@ impl LayeredTransportPipeline {
 impl LayeredTransportPipeline {
     /// One dial attempt. `allow_native` is false for the rustls fallback, so a server that
     /// cannot speak TLS 1.3 is reached with a stack that also negotiates 1.2.
-    async fn dial_with(&self, allow_native: bool) -> FluxResult<BoxedStream> {
+    async fn dial_with(&self, allow_native: bool, force_12: bool) -> FluxResult<BoxedStream> {
         // 1. Layer 1 (Carrier): TCP, or mKCP when the node asks for it. KCP is a
         // reliable byte stream over UDP, so everything above this line — TLS,
         // REALITY, WebSocket, the protocol itself — is unchanged.
@@ -183,6 +183,10 @@ impl LayeredTransportPipeline {
                     let mut cfg = cfg.clone();
                     if !allow_native {
                         cfg.native = false;
+                    }
+                    if force_12 {
+                        // The retry speaks TLS 1.2 with our own client, not with rustls.
+                        cfg.force_tls12 = true;
                     }
                     TlsTransport::connect(stream, &cfg).await?
                 }
@@ -256,15 +260,16 @@ impl LayeredTransportPipeline {
 impl StreamDialer for LayeredTransportPipeline {
     async fn dial(&self) -> FluxResult<BoxedStream> {
         let started = std::time::Instant::now();
-        let first = match tokio::time::timeout(self.connect_timeout, self.dial_with(true)).await {
-            Ok(res) => res,
-            Err(_) => {
-                return Err(flux_types::FluxError::Timeout(format!(
-                    "layered transport dial to {} timed out after {:?}",
-                    self.server_address, self.connect_timeout
-                )));
-            }
-        };
+        let first =
+            match tokio::time::timeout(self.connect_timeout, self.dial_with(true, false)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    return Err(flux_types::FluxError::Timeout(format!(
+                        "layered transport dial to {} timed out after {:?}",
+                        self.server_address, self.connect_timeout
+                    )));
+                }
+            };
 
         // A server that cannot speak TLS 1.3 is old, not hostile. The native client exists for
         // its ClientHello; if that is the only reason the dial failed, redial once with rustls,
@@ -287,16 +292,21 @@ impl StreamDialer for LayeredTransportPipeline {
             return first;
         }
         tracing::debug!(
-            "the server did not negotiate TLS 1.3; retrying this dial with rustls ({text})"
+            "the server did not negotiate TLS 1.3; retrying this dial with our TLS 1.2 client ({text})"
         );
         let remaining = self
             .connect_timeout
             .saturating_sub(started.elapsed())
             .max(std::time::Duration::from_millis(500));
-        match tokio::time::timeout(remaining, self.dial_with(false)).await {
+        match tokio::time::timeout(remaining, self.dial_with(true, true)).await {
             Ok(Ok(stream)) => Ok(stream),
-            // The fallback failing is less informative than the original error.
-            _ => first,
+            Ok(Err(e)) => {
+                // Report both: the first error says why 1.3 failed, the second why the retry
+                // did, and in practice it is the second that is interesting.
+                tracing::debug!("the TLS 1.2 retry failed too: {e}");
+                first
+            }
+            Err(_) => first,
         }
     }
 }
