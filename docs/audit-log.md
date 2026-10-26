@@ -9119,3 +9119,40 @@ still fired. Checking that the build succeeded is not optional when the number m
 
 The honest summary: **the UDP path's cost is one syscall per 1.2 KB, and only batching fixes it.**
 Everything cheaper has been measured and does not help.
+
+### C5.2 — the second cheap candidate: the per-datagram mutex, also noise
+
+The SOCKS UDP relay took a `tokio::sync::Mutex` twice per datagram — once to pin the client's peer
+address on receive, once to read it on send. Both critical sections are two assignments with no
+`.await` inside, so the async mutex's waker bookkeeping was being paid for nothing.
+
+Replaced with a `std::sync::Mutex`, with the guard scoped to a block so it cannot be held across an
+await (a `std` guard is not `Send` and the compiler refuses — correctly).
+
+Measured, build verified:
+
+| configuration | pps (two runs) | mean |
+|---|---|---|
+| `tokio::sync::Mutex` (baseline) | 112 451, 108 203 | 110 327 |
+| `std::sync::Mutex` | 107 199, 114 970 | 111 085 |
+
+**+0.7% — noise.** Reverted, for the same reason as the buffer tuning: an unmeasured change is not
+a change this project keeps.
+
+That the async mutex costs nothing measurable is itself informative: uncontended, it does not park,
+so it is a compare-and-swap plus bookkeeping — a few tens of nanoseconds against a datagram that
+costs ~4 microseconds of wall time end to end.
+
+### Two cheap candidates measured at zero; the arithmetic says why
+
+| candidate | measured | why it fails |
+|---|---|---|
+| socket buffers 212 KiB → 4 MiB | +1.2% | the benchmark never fills the buffer; it is a round trip, not a burst |
+| `tokio::Mutex` → `std::Mutex` | +0.7% | uncontended async mutex costs tens of ns against a 4 µs datagram |
+
+Both were plausible, both were measured, both are noise. The datagram's cost is not in its
+bookkeeping — it is in the **four syscalls** that C5.1 counted, and no amount of user-space tidying
+touches them.
+
+**What remains, and it is the only thing left:** `recvmmsg`/`sendmmsg` batching, which removes the
+syscalls themselves. Everything cheaper has now been tried and measured.
