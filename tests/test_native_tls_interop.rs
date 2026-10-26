@@ -330,12 +330,14 @@ fn which_xray() -> Option<String> {
 /// **The fallback, end to end.** A server that speaks only TLS 1.2 cannot talk to the native
 /// client, which is 1.3-only; the dial path must notice and retry with rustls. Without the
 /// retry this test fails to connect at all, which is exactly what it exists to detect.
-/// **Known failure, deliberately ignored rather than deleted.** The retry fires and our TLS 1.2
-/// handshake completes — Xray logs `accepted tcp:…`, so the request arrives — but the download
-/// never returns: `upload=300000 B, download=0 B`. Our 1.2 client carries a megabyte both ways
-/// against a rustls 1.2 server, so the difference is in what Xray sends back rather than in the
-/// handshake. Kept as a test so the next session starts from a reproducer, not from a description.
-#[ignore = "our TLS 1.2 client completes the handshake with Xray but the download stalls"]
+/// The retry fires, our TLS 1.2 client completes the handshake, and data crosses in both
+/// directions through the real `xray` binary pinned to TLS 1.2.
+///
+/// This test spent six cycles `#[ignore]`d on a symptom — `upload=…, download=0` — that turned out
+/// to be a defect in the *test harness*: the client config pointed at a relay port that was not
+/// listening, and the error surfaced to the user named the destination rather than the node. The
+/// TLS 1.2 path had been working. Recorded here because the lesson is the point: a reproducible
+/// symptom is not the same thing as a diagnosis.
 #[tokio::test]
 async fn a_tls12_only_server_is_reached_through_the_fallback() {
     let Some(bin) = which_xray() else {
