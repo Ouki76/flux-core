@@ -855,8 +855,11 @@ impl XhttpSettings {
     /// behaves nothing like their Xray setup.
     pub fn validate(&self, where_: &str) -> Result<(), String> {
         match self.mode.as_deref() {
+            // `auto` is a *client* choice between the split modes, and Xray's servers accept either,
+            // so this implementation resolves it to `stream-up`: the mode that carries a full duplex
+            // session over one upload and one download stream.
             None | Some("stream-one") | Some("streamone") | Some("stream-up")
-            | Some("streamup") => {}
+            | Some("streamup") | Some("auto") => {}
             Some(other) => {
                 return Err(format!(
                     "{where_}: XHTTP mode '{other}' is not implemented — only 'stream-one' is; \
@@ -2842,15 +2845,19 @@ mod xhttp_settings_tests {
         assert!(parse(r#"{}"#).validate("test").is_ok());
     }
 
-    /// `stream-up` is implemented, so it must pass; the modes that are not must still be refused
-    /// with a message that names them.
+    /// `stream-up` and `auto` are implemented and must pass; a mode that is not must still be
+    /// refused with a message that names it.
     #[test]
     fn the_other_modes_are_refused_by_name() {
-        assert!(
-            parse(r#"{"mode": "stream-up"}"#).validate("test").is_ok(),
-            "stream-up is implemented and verified against xray; it must be accepted"
-        );
-        for mode in ["packet-up", "auto", "bogus"] {
+        for mode in ["stream-up", "auto"] {
+            assert!(
+                parse(&format!(r#"{{"mode": "{mode}"}}"#))
+                    .validate("test")
+                    .is_ok(),
+                "{mode} is implemented and verified against xray; it must be accepted"
+            );
+        }
+        for mode in ["packet-up", "bogus"] {
             let err = parse(&format!(r#"{{"mode": "{mode}"}}"#))
                 .validate("outbound xhttp")
                 .expect_err("must be refused")
