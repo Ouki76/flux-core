@@ -859,7 +859,7 @@ impl XhttpSettings {
             // so this implementation resolves it to `stream-up`: the mode that carries a full duplex
             // session over one upload and one download stream.
             None | Some("stream-one") | Some("streamone") | Some("stream-up")
-            | Some("streamup") | Some("auto") | Some("packet-up") | Some("packetup") => {}
+            | Some("streamup") | Some("auto") => {}
             Some(other) => {
                 return Err(format!(
                     "{where_}: XHTTP mode '{other}' is not implemented — only 'stream-one' is; \
@@ -2849,7 +2849,7 @@ mod xhttp_settings_tests {
     /// refused with a message that names it.
     #[test]
     fn the_other_modes_are_refused_by_name() {
-        for mode in ["stream-up", "auto", "packet-up"] {
+        for mode in ["stream-up", "auto"] {
             assert!(
                 parse(&format!(r#"{{"mode": "{mode}"}}"#))
                     .validate("test")
@@ -2857,17 +2857,16 @@ mod xhttp_settings_tests {
                 "{mode} is implemented and verified against xray; it must be accepted"
             );
         }
-        for mode in ["bogus"] {
-            let err = parse(&format!(r#"{{"mode": "{mode}"}}"#))
-                .validate("outbound xhttp")
-                .expect_err("must be refused")
-                .to_string();
-            assert!(err.contains(mode), "the error must name the mode: {err}");
-            assert!(
-                err.contains("outbound xhttp"),
-                "and where it came from: {err}"
-            );
-        }
+        let bogus = "bogus";
+        let err = parse(&format!(r#"{{"mode": "{bogus}"}}"#))
+            .validate("outbound xhttp")
+            .expect_err("an unknown mode must be refused")
+            .to_string();
+        assert!(err.contains(bogus), "the error must name the mode: {err}");
+        assert!(
+            err.contains("outbound xhttp"),
+            "and where it came from: {err}"
+        );
     }
 
     /// Settings that belong to modes we do not implement are refused too, rather than accepted and

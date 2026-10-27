@@ -10129,3 +10129,33 @@ That is a different class of fault from everything investigated so far, and it n
 the channel rather than another architectural guess: log on both sides of the send in `poll_write`.
 
 Reverted to refusal; the implementation stays behind it. 1174 tests, clippy clean.
+
+### C7.17 — packet-up: the client is verified, the server half is written but not working
+
+Two halves this cycle:
+
+**Client — done and verified (C7.16).** `HELLO` through a real xray server in `packet-up` mode.
+
+**Server — written, not working.** `accept` now has three branches:
+
+- `POST /<base>/<session>/<seq>` — read the body, hand it to a per-session `Reassembly`
+  (`BTreeMap<u64, Bytes>` draining from the next expected index; a duplicate sequence is dropped
+  rather than delivered twice), answer 200, keep accepting;
+- `GET /<base>/<session>` — open the session: an unbounded channel for the upload, another for the
+  download, a task draining the download into the response body, and a `ChannelDuplex` returned to
+  the caller;
+- everything else — the existing `stream-one` and `stream-up` paths.
+
+Against our own server with a `packet-up` client:
+
+```
+curl -x socks5h://127.0.0.1:19911 http://127.0.0.1:17171/   →  (nothing)
+```
+
+So the three-branch `accept` does not yet move data, and the likely fault is the same class as the
+client's was: the branches are ordered such that the download GET may be classified before the
+session exists, or the returned `ChannelDuplex`'s upload channel is not the one the POST handler
+fills. **The next step is the same that worked for the client: count what each branch receives**,
+rather than reasoning about the ordering again.
+
+Config refuses `packet-up` again, so nothing half-working is reachable. 1174 tests, clippy clean.

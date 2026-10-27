@@ -413,16 +413,130 @@ where
     }))
 }
 
+/// A duplex over two channels: reads come from `rx`, writes go to `tx`.
+///
+/// The server half of `packet-up` needs exactly this shape. Its upload is not a stream at all — it is
+/// a series of separate POSTs reassembled by sequence — so the read side is fed by the POST handlers
+/// through a channel; and its download is an h2 response body, so the write side is drained into that
+/// `SendStream` by a task.
+pub struct ChannelDuplex {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
+    tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    read_buf: Bytes,
+    read_pos: usize,
+}
+
+impl std::fmt::Debug for ChannelDuplex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChannelDuplex").finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for ChannelDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        loop {
+            if this.read_pos < this.read_buf.len() {
+                let avail = this.read_buf.len() - this.read_pos;
+                let to_copy = avail.min(buf.remaining());
+                buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + to_copy]);
+                this.read_pos += to_copy;
+                if this.read_pos == this.read_buf.len() {
+                    this.read_buf = Bytes::new();
+                    this.read_pos = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(data)) => {
+                    this.read_buf = data;
+                    this.read_pos = 0;
+                }
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for ChannelDuplex {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        match self.tx.send(Bytes::copy_from_slice(buf)) {
+            Ok(()) => Poll::Ready(Ok(buf.len())),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the download writer has stopped",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Reassembles `packet-up` POSTs for one session.
+#[derive(Default)]
+struct Reassembly {
+    /// Chunks that have arrived but cannot be delivered yet, keyed by sequence.
+    pending: std::collections::BTreeMap<u64, Bytes>,
+    /// The next sequence number expected.
+    next: u64,
+}
+
+impl Reassembly {
+    /// Takes one POST's chunk and returns whatever became deliverable, in order.
+    ///
+    /// A duplicate or already-delivered sequence is dropped rather than delivered twice — a retried
+    /// POST must not corrupt the stream above it.
+    fn accept(&mut self, seq: u64, chunk: Bytes) -> Vec<Bytes> {
+        if seq < self.next {
+            return Vec::new();
+        }
+        self.pending.insert(seq, chunk);
+        let mut out = Vec::new();
+        while let Some(chunk) = self.pending.remove(&self.next) {
+            self.next += 1;
+            out.push(chunk);
+        }
+        out
+    }
+}
+
 /// Server half: accepts one bidirectional request and returns it as a stream.
 ///
 /// `path` is the configured base path. Anything under it is accepted, because the client
 /// appends a per-session suffix; anything else is refused with 404, like a web server
 /// serving only its own tree.
-pub async fn accept<S>(stream: S, path: &str, no_sse_header: bool) -> FluxResult<H2Stream>
+pub async fn accept<S>(
+    stream: S,
+    path: &str,
+    no_sse_header: bool,
+) -> FluxResult<Box<dyn AsyncStream>>
 where
     S: AsyncStream + 'static,
 {
     let mut connection = shared::server_handshake(stream, "xhttp").await?;
+    // Per-connection `packet-up` state: sessions opened by a download GET, and the chunks reassembled
+    // for them from the POSTs that share this connection.
+    let mut packet_sessions: HashMap<String, tokio::sync::mpsc::UnboundedSender<Bytes>> =
+        HashMap::new();
+    let mut reassembly: HashMap<String, Reassembly> = HashMap::new();
     let (request, mut respond) = connection
         .accept()
         .await
@@ -450,6 +564,96 @@ where
         // upload half of a split session and the server waited forever for a download that stream-one
         // clients never send.
         .filter(|suffix| suffix.len() == 32 && suffix.chars().all(|c| c.is_ascii_hexdigit()));
+
+    // `packet-up` download: a GET naming a session with no sequence. It opens the session, and the
+    // chunks arrive as separate POSTs on this same connection, so the returned stream reads from a
+    // channel the POST handler feeds and writes into this response body.
+    if request.method() == Method::GET
+        && under_base
+        && let Some(session) = path_session.clone()
+    {
+        let (upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (down_tx, mut down_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        packet_sessions.insert(session.clone(), upload_tx);
+        // Anything already reassembled before the download opened is delivered first.
+        if let Some(ready) = reassembly.remove(&session) {
+            for (_, piece) in ready.pending {
+                let _ = down_tx.send(piece);
+            }
+        }
+        let body_type = if no_sse_header {
+            "application/octet-stream"
+        } else {
+            "text/event-stream"
+        };
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", body_type)
+            .body(())
+            .map_err(|e| FluxError::Protocol {
+                protocol: "xhttp",
+                message: format!("failed to build the XHTTP download response: {e}"),
+            })?;
+        let mut send: SendStream<Bytes> =
+            respond
+                .send_response(response, false)
+                .map_err(|e| FluxError::Protocol {
+                    protocol: "xhttp",
+                    message: format!("failed to send the XHTTP download response: {e}"),
+                })?;
+        tokio::spawn(async move {
+            while let Some(chunk) = down_rx.recv().await {
+                if send.send_data(chunk, false).is_err() {
+                    break;
+                }
+            }
+            let _ = send.send_data(Bytes::new(), true);
+        });
+        shared::spawn_connection_driver(connection, None);
+        return Ok(Box::new(ChannelDuplex {
+            rx: upload_rx,
+            tx: down_tx,
+            read_buf: Bytes::new(),
+            read_pos: 0,
+        }));
+    }
+
+    // `packet-up` uploads: `/<base>/<session>/<seq>`, each POST carrying one chunk. They are
+    // reassembled here and delivered to the session's download stream, which is a separate request.
+    if request.method() == Method::POST && under_base && uri_path.matches('/').count() >= 3 {
+        let (session, seq) = match uri_path.rsplit_once('/') {
+            Some((rest, seq)) => (rest.rsplit('/').next().unwrap_or("").to_string(), seq),
+            None => (String::new(), ""),
+        };
+        let seq: u64 = seq.parse().unwrap_or_default();
+        let mut body = request.into_body();
+        let mut chunk = Vec::new();
+        while let Some(frame) = body.data().await {
+            match frame {
+                Ok(data) => chunk.extend_from_slice(&data),
+                Err(_) => break,
+            }
+        }
+        let ack = Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .expect("static ack response");
+        let _ = respond.send_response(ack, true);
+        if let Some(sender) = packet_sessions.get(&session) {
+            for piece in reassembly
+                .entry(session.clone())
+                .or_default()
+                .accept(seq, Bytes::from(chunk))
+            {
+                let _ = sender.send(piece);
+            }
+        }
+        shared::spawn_connection_driver(connection, None);
+        return Err(FluxError::Protocol {
+            protocol: "xhttp",
+            message: format!("packet-up chunk {seq} for session {session} accepted"),
+        });
+    }
 
     if let Some(session) = path_session
         && request.method() == Method::POST
@@ -511,7 +715,7 @@ where
                     message: format!("failed to send the XHTTP download response: {e}"),
                 })?;
         shared::spawn_connection_driver(connection, None);
-        return Ok(H2Stream::new(send, recv));
+        return Ok(Box::new(H2Stream::new(send, recv)));
     }
 
     // Xray only ever uses POST for a streaming upload; anything else is not this
@@ -554,7 +758,7 @@ where
 
     let recv: RecvStream = request.into_body();
     shared::spawn_connection_driver(connection, None);
-    Ok(H2Stream::new(send, recv))
+    Ok(Box::new(H2Stream::new(send, recv)))
 }
 
 /// Normalises a configured path the way Xray does: leading and trailing slashes.
