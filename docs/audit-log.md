@@ -11924,3 +11924,16 @@ The effect is real and reproducible. What C7.88 corrected is the **why**: h2 doe
 That also answers, honestly, why no unit test catches the mutation (C7.87): in a duplex harness the headers are delivered either way, because there is no network buffering to defeat. The property is only observable **against a real peer**, which is precisely why twelve rounds of interop measurement found it and 313 tests did not.
 
 Comment in the source updated to say flush, not "starts the stream".
+
+### C7.90 — stability run started (item 4), after items 2 and 3 were closed with evidence
+
+Items 2 and 3 reached a defensible end state this session, so item 4 is allowed to begin:
+
+| item | evidence |
+|---|---|
+| 2 audit | 60 `unsafe` all in syscall/buffer code with no safe alternative; 2 `panic!` proved unreachable (C7.80); `wireguard` `unwrap` cluster guarded by a length check (C7.71); dead-code allowances quantified rather than removed blindly (C7.83) |
+| 3 features | all 69 config fields referenced (C7.85); XHTTP settings traced into `PacketUpOptions` and the POST loop (C7.84); and a mutation test **proved** what the suite cannot see (C7.87) |
+
+The stability run: `/tmp/stress.sh 1800` — thirty minutes of continuous requests through the real stack (flux + xray + echo), sampling RSS, descriptors and thread count every three rounds, recording success and failure counts throughout.
+
+What it must show to be worth anything: flat RSS (no leak), flat descriptor count, no thread growth, and a failure rate consistent with the interop result rather than climbing with time. A number that stays flat for thirty minutes is the first evidence in this whole session that is about endurance rather than a single burst.
