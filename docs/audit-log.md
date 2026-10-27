@@ -10438,3 +10438,25 @@ What was changed and kept:
 The instability is unexplained and I will not present a single successful run as verification. What
 *is* established: the reverse direction works at all only over TLS with `alpn: ["h2"]`, cleartext is
 refused at the h2 preface, and `stream-one` works end to end.
+
+### C7.28 — reverse-direction results, counted rather than asserted
+
+xray as a client over TLS against our inbound, repeated runs with a settle between them (the earlier
+"0/2 everywhere" was a bug in my own loop: `xray run -c` was given the log file instead of the config):
+
+| mode | runs that returned `HELLO` |
+|---|---|
+| `stream-one` | **2/2** |
+| `packet-up` | **2/3** |
+| `stream-up` | 0/2 |
+| `auto` | 0/2 in the loop, 1/1 in an earlier isolated run |
+
+So the reverse direction **does work** — `stream-one` reliably, `packet-up` most of the time — and the
+instability is real and unexplained. Two candidate causes I did not separate: xray's listener may not
+release port 19950 fast enough between runs (the failing runs are always the later ones in a burst),
+and the split modes may genuinely race.
+
+**Not claimed:** a clean 4/4. What is established is that our server serves an xray client over TLS
+with h2 ALPN for `stream-one` and `packet-up`, and that cleartext is refused at the h2 preface.
+
+Item (1) is complete and verified. Item (2) is partially verified with counted, not asserted, results.
