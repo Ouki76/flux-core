@@ -11350,3 +11350,42 @@ multiplexing work was aimed at the right structure but implemented too broadly.
 **Next, one command:** set `"xmux": {"maxConnections": 64}` in the client config and re-run the burst. If
 the rate goes to 10/10 the mechanism is confirmed at a stroke, and the real fix is on our side — close
 the connection when the tunnel it serves is done.
+
+### C7.60 — mechanism confirmed: the pool cap of two was the wall
+
+C7.59 proposed that Xray's `xmux` pool holds two connections, our server never releases them, and the
+third request therefore waits forever. Tested by raising the client's cap:
+
+```
+"xmux": {"maxConnections": 64}
+```
+
+Result, same burst, same server:
+
+```
+req  1..10: O O O O O O O O O O      10/10
+timings:    0.2 s total — every request after the first was instantaneous
+tcp accepted: 10
+```
+
+**Ten of ten, ten connections, all in a fifth of a second.** The wall was exactly the pool cap.
+
+### What this means, and what the fix is
+
+The client's default pool holds **two** connections per outbound. Our server serves **one tunnel per
+connection and never closes it** — `spawn_connection_driver(connection, None)` keeps it alive until the
+peer disconnects. So after two requests the pool is full of connections that both sides consider busy,
+and every further request waits for one that will never be released. Raising the client's cap to 64
+merely postpones it: with enough requests it would fill again.
+
+**The defect is ours**: a connection that carries one tunnel must be released when that tunnel ends, so
+the peer's pool can reuse or replace it. That is the same structural point the multiplexing work aimed
+at (C7.37), but stated correctly: we do not need to multiplex several tunnels on one connection — we
+need to **close ours when our tunnel is done**, which lets the peer's pool work as designed.
+
+The GOAWAY attempt (C7.35) failed because it closed the connection while the tunnel still needed it;
+closing it **after** the tunnel finishes is the version that should work.
+
+This is the first time in seventeen cycles that the failure has been reproduced away rather than merely
+argued about: 0/10 becomes 10/10 by changing only the pool cap, which pins the cause to connection
+lifetime on our side.
