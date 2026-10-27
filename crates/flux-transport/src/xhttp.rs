@@ -760,6 +760,34 @@ where
                 // download GET, and treating the unnumbered form as sequential keeps one code path.
                 let seq: Option<u64> = seq_str.parse().ok();
                 let mut body = post.into_body();
+                let ack = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(())
+                    .expect("static ack response");
+                let _ = post_respond.send_response(ack, true);
+                // A `stream-up` POST carries a **streaming** body: its DATA frames arrive after the
+                // headers, so reading it inline would block this accept loop and the connection would
+                // stall after the first chunk. A numbered `packet-up` POST is complete when it
+                // arrives, so it is read here.
+                if seq.is_none() {
+                    let sender = packet_sessions.get(&session_of_post).cloned();
+                    tokio::spawn(async move {
+                        while let Some(frame) = body.data().await {
+                            match frame {
+                                Ok(data) => {
+                                    if let Some(sender) = &sender
+                                        && !data.is_empty()
+                                        && sender.send(data).is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                    continue;
+                }
                 let mut chunk = Vec::new();
                 while let Some(frame) = body.data().await {
                     match frame {
@@ -767,11 +795,6 @@ where
                         Err(_) => break,
                     }
                 }
-                let ack = Response::builder()
-                    .status(StatusCode::OK)
-                    .body(())
-                    .expect("static ack response");
-                let _ = post_respond.send_response(ack, true);
                 let sender = packet_sessions.get(&session_of_post).cloned();
                 let state = reassembly
                     .entry(session_of_post.clone())

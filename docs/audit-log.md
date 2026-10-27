@@ -10506,3 +10506,24 @@ tests and clippy still pass.
 
 The xray-only intermittent failure remains unexplained. It is not the port (C7.29), not the POST
 numbering (this entry), and not reproducible against our own client at all.
+
+### C7.31 — stream-up fixed: the accept loop was blocking on a streaming body
+
+C7.30 left `stream-up` traced to the right place: xray sends the download GET, then an **unnumbered
+POST**, and nothing moved. The cause was in our accept loop — it read the POST's body inline with
+`while let Some(frame) = body.data().await`. For `stream-up` that body is a **stream**: its DATA frames
+arrive after the headers, so the loop blocked on the first POST and never accepted another request or
+delivered the data.
+
+The fix spawns a task for an unnumbered POST that drains its frames straight into the session's
+download channel, so the accept loop stays free. A numbered `packet-up` POST is complete when it
+arrives and is still read inline.
+
+**Verified:** with the fix, xray's client in `stream-up` returned `HELLO` through the tunnel — the mode
+that had never worked once now works.
+
+The sample that followed (all four modes, 0/2) is **invalid**, not evidence: the echo target had not
+released its port between runs (`Address already in use`), so nothing was being served. Recording it
+because a number that was measured wrongly is worth as much as no number.
+
+313 transport tests pass, clippy clean.
