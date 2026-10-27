@@ -9863,3 +9863,28 @@ client spawns a task that awaits the upload's response; if that future resolves 
 answers the POST immediately with an empty body), the task ends and its stream may be cancelled while
 the upload is meant to stay open. Awaiting a response and *then* dropping its stream is different from
 keeping it alive — the fix may be to hold the response body, not just the future.
+
+### C7.8 — stream-up against real xray: the tunnel establishes and the upload flows
+
+C7.7's hypothesis was right for the first symptom. The upload's response body, not just its future,
+had to be drained — dropping a `RecvStream` sends `RST_STREAM CANCEL`, which is the reset that was
+seen on stream 1. With the body drained the reset is gone and, against the real xray binary:
+
+```
+flux:  stream closed gracefully: upload=79 B, download=0 B
+xray:  transport/internet: dialing to tcp:127.0.0.1:17171
+xray:  proxy/freedom: connection opened to tcp:127.0.0.1:17171
+```
+
+**The session pairs, the upload arrives, xray opens the target connection.** Everything up to the
+download now works against xray — 79 bytes of HTTP request crossed the tunnel and a real connection
+was made at the far end.
+
+**What is still missing: the download direction returns 0 bytes.** The target's reply never reaches
+our client, which is why the config still refuses the mode.
+
+**Next cycle starts here:** the download half is `H2Stream`'s `recv` in `H2RecvState::Pending`. It
+resolves on first read — and the log shows the client closing "gracefully" right after the upload,
+which suggests the read never polled the pending future, or the future resolved to an error that the
+read path treated as end-of-stream. Instrument `H2Stream::poll_read` on a `Pending` state rather than
+guessing which of the two it is — that mistake cost two cycles already.

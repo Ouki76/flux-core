@@ -855,9 +855,9 @@ impl XhttpSettings {
     /// behaves nothing like their Xray setup.
     pub fn validate(&self, where_: &str) -> Result<(), String> {
         match self.mode.as_deref() {
-            // `stream-up` is implemented and its own tests pass, but it is not verified against a
-            // real xray server yet, so it stays refused: a mode that connects and then resets the
-            // download stream is worse than one the user is told about at startup.
+            // `stream-up` now establishes a tunnel against real xray and carries the upload, but the
+            // download direction returns nothing yet (C7.8), so it stays refused: a tunnel that
+            // connects and carries one direction is worse than a startup error.
             None | Some("stream-one") | Some("streamone") => {}
             Some(other) => {
                 return Err(format!(

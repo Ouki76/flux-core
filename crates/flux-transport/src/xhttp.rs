@@ -123,9 +123,19 @@ where
                 protocol: "xhttp",
                 message: format!("failed to send the XHTTP upload: {e}"),
             })?;
-    // Awaiting, not dropping: dropping a `ResponseFuture` resets its stream.
+    // The upload's response must not merely be awaited — its **body** must be drained and held.
+    // Dropping a `ResponseFuture` resets the stream, and dropping the `RecvStream` of a response
+    // whose body has not been read sends `RST_STREAM CANCEL`, which is exactly what xray saw:
+    // `Reset { stream_id: 1, error_code: CANCEL }` on the upload while the tunnel was setting up.
     tokio::spawn(async move {
-        let _ = upload_response.await;
+        if let Ok(response) = upload_response.await {
+            let mut body = response.into_body();
+            while let Some(chunk) = body.data().await {
+                if chunk.is_err() {
+                    break;
+                }
+            }
+        }
     });
     let (download_response, _) =
         client
