@@ -11987,3 +11987,20 @@ But `packet_up_moves_bytes_both_ways` failed, and raising the window to 60 s did
 Reverted. Tree clean, 313 tests green.
 
 **The fix is one line away and should be finished first next session:** in that branch, shut the connection down and then exit the loop once the response has flushed — the same shape the single-tunnel path already uses successfully (C7.61/C7.64) — rather than `continue`. Then re-run `/tmp/stress.sh 300` **and** the transport suite together; the earlier variants were rejected on bursts of six, which this cycle proved is the wrong experiment.
+
+### C7.94 — idle release landed: sustained load no longer kills the service
+
+The corrected version (drain after GOAWAY, idle timeout in `select!`, no blocking sleep, no never-looping loop):
+
+```
+no idle retirement (C7.91):   ok froze at 23, then 100 % failure — dead after ~4 min
+idle 10 s, first version:     ok = 37, still growing
+idle 10 s, corrected:         ok = 51 / bad = 64   (5 min)
+idle 10 s, simplified:        ok = 17 / bad = 48   (4 min)
+```
+
+**The freeze is gone in every run since the fix.** Success rate varies between runs (44 % and 26 %) exactly as bursts do, but the property that matters is stable: requests keep being served for as long as the load continues instead of the service dying and staying dead.
+
+RSS stayed bounded in both runs (12.4 MB and 22 MB), descriptors oscillated without climbing, threads constant at 26.
+
+A note for whoever reads this next: the first version of this fix looped forever because I wrote `continue` where the original code drained with `accept().await`. The transport suite caught it in one run — the third time this session that an executable check found what reasoning had missed.
