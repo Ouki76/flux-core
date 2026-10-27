@@ -10527,3 +10527,24 @@ released its port between runs (`Address already in use`), so nothing was being 
 because a number that was measured wrongly is worth as much as no number.
 
 313 transport tests pass, clippy clean.
+
+### C7.32 — the likely cause of the xray-only flakiness: the registry is per-connection
+
+Our `packet_sessions` and `reassembly` maps live **inside one connection's accept loop**. That is
+correct for our own client, which sends the download GET and the upload POSTs on one h2 connection —
+and it is why nothing ever fails against ourselves.
+
+Xray's client is free to open the two directions on **separate connections**, and there is real
+evidence for it in the logs: the failing runs show the GET arriving and the session being opened, and
+the POSTs then landing on a *different* connection whose accept loop has an empty registry. The
+session's sender is never found, the chunk goes into `state.ready` of a session nobody will drain, and
+the request times out. The successes are the runs where both directions happened to share a connection.
+
+That explains every observation without a new mystery: intermittent, only against xray's client, never
+against ours, and independent of port, POST numbering, and payload size.
+
+**Fix, not yet implemented:** move the session registry out of the connection and into the listener —
+a process-wide map keyed by session id, with the per-connection loop only *looking up* sessions. It
+needs a TTL, because a map that outlives connections must not leak a session whose peer vanished.
+
+This is the last open item of the objective and it now has a named cause rather than a symptom.
