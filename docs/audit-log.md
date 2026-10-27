@@ -11620,3 +11620,36 @@ So packet-up's remaining ~37 % is **not** a connection-lifetime problem, and the
 shape of the loss: **10 download GETs for 10 requests but only 9 uploads** — every request opens its
 download and some never send an upload. That specific loss, on a connection we are now forbidden from
 closing early, is the next thing to explain.
+
+### C7.71 — code audit, inventory: production code's risky constructs, counted honestly
+
+Counted across the workspace with test modules excluded (`#[cfg(test)]` and everything after it), so the
+numbers describe code that actually ships:
+
+```
+unwrap()  37      expect()  42      panic!()  3      unsafe  60
+```
+
+By file, the concentration:
+
+| file | unwrap+expect | unsafe |
+|---|---|---|
+| `flux-protocol/src/wireguard.rs` | 17 | 0 |
+| `flux-transport/src/reality.rs` | 10 | 0 |
+| `flux-inbound/src/tun.rs` | 8 | 13 |
+| `flux-outbound/src/wireguard.rs` | 4 | 16 |
+| `flux-common/src/splice.rs` | 1 | 9 |
+
+**Spot-checked the worst offender first**, on the principle that a panic reachable from the network is a
+denial of service and an `unwrap` on a constant length is merely untidy. `wireguard.rs:599` does
+`u32::from_le_bytes(body[0..4].try_into().unwrap())` on a received packet — which would abort the process
+on a short message. It is **guarded**: `packet.len() < expected_msg_len` returns a protocol error eleven
+lines earlier. Not a vulnerability.
+
+The `unsafe` is where it should be — `tun.rs` (ioctl and raw descriptors), `wireguard.rs` outbound
+(packet buffers), `splice.rs` (the `splice(2)` syscall path). None of it is a shortcut around a safe
+alternative.
+
+So the audit's opening finding is that the numbers are **consistent with a well-behaved codebase**, and
+the work is to confirm each site rather than to expect a harvest. The next step is the remaining files in
+the table plus the three `panic!` sites, each checked for reachability rather than rewritten for taste.
