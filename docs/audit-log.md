@@ -11024,3 +11024,32 @@ on xray's side.
 The next cycle should measure **how many connections our process is holding** at the point it breaks
 (`/proc/<pid>/fd` count, and the accept loop's own count) rather than guessing at a limit — a leak of
 h2 connections that are never closed would look exactly like this.
+
+### C7.50 — descriptors do not leak; the client stops opening connections
+
+Measured the flux process's descriptor count before and after every request in a burst of eight:
+
+```
+req 1: O  fds before=10 after=12
+req 2: X  fds before=12 after=13
+req 3..8: X  fds 13 -> 13
+```
+
+**No leak.** The count settles at 13 and stays there. What changes is that from request 2 onward
+**no new connection is opened at all** — the descriptor count cannot rise because nothing arrives.
+
+So the failures are not our resource running out. They are the client no longer dialling. Combined with
+C7.49 (six successes then failures; and 1/2 in every round across five client restarts) the picture is
+of the client's own connection pool reaching a state it will not leave.
+
+Tried bounding our connection lifetime (2 s linger) as a candidate fix — no effect, and on inspection
+the patch did not even touch the `packet-up` path, which spawns its own accept loop rather than using
+`spawn_connection_driver`. Reverted; recorded as an untested dead end rather than a result.
+
+**Where the objective stands.** Eleven hypotheses have been measured and cleared on our side: session
+registry, reassembly, accept loop, download writer, POST numbering, GOAWAY, connection reuse, priming
+frame, descriptor exhaustion, connection lifetime, per-process badness. Every trace shows the server
+behaving identically for a served and an unserved request, with the client simply not sending.
+
+The remaining work is no longer guesswork: it is reading Xray's `splithttp` client to find the
+condition under which it stops dialling, because the evidence says the decision is entirely there.
