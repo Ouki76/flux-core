@@ -11844,3 +11844,16 @@ xhttp.rs       13 references; line 380 takes min_interval and paces the POST loo
 Also confirmed the server-side trio reaches the pipeline: `instance.rs` passes `xpadding`, `packet_up_options`, `max_buffered_posts` and `stream_up_server_secs` into the framing layers (lines 1125, 1136, 1678, 1679).
 
 **Verdict for XHTTP on item 3: every advertised setting is reachable and used.** The general lesson worth keeping: a grep that excludes the file where conversion happens will always "prove" that settings are unused.
+
+### C7.85 — item 3: no config setting is a stub, measured across the whole tree
+
+Rather than spot-checking names by hand (which produced the false alarm in C7.84), extracted every `pub <field>:` from `crates/flux-app/src/config.rs` and counted its occurrences across **all** `.rs` files in the workspace:
+
+```
+config fields declared:                          69
+fields mentioned only at their declaration:      0
+```
+
+Every setting is read somewhere. Combined with C7.84 (the XHTTP group traced from config through `PacketUpOptions` into the POST loop) and C7.60 (the client pool cap demonstrably driving behaviour), the settings surface is verified as real rather than decorative.
+
+This is the check that should have come first on item 3: a mechanical scan of declaration-versus-use beats an afternoon of reading field names and guessing.
