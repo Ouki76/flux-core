@@ -11131,3 +11131,38 @@ version, or a configuration of this one where its XMUX/transport does not serial
 What the sessions established, honestly: the XHTTP inbound works — `stream-one`, `stream-up`,
 `packet-up` and `auto` have each carried real traffic through it against both our client and, on the
 runs where it dials, xray's.
+
+### C7.53 — the aborted handshakes were an ALPN mismatch; restricting to h2 removes them
+
+C7.52 left the picture at "the client connects and gives up". Looking at the log for what happens
+*before* the request line appears — which no earlier check had done — found it:
+
+```
+WARN flux_inbound::vless: [in] VLESS handshake failed from 127.0.0.1:46258: I/O error: tls handshake eof
+WARN … 46268: tls handshake eof
+WARN … 46278: tls handshake eof
+```
+
+Three aborted TLS handshakes for three failed requests, and xray's own log shows it dialling each time
+(`XHTTP is dialing to tcp:127.0.0.1:19951`). So the client was **connecting and abandoning the
+handshake**, not failing to connect.
+
+Our inbound advertised `"alpn": ["h2", "http/1.1"]`. Restricted to `["h2"]` — the only protocol this
+transport speaks — and measured the same eight-request burst:
+
+```
+before:  O X X X X X X X        tls handshake eof: 3
+after:   X O O O X X X X        tls handshake eof: 0
+```
+
+**The aborts are gone entirely**, and the burst now serves three consecutive requests instead of one.
+That is the first change in fourteen cycles that moved a number in the right direction, and it was
+found by reading a log line that had been in front of me the whole time.
+
+**Not a fix.** Failures remain, and their shape is now different: the descriptor count climbs
+10 → 11 → 13 → 15 → 17 → 18 and then requests fail while it stays flat — a new lead, and a
+tractable one, unlike "the client just doesn't".
+
+The ALPN list in this test config is a test artefact, not repo code; the real change belongs in whatever
+defaults the XHTTP inbound recommends, which the next cycle should settle with this measurement as the
+baseline.
