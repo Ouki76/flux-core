@@ -10311,3 +10311,28 @@ take an HTTP/1.1 branch when the preface is absent — parsing a request line, s
 body as the upload, and writing a chunked response as the download. That is a transport-sized piece of
 work, not a patch, and it is the honest answer to "does the core work for xray clients": today, not
 without TLS.
+
+### C7.23 — the packet-up failure is about the *number* of POSTs, not their size
+
+C7.20 reported that a 200-byte write failed while a 4-byte one passed, and could not explain why the
+payload size would matter. It does not. Measured directly, with a probe that differs only in how many
+POSTs the poster emits:
+
+| write | POSTs | server `send_response` |
+|---|---|---|
+| 4 bytes, default limit | 1 | **ok** |
+| 200 bytes, default limit | **1** | **ok** |
+| 200 bytes, 64-byte limit | **4** | fails: `User(UnexpectedFrameType)` |
+
+**One POST is fine; several are not.** Removing the 100 ms delays from the end-to-end tests made
+exactly the two multi-POST tests fail and left the single-write one passing, which is the same fact
+from the other side.
+
+That is a much sharper statement than C7.20's, and it points at the poster's loop rather than at the
+size of any frame: each iteration calls `client.send_request(...)` and then `posted.await`. Something
+in issuing several requests on one connection while the peer is still answering the first is what puts
+the server's download stream into a state h2 considers already-answered.
+
+**Still not fixed.** The delays are back, and the note in the tests now says why. The next attempt
+should watch the h2 client's stream ids for the POSTs against the server's view — the answer will be
+in which stream the server thinks it already responded on.

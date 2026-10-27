@@ -1550,6 +1550,8 @@ mod split_write_tests {
             )
             .await
             .expect("client packet-up");
+            // The download request must be answered before the first POST: with more than one POST
+            // the server's `send_response` fails with `unexpected frame type`. Recorded in C7.23.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             c.write_all(&expected).await.expect("write");
             c.flush().await.expect("flush");
@@ -1610,7 +1612,6 @@ mod split_write_tests {
             )
             .await
             .expect("client packet-up");
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             c.write_all(b"ping").await.expect("write");
             c.flush().await.expect("flush");
             // Keep the client alive; the server must end the stream, not the client.
@@ -1676,8 +1677,8 @@ mod split_write_tests {
             )
             .await
             .expect("client packet-up");
-            // Let the download request be processed before the first POST: in real use the relay
-            // writes only after the tunnel is up.
+            // More than one POST makes the server's `send_response` fail with `unexpected frame
+            // type` unless the download has been answered first. Recorded in C7.23.
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             c.write_all(&expected).await.expect("write");
             c.flush().await.expect("flush");
