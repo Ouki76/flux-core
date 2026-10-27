@@ -10600,3 +10600,28 @@ correct behaviour for a transport that serves one stream per connection.
 
 313 transport tests pass, clippy clean. End-to-end confirmation against xray's client is still owed:
 this environment kills any process tree I start, so the run has to happen in the user's shell.
+
+### C7.35 — the GOAWAY fix broke the working case; reverted
+
+C7.34's diagnosis — we serve one request per connection and silently refuse the rest — is still the
+best explanation of "first works, rest fail". The fix for it, however, was wrong: sending
+`graceful_shutdown()` after refusing a second request made **even the first request fail**. After the
+change, five sequential requests against xray's client all returned nothing, with both processes up and
+xray dialling the target — the tunnel established and then carried nothing.
+
+Reverted. The reasoning for the revert is the same one this audit has applied throughout: a change that
+breaks a case that used to work is not an improvement, whatever the theory says.
+
+What the observations now pin down:
+
+- our server serves exactly one XHTTP request per h2 connection;
+- xray reuses the connection for later requests;
+- refusing them leaves the peer sending into a dead connection;
+- but telling the peer to reconnect via GOAWAY disrupts the live tunnel as well.
+
+The next attempt must find a way to either (a) serve multiple requests per connection properly — a
+registry of live tunnels per connection rather than one — or (b) end the connection **after the tunnel
+it serves is finished**, not when a second request arrives. Option (a) is the correct design and the
+one Xray itself uses.
+
+313 transport tests pass, clippy clean, tree clean.
