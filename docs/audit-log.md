@@ -10991,3 +10991,36 @@ Both sides restart for every trial, so either could be the one: flux's listener 
 client pool and its TLS session. The next cycle should separate them by restarting **only xray** between
 requests within one flux process: if the badness follows xray's restart, it is on its side; if it
 persists through xray restarts, it is on ours.
+
+### C7.49 — it is not random: six successes, then it breaks
+
+Two measurements that finally separate the pattern from the noise.
+
+**First — flux alive across five xray restarts**, two requests per round:
+
+```
+xray restart 1: 1/2   restart 2: 1/2   restart 3: 1/2   restart 4: 1/2   restart 5: 1/2
+```
+
+Not "a bad process": every restart of the client behaves identically, so the flakiness is **not** a
+per-process property of either side. That also deflates C7.48's "runs are globally good or bad" — with
+five rounds the same 1/2 every time is what a stable per-request pattern looks like.
+
+**Second — the per-request sequence**, eight consecutive requests, one stack, no restarts:
+
+```
+sequence: OOOOOOXX      (O = HELLO, X = nothing)
+```
+
+**Six successes, then failures.** Not alternating, not random: the first six tunnels work and then it
+stops. A random race cannot produce a clean prefix; something **degrades after roughly six successful
+requests**.
+
+Candidates that fit "a resource that runs out", in order: a connection or stream limit on our side
+(each request opens a fresh h2 connection and we never close them promptly — the connection is handed
+to a driver that lives as long as the peer keeps it), file descriptors, or XMUX's own concurrency pool
+on xray's side.
+
+The next cycle should measure **how many connections our process is holding** at the point it breaks
+(`/proc/<pid>/fd` count, and the accept loop's own count) rather than guessing at a limit — a leak of
+h2 connections that are never closed would look exactly like this.
