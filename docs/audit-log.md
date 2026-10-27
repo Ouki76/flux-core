@@ -11778,3 +11778,25 @@ Every path produces a key of exactly `kind.key_len()`, so `UnboundKey::new` cann
 Deliberately **not** rewritten into a `Result`. It guards an invariant, the invariant holds at every call site, and the objective says to leave the API and behaviour alone unless a change is proven better — turning an unreachable panic into a propagated error would add error paths to callers for a case that cannot occur. Recorded so the next reader does not have to re-derive it.
 
 Audit status so far: production `unsafe` (60) all in syscall/buffer code with no safe alternative; the two `panic!` sites cleared; the biggest `unwrap` cluster (`wireguard`) cleared in C7.71. Remaining: the three `panic!`-adjacent files, duplicated code across crates, and the benches for anything slow.
+
+### C7.81 — gates verified after the XHTTP changes: full workspace green, both benches assert
+
+Ran the whole suite and both assertion benchmarks against the current tree (the one carrying the empty opening frame):
+
+```
+cargo test --workspace    every suite ok, 0 failed  (including 313 transport)
+bench_matrix --assert     ASSERT PASSED: every row is at or above both competitors within 10 %   exit 0
+bench_rps --assert        ASSERT PASSED
+```
+
+`bench_rps` numbers, since they are the point of the exercise:
+
+```
+flux-core   12290 rps    median 2150 µs
+sing-box    10309 rps    median 2738 µs
+xray         1301 rps    median 2403 µs
+```
+
+flux-core is **19 % above sing-box and 9.5x xray** on this run. The transport change cost nothing measurable — as expected for one empty frame per download.
+
+Also corrected a long-standing harness mistake: the benches are **examples**, not binaries, so `./target/release/bench_matrix` never existed and any earlier claim of running it from that path was wrong. The correct invocation is `cargo build --release --example bench_matrix` / `./target/release/examples/bench_matrix`.
