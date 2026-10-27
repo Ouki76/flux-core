@@ -10336,3 +10336,22 @@ the server's download stream into a state h2 considers already-answered.
 **Still not fixed.** The delays are back, and the note in the tests now says why. The next attempt
 should watch the h2 client's stream ids for the POSTs against the server's view — the answer will be
 in which stream the server thinks it already responded on.
+
+### C7.24 — reverse direction: the TLS route was attempted and not established
+
+C7.22 established that Xray's client uses HTTP/1.1 in cleartext. The remaining hope was that with TLS
+and `alpn: ["h2"]` it would speak h2, which our server already handles — that would close the reverse
+direction without implementing HTTP/1.1.
+
+Attempted with a self-signed certificate, our inbound configured
+`security: tls` + `alpn: ["h2", "http/1.1"]` + `framing: xhttp`, and xray as client with
+`security: tls`, `alpn: ["h2"]`, `mode: stream-one`.
+
+**The attempt did not produce a result.** The first run was refused by our own config validation
+(`server_name` is not supported on a TLS inbound — a real limitation, now noted), and the retries after
+removing it were killed by port contention on the echo server before either log was written.
+
+So this route is **untested, not disproved**. It remains the cheapest way to close item (2): one clean
+run with the port handling done properly would answer it in a single command.
+
+Item (1) is done and verified (C7.23 fix, delays removed, xray interop re-run).
