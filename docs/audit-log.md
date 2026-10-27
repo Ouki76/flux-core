@@ -10099,3 +10099,33 @@ wait as C7.6, one layer up. That is a hypothesis and it is **not** confirmed; th
 confirm it by logging either side of that await rather than by rewriting the mode again.
 
 Config refuses `packet-up` again; the implementation stays behind the refusal.
+
+### C7.16 — the deadlock hypothesis was wrong; the poster is starved, not blocked
+
+C7.15 proposed that `connect_packet_up` awaited the download before spawning the poster, and that the
+peer answered the download only once an upload existed. The architecture was changed accordingly:
+the poster is now spawned **before** the download is polled, and the read half holds a pending
+`ResponseFuture` (`PacketUpRecv::Pending`) that resolves on first read — the same design that fixed
+`stream-up` in C7.6.
+
+**The behaviour did not change at all:**
+
+```
+curl through the tunnel:  nothing
+flux log:                 0 lines containing "packet-up", with level = debug
+xray log:                 0 requests received
+```
+
+So the hypothesis is **refuted**, and the new facts narrow it further:
+
+- the relay still reports `up=79`, so `PacketUpStream::poll_write` ran, the channel send returned `Ok`,
+  and `connect_packet_up` returned successfully — meaning the poster **was** spawned;
+- with `debug` enabled and three `warn!` guards around the POST, the poster printed nothing.
+
+A spawned task that never logs and whose channel never yields a chunk means **the bytes are not
+reaching that channel**. The write path returns `Ok` and the chunk disappears.
+
+That is a different class of fault from everything investigated so far, and it needs a byte counter on
+the channel rather than another architectural guess: log on both sides of the send in `poll_write`.
+
+Reverted to refusal; the implementation stays behind it. 1174 tests, clippy clean.

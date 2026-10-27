@@ -171,8 +171,10 @@ fn session_id() -> String {
 /// be a stream at all: it has to queue chunks for a task that numbers and posts them. The read half is
 /// unchanged, because the download is the same GET `stream-up` uses.
 pub struct PacketUpStream {
-    /// Download half: the GET's response body, already resolved when the stream is built.
-    recv: RecvStream,
+    /// Download half. It starts as a **pending** response, exactly like `stream-up`: awaiting it
+    /// before returning would deadlock against a peer that answers the download only once an upload
+    /// exists, which is the circular wait C7.6 hit one layer up.
+    recv: PacketUpRecv,
     read_buf: Bytes,
     read_pos: usize,
     read_done: bool,
@@ -183,6 +185,13 @@ pub struct PacketUpStream {
     /// queue is fed by the relay's 64 KiB reads and drained by a poster on the same task set, so its
     /// depth is bounded in practice by how far the relay runs ahead of the tunnel.
     tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+}
+
+/// The download half's state: a response that has not arrived yet, one that has, or a finished body.
+enum PacketUpRecv {
+    Pending(h2::client::ResponseFuture),
+    Ready(RecvStream),
+    Done,
 }
 
 impl std::fmt::Debug for PacketUpStream {
@@ -213,19 +222,46 @@ impl AsyncRead for PacketUpStream {
             if this.read_done {
                 return Poll::Ready(Ok(()));
             }
-            match Pin::new(&mut this.recv).poll_data(cx) {
-                Poll::Ready(Some(Ok(data))) => {
-                    this.read_buf = data;
-                    this.read_pos = 0;
+            if let PacketUpRecv::Pending(fut) = &mut this.recv {
+                match Pin::new(fut).poll(cx) {
+                    Poll::Ready(Ok(response)) => {
+                        let status = response.status();
+                        if !status.is_success() {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::ConnectionRefused,
+                                format!("H2 tunnel rejected by peer with HTTP status {status}"),
+                            )));
+                        }
+                        this.recv = PacketUpRecv::Ready(response.into_body());
+                        continue;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
+                    }
+                    Poll::Pending => return Poll::Pending,
                 }
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
-                }
-                Poll::Ready(None) => {
+            }
+            match &mut this.recv {
+                PacketUpRecv::Ready(recv) => match Pin::new(recv).poll_data(cx) {
+                    Poll::Ready(Some(Ok(data))) => {
+                        this.read_buf = data;
+                        this.read_pos = 0;
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
+                    }
+                    Poll::Ready(None) => {
+                        this.read_done = true;
+                        this.recv = PacketUpRecv::Done;
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                PacketUpRecv::Done => {
                     this.read_done = true;
                     return Poll::Ready(Ok(()));
                 }
-                Poll::Pending => return Poll::Pending,
+                PacketUpRecv::Pending(_) => continue,
             }
         }
     }
@@ -300,13 +336,8 @@ where
                 protocol: "xhttp",
                 message: format!("failed to send the XHTTP download: {e}"),
             })?;
-    let response = download_response.await.map_err(|e| FluxError::Protocol {
-        protocol: "xhttp",
-        message: format!("the XHTTP download was refused: {e}"),
-    })?;
-    let recv = response.into_body();
-
-    // Upload: a task posts each queued chunk to /<base>/<session>/<seq>.
+    // Upload: a task posts each queued chunk to /<base>/<session>/<seq>. It is spawned **before** the
+    // download is polled, because a peer may only answer the download once an upload exists.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     let host = host.to_string();
     let headers = headers.clone();
@@ -360,7 +391,7 @@ where
     });
 
     Ok(Box::new(PacketUpStream {
-        recv,
+        recv: PacketUpRecv::Pending(download_response),
         read_buf: Bytes::new(),
         read_pos: 0,
         read_done: false,
