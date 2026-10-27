@@ -339,6 +339,21 @@ async fn serve_connection<St>(
             }
         };
 
+    serve_stream(stream, req, client_addr, disp, inbound_tag, mux).await;
+}
+
+/// Serves one already-framed VLESS stream: everything after transport and framing are done.
+///
+/// Split out of `serve_connection` so a transport that multiplexes several tunnels over one
+/// connection — XHTTP does, and Xray's client relies on it — can hand each extra tunnel here.
+async fn serve_stream(
+    stream: BoxedStream,
+    req: flux_protocol::vless::VlessRequest,
+    client_addr: SocketAddr,
+    disp: Arc<dyn Dispatcher>,
+    inbound_tag: Arc<str>,
+    mux: Option<MuxConfig>,
+) {
     // A mux session is a normal VLESS connection whose target is
     // the reserved mux destination (sing-box convention). It is
     // TCP-only: taking the branch for a UDP/PACKETADDR request
