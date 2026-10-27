@@ -855,8 +855,10 @@ impl XhttpSettings {
     /// behaves nothing like their Xray setup.
     pub fn validate(&self, where_: &str) -> Result<(), String> {
         match self.mode.as_deref() {
-            None | Some("stream-one") | Some("streamone") | Some("stream-up")
-            | Some("streamup") => {}
+            // `stream-up` is implemented and its own tests pass, but it is not verified against a
+            // real xray server yet, so it stays refused: a mode that connects and then resets the
+            // download stream is worse than one the user is told about at startup.
+            None | Some("stream-one") | Some("streamone") => {}
             Some(other) => {
                 return Err(format!(
                     "{where_}: XHTTP mode '{other}' is not implemented — only 'stream-one' is; \
@@ -2846,11 +2848,7 @@ mod xhttp_settings_tests {
     /// with a message that names them.
     #[test]
     fn the_other_modes_are_refused_by_name() {
-        assert!(
-            parse(r#"{"mode": "stream-up"}"#).validate("test").is_ok(),
-            "stream-up is implemented and must be accepted"
-        );
-        for mode in ["packet-up", "auto", "bogus"] {
+        for mode in ["packet-up", "stream-up", "auto", "bogus"] {
             let err = parse(&format!(r#"{{"mode": "{mode}"}}"#))
                 .validate("outbound xhttp")
                 .expect_err("must be refused")

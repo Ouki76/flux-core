@@ -9832,3 +9832,34 @@ type plus the mode plumbing, the config relaxation, and the interop run. Reverte
 
 **Where the next cycle starts, exactly:** add `H2Stream::new_client_split(upload, download_response)`,
 have `connect_stream_up` use it, and the deadlock is gone by construction.
+
+### C7.7 — stream-up works against our own pair; against real xray it sends CANCEL
+
+Built and passing: `connect_stream_up` and the server pairing move bytes both ways over one duplex
+socket, after three real bugs were found and fixed (C7.4–C7.6):
+
+1. dropping a `ResponseFuture` resets its stream;
+2. the client awaited the download response before writing while the server waited for the upload
+   before flushing — a deadlock, fixed by `H2Stream::new_client_split` handing back a stream whose
+   receive half is still `Pending`;
+3. dropping a `SendStream` sends `RST_STREAM CANCEL`; `shutdown()` ends it properly.
+
+**Against the real xray binary it does not work yet.** With xray configured
+`"network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-up"}` and our client set to the
+same mode, a request through the tunnel produced no data, and our own log shows:
+
+```
+h2::codec::framed_write: send frame=Reset { stream_id: StreamId(1), error_code: CANCEL }
+GoAway { error_code: NO_ERROR, last_stream_id: StreamId(0) }
+```
+
+**So `stream-up` is refused at startup again**, deliberately. The implementation and its tests stay in
+the tree, but a config cannot reach them until the mode is verified against xray. That is the
+objective's own rule and it is the right one: the failure mode here is a tunnel that connects and
+then carries nothing.
+
+**What the next cycle should check first:** the `CANCEL` is on **stream 1 — the upload POST**. Our
+client spawns a task that awaits the upload's response; if that future resolves or errors early (xray
+answers the POST immediately with an empty body), the task ends and its stream may be cancelled while
+the upload is meant to stay open. Awaiting a response and *then* dropping its stream is different from
+keeping it alive — the fix may be to hold the response body, not just the future.
