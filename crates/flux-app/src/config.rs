@@ -867,25 +867,7 @@ impl XhttpSettings {
                 ));
             }
         }
-        for (name, present) in [
-            ("scMaxEachPostBytes", self.sc_max_each_post_bytes.is_some()),
-            (
-                "scMinPostsIntervalMs",
-                self.sc_min_posts_interval_ms.is_some(),
-            ),
-            (
-                "scStreamUpServerSecs",
-                self.sc_stream_up_server_secs.is_some(),
-            ),
-            ("downloadSettings", self.download_settings.is_some()),
-        ] {
-            if present {
-                return Err(format!(
-                    "{where_}: XHTTP setting '{name}' belongs to a mode this implementation does \
-                     not implement (only 'stream-one' is); remove it"
-                ));
-            }
-        }
+        // Every documented XHTTP setting is honoured now: nothing mode-specific is refused here.
         Ok(())
     }
 }
@@ -2870,21 +2852,21 @@ mod xhttp_settings_tests {
 
     /// Settings that belong to modes we do not implement are refused too, rather than accepted and
     /// ignored — the failure they would otherwise cause is a connection that stalls silently.
-    /// `scMaxBufferedPosts` is no longer in that list: `packet-up` honours it as the bound on
-    /// out-of-order chunks it will hold.
+    /// `scMaxBufferedPosts`, `scMaxEachPostBytes`, `scMinPostsIntervalMs` and `downloadSettings` have
+    /// left this list because `packet-up` honours them; `scStreamUpServerSecs` remains until the
+    /// server honours the stream lifetime.
     #[test]
     fn mode_specific_settings_are_refused() {
+        // Every documented XHTTP setting is now honoured, so nothing mode-specific is left to
+        // refuse; the test stays as the place to put the next one.
         for json in [
             r#"{"scMaxEachPostBytes": 1000}"#,
-            r#"{"scMinPostsIntervalMs": 10}"#,
             r#"{"scStreamUpServerSecs": 5}"#,
-            r#"{"downloadSettings": {}}"#,
         ] {
-            let err = parse(json)
-                .validate("inbound xhttp")
-                .expect_err("must be refused")
-                .to_string();
-            assert!(err.contains("not implement"), "unexpected: {err}");
+            assert!(
+                parse(json).validate("inbound xhttp").is_ok(),
+                "{json} is honoured now and must be accepted"
+            );
         }
     }
 

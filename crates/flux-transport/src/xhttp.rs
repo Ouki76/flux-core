@@ -19,6 +19,7 @@ use flux_types::traits::AsyncStream;
 use h2::{RecvStream, SendStream};
 use http::{Method, Request, Response, StatusCode};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -302,6 +303,22 @@ impl AsyncWrite for PacketUpStream {
     }
 }
 
+/// Xray's default for `scMaxEachPostBytes`: 1 MB.
+pub const DEFAULT_MAX_EACH_POST_BYTES: usize = 1_000_000;
+
+/// The `packet-up` settings that change its behaviour rather than its wire shape.
+#[derive(Debug, Clone, Default)]
+pub struct PacketUpOptions {
+    /// Largest body one POST may carry; a larger write is split across several.
+    pub max_each_post_bytes: Option<usize>,
+    /// Minimum gap between consecutive POSTs.
+    pub min_posts_interval: Option<std::time::Duration>,
+    /// Path for the download request, when `downloadSettings` overrides the upload's.
+    pub download_path: Option<String>,
+    /// Headers for the download request, overriding or extending the upload's.
+    pub download_headers: HashMap<String, String>,
+}
+
 /// Client half of `packet-up`.
 pub async fn connect_packet_up<S>(
     stream: S,
@@ -309,6 +326,7 @@ pub async fn connect_packet_up<S>(
     path: &str,
     headers: &HashMap<String, String>,
     xpadding: Option<&str>,
+    options: &PacketUpOptions,
 ) -> FluxResult<Box<dyn AsyncStream>>
 where
     S: AsyncStream + 'static,
@@ -318,14 +336,21 @@ where
     let base = normalize_path(path);
     let padding = padding_param(xpadding);
 
-    // Download: the same GET as `stream-up`.
-    let download_url = format!("{base}{session}?x_padding={padding}");
+    // Download: the same GET as `stream-up`, unless `downloadSettings` gives it its own path.
+    let download_base = match options.download_path.as_deref() {
+        Some(p) => normalize_path(p),
+        None => base.clone(),
+    };
+    let download_url = format!("{download_base}{session}?x_padding={padding}");
     let mut builder = Request::builder()
         .method("GET")
         .uri(download_url.as_str())
         .header("Host", host)
         .header("content-type", "application/octet-stream");
     for (k, v) in headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    for (k, v) in &options.download_headers {
         builder = builder.header(k.as_str(), v.as_str());
     }
     let download_request = builder.body(()).map_err(|e| FluxError::Protocol {
@@ -344,61 +369,79 @@ where
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     let host = host.to_string();
     let headers = headers.clone();
+    let max_post = options
+        .max_each_post_bytes
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_EACH_POST_BYTES);
+    let min_interval = options.min_posts_interval;
     tokio::spawn(async move {
         let mut seq: u64 = 0;
         tracing::debug!("packet-up: poster started");
         while let Some(chunk) = rx.recv().await {
-            tracing::trace!("packet-up: posting seq {seq}");
-            let url = format!("{base}{session}/{seq}?x_padding={padding}");
-            seq += 1;
-            let mut builder = Request::builder()
-                .method("POST")
-                .uri(url.as_str())
-                .header("Host", host.as_str())
-                .header("content-type", "application/octet-stream");
-            for (k, v) in &headers {
-                builder = builder.header(k.as_str(), v.as_str());
-            }
-            let Ok(request) = builder.body(()) else {
-                tracing::warn!("packet-up: could not build the POST request");
-                break;
+            // One write can exceed the configured POST size, so it is split here rather than being
+            // sent as a body the peer would refuse.
+            let pieces: Vec<Bytes> = if chunk.len() <= max_post {
+                vec![chunk]
+            } else {
+                chunk.chunks(max_post).map(Bytes::copy_from_slice).collect()
             };
-            // The chunk **is** the request body, and this request ends with it: `end_of_stream =
-            // false` above only opens the stream so a body can follow. Without the `send_data` the
-            // POST stays open forever and the peer never answers — which is exactly what the
-            // counters showed: the poster queued seq 0 and then waited for a response that could
-            // not come.
-            let (posted, mut body) = match client.send_request(request, false) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    tracing::warn!("packet-up: send_request failed for seq {seq}: {e}");
-                    break;
+            for piece in pieces {
+                if let Some(interval) = min_interval
+                    && !interval.is_zero()
+                {
+                    tokio::time::sleep(interval).await;
                 }
-            };
-            if let Err(e) = body.send_data(chunk, true) {
-                tracing::warn!("packet-up: sending the body for seq {seq} failed: {e}");
-                break;
-            }
-            // The request body completes this POST, and the response is **drained**: a response body
-            // dropped unread sends `RST_STREAM CANCEL`, which is the fault C7.8 took three cycles to
-            // find on the stream-up upload path.
-            match posted.await {
-                Ok(response) if response.status().is_success() => {
-                    tracing::trace!("packet-up: seq posted, status {}", response.status());
-                    let mut body = response.into_body();
-                    while let Some(chunk) = body.data().await {
-                        if chunk.is_err() {
-                            break;
+                let url = format!("{base}{session}/{seq}?x_padding={padding}");
+                seq += 1;
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri(url.as_str())
+                    .header("Host", host.as_str())
+                    .header("content-type", "application/octet-stream");
+                for (k, v) in &headers {
+                    builder = builder.header(k.as_str(), v.as_str());
+                }
+                let Ok(request) = builder.body(()) else {
+                    tracing::warn!("packet-up: could not build the POST request");
+                    return;
+                };
+                // The chunk **is** the request body, and this request ends with it: `end_of_stream =
+                // false` above only opens the stream so a body can follow. Without the `send_data` the
+                // POST stays open forever and the peer never answers — which is exactly what the
+                // counters showed: the poster queued seq 0 and then waited for a response that could
+                // not come.
+                let (posted, mut body) = match client.send_request(request, false) {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!("packet-up: send_request failed for seq {seq}: {e}");
+                        return;
+                    }
+                };
+                if let Err(e) = body.send_data(piece, true) {
+                    tracing::warn!("packet-up: sending the body for seq {seq} failed: {e}");
+                    return;
+                }
+                // The request body completes this POST, and the response is **drained**: a response body
+                // dropped unread sends `RST_STREAM CANCEL`, which is the fault C7.8 took three cycles to
+                // find on the stream-up upload path.
+                match posted.await {
+                    Ok(response) if response.status().is_success() => {
+                        tracing::trace!("packet-up: seq posted, status {}", response.status());
+                        let mut body = response.into_body();
+                        while let Some(chunk) = body.data().await {
+                            if chunk.is_err() {
+                                break;
+                            }
                         }
                     }
-                }
-                Ok(response) => {
-                    tracing::warn!("packet-up: POST rejected with {}", response.status());
-                    break;
-                }
-                Err(e) => {
-                    tracing::warn!("packet-up: POST failed: {e}");
-                    break;
+                    Ok(response) => {
+                        tracing::warn!("packet-up: POST rejected with {}", response.status());
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::warn!("packet-up: POST failed: {e}");
+                        return;
+                    }
                 }
             }
         }
@@ -452,6 +495,11 @@ impl AsyncRead for ChannelDuplex {
                 return Poll::Ready(Ok(()));
             }
             match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(data)) if data.is_empty() => {
+                    // The watchdog for `scStreamUpServerSecs` closes the upload by sending an empty
+                    // chunk, which is indistinguishable from a clean end — and is one.
+                    return Poll::Ready(Ok(()));
+                }
                 Poll::Ready(Some(data)) => {
                     this.read_buf = data;
                     this.read_pos = 0;
@@ -496,6 +544,10 @@ struct Reassembly {
     pending: std::collections::BTreeMap<u64, Bytes>,
     /// The next sequence number expected.
     next: u64,
+    /// Chunks that became deliverable **before** the download stream existed. They must not be
+    /// dropped: the client posts as soon as it has data, and the server's download request may be
+    /// accepted a moment later. Losing them would corrupt the stream silently.
+    ready: VecDeque<Bytes>,
     /// How many out-of-order chunks may be held. This is Xray's `scMaxBufferedPosts`, and it exists
     /// because a peer that never fills the gap would otherwise make the server buffer without bound.
     max_buffered: usize,
@@ -505,6 +557,7 @@ impl Default for Reassembly {
     fn default() -> Self {
         Self {
             pending: std::collections::BTreeMap::new(),
+            ready: VecDeque::new(),
             next: 0,
             max_buffered: DEFAULT_MAX_BUFFERED_POSTS,
         }
@@ -551,6 +604,7 @@ pub async fn accept<S>(
     path: &str,
     no_sse_header: bool,
     max_buffered_posts: Option<u64>,
+    stream_up_server_secs: Option<u64>,
 ) -> FluxResult<Box<dyn AsyncStream>>
 where
     S: AsyncStream + 'static,
@@ -601,10 +655,19 @@ where
     {
         let (upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         let (down_tx, mut down_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-        packet_sessions.insert(session.clone(), upload_tx);
+        packet_sessions.insert(session.clone(), upload_tx.clone());
+        // `scStreamUpServerSecs`: an upload stream must not live forever. The watchdog closes it by
+        // sending the empty end-of-upload marker; a peer that keeps uploading simply reopens one.
+        if let Some(secs) = stream_up_server_secs.filter(|n| *n > 0) {
+            let closer = upload_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                let _ = closer.send(Bytes::new());
+            });
+        }
         // Anything already reassembled before the download opened is delivered first.
-        if let Some(ready) = reassembly.remove(&session) {
-            for (_, piece) in ready.pending {
+        if let Some(state) = reassembly.remove(&session) {
+            for piece in state.ready {
                 let _ = down_tx.send(piece);
             }
         }
@@ -945,7 +1008,7 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false, None)
+            let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
                 .expect("server accept");
             let mut buf = vec![0u8; 5];
@@ -1021,8 +1084,11 @@ mod tests {
         // implementation does not speak. Answering 200 would leave a client waiting for
         // a download stream that never carries anything.
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server =
-            tokio::spawn(async move { accept(server_io, "/tunnel", false, None).await.is_err() });
+        let server = tokio::spawn(async move {
+            accept(server_io, "/tunnel", false, None, None)
+                .await
+                .is_err()
+        });
         let mut client = shared::client_handshake(client_io, "xhttp")
             .await
             .expect("client");
@@ -1045,7 +1111,7 @@ mod tests {
         // Xray appends things to the base path; the prefix rule must not be exact-match.
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false, None)
+            let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
                 .expect("accept");
             let mut buf = [0u8; 3];
@@ -1079,8 +1145,11 @@ mod tests {
     #[tokio::test]
     async fn a_path_outside_the_base_is_refused() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server =
-            tokio::spawn(async move { accept(server_io, "/tunnel", false, None).await.is_err() });
+        let server = tokio::spawn(async move {
+            accept(server_io, "/tunnel", false, None, None)
+                .await
+                .is_err()
+        });
         let mut client = shared::client_handshake(client_io, "xhttp")
             .await
             .expect("client");
@@ -1253,7 +1322,7 @@ mod stream_up_end_to_end {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false, None)
+            let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
                 .expect("server must pair the session");
             let mut buf = vec![0u8; 64];
@@ -1316,7 +1385,7 @@ mod packet_up_tests {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false, None)
+            let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
                 .expect("server must open the packet-up session");
             let mut buf = vec![0u8; 64];
@@ -1330,10 +1399,16 @@ mod packet_up_tests {
         });
 
         let client = tokio::spawn(async move {
-            let mut c =
-                connect_packet_up(client_io, "example.com", "/tunnel", &HashMap::new(), None)
-                    .await
-                    .expect("client packet-up");
+            let mut c = connect_packet_up(
+                client_io,
+                "example.com",
+                "/tunnel",
+                &HashMap::new(),
+                None,
+                &PacketUpOptions::default(),
+            )
+            .await
+            .expect("client packet-up");
             c.write_all(b"ping").await.expect("client write");
             c.flush().await.expect("client flush");
             let mut buf = vec![0u8; 64];

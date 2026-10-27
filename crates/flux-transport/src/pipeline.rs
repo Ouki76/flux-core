@@ -68,6 +68,8 @@ pub enum FramingLayer {
         stream_up: bool,
         /// Send `packet-up`: every write becomes its own numbered POST.
         packet_up: bool,
+        /// `packet-up` options: POST size, pacing, and download overrides.
+        packet_up_options: crate::xhttp::PacketUpOptions,
     },
     /// gRPC framing over HTTP/2.
     Grpc {
@@ -219,6 +221,7 @@ impl LayeredTransportPipeline {
                     xpadding,
                     stream_up,
                     packet_up,
+                    packet_up_options,
                 } => {
                     if *packet_up {
                         crate::xhttp::connect_packet_up(
@@ -227,6 +230,7 @@ impl LayeredTransportPipeline {
                             path,
                             headers,
                             xpadding.as_deref(),
+                            packet_up_options,
                         )
                         .await?
                     } else if *stream_up {
@@ -389,6 +393,8 @@ pub enum ServerFramingLayer {
         no_sse_header: bool,
         /// Xray's `scMaxBufferedPosts`: how many out-of-order `packet-up` chunks may be held.
         max_buffered_posts: Option<u64>,
+        /// Xray's `scStreamUpServerSecs`: how long an upload stream may stay open.
+        stream_up_server_secs: Option<u64>,
     },
     /// Upgrade framing.
     HttpUpgrade {
@@ -484,12 +490,14 @@ impl ServerTransportPipeline {
                         path,
                         no_sse_header,
                         max_buffered_posts,
+                        stream_up_server_secs,
                     } => {
                         let st = crate::xhttp::accept(
                             stream,
                             path.as_deref().unwrap_or(crate::xhttp::DEFAULT_XHTTP_PATH),
                             *no_sse_header,
                             *max_buffered_posts,
+                            *stream_up_server_secs,
                         )
                         .await?;
                         Box::new(st)
