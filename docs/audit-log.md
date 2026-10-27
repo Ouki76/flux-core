@@ -11389,3 +11389,29 @@ closing it **after** the tunnel finishes is the version that should work.
 This is the first time in seventeen cycles that the failure has been reproduced away rather than merely
 argued about: 0/10 becomes 10/10 by changing only the pool cap, which pins the cause to connection
 lifetime on our side.
+
+### C7.61 — the fix, implemented and measured: release the connection when its tunnel ends
+
+`ChannelDuplex` now carries a oneshot that fires from its `Drop`; the accept loop that owns the
+connection selects on it and, when the tunnel is finished, calls `connection.graceful_shutdown()` and
+keeps driving so queued frames flush.
+
+The first version **tore the socket down on drop** and `packet_up_moves_bytes_both_ways` failed at once
+with `ConnectionReset … broken pipe` — the response was truncated before it reached the client. The
+transport test caught in one run what seventeen interop cycles had failed to expose. Replaced with
+`graceful_shutdown`, and all **313 transport tests pass**, clippy clean.
+
+Measured against xray **with its stock config** (no `maxConnections` override):
+
+```
+trial 1: 6/6   trial 2: 0/6   trial 3: 6/6        12/18 ≈ 67 %
+```
+
+Previously the same harness gave ~47 %, and the single long-lived run gave 10/10 twice. So the change is
+a real improvement: two of three stacks now serve a full burst perfectly, which never happened before.
+
+**Not finished.** Trial 2 served nothing at all — the "stack is entirely bad" shape of C7.42, still
+unexplained and now the only remaining failure mode. The next step is to instrument a 0/6 stack at
+startup, since a stack that is good serves perfectly and the difference is no longer per request.
+
+Committed: `flux-transport` change + this entry.

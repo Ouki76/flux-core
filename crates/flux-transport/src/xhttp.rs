@@ -467,6 +467,18 @@ pub struct ChannelDuplex {
     tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     read_buf: Bytes,
     read_pos: usize,
+    /// Fired when this tunnel is dropped. The connection it was served on carries exactly one tunnel,
+    /// and a peer pools connections: leaving ours open fills the pool with connections nobody can
+    /// reuse, which is the wall measured in C7.59/C7.60.
+    close: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for ChannelDuplex {
+    fn drop(&mut self) {
+        if let Some(close) = self.close.take() {
+            let _ = close.send(());
+        }
+    }
 }
 
 impl std::fmt::Debug for ChannelDuplex {
@@ -723,6 +735,7 @@ where
     {
         let (upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         let (down_tx, mut down_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
         with_sessions(|map| {
             map.insert(
                 session.clone(),
@@ -790,8 +803,23 @@ where
         // without ever handing them to anyone. That is why nothing moved before — the POSTs were
         // never read, not misrouted.
         tokio::spawn(async move {
-            while let Some(accepted) = connection.accept().await {
-                let Ok((post, mut post_respond)) = accepted else {
+            loop {
+                let mut closing = false;
+                let accepted = tokio::select! {
+                    // The tunnel this connection serves is finished. Announce a graceful shutdown so
+                    // the peer can retire the connection and its pool can replace it; the driver keeps
+                    // running below so already-queued response frames are flushed before the socket
+                    // is closed. Tearing the socket down here instead truncated the response — the
+                    // transport test caught it immediately.
+                    _ = &mut close_rx => {
+                        connection.graceful_shutdown();
+                        closing = true;
+                        connection.accept().await
+                    }
+                    next = connection.accept() => next,
+                };
+                let _ = closing;
+                let Some(Ok((post, mut post_respond))) = accepted else {
                     break;
                 };
                 let post_path = post.uri().path().to_string();
@@ -874,6 +902,7 @@ where
             tx: down_tx,
             read_buf: Bytes::new(),
             read_pos: 0,
+            close: Some(close_tx),
         }));
     }
 
