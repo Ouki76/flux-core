@@ -10279,3 +10279,35 @@ so a rejected request would be silent — that is a bad way to run an interop te
 `xhttp` client requires `host` to match the `Host` header our server expects.
 
 Both items of this objective remain open.
+
+### C7.22 — why the reverse direction fails: xray speaks HTTP/1.1, our server speaks h2
+
+C7.21 said to run the interop with a proper log. Done — and it answers the question outright:
+
+```
+flux: DEBUG h2::codec::framed_write: send frame=Settings { … }
+flux: DEBUG h2::server: connection error PROTOCOL_ERROR -- read_preface: invalid preface
+flux:  WARN flux_vless: VLESS handshake failed: Protocol error (xhttp):
+      server H2 handshake failed: connection error detected: unspecific protocol error detected
+```
+
+**`invalid preface`** is the whole story. Our XHTTP server starts every connection with
+`shared::server_handshake`, which expects the HTTP/2 connection preface `PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n`.
+Xray's XHTTP client, in cleartext and in `stream-one` mode, sends **HTTP/1.1** instead.
+
+That also explains why the other direction works and this one never did: our *client* speaks h2, and
+Xray's *server* accepts h2c; but Xray's *client* does not use h2 without TLS, and our server has no
+HTTP/1.1 path at all.
+
+So the reverse direction is not a bug to hunt — it is a **missing protocol on our side**:
+
+| direction | our side speaks | xray side speaks | works |
+|---|---|---|---|
+| our client → xray server | h2 | h2c | **yes** |
+| xray client → our server | h2 **only** | HTTP/1.1 (cleartext) | **no** |
+
+**Not implemented.** Fixing it means our XHTTP inbound must sniff the first bytes of a connection and
+take an HTTP/1.1 branch when the preface is absent — parsing a request line, streaming the request
+body as the upload, and writing a chunked response as the download. That is a transport-sized piece of
+work, not a patch, and it is the honest answer to "does the core work for xray clients": today, not
+without TLS.
