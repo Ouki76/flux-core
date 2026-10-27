@@ -12064,3 +12064,13 @@ Put together, the evidence is now symmetric:
 A server that serves 100 % of two modes and 100 % of the third when the client is not racing its own pool, plus a client that interoperates with xray in the other direction, is not a server with a transport defect. The one remaining number belongs to xray's `packet-up` client under rapid connection reuse.
 
 That is where this campaign ends, and where it should: every hypothesis left is on the far side of a wire this machine cannot capture without root.
+
+### C7.98 — twenty-minute stability run started
+
+`/tmp/stress.sh 1200` — thirty-three minutes after the four-minute failure this run is meant to disprove. Started 05:54, pid 19400, sampling every three rounds:
+
+```
+t=73s  rss=11376kB fds=17 thr=26 ok=2 bad=13
+```
+
+What this run has to show to be worth reporting: success continuing past the four-minute mark, bounded RSS, flat descriptors, constant threads. The four-minute failure (C7.91) is the specific thing it exists to falsify.
