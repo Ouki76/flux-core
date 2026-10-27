@@ -10380,3 +10380,32 @@ working end-to-end result. What it establishes is that the TLS route is viable a
 conclusion — "our server cannot serve xray clients" — holds only for cleartext.
 
 Item (1) remains done; item (2) needs one clean run with a free port.
+
+### C7.26 — reverse direction works over TLS: stream-one and packet-up verified against xray's client
+
+The reverse direction had been blocked by three separate problems, all now cleared:
+
+1. **cleartext**: xray's client speaks HTTP/1.1 and our server requires the h2 preface (C7.22). Over
+   **TLS with `alpn: ["h2"]`** that disappears.
+2. **harness**: this xray removed `allowInsecure` (replacement `pinnedPeerCertSha256`, taking **hex**),
+   and the pin must be the hash of the **certificate DER**, not of the public key — the public-key pin
+   produced `BadCertificate`.
+3. **session format**: our server demanded exactly 32 hex characters for a session id. Xray's own
+   client uses a different shape, so its split modes were refused while our own client worked. The
+   check now accepts a single path segment of 8–64 alphanumerics (`-`/`_` allowed).
+
+Result, xray as client over TLS against our inbound:
+
+| mode | result |
+|---|---|
+| `stream-one` | **`HELLO`** |
+| `packet-up` | **`HELLO`** |
+| `stream-up` | no answer |
+| `auto` | no answer |
+
+So the reverse direction is **verified for two of the four modes**. `stream-up` still fails — it is the
+one mode where our server accepts a POST and then waits for a second request, and Xray's client
+evidently opens them in a different order or on a different connection; `auto` presumably picks
+`stream-up` for this traffic, which would explain it failing too.
+
+Cleartext remains unsupported and needs an HTTP/1.1 branch on the server (C7.22).

@@ -649,7 +649,17 @@ where
         // and what Xray generates. Without this, any request carrying a sub-path was treated as the
         // upload half of a split session and the server waited forever for a download that stream-one
         // clients never send.
-        .filter(|suffix| suffix.len() == 32 && suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        // A session is a single path segment of hex-or-alphanumeric characters and a plausible
+        // length. Demanding exactly 32 hex characters refused Xray's own client, whose session ids
+        // do not have that shape, so the split modes worked only against our own client.
+        .filter(|suffix| {
+            !suffix.is_empty()
+                && !suffix.contains('/')
+                && (8..=64).contains(&suffix.len())
+                && suffix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
 
     // `packet-up` download: a GET naming a session with no sequence. It opens the session, and the
     // chunks arrive as separate POSTs on this same connection, so the returned stream reads from a
