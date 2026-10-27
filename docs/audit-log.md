@@ -10729,3 +10729,29 @@ loop breaks the stream that the driver was already serving, and the tests cannot
 attempt should keep `spawn_connection_driver` for the connection that carries the first tunnel and only
 start a multiplexer for connections that have **no** tunnel yet — or, better, prove with a unit test
 that a second request on one connection yields a second usable stream before touching the inbound.
+
+### C7.40 — the "5/5 baseline" is not reproducible; the measurement itself is unstable
+
+C7.39 reverted the multiplexing change because it turned 5/5 into 0/5. This cycle checked whether the
+revert actually restored anything, and it did not:
+
+| code under test | result |
+|---|---|
+| current tree at `44a90ef` (multiplexing reverted) | **0/5** |
+| `vless.rs` restored verbatim to `5fa3567` (before any refactor) | **0/5** |
+
+So the 5/5 recorded in C7.36 was **one observation, not a baseline**. Running the same binary against
+the same configs and getting 0/5 twice in a row, and the pre-refactor code doing the same, means the
+end-to-end measurement is not stable enough to judge a change by — which also means C7.39's conclusion
+("multiplexing regressed it") is **not established**. I withdrew an implementation on the strength of
+an unstable measurement, and that was premature.
+
+The one diagnostic that did move forward: with the tunnel up, flux logs
+`VLESS handshake timed out from 127.0.0.1` — the framed stream carries no bytes for 15 s. Combined with
+h2 logging a second `Headers` frame on `StreamId(3)`, the picture is a connection whose streams exist
+but whose bodies are not being read, in the runs that fail.
+
+**Before any further implementation work, the measurement has to be made trustworthy:** several
+independent runs per configuration, reporting how many of N returned HELLO, rather than one burst that
+happens to come out 5/5 or 0/5. Without that, every change — including correct ones — will be judged
+by noise.
