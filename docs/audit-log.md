@@ -11659,3 +11659,11 @@ the table plus the three `panic!` sites, each checked for reachability rather th
 Both `panic!` sites are in the shadowsocks AEAD setup, firing only when a *derived* subkey length disagrees with the method key length. The subkey is derived rather than received, so the question is whether derivation can produce a different length; that check is the remaining work. Honest status: **unverified**, not "safe".
 
 Also discarded a measurement: I tested `no_sse_header` while the previous run was still going, and the output shows two `DONE` lines and interleaved trials. It measures nothing. Config restored. That is the second harness defect this session that nearly produced a believed number — `/tmp/measure.sh` must refuse to start while another copy runs.
+
+### C7.73 — harness now refuses to overlap; noSSEHeader result left ambiguous on purpose
+
+`/tmp/measure.sh` now takes an exclusive `flock` and exits 1 when another copy runs. Verified: when I started a second measurement the script refused ("another measurement is running") and the file I read was the **previous** run's, timestamped three minutes earlier. The guard works, and it caught me about to report stale numbers a third time.
+
+The run it protected was the `no_sse_header` test, which read **1/18** (0/6, 0/6, 1/6). That is far below the 63 % baseline, but it ran while an earlier process was still finishing, so I am **not** treating it as evidence that `NoSSEHeader` is harmful — the honest position is "ambiguous, discarded". Config restored.
+
+What this cycle actually fixed is the instrument: overlapping runs were silently blending results, which has already produced two numbers I nearly believed (C7.72 and here). A measurement harness that cannot detect its own overlap is worse than no harness.
