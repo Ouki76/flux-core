@@ -10482,3 +10482,27 @@ client specifically — its POST timing or its session reuse against our accept 
 
 **Not claimed as done.** This is the sharpest statement I can make without another cycle: 1 failure in
 3 when the peer is xray's client, 0 in many when the peer is ours.
+
+### C7.30 — a real logic bug in the reassembly state, and it does not explain the flakiness
+
+Found while looking for the xray-only instability: when the download opened, `accept` **removed** the
+session's `Reassembly`, and the next POST recreated it with `next: 0`. Any chunk already delivered
+therefore left a gap that could never fill, and every later POST waited behind it forever. That is a
+genuine bug — the expected sequence must survive the download opening — and it is fixed by draining
+`ready` in place instead of removing the state.
+
+**It does not fix the flakiness.** Sampled four times against xray's client after the change:
+
+```
+packet-up #1 -> HELLO
+packet-up #2 -> НЕТ
+packet-up #3 -> НЕТ
+packet-up #4 -> НЕТ
+```
+
+1 of 4, against 2 of 3 before the change — the wrong direction, and with these sample sizes the honest
+statement is that **the change is neutral on this symptom** while being correct in itself. 313 transport
+tests and clippy still pass.
+
+The xray-only intermittent failure remains unexplained. It is not the port (C7.29), not the POST
+numbering (this entry), and not reproducible against our own client at all.

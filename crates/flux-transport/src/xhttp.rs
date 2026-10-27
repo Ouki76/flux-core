@@ -695,8 +695,12 @@ where
             });
         }
         // Anything already reassembled before the download opened is delivered first.
-        if let Some(state) = reassembly.remove(&session) {
-            for piece in state.ready {
+        // Drain what was reassembled before the download opened, but **keep the state**: removing it
+        // reset the expected sequence to zero, so every later POST arrived "out of order" behind a gap
+        // that could never fill and the session delivered nothing. That is the intermittent failure
+        // seen only against xray's client, which posts early enough to fill this queue.
+        if let Some(state) = reassembly.get_mut(&session) {
+            for piece in state.ready.drain(..) {
                 let _ = down_tx.send(piece);
             }
         }
