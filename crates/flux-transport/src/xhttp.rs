@@ -665,6 +665,10 @@ pub async fn accept<S>(
 where
     S: AsyncStream + 'static,
 {
+    // A stable id per connection, so a session's download and its uploads can be told apart when
+    // xray multiplexes and may put them on different connections (C7.45).
+    static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let conn_id = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut connection = shared::server_handshake(stream, "xhttp").await?;
     let buffered_bound = max_buffered_posts
         .map(|n| n as usize)
@@ -860,7 +864,7 @@ where
                     }
                 });
                 tracing::debug!(
-                    "packet-up: POST seq={seq:?} session={} delivered={delivered:?}",
+                    "packet-up: conn#{conn_id} POST seq={seq:?} session={} delivered={delivered:?}",
                     &session_of_post[..session_of_post.len().min(8)]
                 );
             }

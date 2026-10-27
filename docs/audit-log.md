@@ -10906,3 +10906,33 @@ posting.
 Next cycle: run with three or more requests per trial so XMUX actually reuses a connection, and log
 which connection each GET and each POST arrives on (a per-connection id at accept), rather than only
 the method and path. That distinguishes "session on another connection" from "upload never sent".
+
+### C7.46 — deeper bursts: three of four requests still send no upload
+
+Ran four requests per trial with a per-connection id added to the log:
+
+```
+trial 1: 2/4   trial 2: 0/4   trial 3: 1/4
+trace (trial 3): packet-up: conn#1 POST seq=0 session=81ecefc5 delivered=Some(105)
+```
+
+One POST for four requests. Same shape as C7.43 and C7.44: the downloads are opened, the uploads are
+not sent.
+
+**The instrumentation is incomplete and that limited this cycle** — the connection id landed on the
+POST line but not on the first-request line, so the trace cannot yet say *which* connection each
+download arrived on. That is the one measurement the next cycle needs, and it is a one-line fix
+(the replacement did not apply to the formatted source).
+
+**Where the objective stands after eleven cycles on it.** Established by measurement, each reversing an
+earlier belief:
+
+1. the failure is **random and roughly one in two**, not "first works, rest fail" (C7.41);
+2. the failures **cluster per run**, not per request (C7.42);
+3. xray **does not send the upload** for the failing tunnels — nothing on our side drops it (C7.43,
+   C7.44);
+4. xray **multiplexes with XMUX** and opens connections per its own concurrency policy (C7.45).
+
+What remains is exactly one question: **what makes Xray decide to post for one download and not
+another.** Everything on our side that was suspected — session registry, reassembly, accept loop,
+download writer, connection reuse, GOAWAY — has been measured and cleared.
