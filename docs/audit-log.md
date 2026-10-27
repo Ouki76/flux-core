@@ -11812,3 +11812,19 @@ cargo audit              no vulnerabilities in Cargo.lock
 ```
 
 Together with C7.81 (workspace tests green, both benches asserting), the five static gates and both benchmarks are confirmed on the same tree that carries the XHTTP fixes. Nothing in the objective is blocked by a gate.
+
+### C7.83 — audit: what the 24 dead-code allowances actually hide
+
+Removed every `#[allow(dead_code)]` from `tls13.rs` and let the compiler answer, rather than guessing what they were for:
+
+```
+fields `resumed`, `debug_master_secret`, `debug_hash_before_cf`, `debug_c_ap` are never read
+function `read_record_typed` is never used
+method `is_empty` is never used
+```
+
+So the allowances are not decorative: they suppress **six genuinely dead items in one file**, and the same pattern repeats across the 24 sites.
+
+Important distinction among them, and the reason I did **not** simply delete everything: `debug_master_secret`, `debug_hash_before_cf` and `debug_c_ap` are the state a TLS key-log implementation needs. They are "never read" today because key logging is not wired up — deleting them would remove the groundwork for a real feature, while keeping them unread is dead weight. The honest fix is one of two things, and it is a design decision rather than a cleanup: wire key logging behind an off-by-default feature, or delete the fields and re-derive them if the feature is ever built.
+
+Restored the file unchanged; the tree is clean. Recorded so the next session does not repeat the experiment and so that the cleanup is done deliberately, not as a blanket "remove and see".
