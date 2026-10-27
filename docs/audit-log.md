@@ -11937,3 +11937,26 @@ Items 2 and 3 reached a defensible end state this session, so item 4 is allowed 
 The stability run: `/tmp/stress.sh 1800` — thirty minutes of continuous requests through the real stack (flux + xray + echo), sampling RSS, descriptors and thread count every three rounds, recording success and failure counts throughout.
 
 What it must show to be worth anything: flat RSS (no leak), flat descriptor count, no thread growth, and a failure rate consistent with the interop result rather than climbing with time. A number that stays flat for thirty minutes is the first evidence in this whole session that is about endurance rather than a single burst.
+
+### C7.91 — sustained load: everything stops after about four minutes
+
+The stability run (`/tmp/stress.sh 1800`, five requests per round through the real stack):
+
+```
+t=72s   rss=11476kB fds=18 thr=26  ok=2   bad=13
+t=247s  rss=17104kB fds=60 thr=26  ok=23  bad=67
+t=325s  rss=17180kB fds=53 thr=26  ok=23  bad=97      <- ok stops growing
+t=427s  rss=17568kB fds=41 thr=26  ok=23  bad=127
+```
+
+Three things, and only one of them is good:
+
+- **RSS settles at ~17.1-17.5 MB and stays.** No memory leak.
+- **Threads constant at 26; descriptors oscillate 41-60 and do not climb.** No descriptor leak.
+- **`ok` stops growing at 23 after roughly four minutes and `bad` climbs forever.** The service stops working entirely.
+
+Diagnosed live: xray and the echo target are both alive, curl returns **rc=28 (timeout)**, and flux logs `VLESS handshake timed out` repeatedly. So the tunnel opens and then carries no request — the same signature as the original interop symptom, now produced **deterministically by load**.
+
+This is the most useful result of the whole campaign: a defect that reproduces on demand beats one that appears in one run in two. The mechanism is almost certainly the one C7.60 pinned — the peer pool filling with connections we keep open — because saturation is exactly what would take four minutes to reach and then never recover.
+
+The fix has been attempted five ways without success (C7.70), but every one of those attempts was measured against rapid bursts of six requests, where the pool is not yet saturated. **Re-testing the idle-release variant against a five-minute sustained run is a completely different experiment** and is the obvious next step.
