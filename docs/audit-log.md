@@ -11909,3 +11909,18 @@ So the explanation in C7.76 — "the empty frame starts the response stream so t
 The measurement itself is unaffected: 8 % -> 46 %, reproduced on two clean runs. Only my account of *why* was wrong, and it was wrong in the direction of sounding more elegant than the truth. Removed the failing tests rather than bending them until they went green.
 
 The right test, for the next attempt, asserts **header arrival within a deadline while the server stays silent** — not a readable frame. That is the property the client actually depends on, and it is testable in this harness.
+
+### C7.89 — the opening frame re-confirmed (11 % vs 46 %) with the mechanism corrected
+
+Re-measured both sides on the overlap-proof harness, current tree:
+
+```
+without the opening frame:  1/6, 0/6, 1/6      2/18 — 11 %
+with the opening frame:                        22/48 — 46 %
+```
+
+The effect is real and reproducible. What C7.88 corrected is the **why**: h2 does not surface a zero-length DATA frame to a reader — a test proved that — so the frame's value is that it forces the transport to flush pending response headers and settings instead of holding them until the first payload byte. The client will not upload until it has our response head, and the frame is what delivers it promptly.
+
+That also answers, honestly, why no unit test catches the mutation (C7.87): in a duplex harness the headers are delivered either way, because there is no network buffering to defeat. The property is only observable **against a real peer**, which is precisely why twelve rounds of interop measurement found it and 313 tests did not.
+
+Comment in the source updated to say flush, not "starts the stream".

@@ -796,6 +796,10 @@ where
         // Zero bytes: legal, carries nothing, and starts the response body so the client stops
         // waiting for the download to produce. Real bytes here — even an SSE comment — corrupt the
         // tunnelled stream and cost every request (C7.77).
+
+        // Zero bytes: legal, carries nothing, and forces the transport to flush the response
+        // headers and settings instead of holding them until the first payload byte. The client
+        // needs them before it will upload (C7.76, corrected in C7.88).
         let _ = send.send_data(Bytes::new(), false);
         tokio::spawn(async move {
             while let Some(chunk) = down_rx.recv().await {
