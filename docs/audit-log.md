@@ -10222,3 +10222,33 @@ If a `packet-up` POST is in flight while the server is still sending the downloa
 rejects it with `unexpected frame type`. The end-to-end tests delay their first write by 100 ms, which
 models real use — the relay writes only once the tunnel is up — but a caller that writes immediately
 after connecting can hit it. Fixing it needs its own cycle and is not claimed here.
+
+### C7.20 — the packet-up "race": reproduced, not explained, and not fixed
+
+The claim in C7.19 was that a POST in flight while the server sends the download response makes the
+server reject it with `unexpected frame type`. This cycle tried to reproduce and fix it, and the honest
+result is **neither**.
+
+What was established, with instrumentation on the server's h2 branches:
+
+```
+DBG server: GET session <uuid>                  ← the download branch is reached
+DBG server: send_response FAILED: Error { kind: User(UnexpectedFrameType) }
+```
+
+- the request that fails is the **download GET**, not the POST;
+- `send_response` on it returns `User(UnexpectedFrameType)`, which in h2 means the stream is not in a
+  state where HEADERS may be sent;
+- **the same test with a 4-byte write passes and with a 200-byte write fails**, which is the fact I
+  could not explain: the payload size changes only how much data the poster queues, not the state of
+  the download stream.
+
+Tested and ruled out: keeping the client alive after writing (no change), the server reading or not
+(no change), the number of POSTs (one POST fails with 200 bytes, one POST passes with 4).
+
+**Not fixed.** The 100 ms delay remains in the end-to-end tests, and C7.19's paragraph saying real use
+never hits it is **withdrawn** — I have no evidence for that claim, and the reproduction shows the
+failure does not depend on anything the relay does differently.
+
+The next attempt should read `h2`'s `streams.rs:1198 send_response` and the stream state it asserts,
+rather than treating the symptom again: the condition is one `if` in that function.
