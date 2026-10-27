@@ -11230,3 +11230,34 @@ Next cycle: start the stack, **wait for it to be genuinely ready** (a first succ
 a listening socket), then measure the burst. If the rate then holds at 5/5 across several stacks, the
 remaining defect is a startup race and has a name; if it does not, the freshly-started case is the one to
 instrument line by line.
+
+### C7.56 — warm-up does not help; one stack reached 5/5, others did not
+
+C7.55 suggested a freshly started stack was the variable. Tested by waiting for a genuine first success
+before measuring:
+
+```
+stack 1: warmup=yes  burst=2/5
+stack 2: warmup=yes  burst=0/5
+stack 3: warmup=yes  burst=5/5
+```
+
+All three stacks reached a first successful request; only one then delivered five of five. Warm-up is
+**not** the variable, and C7.55's reading is withdrawn in that part.
+
+So, with `alpn: ["h2"]` (C7.53's change, which is kept in the test config):
+
+- the rate across stacks is still about **half**, with high variance;
+- **a perfect run is possible** — stack 3 served 5/5, and the earlier timed run served 10/10;
+- the TLS handshake aborts are gone, so what fails now fails differently from before.
+
+**Honest state of the objective.** After fifteen cycles: the aborted TLS handshakes were real and are
+fixed by advertising only `h2`; everything else suspected on our side has been measured and cleared; the
+transport demonstrably can deliver bursts perfectly (5/5 three times, 10/10 once) and demonstrably
+cannot about half the time. The remaining defect is real, reproducible in aggregate, and **still
+unexplained**.
+
+What the next attempt needs is not another hypothesis from me but the one measurement never taken: a
+comparison of a failing request and a succeeding one **at the packet level** (`tcpdump` on lo, or the TLS
+handshake transcript), so the difference is seen rather than inferred. Fifteen cycles of inference have
+produced eleven ruled-out hypotheses and one real fix; the wire itself has not been read once.
