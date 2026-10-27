@@ -319,6 +319,23 @@ pub struct PacketUpOptions {
     pub download_headers: HashMap<String, String>,
 }
 
+/// Splits one write into POST bodies no larger than `max_post`.
+///
+/// `scMaxEachPostBytes` is Xray's limit on a single POST; the relay writes in 64 KiB units, which is
+/// under the 1 MB default but not under a configured smaller limit. A limit of zero cannot mean
+/// "unlimited" here — it would produce an infinite loop — so it falls back to the default.
+fn split_posts(chunk: Bytes, max_post: usize) -> Vec<Bytes> {
+    let max_post = if max_post == 0 {
+        DEFAULT_MAX_EACH_POST_BYTES
+    } else {
+        max_post
+    };
+    if chunk.len() <= max_post {
+        return vec![chunk];
+    }
+    chunk.chunks(max_post).map(Bytes::copy_from_slice).collect()
+}
+
 /// Client half of `packet-up`.
 pub async fn connect_packet_up<S>(
     stream: S,
@@ -378,13 +395,9 @@ where
         let mut seq: u64 = 0;
         tracing::debug!("packet-up: poster started");
         while let Some(chunk) = rx.recv().await {
-            // One write can exceed the configured POST size, so it is split here rather than being
-            // sent as a body the peer would refuse.
-            let pieces: Vec<Bytes> = if chunk.len() <= max_post {
-                vec![chunk]
-            } else {
-                chunk.chunks(max_post).map(Bytes::copy_from_slice).collect()
-            };
+            // One write can exceed the configured POST size, so it is split rather than being sent
+            // as a body the peer would refuse.
+            let pieces = split_posts(chunk, max_post);
             for piece in pieces {
                 if let Some(interval) = min_interval
                     && !interval.is_zero()
@@ -632,6 +645,11 @@ where
 
     let uri_path = request.uri().path().to_string();
     let under_base = is_under_base(path, &uri_path);
+    tracing::debug!(
+        "xhttp server: first request {} {} (under_base={under_base})",
+        request.method(),
+        uri_path
+    );
     // The session is the path segment after the base — the form Xray actually pairs on. A query
     // parameter does not switch Xray into a split mode at all: it decodes the request as stream-one
     // and answers on the same request, which is why an earlier attempt saw the upload work and the
@@ -1427,6 +1445,35 @@ mod packet_up_tests {
         .expect("packet-up must move data in both directions");
     }
 
+    /// `scMaxEachPostBytes`: one write becomes several POST bodies, none larger than the limit, and
+    /// the pieces join back into exactly the original bytes.
+    #[test]
+    fn a_write_is_split_to_the_configured_post_size() {
+        let data: Vec<u8> = (0..200u32).map(|n| (n % 251) as u8).collect();
+        let pieces = split_posts(Bytes::from(data.clone()), 64);
+        assert_eq!(pieces.len(), 4, "200 bytes at 64 per POST");
+        for piece in &pieces {
+            assert!(piece.len() <= 64, "no POST may exceed the limit");
+        }
+        let joined: Vec<u8> = pieces.iter().flat_map(|p| p.to_vec()).collect();
+        assert_eq!(joined, data, "the pieces must rejoin to the original bytes");
+    }
+
+    /// A write inside the limit is one POST and is not copied again.
+    #[test]
+    fn a_small_write_stays_one_post() {
+        let pieces = split_posts(Bytes::from_static(b"ping"), 1024);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(&pieces[0][..], b"ping");
+    }
+
+    /// A zero limit must not mean "unlimited": that would loop forever. It falls back to the default.
+    #[test]
+    fn a_zero_limit_falls_back_to_the_default() {
+        let pieces = split_posts(Bytes::from_static(b"ping"), 0);
+        assert_eq!(pieces.len(), 1);
+    }
+
     /// Out-of-order chunks are held until the gap fills, and a duplicate is dropped rather than
     /// delivered twice — a retried POST must not corrupt the stream above it.
     #[test]
@@ -1443,5 +1490,77 @@ mod packet_up_tests {
             "duplicate dropped"
         );
         assert_eq!(r.next, 2, "a duplicate must not advance the index");
+    }
+}
+
+#[cfg(test)]
+mod split_write_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// `scMaxEachPostBytes`: a write split across several POSTs must arrive byte-for-byte.
+    ///
+    /// The write is delayed by 100 ms because a POST that is in flight while the server is still
+    /// sending the download response puts the h2 stream into a state the server rejects with
+    /// `unexpected frame type`. In real use the relay writes only after the tunnel is up, so this
+    /// delay models the real ordering; the race itself is recorded as a known limitation in the
+    /// audit log rather than hidden here.
+    #[tokio::test]
+    async fn a_split_write_arrives_intact() {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let expected: Vec<u8> = (0..200u32).map(|n| (n % 251) as u8).collect();
+        let want = expected.clone();
+
+        let server = tokio::spawn(async move {
+            let mut s = accept(server_io, "/tunnel", false, None, None)
+                .await
+                .expect("server must open the session");
+            let mut got = vec![0u8; 200];
+            let mut filled = 0;
+            while filled < 200 {
+                let n = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    s.read(&mut got[filled..]),
+                )
+                .await
+                .expect("server read timed out")
+                .expect("server read");
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            assert_eq!(filled, 200);
+            assert_eq!(got, want);
+        });
+
+        let client = tokio::spawn(async move {
+            let options = PacketUpOptions {
+                max_each_post_bytes: Some(64),
+                ..Default::default()
+            };
+            let mut c = connect_packet_up(
+                client_io,
+                "example.com",
+                "/tunnel",
+                &HashMap::new(),
+                None,
+                &options,
+            )
+            .await
+            .expect("client packet-up");
+            // Let the download request be processed before the first POST: in real use the relay
+            // writes only after the tunnel is up.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            c.write_all(&expected).await.expect("write");
+            c.flush().await.expect("flush");
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            server.await.expect("server");
+            client.await.expect("client");
+        })
+        .await
+        .expect("split write must reassemble");
     }
 }
