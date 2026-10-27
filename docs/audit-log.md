@@ -10846,3 +10846,34 @@ be in timing or in something our server does to the connection around the respon
 server's POST handling again — it is demonstrably not where the bytes are lost.
 
 The delivery log stays at `debug` so the next attempt can see the same thing.
+
+### C7.44 — every request gets its own connection, and the failing one never posts
+
+Logged every connection's first request alongside the POST deliveries. One trial, two requests, one
+served:
+
+```
+first request on a connection: GET /x/2d7b74d1-…   ← request 1: download only, no POST, failed
+first request on a connection: GET /x/13266a6f-…   ← request 2: download …
+packet-up: POST seq=0 session=13266a6f delivered=Some(105)   ← … and its upload, succeeded
+```
+
+Two things this settles:
+
+1. **Xray opens a separate connection per request even in `packet-up`.** There is no connection reuse
+   in this workload at all, so the entire multiplexing thread of work (C7.37–C7.39) was solving a
+   problem that does not occur here. The original symptom — "first works, rest fail" — was noise, as
+   C7.41 established.
+2. **The failing request never sends an upload.** Its GET arrives, our server answers, and no POST
+   follows. Nothing on our side drops it; it is never sent.
+
+So the question is now narrow and answerable: **what makes Xray post for one download and not for
+another**, on identical connections, same server, same config, seconds apart.
+
+The candidates worth checking, in order, by reading the response rather than guessing:
+- whether the download response's `content-type` or status differs between the two;
+- whether Xray's client posts only after some framing it expects (an event-stream preamble, or a
+  specific header) and accepts our plain body only when a race lets it through;
+- whether the h2 SETTINGS window advertised by our server is what makes it wait.
+
+The delivery log and the per-connection first-request log both stay at `debug` for the next attempt.
