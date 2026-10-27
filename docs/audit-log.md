@@ -11653,3 +11653,9 @@ alternative.
 So the audit's opening finding is that the numbers are **consistent with a well-behaved codebase**, and
 the work is to confirm each site rather than to expect a harvest. The next step is the remaining files in
 the table plus the three `panic!` sites, each checked for reachability rather than rewritten for taste.
+
+### C7.72 — audit: the two production panics; one contaminated measurement discarded
+
+Both `panic!` sites are in the shadowsocks AEAD setup, firing only when a *derived* subkey length disagrees with the method key length. The subkey is derived rather than received, so the question is whether derivation can produce a different length; that check is the remaining work. Honest status: **unverified**, not "safe".
+
+Also discarded a measurement: I tested `no_sse_header` while the previous run was still going, and the output shows two `DONE` lines and interleaved trials. It measures nothing. Config restored. That is the second harness defect this session that nearly produced a believed number — `/tmp/measure.sh` must refuse to start while another copy runs.
