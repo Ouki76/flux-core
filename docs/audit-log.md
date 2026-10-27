@@ -11318,3 +11318,35 @@ recorded against itself before (C5.8, C7.40) and the third time I have made it.
 What survives, unchanged and uncomfortable: **seven of ten requests produced no tunnel at all.** That is
 the original symptom, still unexplained after sixteen cycles, and every theory I have offered for it has
 either been refuted by measurement or, in two cases, rested on a misread log.
+
+### C7.59 — exact accounting: two TCP connections for ten requests
+
+Added one line per accepted TCP connection so the balance could finally be closed instead of inferred:
+
+```
+20:15:44  tcp accepted from 127.0.0.1:44474   → conn#0 GET /x/ce237f4a-…
+20:15:50  tcp accepted from 127.0.0.1:44478   → conn#1 GET /x/49936248-…
+```
+
+**Two connections in the whole fifty-second burst of ten requests.** And the earlier "4 requests" was my
+own double count — each connection logs both `conn#N first request` and `xhttp first request`, so two
+connections produced four matching lines. (Same mistake as C7.58, caught this time before publishing a
+conclusion.)
+
+TLS/handshake failures in this run: **zero**, so ALPN `h2` is holding.
+
+So the client opens two XHTTP connections, uses them, and then **stops opening more** while curl keeps
+asking. That is the shape of a **pool with a cap of two** whose members are never released, and it fits
+Xray's `xmux` settings exactly — `maxConnections` and `maxConcurrency` default low, with a connection
+considered unavailable until the server closes it.
+
+Our server never closes the h2 connection after a tunnel finishes: `spawn_connection_driver(connection,
+None)` keeps it until the peer closes. So the pool fills with two connections that both sides consider
+busy, and the third request waits forever.
+
+This also explains why the GOAWAY experiment was harmful (it killed the live tunnel) and why the
+multiplexing work was aimed at the right structure but implemented too broadly.
+
+**Next, one command:** set `"xmux": {"maxConnections": 64}` in the client config and re-run the burst. If
+the rate goes to 10/10 the mechanism is confirmed at a stroke, and the real fix is on our side — close
+the connection when the tunnel it serves is done.

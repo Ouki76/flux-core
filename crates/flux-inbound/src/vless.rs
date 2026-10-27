@@ -256,6 +256,9 @@ impl Inbound for VlessInbound {
                     None => None,
                 };
                 crate::optimize_tcp_socket(&socket);
+                // One line per accepted TCP connection, so the accounting from "accepted" to
+                // "request handled" can be closed exactly instead of inferred (C7.58).
+                debug!("[{}] tcp accepted from {}", tag, client_addr);
 
                 let disp = dispatcher.clone();
                 let inbound_tag = tag.clone();
