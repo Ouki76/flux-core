@@ -11415,3 +11415,31 @@ unexplained and now the only remaining failure mode. The next step is to instrum
 startup, since a stack that is good serves perfectly and the difference is no longer per request.
 
 Committed: `flux-transport` change + this entry.
+
+### C7.62 — a startup pause removes the total failures; a residual third remains
+
+C7.61 left one failure mode: a stack serving nothing at all. Tested whether it is a startup effect by
+pausing three seconds after xray is listening, before the first request:
+
+```
+before (no pause):  6/6, 0/6, 6/6        12/18 = 67 %
+with 3 s pause:     3/6, 3/6, 4/6, 5/6   15/24 = 63 %
+```
+
+**No stack served zero** with the pause — the all-or-nothing shape disappears. But no stack served
+everything either, and the total rate is unchanged at about two thirds.
+
+So there are two separate defects, and only the first is now understood:
+
+1. **a connection is never released** — fixed in C7.61, and it is what made perfect bursts possible;
+2. **about one request in three still dies** — present before and after, with a stack-level flavour that
+   a startup pause removes but does not eliminate.
+
+The second is now the whole of the remaining problem. What is known about it: it is not per-connection,
+not the session registry, not POST numbering, not ALPN (which fixed a third, already-solved defect), and
+not our TLS listener. What it looks like from every trace taken: a request reaches xray, xray dials the
+target, and no XHTTP connection follows.
+
+The honest next instrument is on the client's side of the ledger — but the useful thing for a session
+with more room is to instrument **the moment a curl starts versus the moment its connection is
+accepted**, since the pause result says the two are related in time.
