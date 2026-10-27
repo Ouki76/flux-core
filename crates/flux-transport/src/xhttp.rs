@@ -159,18 +159,6 @@ fn session_id() -> String {
     raw.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The value of a query parameter. Both values this transport reads are opaque ASCII.
-fn query_param(uri: &http::Uri, name: &str) -> Option<String> {
-    for pair in uri.query()?.split('&') {
-        if let Some((k, v)) = pair.split_once('=')
-            && k == name
-        {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
-
 /// Server half: accepts one bidirectional request and returns it as a stream.
 ///
 /// `path` is the configured base path. Anything under it is accepted, because the client
@@ -203,7 +191,11 @@ where
     let path_session = uri_path
         .strip_prefix(base.as_str())
         .map(|suffix| suffix.trim_matches('/').to_string())
-        .filter(|suffix| !suffix.is_empty());
+        // Only a real session id counts: 32 lowercase hex characters, which is what our client sends
+        // and what Xray generates. Without this, any request carrying a sub-path was treated as the
+        // upload half of a split session and the server waited forever for a download that stream-one
+        // clients never send.
+        .filter(|suffix| suffix.len() == 32 && suffix.chars().all(|c| c.is_ascii_hexdigit()));
 
     if let Some(session) = path_session
         && request.method() == Method::POST
