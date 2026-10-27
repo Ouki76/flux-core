@@ -539,6 +539,7 @@ impl AsyncWrite for ChannelDuplex {
 }
 
 /// Reassembles `packet-up` POSTs for one session.
+#[derive(Debug)]
 struct Reassembly {
     /// Chunks that have arrived but cannot be delivered yet, keyed by sequence.
     pending: std::collections::BTreeMap<u64, Bytes>,
@@ -615,6 +616,40 @@ fn looks_like_a_session(suffix: &str) -> bool {
             .all(|(want, part)| part.len() == *want && hex(part))
 }
 
+/// A `packet-up`/`stream-up` session, shared across connections.
+///
+/// The upload and the download of one session may travel on **different h2 connections** — Xray's
+/// client is free to split them, and our own client happens not to. Keeping this map inside a single
+/// connection made the split case fail intermittently: the POSTs landed on a connection whose map had
+/// no such session, the chunk was buffered against a download nobody would ever drain, and the request
+/// timed out. That is the whole of the xray-only flakiness recorded in C7.32.
+#[derive(Debug)]
+struct Session {
+    /// Where reassembled upload bytes go; the download half reads from it.
+    tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    /// Ordering state for numbered POSTs.
+    state: Reassembly,
+    /// When the session was opened, for expiry.
+    opened: std::time::Instant,
+}
+
+/// Sessions live for at most this long, whether or not their peer is still around. A registry that
+/// outlives connections must not leak, so expiry is not optional.
+const SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+
+fn sessions() -> &'static std::sync::Mutex<std::collections::HashMap<String, Session>> {
+    static SESSIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Session>>,
+    > = std::sync::OnceLock::new();
+    SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn with_sessions<R>(f: impl FnOnce(&mut std::collections::HashMap<String, Session>) -> R) -> R {
+    let mut guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    guard.retain(|_, s| s.opened.elapsed() < SESSION_TTL);
+    f(&mut guard)
+}
+
 /// Server half: accepts one bidirectional request and returns it as a stream.
 ///
 /// `path` is the configured base path. Anything under it is accepted, because the client
@@ -631,11 +666,6 @@ where
     S: AsyncStream + 'static,
 {
     let mut connection = shared::server_handshake(stream, "xhttp").await?;
-    // Per-connection `packet-up` state: sessions opened by a download GET, and the chunks reassembled
-    // for them from the POSTs that share this connection.
-    let mut packet_sessions: HashMap<String, tokio::sync::mpsc::UnboundedSender<Bytes>> =
-        HashMap::new();
-    let mut reassembly: HashMap<String, Reassembly> = HashMap::new();
     let buffered_bound = max_buffered_posts
         .map(|n| n as usize)
         .unwrap_or(DEFAULT_MAX_BUFFERED_POSTS);
@@ -684,7 +714,19 @@ where
     {
         let (upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         let (down_tx, mut down_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-        packet_sessions.insert(session.clone(), upload_tx.clone());
+        with_sessions(|map| {
+            map.insert(
+                session.clone(),
+                Session {
+                    tx: upload_tx.clone(),
+                    state: Reassembly {
+                        max_buffered: buffered_bound,
+                        ..Reassembly::default()
+                    },
+                    opened: std::time::Instant::now(),
+                },
+            );
+        });
         // `scStreamUpServerSecs`: an upload stream must not live forever. The watchdog closes it by
         // sending the empty end-of-upload marker; a peer that keeps uploading simply reopens one.
         if let Some(secs) = stream_up_server_secs.filter(|n| *n > 0) {
@@ -699,11 +741,13 @@ where
         // reset the expected sequence to zero, so every later POST arrived "out of order" behind a gap
         // that could never fill and the session delivered nothing. That is the intermittent failure
         // seen only against xray's client, which posts early enough to fill this queue.
-        if let Some(state) = reassembly.get_mut(&session) {
-            for piece in state.ready.drain(..) {
-                let _ = down_tx.send(piece);
+        with_sessions(|map| {
+            if let Some(entry) = map.get_mut(&session) {
+                for piece in entry.state.ready.drain(..) {
+                    let _ = down_tx.send(piece);
+                }
             }
-        }
+        });
         let body_type = if no_sse_header {
             "application/octet-stream"
         } else {
@@ -770,7 +814,8 @@ where
                 // stall after the first chunk. A numbered `packet-up` POST is complete when it
                 // arrives, so it is read here.
                 if seq.is_none() {
-                    let sender = packet_sessions.get(&session_of_post).cloned();
+                    let sender =
+                        with_sessions(|map| map.get(&session_of_post).map(|e| e.tx.clone()));
                     tokio::spawn(async move {
                         while let Some(frame) = body.data().await {
                             match frame {
@@ -795,22 +840,16 @@ where
                         Err(_) => break,
                     }
                 }
-                let sender = packet_sessions.get(&session_of_post).cloned();
-                let state = reassembly
-                    .entry(session_of_post.clone())
-                    .or_insert_with(|| Reassembly {
-                        max_buffered: buffered_bound,
-                        ..Reassembly::default()
-                    });
-                let seq = seq.unwrap_or(state.next);
-                for piece in state.accept(seq, Bytes::from(chunk)) {
-                    match &sender {
-                        Some(sender) => {
-                            let _ = sender.send(piece);
+                let chunk = Bytes::from(chunk);
+                let seq = seq.expect("numbered");
+                with_sessions(|map| {
+                    if let Some(entry) = map.get_mut(&session_of_post) {
+                        let ready = entry.state.accept(seq, chunk);
+                        for piece in ready {
+                            let _ = entry.tx.send(piece);
                         }
-                        None => state.ready.push_back(piece),
                     }
-                }
+                });
             }
         });
         return Ok(Box::new(ChannelDuplex {
@@ -842,18 +881,15 @@ where
             .body(())
             .expect("static ack response");
         let _ = respond.send_response(ack, true);
-        if let Some(sender) = packet_sessions.get(&session) {
-            for piece in reassembly
-                .entry(session.clone())
-                .or_insert_with(|| Reassembly {
-                    max_buffered: buffered_bound,
-                    ..Reassembly::default()
-                })
-                .accept(seq, Bytes::from(chunk))
-            {
-                let _ = sender.send(piece);
+        let chunk = Bytes::from(chunk);
+        with_sessions(|map| {
+            if let Some(entry) = map.get_mut(&session) {
+                let ready = entry.state.accept(seq, chunk);
+                for piece in ready {
+                    let _ = entry.tx.send(piece);
+                }
             }
-        }
+        });
         shared::spawn_connection_driver(connection, None);
         return Err(FluxError::Protocol {
             protocol: "xhttp",
