@@ -11716,3 +11716,16 @@ A five-fold improvement, reproduced on a second run with the overlap-proof harne
 Still not the criterion: ~46 %, not 5/5. But it is the first genuine improvement to `packet-up` in this whole campaign, and it points at the real mechanism — the client waits for the download to *start producing*, and one frame unblocks some of that wait but not all of it.
 
 Next: the remaining half. If one frame unblocks half the cases, the others likely need actual bytes and not an empty frame — which would mean the client is blocked on reading a body it considers non-empty. Measure that next; 313 transport tests and clippy stay green.
+
+### C7.77 — the client needs a frame, not bytes; an SSE comment costs everything
+
+C7.76 opened the body with a zero-length DATA frame (46 %). Tried replacing it with real bytes — an SSE comment `:\n\n`, legal for an event-stream reader and carrying no payload:
+
+```
+empty DATA frame:   22/48 — 46 %
+SSE comment:         0/24 —  0 %
+```
+
+Total loss. Either Xray does not strip comments from this stream or the bytes land in the VLESS framing and corrupt it — the distinction does not matter, the answer does: **nothing may be written into the body that is not tunnel payload.** Reverted to the empty frame.
+
+So the mechanism is narrower than "the client waits for data": it waits for the response stream to have **started**, which a zero-length frame satisfies and payload-carrying bytes only appear to satisfy.

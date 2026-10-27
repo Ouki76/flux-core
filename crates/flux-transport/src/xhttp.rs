@@ -793,6 +793,9 @@ where
         // Start the response stream immediately with a zero-length DATA frame. Xray's packet-up
         // client appears to hold its upload until the download produces a frame; with a silent body
         // the two sides can wait on each other. Zero bytes are legal and carry nothing.
+        // Zero bytes: legal, carries nothing, and starts the response body so the client stops
+        // waiting for the download to produce. Real bytes here — even an SSE comment — corrupt the
+        // tunnelled stream and cost every request (C7.77).
         let _ = send.send_data(Bytes::new(), false);
         tokio::spawn(async move {
             while let Some(chunk) = down_rx.recv().await {
