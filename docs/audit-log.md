@@ -11589,3 +11589,34 @@ not overlap with a test run — a rule the earlier measurements broke.
 
 If the flake returns during the stability work (item 4), it gets investigated then with the failing test's
 name captured, which is the one piece of information still missing.
+
+### C7.70 — five release variants, all worse for packet-up; leave its lifetime alone
+
+The deadlock hypothesis: a download whose upload never arrives never finishes its tunnel, so the
+connection pins a slot in the peer's pool for ever and starves later requests. Fixed by retiring any
+connection after 8 s of no traffic, whether or not its tunnel finished.
+
+```
+packet-up: 3/6, 0/6, 0/6      3/18 ≈ 17 %      (baseline 15/24 ≈ 63 %)
+```
+
+Worse for the fifth time running. The full set, all measured against the same harness:
+
+| rule | packet-up |
+|---|---|
+| no release (baseline) | 15/24 ≈ **63 %** |
+| release when the tunnel ends | 17 % |
+| fixed 250 ms linger on the upload connection | 17 % |
+| release on the split download stream | 22 % |
+| release after 5 s idle, tunnel finished | 44 % |
+| release after 8 s idle, regardless of tunnel | 17 % |
+
+**Every attempt to touch packet-up's connection lifetime makes it worse.** That is now a result, not a
+run of bad luck: packet-up is the one mode where the peer genuinely wants the connection to stay, and any
+close we perform costs more requests than it frees. Reverted; baseline kept.
+
+So packet-up's remaining ~37 % is **not** a connection-lifetime problem, and the pool-cap experiment
+(C7.60) explained the other two modes, not this one. What the last measurement did show, cleanly, is the
+shape of the loss: **10 download GETs for 10 requests but only 9 uploads** — every request opens its
+download and some never send an upload. That specific loss, on a connection we are now forbidden from
+closing early, is the next thing to explain.
