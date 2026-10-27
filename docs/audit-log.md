@@ -10460,3 +10460,25 @@ and the split modes may genuinely race.
 with h2 ALPN for `stream-one` and `packet-up`, and that cleartext is refused at the h2 preface.
 
 Item (1) is complete and verified. Item (2) is partially verified with counted, not asserted, results.
+
+### C7.29 — the port hypothesis is eliminated; the flakiness is real
+
+C7.28 offered two candidate causes for `packet-up` answering only two runs in three: xray's listener
+not releasing its port between runs, or a genuine race. Separated by giving every run its own SOCKS
+port (19960, 19961, 19962) so nothing could be held:
+
+```
+packet-up порт 19960 -> HELLO
+packet-up порт 19961 -> НЕТ
+packet-up порт 19962 -> HELLO
+```
+
+**2 of 3 again, with fresh ports.** The port hypothesis is dead: the instability is in the transport,
+not the harness. That is a real, reproducible-in-aggregate defect and it is **not fixed**.
+
+What it is *not*: the packet-up path against our own client, which the unit and end-to-end tests
+exercise without a single failure (C7.23–C7.26). So the difference is on the boundary with xray's
+client specifically — its POST timing or its session reuse against our accept loop.
+
+**Not claimed as done.** This is the sharpest statement I can make without another cycle: 1 failure in
+3 when the peer is xray's client, 0 in many when the peer is ours.
