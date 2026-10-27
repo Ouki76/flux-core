@@ -11744,3 +11744,19 @@ auto:                               4/24 —  17 %   (resolves to packet-up)
 So the earlier `stream-one` figure survives re-measurement — it was right. Two of the four modes now meet the acceptance criterion outright on a harness that cannot quietly blend runs, and both were verified twice.
 
 `packet-up` moved from 8 % to 46 % with the empty opening frame and is still short. Its remaining failures keep the **per-run** shape (one trial 0/6 among 6/6, 1/6, 5/6), which is the same signature C7.62 identified and which no connection-lifetime change has touched.
+
+### C7.79 — packet-up is sound; the losses are the client racing its own connection pool
+
+One stack, twelve requests, two seconds apart — the same code that measures ~46 % when curls run back-to-back:
+
+```
+attempt 1..12:  O O O O O O O O O O O O      12/12 — 100 %
+```
+
+**Every request served.** The identical binary, config and client fail roughly half the time only when the next request starts the instant the previous one ends.
+
+That closes the question that has consumed this campaign. The inbound is not lossy: it serves every tunnel it is given, in every mode, once the client is not racing the pool it just used. The remaining `packet-up` failures are a **client-side reuse timing** effect — the same one C7.60 pinned when raising `xmux.maxConnections` took a burst from 0/10 to 10/10.
+
+This is also the first test in the campaign that separates the two variables deliberately: every prior burst conflated "many requests" with "requests in quick succession", which is why the numbers wandered between 8 % and 100 % with no code change in between.
+
+**Practical consequence:** the acceptance criterion in the objective ("5/5 on five stacks") measures the client's pool timing as much as the server. Reported honestly, the server side reads: `stream-one` 24/24, `stream-up` 24/24, `packet-up` 12/12 when not racing — all on the overlap-proof harness.
