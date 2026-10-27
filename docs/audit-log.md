@@ -11729,3 +11729,18 @@ SSE comment:         0/24 —  0 %
 Total loss. Either Xray does not strip comments from this stream or the bytes land in the VLESS framing and corrupt it — the distinction does not matter, the answer does: **nothing may be written into the body that is not tunnel payload.** Reverted to the empty frame.
 
 So the mechanism is narrower than "the client waits for data": it waits for the response stream to have **started**, which a zero-length frame satisfies and payload-carrying bytes only appear to satisfy.
+
+### C7.78 — clean matrix: two modes perfect, two at 46 %
+
+Re-measured `stream-one` with the overlap-proof harness, because its 15/15 predated the fix and could have been contaminated the way packet-up's 63 % was:
+
+```
+stream-one:  6/6, 6/6, 6/6, 6/6     24/24 — 100 %
+stream-up:   6/6, 6/6, 6/6, 6/6     24/24 — 100 %   (C7.74)
+packet-up:                         22/48 —  46 %   (C7.76)
+auto:                               4/24 —  17 %   (resolves to packet-up)
+```
+
+So the earlier `stream-one` figure survives re-measurement — it was right. Two of the four modes now meet the acceptance criterion outright on a harness that cannot quietly blend runs, and both were verified twice.
+
+`packet-up` moved from 8 % to 46 % with the empty opening frame and is still short. Its remaining failures keep the **per-run** shape (one trial 0/6 among 6/6, 1/6, 5/6), which is the same signature C7.62 identified and which no connection-lifetime change has touched.
