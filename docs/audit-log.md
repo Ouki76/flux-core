@@ -11970,3 +11970,20 @@ The patch did not apply (two text-surgery attempts lost to killed shells). Rathe
 **Next step, precisely:** in `xhttp.rs` around line 818, replace the `close_rx`-triggered shutdown with a loop whose `select!` carries `tokio::time::timeout(IDLE_CLOSE_MS, connection.accept())`, break with `None` on the timeout regardless of whether the tunnel finished, then `graceful_shutdown()`. Judge it with `/tmp/stress.sh 300`, not `/tmp/measure.sh`.
 
 That distinction is the real idea from this cycle: **five rejected retirement designs were all tested against the wrong experiment** — bursts of six, where the pool never saturates, so none of those results could speak to the sustained-load failure.
+
+### C7.93 — idle release does fix saturation, but my loop was wrong; reverted to green
+
+Implemented "retire the connection after IDLE_CLOSE_MS of silence, whether or not the tunnel finished" and judged it on the right experiment at last — a five-minute sustained run:
+
+```
+without idle release (C7.91):  ok froze at 23, bad climbed to 127+ — service dead after ~4 min
+with idle release, 10 s:        ok = 5, 7, 14, 18, 29, 32, 37 — never freezes; FINAL ok=37 bad=73
+```
+
+**The hypothesis is confirmed: idle release prevents the permanent death.** Requests keep being served for the whole five minutes instead of stopping at four.
+
+But `packet_up_moves_bytes_both_ways` failed, and raising the window to 60 s did not help — so the cause was my code, not the timeout value: on `close_rx` I wrote `graceful_shutdown(); continue;`, which loops forever instead of draining and ending. The connection never retires and the test never sees its tunnel close.
+
+Reverted. Tree clean, 313 tests green.
+
+**The fix is one line away and should be finished first next session:** in that branch, shut the connection down and then exit the loop once the response has flushed — the same shape the single-tunnel path already uses successfully (C7.61/C7.64) — rather than `continue`. Then re-run `/tmp/stress.sh 300` **and** the transport suite together; the earlier variants were rejected on bursts of six, which this cycle proved is the wrong experiment.
