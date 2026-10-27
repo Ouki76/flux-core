@@ -12017,3 +12017,26 @@ idle  2 s:  0/6, 2/6, 4/6, 5/6    11/24 = 46 %
 Same range as before the fix (8 %-46 %), so the idle retirement neither helps nor harms bursts. Kept the **10 s** value because that is the one validated under sustained load (C7.94); 2 s measured slightly better here but only inside the noise, and a shorter window would turn the stability win into an untested change.
 
 Nothing was committed for the 2 s experiment — the constant is back at 10 s and the tree is clean.
+
+### C7.96 — final verification on the current tree
+
+```
+cargo fmt --check                OK
+clippy -D warnings               OK
+cargo test --workspace           0 failed suites (incl. 313 transport)
+bench_matrix --assert            ASSERT PASSED: every row at or above both competitors within 10 %
+bench_rps --assert               ASSERT PASSED
+```
+
+Combined with C7.82 (rustdoc 0 warnings, deny all-ok, audit exit 0 with no findings), every gate the objective names is green on the same commit that carries the XHTTP and stability fixes.
+
+**Where the objective stands, stated without embellishment:**
+
+| item | state |
+|---|---|
+| 1 XHTTP | `stream-one` 24/24 and `stream-up` 24/24 on an overlap-proof harness, verified twice. `packet-up`/`auto` do **not** reach 5/5: 29-46 % in fast bursts, but **12/12 when requests are spaced**, and every trace shows the server serving what it is given. The residual is the xray client's connection-pool timing — proved by raising its pool cap, which took a burst from 0/10 to 10/10 |
+| 2 audit | closed: unsafe classified, two `panic!` proved unreachable, `unwrap` cluster proved guarded, dead code quantified |
+| 3 features | closed: 69/69 config fields referenced; a mutation test proved what the suite cannot see |
+| 4 stability | **defect found and fixed**: the service used to stop serving entirely after ~4 minutes of load; with idle connection retirement it keeps serving for the whole run, RSS bounded, descriptors flat, threads constant |
+
+The one acceptance criterion not met is the one the server cannot meet alone, and that conclusion rests on measurement rather than on convenience: spaced requests 12/12, pool-cap experiment 10/10, and no trace anywhere of a request lost server-side.
