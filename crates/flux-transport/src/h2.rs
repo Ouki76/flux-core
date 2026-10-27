@@ -420,7 +420,13 @@ pub(crate) mod shared {
                 while let Some(result) = connection.accept().await {
                     match result {
                         Ok((_request, mut respond)) => {
+                            // This connection already carries the one stream we serve, so a second
+                            // request is refused — but refusing it silently leaves the peer thinking
+                            // the connection is still usable, and it keeps sending new tunnels into a
+                            // connection nothing will read. A GOAWAY tells it to open another one,
+                            // which is what makes a second request work at all (C7.34).
                             respond.send_reset(h2::Reason::REFUSED_STREAM);
+                            connection.graceful_shutdown();
                         }
                         Err(e) if e.is_io() => break,
                         Err(_) => {

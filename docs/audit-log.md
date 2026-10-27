@@ -10575,3 +10575,28 @@ a session id repeats.
 **Next step, precisely:** run one failing case and check whether the session id in the download GET
 differs from the one the POSTs use, and whether a session from the previous run is still present. That
 distinguishes "wrong pairing" from "stale pairing" in one observation.
+
+### C7.34 — the real cause: we serve one request per connection and never say so
+
+The log from a failing repeat run says it outright:
+
+```
+relay copier parked ... b at EOF, a quiet; moved up=79 down=43
+```
+
+`b at EOF` — the tunnel is finished on our side. Meanwhile xray logged *new* connections being
+accepted and dialled, and our server answered none of them. The reason:
+
+**`accept` serves exactly one XHTTP request per h2 connection and then hands the stream to the caller.**
+Nothing accepts a second request. The connection driver that replaces it did the worst possible thing —
+it reset every further request with `REFUSED_STREAM` and left the connection open, so xray kept
+sending new tunnels into a connection nothing would read. The first request works; every later one
+dies silently. That is the whole of the "first works, rest fail" pattern, and it has nothing to do
+with session pairing (which is why C7.32's fix did not help).
+
+Fix: after refusing a second request, send **GOAWAY** (`connection.graceful_shutdown()`), so the peer
+learns the connection is spent and opens another one. That is what h2 has GOAWAY for, and it is the
+correct behaviour for a transport that serves one stream per connection.
+
+313 transport tests pass, clippy clean. End-to-end confirmation against xray's client is still owed:
+this environment kills any process tree I start, so the run has to happen in the user's shell.
