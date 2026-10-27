@@ -873,7 +873,6 @@ impl XhttpSettings {
                 "scMinPostsIntervalMs",
                 self.sc_min_posts_interval_ms.is_some(),
             ),
-            ("scMaxBufferedPosts", self.sc_max_buffered_posts.is_some()),
             (
                 "scStreamUpServerSecs",
                 self.sc_stream_up_server_secs.is_some(),
@@ -2871,12 +2870,13 @@ mod xhttp_settings_tests {
 
     /// Settings that belong to modes we do not implement are refused too, rather than accepted and
     /// ignored — the failure they would otherwise cause is a connection that stalls silently.
+    /// `scMaxBufferedPosts` is no longer in that list: `packet-up` honours it as the bound on
+    /// out-of-order chunks it will hold.
     #[test]
     fn mode_specific_settings_are_refused() {
         for json in [
             r#"{"scMaxEachPostBytes": 1000}"#,
             r#"{"scMinPostsIntervalMs": 10}"#,
-            r#"{"scMaxBufferedPosts": 5}"#,
             r#"{"scStreamUpServerSecs": 5}"#,
             r#"{"downloadSettings": {}}"#,
         ] {

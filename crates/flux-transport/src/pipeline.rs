@@ -387,6 +387,8 @@ pub enum ServerFramingLayer {
         path: Option<String>,
         /// Xray's `noSSEHeader`: answer with a plain body type instead of `text/event-stream`.
         no_sse_header: bool,
+        /// Xray's `scMaxBufferedPosts`: how many out-of-order `packet-up` chunks may be held.
+        max_buffered_posts: Option<u64>,
     },
     /// Upgrade framing.
     HttpUpgrade {
@@ -481,11 +483,13 @@ impl ServerTransportPipeline {
                     ServerFramingLayer::Xhttp {
                         path,
                         no_sse_header,
+                        max_buffered_posts,
                     } => {
                         let st = crate::xhttp::accept(
                             stream,
                             path.as_deref().unwrap_or(crate::xhttp::DEFAULT_XHTTP_PATH),
                             *no_sse_header,
+                            *max_buffered_posts,
                         )
                         .await?;
                         Box::new(st)

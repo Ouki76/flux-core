@@ -491,13 +491,28 @@ impl AsyncWrite for ChannelDuplex {
 }
 
 /// Reassembles `packet-up` POSTs for one session.
-#[derive(Default)]
 struct Reassembly {
     /// Chunks that have arrived but cannot be delivered yet, keyed by sequence.
     pending: std::collections::BTreeMap<u64, Bytes>,
     /// The next sequence number expected.
     next: u64,
+    /// How many out-of-order chunks may be held. This is Xray's `scMaxBufferedPosts`, and it exists
+    /// because a peer that never fills the gap would otherwise make the server buffer without bound.
+    max_buffered: usize,
 }
+
+impl Default for Reassembly {
+    fn default() -> Self {
+        Self {
+            pending: std::collections::BTreeMap::new(),
+            next: 0,
+            max_buffered: DEFAULT_MAX_BUFFERED_POSTS,
+        }
+    }
+}
+
+/// Xray's default for `scMaxBufferedPosts`.
+const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
 impl Reassembly {
     /// Takes one POST's chunk and returns whatever became deliverable, in order.
@@ -506,6 +521,14 @@ impl Reassembly {
     /// POST must not corrupt the stream above it.
     fn accept(&mut self, seq: u64, chunk: Bytes) -> Vec<Bytes> {
         if seq < self.next {
+            return Vec::new();
+        }
+        if self.pending.len() >= self.max_buffered {
+            // Refuse rather than grow: an unbounded buffer here is a memory lever a peer controls.
+            tracing::warn!(
+                "packet-up: {} out-of-order chunks already held, dropping seq {seq}",
+                self.pending.len()
+            );
             return Vec::new();
         }
         self.pending.insert(seq, chunk);
@@ -527,6 +550,7 @@ pub async fn accept<S>(
     stream: S,
     path: &str,
     no_sse_header: bool,
+    max_buffered_posts: Option<u64>,
 ) -> FluxResult<Box<dyn AsyncStream>>
 where
     S: AsyncStream + 'static,
@@ -537,6 +561,9 @@ where
     let mut packet_sessions: HashMap<String, tokio::sync::mpsc::UnboundedSender<Bytes>> =
         HashMap::new();
     let mut reassembly: HashMap<String, Reassembly> = HashMap::new();
+    let buffered_bound = max_buffered_posts
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MAX_BUFFERED_POSTS);
     let (request, mut respond) = connection
         .accept()
         .await
@@ -680,7 +707,10 @@ where
         if let Some(sender) = packet_sessions.get(&session) {
             for piece in reassembly
                 .entry(session.clone())
-                .or_default()
+                .or_insert_with(|| Reassembly {
+                    max_buffered: buffered_bound,
+                    ..Reassembly::default()
+                })
                 .accept(seq, Bytes::from(chunk))
             {
                 let _ = sender.send(piece);
@@ -915,7 +945,7 @@ mod tests {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false)
+            let mut s = accept(server_io, "/tunnel", false, None)
                 .await
                 .expect("server accept");
             let mut buf = vec![0u8; 5];
@@ -992,7 +1022,7 @@ mod tests {
         // a download stream that never carries anything.
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server =
-            tokio::spawn(async move { accept(server_io, "/tunnel", false).await.is_err() });
+            tokio::spawn(async move { accept(server_io, "/tunnel", false, None).await.is_err() });
         let mut client = shared::client_handshake(client_io, "xhttp")
             .await
             .expect("client");
@@ -1015,7 +1045,9 @@ mod tests {
         // Xray appends things to the base path; the prefix rule must not be exact-match.
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false).await.expect("accept");
+            let mut s = accept(server_io, "/tunnel", false, None)
+                .await
+                .expect("accept");
             let mut buf = [0u8; 3];
             s.read_exact(&mut buf).await.expect("read");
             s.write_all(&buf).await.expect("write");
@@ -1048,7 +1080,7 @@ mod tests {
     async fn a_path_outside_the_base_is_refused() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server =
-            tokio::spawn(async move { accept(server_io, "/tunnel", false).await.is_err() });
+            tokio::spawn(async move { accept(server_io, "/tunnel", false, None).await.is_err() });
         let mut client = shared::client_handshake(client_io, "xhttp")
             .await
             .expect("client");
@@ -1221,7 +1253,7 @@ mod stream_up_end_to_end {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false)
+            let mut s = accept(server_io, "/tunnel", false, None)
                 .await
                 .expect("server must pair the session");
             let mut buf = vec![0u8; 64];
@@ -1284,7 +1316,7 @@ mod packet_up_tests {
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
 
         let server = tokio::spawn(async move {
-            let mut s = accept(server_io, "/tunnel", false)
+            let mut s = accept(server_io, "/tunnel", false, None)
                 .await
                 .expect("server must open the packet-up session");
             let mut buf = vec![0u8; 64];

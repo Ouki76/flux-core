@@ -1674,6 +1674,7 @@ fn compile_server_framings(
                 list.push(flux_transport::pipeline::ServerFramingLayer::Xhttp {
                     path,
                     no_sse_header: settings.no_sse_header.unwrap_or(false),
+                    max_buffered_posts: settings.sc_max_buffered_posts,
                 });
             }
             InboundFramingConfig::WebSocket { path } => {
