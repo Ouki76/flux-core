@@ -11960,3 +11960,13 @@ Diagnosed live: xray and the echo target are both alive, curl returns **rc=28 (t
 This is the most useful result of the whole campaign: a defect that reproduces on demand beats one that appears in one run in two. The mechanism is almost certainly the one C7.60 pinned — the peer pool filling with connections we keep open — because saturation is exactly what would take four minutes to reach and then never recover.
 
 The fix has been attempted five ways without success (C7.70), but every one of those attempts was measured against rapid bursts of six requests, where the pool is not yet saturated. **Re-testing the idle-release variant against a five-minute sustained run is a completely different experiment** and is the obvious next step.
+
+### C7.92 — cycle ended clean; the idle-release step is specified for a sustained run
+
+Started re-implementing connection retirement as "close after 10 s of no request, whether or not the tunnel finished" — the variant C7.91 argues for, to be judged on a **five-minute sustained run**, not a six-request burst.
+
+The patch did not apply (two text-surgery attempts lost to killed shells). Rather than half-apply a risky edit to a live transport path, stopped with the tree exactly as committed and no processes left running.
+
+**Next step, precisely:** in `xhttp.rs` around line 818, replace the `close_rx`-triggered shutdown with a loop whose `select!` carries `tokio::time::timeout(IDLE_CLOSE_MS, connection.accept())`, break with `None` on the timeout regardless of whether the tunnel finished, then `graceful_shutdown()`. Judge it with `/tmp/stress.sh 300`, not `/tmp/measure.sh`.
+
+That distinction is the real idea from this cycle: **five rejected retirement designs were all tested against the wrong experiment** — bursts of six, where the pool never saturates, so none of those results could speak to the sustained-load failure.
