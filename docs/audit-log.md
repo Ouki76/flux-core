@@ -10252,3 +10252,30 @@ failure does not depend on anything the relay does differently.
 
 The next attempt should read `h2`'s `streams.rs:1198 send_response` and the stream state it asserts,
 rather than treating the symptom again: the condition is one `if` in that function.
+
+### C7.21 — the h2 condition, and the reverse direction attempted
+
+**The packet-up failure is a state transition, and its shape is now known.** `send_response` fails inside
+`stream.state.send_open(end_stream)` (`h2/src/proto/streams/state.rs:92`), whose match requires
+`local: AwaitingHeaders`. Anything else falls through to `_ => Err(UnexpectedFrameType)`. In other
+words **h2 believes a response has already been sent on that stream** when our server tries to send
+the download's.
+
+That narrows it to "who else answered this stream", not to the data flow — but I did not find the
+culprit inside the remaining budget, so it is still unfixed and the 100 ms delays stay.
+
+**Reverse direction, first attempt.** xray configured as a client (`socks` inbound → `vless` outbound
+over `xhttp` at `/x`, mode `stream-one`) against our inbound with `framing: xhttp` at `/x`:
+
+```
+xray: from tcp:127.0.0.1:60094 accepted tcp:127.0.0.1:17171     ← xray's SOCKS side works
+flux: (empty log)
+curl -x socks5h://127.0.0.1:19930 http://127.0.0.1:17171/       → nothing
+```
+
+xray accepted the request and dialled, but nothing reached our server and no data came back. **Not
+working, cause not established.** The obvious next checks: our server's log level (it ran at `error`,
+so a rejected request would be silent — that is a bad way to run an interop test), and whether xray's
+`xhttp` client requires `host` to match the `Host` header our server expects.
+
+Both items of this objective remain open.
