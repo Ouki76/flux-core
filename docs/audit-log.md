@@ -11293,3 +11293,28 @@ loses.
 **Next cycle, precisely:** log the SOCKS peer address at dispatch and again at write-back for every
 tunnel, and check whether the pairs match. If they do not, the defect is where the relay associates a
 tunnel with its client socket, in the dispatcher rather than in XHTTP.
+
+### C7.58 — retraction: C7.57's "105 full exchanges" was a misreading of my own log
+
+I claimed C7.57 showed many tunnels completing a full exchange while curl reported nothing, and
+concluded the response was being written to the wrong socket. Checked properly, by counting distinct
+copiers (`poke #1`, the first warning each one emits) rather than every repeated poke:
+
+```
+distinct relay copiers in that run:      3
+of which reached a full exchange:        2
+requests issued in that run:            10
+```
+
+**Three tunnels for ten requests, two of which completed.** Not 105 exchanges — 105 was the count of
+log *lines*, since each copier re-prints its counters every 500 ms. Every one of my "full exchange"
+lines came from the same two tunnels.
+
+So C7.57's conclusion is **withdrawn in full**: there is no evidence of responses going to the wrong
+socket, and the dispatcher/session-affinity lead is not supported by anything measured. I read a
+repeated log line as a population, and stated it as a finding — the same class of error this audit has
+recorded against itself before (C5.8, C7.40) and the third time I have made it.
+
+What survives, unchanged and uncomfortable: **seven of ten requests produced no tunnel at all.** That is
+the original symptom, still unexplained after sixteen cycles, and every theory I have offered for it has
+either been refuted by measurement or, in two cases, rested on a misread log.
