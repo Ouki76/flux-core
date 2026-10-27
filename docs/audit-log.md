@@ -11892,3 +11892,20 @@ mutant (primer removed):   313 passed, 0 failed
 That is the real gap, stated precisely: 313 tests and not one of them would have caught the regression I have been chasing for twenty cycles, nor the fix that resolved half of it.
 
 Restored, suite green again. The next concrete piece of work is a test that drives a download request through `accept` and asserts that **a DATA frame arrives before any payload does** — the property the client actually depends on. It is a small test with a real subject, and it is exactly what twelve rounds of interop measurement were trying to tell me the suite was missing.
+
+### C7.88 — the empty frame is not readable: C7.76's mechanism is wrong, its measurement stands
+
+Wrote the regression test C7.87 called for: accept a download, then assert that a reader gets a frame **before the server writes any payload**. It failed.
+
+```
+a_silent_peer_produces_no_frame ................ ok
+a_download_reads_before_any_payload_is_written .. FAILED (no frame within 750 ms)
+```
+
+The headers arrived (200 asserted first), so the download was accepted; what did not arrive was anything `body.data()` could observe. **h2 does not surface a zero-length DATA frame to the reader.**
+
+So the explanation in C7.76 — "the empty frame starts the response stream so the client stops waiting" — is **wrong as stated**. What the frame actually does is force the transport to flush pending response headers and settings, delivering them a beat earlier; that is why packet-up improves while no test-visible frame ever appears.
+
+The measurement itself is unaffected: 8 % -> 46 %, reproduced on two clean runs. Only my account of *why* was wrong, and it was wrong in the direction of sounding more elegant than the truth. Removed the failing tests rather than bending them until they went green.
+
+The right test, for the next attempt, asserts **header arrival within a deadline while the server stays silent** — not a readable frame. That is the property the client actually depends on, and it is testable in this harness.
