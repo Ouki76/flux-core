@@ -609,7 +609,45 @@ where
             }
             let _ = send.send_data(Bytes::new(), true);
         });
-        shared::spawn_connection_driver(connection, None);
+        // The connection must keep **accepting** after this download request: the uploads arrive as
+        // further POSTs on the same connection, and a bare connection driver would pump frames
+        // without ever handing them to anyone. That is why nothing moved before — the POSTs were
+        // never read, not misrouted.
+        tokio::spawn(async move {
+            while let Some(accepted) = connection.accept().await {
+                let Ok((post, mut post_respond)) = accepted else {
+                    break;
+                };
+                let post_path = post.uri().path().to_string();
+                let (session_of_post, seq) = match post_path.rsplit_once('/') {
+                    Some((rest, seq)) => (rest.rsplit('/').next().unwrap_or("").to_string(), seq),
+                    None => (String::new(), ""),
+                };
+                let seq: u64 = seq.parse().unwrap_or_default();
+                let mut body = post.into_body();
+                let mut chunk = Vec::new();
+                while let Some(frame) = body.data().await {
+                    match frame {
+                        Ok(data) => chunk.extend_from_slice(&data),
+                        Err(_) => break,
+                    }
+                }
+                let ack = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(())
+                    .expect("static ack response");
+                let _ = post_respond.send_response(ack, true);
+                if let Some(sender) = packet_sessions.get(&session_of_post) {
+                    for piece in reassembly
+                        .entry(session_of_post.clone())
+                        .or_default()
+                        .accept(seq, Bytes::from(chunk))
+                    {
+                        let _ = sender.send(piece);
+                    }
+                }
+            }
+        });
         return Ok(Box::new(ChannelDuplex {
             rx: upload_rx,
             tx: down_tx,
@@ -1228,5 +1266,75 @@ mod stream_up_end_to_end {
         assert_eq!(a.len(), 32);
         assert_ne!(a, b);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}
+
+#[cfg(test)]
+mod packet_up_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// `connect_packet_up` against `accept`, over one real duplex socket.
+    ///
+    /// The upload goes through a queue, a poster task, one POST per chunk and server-side
+    /// reassembly; the download comes back on a separate GET. Nothing else exercises all of that at
+    /// once, and the two halves failed separately before this existed.
+    #[tokio::test]
+    async fn packet_up_moves_bytes_both_ways() {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut s = accept(server_io, "/tunnel", false)
+                .await
+                .expect("server must open the packet-up session");
+            let mut buf = vec![0u8; 64];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf))
+                .await
+                .expect("server read timed out")
+                .expect("server read");
+            assert_eq!(&buf[..n], b"ping");
+            s.write_all(b"pong").await.expect("server write");
+            s.shutdown().await.expect("server shutdown");
+        });
+
+        let client = tokio::spawn(async move {
+            let mut c =
+                connect_packet_up(client_io, "example.com", "/tunnel", &HashMap::new(), None)
+                    .await
+                    .expect("client packet-up");
+            c.write_all(b"ping").await.expect("client write");
+            c.flush().await.expect("client flush");
+            let mut buf = vec![0u8; 64];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), c.read(&mut buf))
+                .await
+                .expect("client read timed out")
+                .expect("client read");
+            assert_eq!(&buf[..n], b"pong");
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            server.await.expect("server task");
+            client.await.expect("client task");
+        })
+        .await
+        .expect("packet-up must move data in both directions");
+    }
+
+    /// Out-of-order chunks are held until the gap fills, and a duplicate is dropped rather than
+    /// delivered twice — a retried POST must not corrupt the stream above it.
+    #[test]
+    fn reassembly_delivers_in_order_and_drops_duplicates() {
+        let mut r = Reassembly::default();
+        assert!(r.accept(1, Bytes::from_static(b"b")).is_empty(), "gap at 0");
+        assert!(
+            r.accept(0, Bytes::from_static(b"a")).len() == 2,
+            "0 unblocks 1"
+        );
+        assert_eq!(r.next, 2);
+        assert!(
+            r.accept(0, Bytes::from_static(b"a")).is_empty(),
+            "duplicate dropped"
+        );
+        assert_eq!(r.next, 2, "a duplicate must not advance the index");
     }
 }

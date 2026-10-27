@@ -859,7 +859,7 @@ impl XhttpSettings {
             // so this implementation resolves it to `stream-up`: the mode that carries a full duplex
             // session over one upload and one download stream.
             None | Some("stream-one") | Some("streamone") | Some("stream-up")
-            | Some("streamup") | Some("auto") => {}
+            | Some("streamup") | Some("auto") | Some("packet-up") | Some("packetup") => {}
             Some(other) => {
                 return Err(format!(
                     "{where_}: XHTTP mode '{other}' is not implemented — only 'stream-one' is; \
@@ -2849,7 +2849,7 @@ mod xhttp_settings_tests {
     /// refused with a message that names it.
     #[test]
     fn the_other_modes_are_refused_by_name() {
-        for mode in ["stream-up", "auto"] {
+        for mode in ["stream-up", "auto", "packet-up"] {
             assert!(
                 parse(&format!(r#"{{"mode": "{mode}"}}"#))
                     .validate("test")
