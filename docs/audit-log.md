@@ -11261,3 +11261,35 @@ What the next attempt needs is not another hypothesis from me but the one measur
 comparison of a failing request and a succeeding one **at the packet level** (`tcpdump` on lo, or the TLS
 handshake transcript), so the difference is seen rather than inferred. Fifteen cycles of inference have
 produced eleven ruled-out hypotheses and one real fix; the wire itself has not been read once.
+
+### C7.57 — the responses are being produced. They are not reaching the client that asked
+
+`tcpdump` needs root here, so the wire could not be read directly. The application log gives the same
+answer, and it is the most concrete clue in sixteen cycles:
+
+Several relay copiers complete a **full exchange** — request up, response down — while curl reports
+nothing:
+
+```
+WARN relay copier parked … moved up=79  down=43 — re-polling
+WARN relay copier parked … b at EOF, a quiet; moved up=79 down=43
+WARN relay copier parked … moved up=79 down=43
+```
+
+`up=79` is the HTTP request; `down=43` is exactly `HTTP/1.1 200 OK` + `Content-Length: 5` + blank line
++ `HELLO`. So for those requests **the tunnel did its whole job**. Curl still got nothing.
+
+That rules out the last of the "the client never sends / the server never answers" family and points
+somewhere none of the fifteen earlier hypotheses looked: **the response is delivered to a socket that is
+not the one the request came from.** Data moves correctly through the tunnel and is then written to the
+wrong side.
+
+The obvious mechanism, given what this code does per request: the SOCKS-side connection that the
+response is written back to is looked up per tunnel, and under concurrency two tunnels can end up
+sharing one, or one tunnel's writer is attached to another's socket. That is a session-affinity bug, not
+a transport bug — and it explains why the rate is about half: with two live requests, one wins and one
+loses.
+
+**Next cycle, precisely:** log the SOCKS peer address at dispatch and again at write-back for every
+tunnel, and check whether the pairs match. If they do not, the defect is where the relay associates a
+tunnel with its client socket, in the dispatcher rather than in XHTTP.
