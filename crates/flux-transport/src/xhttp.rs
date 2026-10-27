@@ -97,8 +97,12 @@ where
 {
     let mut client = shared::client_handshake(stream, "xhttp").await?;
     let session = session_id();
+    // The session goes in the **path**, not the query. Xray routes a request with no session to the
+    // stream-one branch — which is why an upload carrying `?session=` was decoded as stream-one and
+    // its reply went into the POST's response body, while our separate GET was answered with an empty
+    // body and the download stayed at zero bytes.
     let url = format!(
-        "{base}?session={session}&x_padding={padding}",
+        "{base}{session}?x_padding={padding}",
         base = normalize_path(path),
         padding = padding_param(xpadding)
     );
@@ -191,7 +195,17 @@ where
 
     let uri_path = request.uri().path().to_string();
     let under_base = is_under_base(path, &uri_path);
-    if let Some(session) = query_param(request.uri(), "session")
+    // The session is the path segment after the base — the form Xray actually pairs on. A query
+    // parameter does not switch Xray into a split mode at all: it decodes the request as stream-one
+    // and answers on the same request, which is why an earlier attempt saw the upload work and the
+    // download stay empty.
+    let base = normalize_path(path);
+    let path_session = uri_path
+        .strip_prefix(base.as_str())
+        .map(|suffix| suffix.trim_matches('/').to_string())
+        .filter(|suffix| !suffix.is_empty());
+
+    if let Some(session) = path_session
         && request.method() == Method::POST
         && under_base
     {
@@ -204,8 +218,11 @@ where
                 });
             }
         };
-        if download.method() != Method::GET
-            || query_param(download.uri(), "session").as_deref() != Some(session.as_str())
+        let download_path = download.uri().path().to_string();
+        let download_session = download_path
+            .strip_prefix(base.as_str())
+            .map(|suffix| suffix.trim_matches('/').to_string());
+        if download.method() != Method::GET || download_session.as_deref() != Some(session.as_str())
         {
             let refusal = Response::builder()
                 .status(StatusCode::NOT_FOUND)
