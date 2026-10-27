@@ -812,10 +812,6 @@ where
                     // is closed. Tearing the socket down here instead truncated the response — the
                     // transport test caught it immediately.
                     _ = &mut close_rx => {
-                        // `packet-up` splits the upload across numbered POSTs that may still be in
-                        // flight when the download tunnel ends. Give them a moment to land before
-                        // retiring the connection, or uploads are cut mid-session (C7.64).
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         connection.graceful_shutdown();
                         closing = true;
                         connection.accept().await
