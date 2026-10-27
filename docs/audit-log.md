@@ -11529,3 +11529,25 @@ same "deadline in the select, not a blocking sleep" shape C7.65 established, wit
 "no traffic for N seconds" rather than "N seconds after the tunnel closed".
 
 State restored to `c3cb224`: 313 tests pass, `stream-one` 15/15, `stream-up` 15/15, `packet-up` ~63 %.
+
+### C7.67 — idle-based retirement: 8/18, not better than the 15/24 baseline; reverted
+
+Replaced "retire when the tunnel ends" with "retire after 5 s with no request on the connection", a
+timer in the `select!` that resets on every accepted POST:
+
+```
+packet-up: 5/6, 3/6, 0/6      8/18 ≈ 44 %      (baseline 15/24 ≈ 63 %)
+```
+
+Not an improvement, and the sample is too small to call it a regression either. Reverted rather than kept
+on hope — the tree is back at `c3cb224`, 313 tests green, `stream-one` and `stream-up` at 15/15.
+
+**Where packet-up stands.** Four distinct attempts to release its connection — on tunnel end, on a fixed
+250 ms linger, on the download stream, and on idle — all measured, none better than leaving it alone.
+The strongest conclusion available: packet-up's remaining failures are **not** caused by connection
+release, unlike the other two modes, and the pool-cap experiment that explained them (C7.60) is not the
+whole story here.
+
+The next thing to try is not another release variant but a direct look at where the ~37 % goes: log
+per connection whether the numbered POSTs arrived at all versus whether the download tunnel was opened
+and never fed. Those are different defects and the current logs conflate them.
