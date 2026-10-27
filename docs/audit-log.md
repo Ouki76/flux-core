@@ -10355,3 +10355,28 @@ So this route is **untested, not disproved**. It remains the cheapest way to clo
 run with the port handling done properly would answer it in a single command.
 
 Item (1) is done and verified (C7.23 fix, delays removed, xray interop re-run).
+
+### C7.25 — reverse direction over TLS: the handshake passes, the data path was not shown
+
+Two harness faults were cleared first, both of which had hidden the result:
+
+1. `xray` in this version removed `allowInsecure`; the replacement is `pinnedPeerCertSha256`, and it
+   takes **hex**, not base64 — `encoding/hex: invalid byte: U+0070 'p'` was that mistake;
+2. the echo target's port was still held by an earlier run, so the last attempt's target never bound.
+
+With both fixed, xray as a client over **TLS with `alpn: ["h2"]`** against our inbound:
+
+```
+xray: from tcp:127.0.0.1:42702 accepted tcp:127.0.0.1:17172
+flux: preface errors: 0
+```
+
+**`preface: 0` is the meaningful part.** In cleartext xray sends HTTP/1.1 and our server rejects it at
+the preface (C7.22). Over TLS with h2 ALPN there is no preface error, so the connection is accepted as
+HTTP/2 — the protocol mismatch that blocked the reverse direction does not apply here.
+
+**But the request returned no data**, and that attempt's target was not listening, so this is **not** a
+working end-to-end result. What it establishes is that the TLS route is viable and that C7.22's
+conclusion — "our server cannot serve xray clients" — holds only for cleartext.
+
+Item (1) remains done; item (2) needs one clean run with a free port.
