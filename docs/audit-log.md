@@ -9888,3 +9888,37 @@ resolves on first read — and the log shows the client closing "gracefully" rig
 which suggests the read never polled the pending future, or the future resolved to an error that the
 read path treated as end-of-stream. Instrument `H2Stream::poll_read` on a `Pending` state rather than
 guessing which of the two it is — that mistake cost two cycles already.
+
+### C7.9 — the read path is correct, so the download is not being answered
+
+C7.8 said to instrument `H2Stream::poll_read` in the `Pending` state rather than guess. Reading it
+settles the question without an experiment: `poll_read` polls the response future, and on success
+switches to `Ready(response.into_body())` and `continue`s into the data path. A non-2xx status is
+surfaced as `ConnectionRefused` rather than spliced in as payload. **The read path is correct.**
+
+So `download = 0 B` does not mean "we failed to read it" — it means **xray is not sending anything on
+the stream we opened**, or our GET is not being paired with the session at all.
+
+What the C7.8 log establishes on the other side:
+
+```
+xray: dialing to tcp:127.0.0.1:17171
+xray: proxy/freedom: connection opened to tcp:127.0.0.1:17171
+```
+
+Xray accepted the **upload**, decoded the VLESS request inside it, and dialled the target. If the
+download GET were paired, its reply would follow that connection. It does not, and the tunnel closes
+with upload=79 B, download=0 B.
+
+**The remaining question is narrow and answerable:** does xray pair a GET carrying
+`?session=<uuid>`, or does it expect the session in the **path** (`/<path>/<uuid>`) for the download
+half? Our POST is accepted with the query form, so at least the upload half tolerates it — but Xray's
+`hub.go` comment about a session living "as long as the GET request is opened" does not say which form
+opens it, and C6.3 recorded the download as `GET /?session=UUID` from the docs, which may describe the
+*streaming* form only.
+
+**Next cycle, first action:** run xray with `loglevel: debug` and look for the GET request in its own
+log — it logs accepted connections and rejected requests. If the GET is rejected, its message says
+why; if it is accepted, the pairing is fine and the fault is on our side of the response body.
+That is one experiment, not a redesign, and it is where this should have gone before re-reading our
+own code.
