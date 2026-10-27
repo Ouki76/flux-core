@@ -11195,3 +11195,38 @@ connection we hand to the driver, or Xray's own XMUX health accounting.
 after the first the failures start. If the wall is time-based it will land at the same number of seconds
 regardless of how many requests happened before it — which is a different experiment from counting
 requests, and the only one that distinguishes the two.
+
+### C7.55 — 10 of 10 on one stack, 1–2 of 5 when the stack is restarted
+
+Two measurements, same binary, same configs, `alpn: ["h2"]`:
+
+**One long-lived stack, ten requests, every one timestamped:**
+
+```
+req  1 at 0.0s: O      req  6 at 0.8s: O
+req  2 at 0.7s: O      req  7 at 0.8s: O
+…                      req 10 at 0.8s: O          10/10
+```
+
+Not only did every request succeed — after the first, **each took about ten milliseconds**, so the whole
+burst finished in under a second. When the tunnel is up and reused, this transport is fast and reliable.
+
+**Three freshly restarted stacks, five requests each:**
+
+```
+trial 1: 1/5   trial 2: 2/5   trial 3: 1/5
+```
+
+Same code. The difference is **whether the stack was freshly started**. That is not a property of the
+inbound's logic — it is a property of startup — and it finally gives the earlier "runs are globally good
+or bad" observation a place to live.
+
+The time-based reading of C7.54 is now doubtful in its original form: the failing requests each wait for
+curl's six-second timeout, so a slow run is slow *because* it is failing, not the other way round. What
+survives is the sharper statement: **a stack that gets its first request through stays healthy; one that
+fails once tends not to recover.**
+
+Next cycle: start the stack, **wait for it to be genuinely ready** (a first successful request, not just
+a listening socket), then measure the burst. If the rate then holds at 5/5 across several stacks, the
+remaining defect is a startup race and has a name; if it does not, the freshly-started case is the one to
+instrument line by line.
