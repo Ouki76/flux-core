@@ -11828,3 +11828,19 @@ So the allowances are not decorative: they suppress **six genuinely dead items i
 Important distinction among them, and the reason I did **not** simply delete everything: `debug_master_secret`, `debug_hash_before_cf` and `debug_c_ap` are the state a TLS key-log implementation needs. They are "never read" today because key logging is not wired up — deleting them would remove the groundwork for a real feature, while keeping them unread is dead weight. The honest fix is one of two things, and it is a design decision rather than a cleanup: wire key logging behind an off-by-default feature, or delete the fields and re-derive them if the feature is ever built.
 
 Restored the file unchanged; the tree is clean. Recorded so the next session does not repeat the experiment and so that the cleanup is done deliberately, not as a blanket "remove and see".
+
+### C7.84 — item 3: the XHTTP settings are genuinely wired, after one false alarm
+
+First pass claimed three settings were parsed and unused (`sc_max_each_post_bytes`, `sc_min_posts_interval_ms`, `download_settings`) because a grep excluding `config.rs` found no other reference. **That was my mistake, not a defect**: all three are converted into `PacketUpOptions` inside `config.rs::packet_up_options()`, which is exactly where a config field should be consumed.
+
+Followed the chain all the way to the wire instead of stopping at the struct:
+
+```
+config.rs      sc_max_each_post_bytes / sc_min_posts_interval_ms / download_settings
+                  -> PacketUpOptions { max_each_post_bytes, min_posts_interval, download_path, download_headers }
+xhttp.rs       13 references; line 380 takes min_interval and paces the POST loop with it
+```
+
+Also confirmed the server-side trio reaches the pipeline: `instance.rs` passes `xpadding`, `packet_up_options`, `max_buffered_posts` and `stream_up_server_secs` into the framing layers (lines 1125, 1136, 1678, 1679).
+
+**Verdict for XHTTP on item 3: every advertised setting is reachable and used.** The general lesson worth keeping: a grep that excludes the file where conversion happens will always "prove" that settings are unused.
