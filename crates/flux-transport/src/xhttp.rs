@@ -594,6 +594,27 @@ impl Reassembly {
     }
 }
 
+/// Whether a path suffix is a session id.
+///
+/// Two shapes are accepted, and both are exact on purpose: any looser rule turns an ordinary
+/// sub-path into a split-session request, and the server then waits for a second request that a
+/// `stream-one` client will never send — which is a hang, not an error.
+///
+/// - 32 hex characters: what our own client generates;
+/// - a UUID, `8-4-4-4-12` hex with dashes: what Xray's client generates.
+fn looks_like_a_session(suffix: &str) -> bool {
+    let hex = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
+    if suffix.len() == 32 && hex(suffix) {
+        return true;
+    }
+    let parts: Vec<&str> = suffix.split('-').collect();
+    matches!(parts.len(), 5)
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&parts)
+            .all(|(want, part)| part.len() == *want && hex(part))
+}
+
 /// Server half: accepts one bidirectional request and returns it as a stream.
 ///
 /// `path` is the configured base path. Anything under it is accepted, because the client
@@ -652,14 +673,7 @@ where
         // A session is a single path segment of hex-or-alphanumeric characters and a plausible
         // length. Demanding exactly 32 hex characters refused Xray's own client, whose session ids
         // do not have that shape, so the split modes worked only against our own client.
-        .filter(|suffix| {
-            !suffix.is_empty()
-                && !suffix.contains('/')
-                && (8..=64).contains(&suffix.len())
-                && suffix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        });
+        .filter(|suffix| looks_like_a_session(suffix));
 
     // `packet-up` download: a GET naming a session with no sequence. It opens the session, and the
     // chunks arrive as separate POSTs on this same connection, so the returned stream reads from a
@@ -724,11 +738,23 @@ where
                     break;
                 };
                 let post_path = post.uri().path().to_string();
-                let (session_of_post, seq) = match post_path.rsplit_once('/') {
-                    Some((rest, seq)) => (rest.rsplit('/').next().unwrap_or("").to_string(), seq),
-                    None => (String::new(), ""),
+                // `/<base>/<session>/<seq>` for packet-up, `/<base>/<session>` for stream-up. Taking
+                // the last segment as a sequence unconditionally made the session "x" for the
+                // unnumbered form, which is why xray's stream-up never delivered anything.
+                let last = post_path.rsplit('/').next().unwrap_or("");
+                let (session_of_post, seq_str) = match last.parse::<u64>() {
+                    Ok(_) => match post_path.rsplit_once('/') {
+                        Some((rest, seq)) => {
+                            (rest.rsplit('/').next().unwrap_or("").to_string(), seq)
+                        }
+                        None => (String::new(), ""),
+                    },
+                    Err(_) => (last.to_string(), ""),
                 };
-                let seq: u64 = seq.parse().unwrap_or_default();
+                // A POST carrying a number is `packet-up`; one without is `stream-up`, where the whole
+                // upload is a single streaming body. Both land here because both follow the session's
+                // download GET, and treating the unnumbered form as sequential keeps one code path.
+                let seq: Option<u64> = seq_str.parse().ok();
                 let mut body = post.into_body();
                 let mut chunk = Vec::new();
                 while let Some(frame) = body.data().await {
@@ -742,13 +768,20 @@ where
                     .body(())
                     .expect("static ack response");
                 let _ = post_respond.send_response(ack, true);
-                if let Some(sender) = packet_sessions.get(&session_of_post) {
-                    for piece in reassembly
-                        .entry(session_of_post.clone())
-                        .or_default()
-                        .accept(seq, Bytes::from(chunk))
-                    {
-                        let _ = sender.send(piece);
+                let sender = packet_sessions.get(&session_of_post).cloned();
+                let state = reassembly
+                    .entry(session_of_post.clone())
+                    .or_insert_with(|| Reassembly {
+                        max_buffered: buffered_bound,
+                        ..Reassembly::default()
+                    });
+                let seq = seq.unwrap_or(state.next);
+                for piece in state.accept(seq, Bytes::from(chunk)) {
+                    match &sender {
+                        Some(sender) => {
+                            let _ = sender.send(piece);
+                        }
+                        None => state.ready.push_back(piece),
                     }
                 }
             }

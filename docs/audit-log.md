@@ -10409,3 +10409,32 @@ evidently opens them in a different order or on a different connection; `auto` p
 `stream-up` for this traffic, which would explain it failing too.
 
 Cleartext remains unsupported and needs an HTTP/1.1 branch on the server (C7.22).
+
+### C7.27 — reverse direction: only stream-one is reliably verified
+
+Multiple runs of the four modes, xray as client over TLS against our inbound, gave **inconsistent**
+results: `packet-up` and `auto` each answered `HELLO` once, then stopped answering after the session
+filter was tightened to exact shapes (32 hex, or a UUID `8-4-4-4-12`). `stream-one` has answered
+`HELLO` on every run.
+
+What was changed and kept:
+
+- `looks_like_a_session` now accepts **only** a 32-hex id or a UUID. A looser rule (any 8–64 character
+  segment) made `a_deep_path_under_the_base_is_accepted` hang, because a sub-path was taken for a
+  session and the server waited forever for a second request;
+- a POST with **no** sequence number is treated as the next sequential chunk, so a `stream-up` upload
+  can share the `packet-up` reassembly path;
+- the earlier bug where the unnumbered POST's last segment was parsed as the session (giving the
+  session "x") is fixed.
+
+**Honest status of item (2):**
+
+| mode | state |
+|---|---|
+| `stream-one` | **verified**, repeatedly, over TLS |
+| `packet-up`, `auto` | answered once, not reproducible since — **not established** |
+| `stream-up` | never answered |
+
+The instability is unexplained and I will not present a single successful run as verification. What
+*is* established: the reverse direction works at all only over TLS with `alpn: ["h2"]`, cleartext is
+refused at the h2 preface, and `stream-one` works end to end.
