@@ -842,14 +842,22 @@ where
                 }
                 let chunk = Bytes::from(chunk);
                 let seq = seq.expect("numbered");
-                with_sessions(|map| {
+                let delivered = with_sessions(|map| {
                     if let Some(entry) = map.get_mut(&session_of_post) {
                         let ready = entry.state.accept(seq, chunk);
+                        let n: usize = ready.iter().map(|p| p.len()).sum();
                         for piece in ready {
                             let _ = entry.tx.send(piece);
                         }
+                        Some(n)
+                    } else {
+                        None
                     }
                 });
+                tracing::debug!(
+                    "packet-up: POST seq={seq:?} session={} delivered={delivered:?}",
+                    &session_of_post[..session_of_post.len().min(8)]
+                );
             }
         });
         return Ok(Box::new(ChannelDuplex {

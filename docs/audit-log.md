@@ -10817,3 +10817,32 @@ about an individual tunnel.
 
 That redirects the search again, and this time with evidence: compare a stack that serves 0/3 with one
 that serves 3/3 on the *same* binary, and look at what differs at startup rather than at request time.
+
+### C7.43 — the failing requests never send an upload at all
+
+Instrumented the numbered-POST path to log every delivery, then ran four trials of two requests:
+
+```
+trials: 1/2, 1/2, 1/2, 1/2        (8 requests, 4 served)
+flux log for one trial: exactly ONE line —
+  packet-up: POST seq=0 session=d8e3d091 delivered=Some(105)
+```
+
+**Two requests were made; one POST arrived.** The successful request's chunk was delivered (105 bytes,
+`delivered=Some(105)`). The failing request produced **no POST whatsoever** — our server never received
+an upload for it.
+
+So the failure is **upstream of everything examined so far**: not the session registry, not the
+reassembly, not the accept loop, not the download writer. Xray opens the download, our server answers
+200, and then xray simply does not post the request body for that tunnel.
+
+That is consistent with the per-run clustering too: whether xray posts appears to depend on some state
+it establishes once — most plausibly whether it considers the download response acceptable. A 200 with
+`content-type: text/event-stream` and an open body is what it gets every time, so the difference must
+be in timing or in something our server does to the connection around the response.
+
+**Next cycle starts here:** correlate a failing GET's exact response bytes against a succeeding one
+(alpn negotiated, response headers, whether the connection was reused), rather than touching the
+server's POST handling again — it is demonstrably not where the bytes are lost.
+
+The delivery log stays at `debug` so the next attempt can see the same thing.
