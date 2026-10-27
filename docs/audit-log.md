@@ -9922,3 +9922,43 @@ log — it logs accepted connections and rejected requests. If the GET is reject
 why; if it is accepted, the pairing is fine and the fault is on our side of the response body.
 That is one experiment, not a redesign, and it is where this should have gone before re-reading our
 own code.
+
+### C7.10 — XHTTP modes: what is verified, and the one that is not
+
+| mode | implemented | verified against real xray | config |
+|---|---|---|---|
+| `stream-one` | yes | yes (+285% in the matrix) | accepted |
+| `stream-up` | yes | **yes** — `HELLO` through the tunnel | accepted |
+| `auto` | yes (resolves to `stream-up`) | **yes** — `HELLO` through the tunnel | accepted |
+| `packet-up` | **no** | — | refused by name |
+
+Interop evidence for the two new modes, with xray configured `"network": "xhttp"` and the server mode
+set to `stream-up`:
+
+```
+curl -x socks5h://127.0.0.1:19901 http://127.0.0.1:17171/   →   HELLO
+xray: connection opened to tcp:127.0.0.1:17171
+```
+
+No regressions after the changes:
+
+```
+VLESS / XHTTP   422.3 MiB/s vs xray 133.9  (+215.3%)   ASSERT PASSED
+bench_rps --tls                                        ASSERT PASSED
+1174 tests pass, clippy clean
+```
+
+### Why `packet-up` is still refused
+
+`stream-up` and `packet-up` share a download half but not an upload half. `stream-up` sends one POST
+whose body stays open; `packet-up` sends **many POSTs, each carrying a sequence number**, and the
+server reassembles them in order. On our side that means:
+
+- the client's write path can no longer be a `SendStream` — it has to become "queue this chunk, and a
+  task POSTs it with the next sequence number", which is a different stream type from `H2Stream`;
+- the server needs a reassembly buffer keyed by sequence, draining from the next expected index, with
+  the bound that `scMaxBufferedPosts` exists to express;
+- the exact form of the sequence in the request (query or path segment) has to be established against
+  xray, as C7.8 established it for the session — and guessing it is what cost four cycles there.
+
+**That is a genuine piece of work, not a variant flag**, and it is the only thing left in item A.
