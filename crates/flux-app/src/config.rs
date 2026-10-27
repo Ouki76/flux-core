@@ -849,6 +849,40 @@ pub struct XhttpSettings {
 }
 
 impl XhttpSettings {
+    /// Turns the settings into the options the `packet-up` client consumes.
+    ///
+    /// `downloadSettings` may give the download request its own path and headers; anything it omits
+    /// falls back to the upload's. Extracted from the wiring so the mapping is testable without
+    /// building an instance.
+    pub fn packet_up_options(&self) -> flux_transport::xhttp::PacketUpOptions {
+        let mut download_headers = std::collections::HashMap::new();
+        let mut download_path = None;
+        if let Some(d) = self.download_settings.as_ref() {
+            if let Some(p) = d.get("path").and_then(|v| v.as_str()) {
+                download_path = Some(p.to_string());
+            }
+            if let Some(h) = d.get("headers").and_then(|v| v.as_object()) {
+                for (k, v) in h {
+                    if let Some(v) = v.as_str() {
+                        download_headers.insert(k.clone(), v.to_string());
+                    }
+                }
+            }
+        }
+        flux_transport::xhttp::PacketUpOptions {
+            max_each_post_bytes: self
+                .sc_max_each_post_bytes
+                .as_ref()
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize),
+            min_posts_interval: self
+                .sc_min_posts_interval_ms
+                .map(std::time::Duration::from_millis),
+            download_path,
+            download_headers,
+        }
+    }
+
     /// Rejects every setting this implementation cannot honour, naming it.
     ///
     /// Called once at config load so a user learns at startup rather than from a connection that
@@ -2872,6 +2906,44 @@ mod xhttp_settings_tests {
 
     /// A full Xray-shaped framing block must parse through the enum, which is what a user actually
     /// writes.
+    /// `downloadSettings` must reach the client with its own path and headers, and the two
+    /// packet-up numbers must survive the trip — otherwise the setting is accepted and ignored, which
+    /// is the failure mode this whole surface exists to avoid.
+    #[test]
+    fn download_settings_and_post_options_reach_the_client() {
+        let s = parse(
+            r#"{
+                "scMaxEachPostBytes": 4096,
+                "scMinPostsIntervalMs": 25,
+                "downloadSettings": {"path": "/dl", "headers": {"X-Down": "1"}}
+            }"#,
+        );
+        let options = s.packet_up_options();
+        assert_eq!(options.max_each_post_bytes, Some(4096));
+        assert_eq!(
+            options.min_posts_interval,
+            Some(std::time::Duration::from_millis(25))
+        );
+        assert_eq!(options.download_path.as_deref(), Some("/dl"));
+        assert_eq!(
+            options.download_headers.get("X-Down").map(|v| v.as_str()),
+            Some("1")
+        );
+    }
+
+    /// With no `downloadSettings`, the download shares the upload's path and headers.
+    #[test]
+    fn without_download_settings_the_download_inherits() {
+        let options = parse(r#"{}"#).packet_up_options();
+        assert!(options.download_path.is_none());
+        assert!(options.download_headers.is_empty());
+        assert_eq!(
+            options.max_each_post_bytes, None,
+            "client falls back to 1 MB"
+        );
+        assert_eq!(options.min_posts_interval, None);
+    }
+
     #[test]
     fn a_full_xray_framing_block_parses() {
         let cfg: FramingConfig = serde_json::from_str(

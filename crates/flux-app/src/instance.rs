@@ -1133,36 +1133,7 @@ fn compile_client_framings(
                         settings.mode.as_deref(),
                         Some("stream-up") | Some("streamup") | Some("auto")
                     ),
-                    packet_up_options: {
-                        // `downloadSettings` may carry its own path and headers for the download
-                        // request; anything it does not name falls back to the upload's.
-                        let mut download_headers = std::collections::HashMap::new();
-                        let mut download_path = None;
-                        if let Some(d) = settings.download_settings.as_ref() {
-                            if let Some(p) = d.get("path").and_then(|v| v.as_str()) {
-                                download_path = Some(p.to_string());
-                            }
-                            if let Some(h) = d.get("headers").and_then(|v| v.as_object()) {
-                                for (k, v) in h {
-                                    if let Some(v) = v.as_str() {
-                                        download_headers.insert(k.clone(), v.to_string());
-                                    }
-                                }
-                            }
-                        }
-                        flux_transport::xhttp::PacketUpOptions {
-                            max_each_post_bytes: settings
-                                .sc_max_each_post_bytes
-                                .as_ref()
-                                .and_then(|v| v.as_u64())
-                                .map(|n| n as usize),
-                            min_posts_interval: settings
-                                .sc_min_posts_interval_ms
-                                .map(std::time::Duration::from_millis),
-                            download_path,
-                            download_headers,
-                        }
-                    },
+                    packet_up_options: settings.packet_up_options(),
                 });
             }
             FramingConfig::WebSocket { path, headers } => {

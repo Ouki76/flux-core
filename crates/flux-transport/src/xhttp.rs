@@ -1498,6 +1498,133 @@ mod split_write_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// `scMinPostsIntervalMs`: the poster must actually wait between POSTs.
+    ///
+    /// 200 bytes at 64 per POST is four requests, so with a 50 ms interval the transfer cannot finish
+    /// in less than 150 ms. Without the pacing this completes almost instantly — which is the
+    /// difference the setting is supposed to make.
+    #[tokio::test]
+    async fn posts_are_paced_by_the_configured_interval() {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+        let expected: Vec<u8> = (0..200u32).map(|n| (n % 251) as u8).collect();
+        let want = expected.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<std::time::Duration>();
+
+        let server = tokio::spawn(async move {
+            let mut s = accept(server_io, "/tunnel", false, None, None)
+                .await
+                .expect("server must open the session");
+            let started = std::time::Instant::now();
+            let mut got = vec![0u8; 200];
+            let mut filled = 0;
+            while filled < 200 {
+                let n = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    s.read(&mut got[filled..]),
+                )
+                .await
+                .expect("server read timed out")
+                .expect("server read");
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            assert_eq!(got, want);
+            let _ = done_tx.send(started.elapsed());
+        });
+
+        let client = tokio::spawn(async move {
+            let options = PacketUpOptions {
+                max_each_post_bytes: Some(64),
+                min_posts_interval: Some(std::time::Duration::from_millis(50)),
+                ..Default::default()
+            };
+            let mut c = connect_packet_up(
+                client_io,
+                "example.com",
+                "/tunnel",
+                &HashMap::new(),
+                None,
+                &options,
+            )
+            .await
+            .expect("client packet-up");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            c.write_all(&expected).await.expect("write");
+            c.flush().await.expect("flush");
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            server.await.expect("server");
+            client.await.expect("client");
+        })
+        .await
+        .expect("paced transfer must complete");
+        let elapsed = done_rx.await.expect("server timing");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(150),
+            "four POSTs at a 50 ms interval cannot arrive in {elapsed:?}"
+        );
+    }
+
+    /// `scStreamUpServerSecs`: the server must not keep an upload stream open forever.
+    ///
+    /// With a one-second lifetime the read returns end-of-stream on its own, without the client
+    /// closing anything.
+    #[tokio::test]
+    async fn the_upload_stream_closes_on_its_own_lifetime() {
+        let (client_io, server_io) = tokio::io::duplex(256 * 1024);
+
+        let server = tokio::spawn(async move {
+            let mut s = accept(server_io, "/tunnel", false, None, Some(1))
+                .await
+                .expect("server must open the session");
+            let mut buf = vec![0u8; 64];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf))
+                .await
+                .expect("first read timed out")
+                .expect("first read");
+            assert_eq!(&buf[..n], b"ping");
+            // Nothing else is written; the lifetime must end the stream by itself.
+            let started = std::time::Instant::now();
+            let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf))
+                .await
+                .expect("the stream should close on its own lifetime")
+                .expect("second read");
+            assert_eq!(n, 0, "the lifetime must end the stream");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(4),
+                "it should close near the configured second, not later"
+            );
+        });
+
+        let client = tokio::spawn(async move {
+            let mut c = connect_packet_up(
+                client_io,
+                "example.com",
+                "/tunnel",
+                &HashMap::new(),
+                None,
+                &PacketUpOptions::default(),
+            )
+            .await
+            .expect("client packet-up");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            c.write_all(b"ping").await.expect("write");
+            c.flush().await.expect("flush");
+            // Keep the client alive; the server must end the stream, not the client.
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            server.await.expect("server");
+            client.await.expect("client");
+        })
+        .await
+        .expect("the server must close the upload stream itself");
+    }
+
     /// `scMaxEachPostBytes`: a write split across several POSTs must arrive byte-for-byte.
     ///
     /// The write is delayed by 100 ms because a POST that is in flight while the server is still
