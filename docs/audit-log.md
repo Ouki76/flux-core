@@ -11857,3 +11857,24 @@ fields mentioned only at their declaration:      0
 Every setting is read somewhere. Combined with C7.84 (the XHTTP group traced from config through `PacketUpOptions` into the POST loop) and C7.60 (the client pool cap demonstrably driving behaviour), the settings surface is verified as real rather than decorative.
 
 This is the check that should have come first on item 3: a mechanical scan of declaration-versus-use beats an afternoon of reading field names and guessing.
+
+### C7.86 — item 3: the "tests without assertions" scan is a false signal, and that is the fourth this session
+
+Scanned all test functions for a missing `assert`/`expect`/`unwrap`/`panic!` in their own body:
+
+```
+test functions:                                  905
+apparently without a single check:                18
+```
+
+Picked one at random (`grpc.rs:1401`) and read it: it ends with
+
+```rust
+expect_payload(&mut cli, b"after the empty message", "empty frame skip").await;
+```
+
+and `expect_payload` (line 1355) contains three `assert`/`panic!` sites. **The test asserts through a helper**, so the scan cannot see it. The same applies to the three `single_byte_mutations_never_panic_or_block` tests, which share a harness.
+
+**So this scan certifies nothing and I am not reporting it as a finding.** It is the fourth instrument-induced false alarm of the session (C7.58 repeated log lines, C7.72 overlapping runs, C7.84 grep excluding the conversion site, and this). A textual scan cannot decide whether a test asserts; only reading the helper can, and the tooling for that is a reader, not a regex.
+
+What would actually work: instrument the test binary to count assertions executed per test (`--nocapture` plus a global counter, or a custom test harness), or simply read the 18. Neither is a regex.
