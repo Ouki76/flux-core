@@ -188,9 +188,9 @@ pub struct PacketUpStream {
     tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 }
 
-/// The download half's state: a response that has not arrived yet, one that has, or a finished body.
+/// The download half's state. The response is resolved before the stream is handed out — a `packet-up`
+/// client must not post until the download has been answered (C7.23) — so there is no pending case.
 enum PacketUpRecv {
-    Pending(h2::client::ResponseFuture),
     Ready(RecvStream),
     Done,
 }
@@ -223,25 +223,6 @@ impl AsyncRead for PacketUpStream {
             if this.read_done {
                 return Poll::Ready(Ok(()));
             }
-            if let PacketUpRecv::Pending(fut) = &mut this.recv {
-                match Pin::new(fut).poll(cx) {
-                    Poll::Ready(Ok(response)) => {
-                        let status = response.status();
-                        if !status.is_success() {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::ConnectionRefused,
-                                format!("H2 tunnel rejected by peer with HTTP status {status}"),
-                            )));
-                        }
-                        this.recv = PacketUpRecv::Ready(response.into_body());
-                        continue;
-                    }
-                    Poll::Ready(Err(e)) => {
-                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
             match &mut this.recv {
                 PacketUpRecv::Ready(recv) => match Pin::new(recv).poll_data(cx) {
                     Poll::Ready(Some(Ok(data))) => {
@@ -262,7 +243,6 @@ impl AsyncRead for PacketUpStream {
                     this.read_done = true;
                     return Poll::Ready(Ok(()));
                 }
-                PacketUpRecv::Pending(_) => continue,
             }
         }
     }
@@ -381,8 +361,15 @@ where
                 protocol: "xhttp",
                 message: format!("failed to send the XHTTP download: {e}"),
             })?;
-    // Upload: a task posts each queued chunk to /<base>/<session>/<seq>. It is spawned **before** the
-    // download is polled, because a peer may only answer the download once an upload exists.
+    // The download must be answered **before** the first POST: several POSTs issued while the server
+    // is still sending its download response leave that stream in a state h2 considers
+    // already-answered, and the server refuses it with `unexpected frame type` (C7.23).
+    let download_response = download_response.await.map_err(|e| FluxError::Protocol {
+        protocol: "xhttp",
+        message: format!("the XHTTP download was refused: {e}"),
+    })?;
+    let recv_pending = PacketUpRecv::Ready(download_response.into_body());
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     let host = host.to_string();
     let headers = headers.clone();
@@ -461,7 +448,7 @@ where
     });
 
     Ok(Box::new(PacketUpStream {
-        recv: PacketUpRecv::Pending(download_response),
+        recv: recv_pending,
         read_buf: Bytes::new(),
         read_pos: 0,
         read_done: false,
@@ -1550,9 +1537,6 @@ mod split_write_tests {
             )
             .await
             .expect("client packet-up");
-            // The download request must be answered before the first POST: with more than one POST
-            // the server's `send_response` fails with `unexpected frame type`. Recorded in C7.23.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             c.write_all(&expected).await.expect("write");
             c.flush().await.expect("flush");
         });
@@ -1677,9 +1661,6 @@ mod split_write_tests {
             )
             .await
             .expect("client packet-up");
-            // More than one POST makes the server's `send_response` fail with `unexpected frame
-            // type` unless the download has been answered first. Recorded in C7.23.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             c.write_all(&expected).await.expect("write");
             c.flush().await.expect("flush");
         });
