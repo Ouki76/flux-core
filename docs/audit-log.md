@@ -9962,3 +9962,28 @@ server reassembles them in order. On our side that means:
   xray, as C7.8 established it for the session — and guessing it is what cost four cycles there.
 
 **That is a genuine piece of work, not a variant flag**, and it is the only thing left in item A.
+
+### C7.11 — full matrix after the XHTTP changes: no regressions
+
+Six rounds, 150 MB per row, `--assert 0.10` **PASSED** — every row at or above both competitors:
+
+| protocol | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | 661.0 | 560.3 | 573.8 | +18.0% | +15.2% |
+| WireGuard | 63.2 | 39.9 | — | +58.6% | — |
+| TUIC v5 | 103.4 | 49.2 | — | +110.0% | — |
+| Hysteria2 | 99.6 | 46.4 | — | +114.8% | — |
+| VLESS / TLS | 325.1 | 290.8 | 244.5 | +11.8% | +33.0% |
+| **VLESS / XHTTP** | **461.4** | — | 133.0 | — | **+246.8%** |
+| VLESS / WS + TLS | 312.0 | 295.4 | 101.4 | +5.6% | +207.9% |
+| VLESS / gRPC | 415.1 | — | 166.7 | — | +148.9% |
+| VLESS / gRPC + TLS | 246.6 | 99.9 | 162.4 | +146.8% | +51.9% |
+| VLESS / REALITY | 335.0 | 315.0 | 222.4 | +6.4% | +50.7% |
+| REALITY + Vision | 334.9 | 282.8 | 232.7 | +18.4% | +43.9% |
+| VMess / WS + TLS | 209.7 | 181.3 | 175.1 | +15.7% | +19.7% |
+| Trojan / TLS | 343.7 | 297.9 | — | +15.4% | — |
+| Shadowsocks-2022 | 339.9 | 336.2 | 278.7 | +1.1% | +21.9% |
+| Shadowsocks-AEAD | 329.6 | 251.3 | — | +31.2% | — |
+
+The XHTTP row moved from 455.3 to **461.4** while gaining two working modes, so the split-session code
+costs nothing on the stream-one path it also serves.
