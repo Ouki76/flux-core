@@ -10548,3 +10548,30 @@ a process-wide map keyed by session id, with the per-connection loop only *looki
 needs a TTL, because a map that outlives connections must not leak a session whose peer vanished.
 
 This is the last open item of the objective and it now has a named cause rather than a symptom.
+
+### C7.33 — C7.32's hypothesis is refuted, and the failure is downstream of the tunnel
+
+The process-wide registry was implemented (commit `3c30927`, TTL 120 s) and tested against xray's
+client four times: **1 of 4**. So splitting the directions across connections was not the cause.
+
+The pattern is sharper than "intermittent": **the first run works and every later one fails** while
+flux-core keeps running. That points at state accumulated inside our process, not at xray.
+
+And the failure is **not in the tunnel**. The relay counter for a failing run reads:
+
+```
+moved up=79   down=43
+```
+
+79 bytes up is the HTTP request; **43 bytes down is exactly the response** — `HTTP/1.1 200 OK\r\n` (17)
++ `Content-Length: 5\r\n` (19) + `\r\n` (2) + `HELLO` (5). The full answer crossed the tunnel, and curl
+still reported nothing.
+
+So the data was delivered to **the wrong SOCKS stream**, or to a stream that no longer belongs to the
+request. Combined with "first run works, later runs fail", the most likely mechanism is stale state
+being reused across xray restarts — the 120 s TTL I just added would make that *worse*, not better, if
+a session id repeats.
+
+**Next step, precisely:** run one failing case and check whether the session id in the download GET
+differs from the one the POSTs use, and whether a session from the previous run is still present. That
+distinguishes "wrong pairing" from "stale pairing" in one observation.
