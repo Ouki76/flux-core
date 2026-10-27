@@ -11699,3 +11699,20 @@ Two consequences worth recording:
 
 1. our numbered-POST handling (`/<base>/<session>/<seq>`) is **barely exercised** by the client this work has been testing against — it is implemented and unit-tested, but the interop evidence for it is thin, which matters for objective item 3;
 2. the ~8 % failures are therefore **not** in the numbered path. They sit in the same GET-plus-POST flow that `stream-up` drives at 100 %, so the difference between a good and a bad stack is a property of the run, not of the mode.
+
+### C7.76 — opening the response stream with an empty DATA frame: 8 % -> ~46 % for packet-up
+
+C7.75 showed `packet-up` driving the same GET-plus-POST flow that `stream-up` drives at 100 %, so the difference had to be what the client expects from the **download response**. Sent a zero-length DATA frame immediately after the download headers — legal, carries nothing:
+
+```
+baseline (clean):        0/6, 0/6, 1/6, 1/6        2/24 —  8 %
+with empty DATA frame:   6/6, 0/6, 1/6, 5/6       12/24 — 50 %
+confirmation run:        2/6, 1/6, 5/6, 2/6       10/24 — 42 %
+                                                22/48 — 46 %
+```
+
+A five-fold improvement, reproduced on a second run with the overlap-proof harness. **C7.48 rejected this very change at 8/16 vs 8/16 — that measurement was taken with the old harness and is now void.** This is the third figure in the log that the contaminated harness had wrong in the negative direction.
+
+Still not the criterion: ~46 %, not 5/5. But it is the first genuine improvement to `packet-up` in this whole campaign, and it points at the real mechanism — the client waits for the download to *start producing*, and one frame unblocks some of that wait but not all of it.
+
+Next: the remaining half. If one frame unblocks half the cases, the others likely need actual bytes and not an empty frame — which would mean the client is blocked on reading a body it considers non-empty. Measure that next; 313 transport tests and clippy stay green.
