@@ -9987,3 +9987,31 @@ Six rounds, 150 MB per row, `--assert 0.10` **PASSED** — every row at or above
 
 The XHTTP row moved from 455.3 to **461.4** while gaining two working modes, so the split-session code
 costs nothing on the stream-one path it also serves.
+
+### C7.12 — packet-up's wire form, established empirically instead of guessed
+
+C7.10 said the sequence number's position had to be established against xray rather than guessed, as
+the session's position cost four cycles. Probing the real xray binary in `mode: "packet-up"` with
+plain POSTs settles it:
+
+| request | status |
+|---|---|
+| `POST /x/<session>/<seq>?x_padding=…` | **200 — accepted** |
+| `POST /x/<session>?x_padding=…&seq=0` | 400 |
+| `POST /x/<session>?x_padding=…` | 400 |
+
+**The sequence is a path segment: `/<base>/<session>/<seq>`.** And every request without `x_padding`
+is refused, which independently confirms our client's insistence on the padding parameter.
+
+That removes the guesswork that would otherwise have been the expensive part of `packet-up`. What
+remains is mechanical:
+
+1. **client** — the write path can no longer be a `SendStream`: each chunk becomes a POST to
+   `/<base>/<session>/<next_seq>`, so the stream needs a small type that queues chunks and lets a task
+   POST them in order, with the download half unchanged from `stream-up`;
+2. **server** — the same session registry, plus a `BTreeMap<u64, Bytes>` per session draining from the
+   next expected index, bounded by `scMaxBufferedPosts`;
+3. **tests** — the e2e test for `stream-up` with the client swapped for the packet form, then the xray
+   interop run.
+
+Not implemented yet; `packet-up` remains refused by name.
