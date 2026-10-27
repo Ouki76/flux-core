@@ -11166,3 +11166,32 @@ tractable one, unlike "the client just doesn't".
 The ALPN list in this test config is a test artefact, not repo code; the real change belongs in whatever
 defaults the XHTTP inbound recommends, which the next cycle should settle with this measurement as the
 baseline.
+
+### C7.54 — with h2-only ALPN: 3/3, then 4 of 8. The aborts are gone; a different wall remains
+
+Two more runs with `alpn: ["h2"]`:
+
+```
+probe (3 requests):        O O O            3/3
+sequence (8 requests):     O O O O X X X X  4/8
+```
+
+The first three-request run served everything. The eight-request run served four and then stopped. So
+C7.53's change is real — the aborted TLS handshakes no longer appear as failures — but it does not
+remove the wall, it moves it.
+
+Across every run today the wall has landed at a different place: 1, 3, 4, 6 successes. That is not a
+count-based limit; it is consistent with **elapsed time**: requests take one to two seconds each, and
+the break has always come within roughly five to ten seconds of the first request.
+
+A time-based expiry fits the facts better than anything else tried: it explains why the break point
+moved when the success rate changed, why the descriptors stop growing at the break (no new connection is
+opened), and why the client is silent rather than erroring.
+
+Candidates for the timer, none yet measured: our TLS session ticket lifetime, an idle timeout on the h2
+connection we hand to the driver, or Xray's own XMUX health accounting.
+
+**The next measurement is exact and cheap:** timestamp every request in the burst and record how long
+after the first the failures start. If the wall is time-based it will land at the same number of seconds
+regardless of how many requests happened before it — which is a different experiment from counting
+requests, and the only one that distinguishes the two.
