@@ -11667,3 +11667,18 @@ Also discarded a measurement: I tested `no_sse_header` while the previous run wa
 The run it protected was the `no_sse_header` test, which read **1/18** (0/6, 0/6, 1/6). That is far below the 63 % baseline, but it ran while an earlier process was still finishing, so I am **not** treating it as evidence that `NoSSEHeader` is harmful — the honest position is "ambiguous, discarded". Config restored.
 
 What this cycle actually fixed is the instrument: overlapping runs were silently blending results, which has already produced two numbers I nearly believed (C7.72 and here). A measurement harness that cannot detect its own overlap is worse than no harness.
+
+### C7.74 — clean re-baseline invalidates every earlier packet-up number
+
+With the harness now refusing to overlap (C7.73), both modes re-measured from scratch, four trials of six requests:
+
+```
+stream-up:  6/6, 6/6, 6/6, 6/6     24/24 — 100 %
+packet-up:  0/6, 0/6, 1/6, 1/6      2/24 —  8 %
+```
+
+**packet-up is at 8 %, not the 63 % this log has quoted since C7.61.** That 63 % came from runs that overlapped one another, which C7.73 proved the old harness could not detect. Every comparison built on it — the table in C7.70 ranking five release variants from "63 % baseline" — compared contaminated numbers against contaminated numbers. The *conclusions* about direction (each variant felt worse) may still hold, but the figures must not be trusted and are superseded by this entry.
+
+What does hold, cleanly: **stream-up serves 24 of 24.** The inbound is sound and the transport is fast; the defect is specific to `packet-up` and is severe.
+
+That the two differ so completely rules out anything shared — TLS, ALPN, h2, the listener, the VLESS handshake, the download response. It leaves the one structural difference: `packet-up` splits the upload across **numbered POSTs**, `stream-up` sends one streaming POST. So the next investigation is that numbered path and nothing else.
