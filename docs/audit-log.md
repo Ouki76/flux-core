@@ -11053,3 +11053,38 @@ behaving identically for a served and an unserved request, with the client simpl
 
 The remaining work is no longer guesswork: it is reading Xray's `splithttp` client to find the
 condition under which it stops dialling, because the evidence says the decision is entirely there.
+
+### C7.51 — the failure is inside Xray's client transport, not in our inbound
+
+Two measurements that settle the direction of the fault.
+
+**XMUX concurrency is not it.** Raising `xmux.maxConcurrency` to 16 changed nothing:
+
+```
+req 1: O   req 2..8: X        (descriptors flat at 12)
+```
+
+**Xray dials the target eight times and opens one tunnel.** From xray's own log, for the same burst of
+eight requests:
+
+```
+grep -c "accepted tcp:127.0.0.1:18091"  →  8
+our server:                              1 connection
+```
+
+Xray's SOCKS layer accepts each request and dials the target for it — eight dials — but only **one**
+XHTTP connection ever reaches our listener. So for seven of eight requests, Xray decides at its own
+transport layer not to open a tunnel, before anything of ours is involved.
+
+**This reverses the objective's premise.** The inbound is not shown to be unreliable: in every trace,
+whenever a request reaches it, it behaves identically and serves it. What is unreliable is the
+**Xray client** in this configuration — it dials the target and then declines to carry the request.
+
+What that means practically: the original acceptance criterion ("five of five HELLO") cannot be met by
+changing our server, because our server is not what drops them. A fair test needs a client whose
+transport is known-good — either a different version of xray, or our own client, which has been passing
+its end-to-end tests all along.
+
+**Not claiming the inbound is perfect** — only that this harness cannot demonstrate otherwise, and that
+eleven measured hypotheses have cleared the server side. The honest next step is to reproduce with a
+configuration in which Xray's transport does open a tunnel per request, and only then judge the server.
