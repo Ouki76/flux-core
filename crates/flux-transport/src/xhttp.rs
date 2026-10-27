@@ -323,15 +323,23 @@ where
             for (k, v) in &headers {
                 builder = builder.header(k.as_str(), v.as_str());
             }
-            let Ok(request) = builder.body(()) else { break };
-            let Ok((posted, _)) = client.send_request(request, false) else {
+            let Ok(request) = builder.body(()) else {
+                tracing::warn!("packet-up: could not build the POST request");
                 break;
+            };
+            let (posted, _) = match client.send_request(request, false) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("packet-up: send_request failed for seq {seq}: {e}");
+                    break;
+                }
             };
             // The request body completes this POST, and the response is **drained**: a response body
             // dropped unread sends `RST_STREAM CANCEL`, which is the fault C7.8 took three cycles to
             // find on the stream-up upload path.
             match posted.await {
                 Ok(response) if response.status().is_success() => {
+                    tracing::debug!("packet-up: seq posted, status {}", response.status());
                     let mut body = response.into_body();
                     while let Some(chunk) = body.data().await {
                         if chunk.is_err() {
@@ -339,7 +347,14 @@ where
                         }
                     }
                 }
-                _ => break,
+                Ok(response) => {
+                    tracing::warn!("packet-up: POST rejected with {}", response.status());
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("packet-up: POST failed: {e}");
+                    break;
+                }
             }
         }
     });

@@ -10069,3 +10069,33 @@ failure, then look again.**
 The config refuses `packet-up` again; the implementation stays behind it, unreachable from a config.
 
 1174 tests pass, clippy clean, tree clean.
+
+### C7.15 — packet-up: logging narrows it to "the poster task never runs"
+
+C7.14 said the first change must be logging, not more guessing. Done, and it paid immediately:
+
+```
+flux:  DEBUG h2::client: client connection bound          ← h2 handshake fine
+flux:  WARN relay copier parked … moved up=79 down=0      ← the 79-byte request was written
+flux:  (no "packet-up:" lines at all, with DEBUG enabled)
+xray:  zero requests received
+```
+
+Three facts, and they do not fit together yet:
+
+1. **the h2 connection is established** — `client connection bound`;
+2. **the write reaches `PacketUpStream`** — the relay reports `up=79`, and `poll_write` sends to the
+   channel and returns `Ok`;
+3. **the poster logs nothing** — not the success line, not any of the three failure lines that were
+   added around the POST.
+
+If the poster had run and failed, it would have logged. It logged nothing, so either the task never
+started or it is blocked before the first POST — and the chunk never leaves the queue.
+
+**The most likely cause, given where the spawn sits:** the channel and the poster are created *after*
+`download_response.await`. If xray answers the download GET in `packet-up` mode only once an upload
+exists, that await never returns, so there is no poster, no POST, and no upload — the same circular
+wait as C7.6, one layer up. That is a hypothesis and it is **not** confirmed; the next cycle should
+confirm it by logging either side of that await rather than by rewriting the mode again.
+
+Config refuses `packet-up` again; the implementation stays behind the refusal.
