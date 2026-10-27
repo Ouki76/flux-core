@@ -21,16 +21,35 @@ pub struct H2Stream {
     recv: H2RecvState,
     read_buf: Bytes,
     read_pos: usize,
+    /// Fired when the tunnel ends, so the connection that carries it can be released and the peer's
+    /// pool can replace it (C7.61). A stream-one tunnel has exactly one per connection, so nothing
+    /// else needs the connection afterwards.
+    close: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for H2Stream {
+    fn drop(&mut self) {
+        if let Some(close) = self.close.take() {
+            let _ = close.send(());
+        }
+    }
 }
 
 impl H2Stream {
     /// Wraps one h2 stream pair as a byte stream.
+    /// Attaches the signal used to release the connection when this tunnel finishes.
+    pub fn with_close(mut self, close: tokio::sync::oneshot::Sender<()>) -> Self {
+        self.close = Some(close);
+        self
+    }
+
     pub fn new(send: SendStream<Bytes>, recv: RecvStream) -> Self {
         Self {
             send,
             recv: H2RecvState::Ready(recv),
             read_buf: Bytes::new(),
             read_pos: 0,
+            close: None,
         }
     }
 
@@ -49,6 +68,7 @@ impl H2Stream {
             recv: H2RecvState::Pending(download),
             read_buf: Bytes::new(),
             read_pos: 0,
+            close: None,
         }
     }
 
@@ -62,6 +82,7 @@ impl H2Stream {
             recv: H2RecvState::Pending(response_fut),
             read_buf: Bytes::new(),
             read_pos: 0,
+            close: None,
         }
     }
 

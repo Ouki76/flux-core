@@ -1045,8 +1045,25 @@ where
             })?;
 
     let recv: RecvStream = request.into_body();
-    shared::spawn_connection_driver(connection, None);
-    Ok(Box::new(H2Stream::new(send, recv)))
+    // Same release as the split path: one tunnel per connection, so when it ends the connection must
+    // go back to the peer's pool instead of lingering (C7.63).
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let mut connection = connection;
+        loop {
+            let next = tokio::select! {
+                _ = &mut close_rx => {
+                    connection.graceful_shutdown();
+                    connection.accept().await
+                }
+                next = connection.accept() => next,
+            };
+            if !matches!(next, Some(Ok(_))) {
+                break;
+            }
+        }
+    });
+    Ok(Box::new(H2Stream::new(send, recv).with_close(close_tx)))
 }
 
 /// Normalises a configured path the way Xray does: leading and trailing slashes.

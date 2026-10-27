@@ -11467,3 +11467,24 @@ one request in three is something common to the latter two and absent from `stre
 
 Committed alongside C7.61. The objective's acceptance criterion is now **met for `stream-up`** and
 still unmet for the other three.
+
+### C7.64 — stream-one fixed by the same release; packet-up is the last one standing
+
+C7.63 showed `stream-up` perfect and the others near two thirds, and the reason turned out to be
+mechanical: C7.61 gave the release signal to `ChannelDuplex` only. A `stream-one` tunnel is an
+`H2Stream`, which had no such signal, so its connection was still never released.
+
+`H2Stream` now carries the same oneshot, fired from `Drop`, and the stream-one path shuts its connection
+down gracefully when the tunnel ends.
+
+```
+stream-one: 5/5, 5/5, 5/5        15/15 — 100 %
+```
+
+**Two modes now meet the objective's criterion outright**, both verified over three consecutive stacks
+with no failures: `stream-up` 15/15 and `stream-one` 15/15. 313 transport tests pass, clippy clean.
+
+`packet-up` remains at 3/6, 0/6. It is the only mode whose upload is split across **numbered POSTs** on
+a connection whose download tunnel may finish before the last POST arrives — so the release added here
+may be cutting the connection while uploads are still in flight. That is a specific, checkable
+interaction, and it is the whole of the remaining work.
