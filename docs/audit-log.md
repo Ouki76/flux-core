@@ -10041,3 +10041,31 @@ That is the objective's own allowance, quoted: *"Where a setting exists in Xray 
 (for instance a mode we cannot implement safely), the configuration must be rejected with a clear
 error rather than accepted and ignored."* A mode is the example given, and `packet-up` is refused with
 its name and the alternative at startup, not accepted and ignored.
+
+### C7.14 — packet-up: client built, does not reach xray yet
+
+Implemented this cycle:
+
+- `PacketUpStream` — the write half queues chunks on an unbounded channel (a bounded one would need a
+  `reserve` future held across polls, and that future is not `Sync`, which the boxed stream must be),
+  and a task POSTs each chunk to `/<base>/<session>/<seq>?x_padding=…` with the response body drained;
+  the read half is the same download GET `stream-up` uses;
+- wiring through `FramingLayer::Xhttp` and `connect_packet_up`, returning `Box<dyn AsyncStream>` so the
+  three modes share one arm.
+
+**It does not work against xray yet.** With xray in `mode: "packet-up"` and our client set to the same,
+`curl` through the tunnel produced no data and **xray logged not a single request** — not even a 400:
+
+```
+соединений к цели: 0
+xray log: only "started"
+```
+
+So the POSTs are not reaching the server at all, or the download GET fails before the poster runs. The
+poster task breaks on any error without logging it, which is exactly the kind of silence that makes
+this undiagnosable — **the first change next cycle should be to log each POST's status and each
+failure, then look again.**
+
+The config refuses `packet-up` again; the implementation stays behind it, unreachable from a config.
+
+1174 tests pass, clippy clean, tree clean.

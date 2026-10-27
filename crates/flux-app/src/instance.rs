@@ -1125,6 +1125,10 @@ fn compile_client_framings(
                     xpadding: settings.xpadding_bytes.clone(),
                     // `auto` resolves to `stream-up`: it is a client-side choice between the split
                     // modes and both are served by the same Xray endpoints.
+                    packet_up: matches!(
+                        settings.mode.as_deref(),
+                        Some("packet-up") | Some("packetup")
+                    ),
                     stream_up: matches!(
                         settings.mode.as_deref(),
                         Some("stream-up") | Some("streamup") | Some("auto")

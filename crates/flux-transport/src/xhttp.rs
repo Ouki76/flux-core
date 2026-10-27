@@ -19,6 +19,10 @@ use flux_types::traits::AsyncStream;
 use h2::{RecvStream, SendStream};
 use http::{Method, Request, Response, StatusCode};
 use std::collections::HashMap;
+use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 /// Default request path, matching Xray's default.
 pub const DEFAULT_XHTTP_PATH: &str = "/";
@@ -157,6 +161,196 @@ fn session_id() -> String {
     let mut raw = [0u8; 16];
     rand::rngs::OsRng.fill_bytes(&mut raw);
     raw.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A `packet-up` upload: each write becomes its own POST, numbered per session.
+///
+/// `stream-up` keeps one request body open for the life of the session, which is why its write half
+/// can be a bare `SendStream`. `packet-up` does the opposite — every chunk is a separate request to
+/// `/<base>/<session>/<seq>`, established against the real binary in C7.12 — so the write half cannot
+/// be a stream at all: it has to queue chunks for a task that numbers and posts them. The read half is
+/// unchanged, because the download is the same GET `stream-up` uses.
+pub struct PacketUpStream {
+    /// Download half: the GET's response body, already resolved when the stream is built.
+    recv: RecvStream,
+    read_buf: Bytes,
+    read_pos: usize,
+    read_done: bool,
+    /// Upload half: chunks waiting to be posted.
+    ///
+    /// Unbounded on purpose. A bounded channel would need the writer to hold a `reserve` future across
+    /// polls to wake correctly, and that future is not `Sync`, which the boxed stream must be. The
+    /// queue is fed by the relay's 64 KiB reads and drained by a poster on the same task set, so its
+    /// depth is bounded in practice by how far the relay runs ahead of the tunnel.
+    tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+}
+
+impl std::fmt::Debug for PacketUpStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PacketUpStream").finish_non_exhaustive()
+    }
+}
+
+impl AsyncRead for PacketUpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        loop {
+            if this.read_pos < this.read_buf.len() {
+                let avail = this.read_buf.len() - this.read_pos;
+                let to_copy = avail.min(buf.remaining());
+                buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + to_copy]);
+                this.read_pos += to_copy;
+                if this.read_pos == this.read_buf.len() {
+                    this.read_buf = Bytes::new();
+                    this.read_pos = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+            if this.read_done {
+                return Poll::Ready(Ok(()));
+            }
+            match Pin::new(&mut this.recv).poll_data(cx) {
+                Poll::Ready(Some(Ok(data))) => {
+                    this.read_buf = data;
+                    this.read_pos = 0;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, e)));
+                }
+                Poll::Ready(None) => {
+                    this.read_done = true;
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for PacketUpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let this = &mut *self;
+        let chunk = Bytes::copy_from_slice(buf);
+        let len = chunk.len();
+        match this.tx.send(chunk) {
+            Ok(()) => Poll::Ready(Ok(len)),
+            Err(_) => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the packet-up poster has stopped",
+            ))),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // The poster ends when the last sender drops, which happens with the stream itself.
+        self.read_done = true;
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Client half of `packet-up`.
+pub async fn connect_packet_up<S>(
+    stream: S,
+    host: &str,
+    path: &str,
+    headers: &HashMap<String, String>,
+    xpadding: Option<&str>,
+) -> FluxResult<Box<dyn AsyncStream>>
+where
+    S: AsyncStream + 'static,
+{
+    let mut client = shared::client_handshake(stream, "xhttp").await?;
+    let session = session_id();
+    let base = normalize_path(path);
+    let padding = padding_param(xpadding);
+
+    // Download: the same GET as `stream-up`.
+    let download_url = format!("{base}{session}?x_padding={padding}");
+    let mut builder = Request::builder()
+        .method("GET")
+        .uri(download_url.as_str())
+        .header("Host", host)
+        .header("content-type", "application/octet-stream");
+    for (k, v) in headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let download_request = builder.body(()).map_err(|e| FluxError::Protocol {
+        protocol: "xhttp",
+        message: format!("failed to build the XHTTP download request: {e}"),
+    })?;
+    let (download_response, _) =
+        client
+            .send_request(download_request, true)
+            .map_err(|e| FluxError::Protocol {
+                protocol: "xhttp",
+                message: format!("failed to send the XHTTP download: {e}"),
+            })?;
+    let response = download_response.await.map_err(|e| FluxError::Protocol {
+        protocol: "xhttp",
+        message: format!("the XHTTP download was refused: {e}"),
+    })?;
+    let recv = response.into_body();
+
+    // Upload: a task posts each queued chunk to /<base>/<session>/<seq>.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let host = host.to_string();
+    let headers = headers.clone();
+    tokio::spawn(async move {
+        let mut seq: u64 = 0;
+        while let Some(_chunk) = rx.recv().await {
+            let url = format!("{base}{session}/{seq}?x_padding={padding}");
+            seq += 1;
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(url.as_str())
+                .header("Host", host.as_str())
+                .header("content-type", "application/octet-stream");
+            for (k, v) in &headers {
+                builder = builder.header(k.as_str(), v.as_str());
+            }
+            let Ok(request) = builder.body(()) else { break };
+            let Ok((posted, _)) = client.send_request(request, false) else {
+                break;
+            };
+            // The request body completes this POST, and the response is **drained**: a response body
+            // dropped unread sends `RST_STREAM CANCEL`, which is the fault C7.8 took three cycles to
+            // find on the stream-up upload path.
+            match posted.await {
+                Ok(response) if response.status().is_success() => {
+                    let mut body = response.into_body();
+                    while let Some(chunk) = body.data().await {
+                        if chunk.is_err() {
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+    });
+
+    Ok(Box::new(PacketUpStream {
+        recv,
+        read_buf: Bytes::new(),
+        read_pos: 0,
+        read_done: false,
+        tx,
+    }))
 }
 
 /// Server half: accepts one bidirectional request and returns it as a stream.

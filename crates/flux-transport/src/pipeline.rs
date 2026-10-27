@@ -66,6 +66,8 @@ pub enum FramingLayer {
         xpadding: Option<String>,
         /// Send `stream-up` (SplitHTTP's split directions) instead of `stream-one`.
         stream_up: bool,
+        /// Send `packet-up`: every write becomes its own numbered POST.
+        packet_up: bool,
     },
     /// gRPC framing over HTTP/2.
     Grpc {
@@ -216,9 +218,10 @@ impl LayeredTransportPipeline {
                     headers,
                     xpadding,
                     stream_up,
+                    packet_up,
                 } => {
-                    let st = if *stream_up {
-                        crate::xhttp::connect_stream_up(
+                    if *packet_up {
+                        crate::xhttp::connect_packet_up(
                             stream,
                             &self.host_header,
                             path,
@@ -226,17 +229,29 @@ impl LayeredTransportPipeline {
                             xpadding.as_deref(),
                         )
                         .await?
+                    } else if *stream_up {
+                        Box::new(
+                            crate::xhttp::connect_stream_up(
+                                stream,
+                                &self.host_header,
+                                path,
+                                headers,
+                                xpadding.as_deref(),
+                            )
+                            .await?,
+                        ) as Box<dyn flux_types::traits::AsyncStream>
                     } else {
-                        crate::xhttp::connect(
-                            stream,
-                            &self.host_header,
-                            path,
-                            headers,
-                            xpadding.as_deref(),
-                        )
-                        .await?
-                    };
-                    Box::new(st)
+                        Box::new(
+                            crate::xhttp::connect(
+                                stream,
+                                &self.host_header,
+                                path,
+                                headers,
+                                xpadding.as_deref(),
+                            )
+                            .await?,
+                        ) as Box<dyn flux_types::traits::AsyncStream>
+                    }
                 }
                 FramingLayer::WebSocket { path, headers } => {
                     let ws = crate::websocket::client_handshake(
