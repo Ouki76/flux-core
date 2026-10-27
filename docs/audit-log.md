@@ -10159,3 +10159,24 @@ fills. **The next step is the same that worked for the client: count what each b
 rather than reasoning about the ordering again.
 
 Config refuses `packet-up` again, so nothing half-working is reachable. 1174 tests, clippy clean.
+
+### C7.18 — packet-up is complete, and the gates hold
+
+The last requirement: `bench_matrix --assert` and `bench_rps --assert` after all the XHTTP work.
+
+```
+bench_matrix --rounds 4 --mb 150 --assert 0.10   ASSERT PASSED   (0 failed rows)
+bench_rps --tls --assert 0.10                    ASSERT PASSED
+```
+
+| protocol | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | 698.9 | 496.6 | 545.9 | +40.8% | +28.0% |
+| **VLESS / XHTTP** | **386.0** | — | 105.4 | — | **+266.1%** |
+
+`packet-up` is done on both sides: the client queues chunks and posts them numbered, the server
+reassembles with a bounded `BTreeMap`, `scMaxBufferedPosts` is honoured rather than refused, an
+end-to-end test drives both halves over a real socket, and the mode is verified against the real xray
+binary (`HELLO` through the tunnel).
+
+**All four XHTTP modes now work:** `stream-one`, `stream-up`, `packet-up`, `auto`.
