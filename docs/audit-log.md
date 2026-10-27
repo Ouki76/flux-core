@@ -11443,3 +11443,27 @@ target, and no XHTTP connection follows.
 The honest next instrument is on the client's side of the ledger — but the useful thing for a session
 with more room is to instrument **the moment a curl starts versus the moment its connection is
 accepted**, since the pause result says the two are related in time.
+
+### C7.63 — after the fix: stream-up is perfect, the other three are not
+
+All four modes measured with the same harness against stock xray, after C7.61's connection release:
+
+| mode | trials | total |
+|---|---|---|
+| **stream-up** | **5/5, 5/5, 5/5** | **15/15 — 100 %** |
+| auto | 2/5, 4/5, 4/5 | 10/15 — 67 % |
+| packet-up | 3/6, 3/6, 4/6, 5/6 | 15/24 — 63 % |
+| stream-one | 3/5, 3/5, 3/5 | 9/15 — 60 % |
+
+**`stream-up` is now fully reliable: three consecutive stacks, every request served, no failures.** That
+is the first mode to pass the objective's criterion outright, and it is the mode whose upload is a single
+streaming POST paired with a download GET — the shape the server was built around.
+
+The other three sit near two thirds. That the modes differ so sharply is itself the most useful thing
+this cycle produced: the residual defect is **specific to how the two directions are paired**, not to the
+transport as a whole. `stream-up` keeps both halves on one connection and one session and never fails;
+`stream-one` has no session at all; `packet-up` splits the upload across numbered POSTs. Whatever breaks
+one request in three is something common to the latter two and absent from `stream-up`.
+
+Committed alongside C7.61. The objective's acceptance criterion is now **met for `stream-up`** and
+still unmet for the other three.
