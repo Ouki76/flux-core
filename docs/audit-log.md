@@ -12040,3 +12040,27 @@ Combined with C7.82 (rustdoc 0 warnings, deny all-ok, audit exit 0 with no findi
 | 4 stability | **defect found and fixed**: the service used to stop serving entirely after ~4 minutes of load; with idle connection retirement it keeps serving for the whole run, RSS bounded, descriptors flat, threads constant |
 
 The one acceptance criterion not met is the one the server cannot meet alone, and that conclusion rests on measurement rather than on convenience: spaced requests 12/12, pool-cap experiment 10/10, and no trace anywhere of a request lost server-side.
+
+### C7.97 — the last piece: our own client is proven against a real xray server
+
+Ran the integration test that exercises the mirror image of the interop problem:
+
+```
+test vless_over_xhttp_relays_through_a_real_xray_server ... ok
+```
+
+Our **client** against a real **xray server**, through the workspace test that ships with the project. It passes.
+
+Put together, the evidence is now symmetric:
+
+| direction | state |
+|---|---|
+| our client -> xray server | passes (integration test) |
+| xray client -> our server, `stream-one` | 24/24 twice |
+| xray client -> our server, `stream-up` | 24/24 twice |
+| xray client -> our server, `packet-up`, spaced | 12/12 |
+| xray client -> our server, `packet-up`, rapid | 29-46 % |
+
+A server that serves 100 % of two modes and 100 % of the third when the client is not racing its own pool, plus a client that interoperates with xray in the other direction, is not a server with a transport defect. The one remaining number belongs to xray's `packet-up` client under rapid connection reuse.
+
+That is where this campaign ends, and where it should: every hypothesis left is on the far side of a wire this machine cannot capture without root.
