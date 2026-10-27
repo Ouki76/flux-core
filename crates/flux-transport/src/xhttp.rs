@@ -688,7 +688,7 @@ where
     let uri_path = request.uri().path().to_string();
     let under_base = is_under_base(path, &uri_path);
     tracing::debug!(
-        "xhttp: first request on a connection: {} {}",
+        "xhttp: conn#{conn_id} first request: {} {}",
         request.method(),
         uri_path
     );

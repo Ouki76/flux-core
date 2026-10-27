@@ -10936,3 +10936,34 @@ earlier belief:
 What remains is exactly one question: **what makes Xray decide to post for one download and not
 another.** Everything on our side that was suspected — session registry, reassembly, accept loop,
 download writer, connection reuse, GOAWAY — has been measured and cleared.
+
+### C7.47 — the trace is complete: GET acknowledged, upload never sent, nothing else differs
+
+With the connection id on both lines, a 2/4 trial reads cleanly:
+
+```
+conn#0 first request: GET /x/63d154df-…   conn#0 POST seq=0 session=63d154df delivered=Some(105)
+conn#1 first request: GET /x/0c0d3aed-…   conn#1 POST seq=0 session=0c0d3aed delivered=Some(105)
+conn#2 first request: GET /x/a7ddc99c-…   (nothing further)
+```
+
+Three connections, three downloads, **two uploads**. The third download is answered and then Xray is
+silent. There is no drop on our side and no difference in how the three were handled: same path shape,
+same method, same server, consecutive seconds.
+
+Trials: `0/4, 2/4, 2/4` — the rate across this and previous runs sits near half, with the outcome
+clustering by run rather than by request (C7.42).
+
+**What this rules out, finally and by direct observation:** the session registry, the reassembly, the
+accept loop, the download writer, POST numbering, connection reuse, and GOAWAY. In every failing case
+the server does exactly what it does in every succeeding case and then waits for an upload that is
+never sent.
+
+**The only question left is on Xray's side of the wire:** what makes its `packet-up` client decide not
+to post for one download. Two things are worth reading in its source rather than guessing — whether it
+waits for a first DATA frame on the download before posting (our body is silent until data arrives,
+which would deadlock half the time depending on timing), and whether XMUX's health accounting can
+discard a client mid-request.
+
+The instrumentation (`conn#N` on both first-request and POST lines) stays in the tree at `debug`; it is
+what made this observable and the next attempt will need it.
