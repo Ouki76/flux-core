@@ -71,3 +71,35 @@ CPU-эффективность: **в 2.6 раза лучше sing-box и в 3.3 
 3. **Выигрыш от возобновления на реальном канале** измерен: ~1 мс на соединение (1.76 против 2.76 мс).
 4. **IPv6 проверен** только по локальной сети.
 5. UDP выигрывает за счёт ядер: на 2 ядрах мы и sing-box равны (+2.7%), на 24 — +32%.
+
+## XHTTP reliability and stability — session results
+
+Measured against a real xray client over TLS, with a harness that restarts the stack per trial and refuses to run two measurements at once (an earlier version silently blended runs and produced numbers this log has since retracted).
+
+### Mode matrix
+
+| mode | result | notes |
+|---|---|---|
+| `stream-one` | **24/24** | verified twice over three fresh stacks |
+| `stream-up` | **24/24** | verified twice |
+| `packet-up` | 29-46 % rapid, **12/12 spaced** | server serves every tunnel it is given |
+| `auto` | resolves to `packet-up` | same result |
+
+### Three real defects found and fixed
+
+1. **Aborted TLS handshakes.** The inbound advertised `alpn: ["h2", "http/1.1"]`; xray asks for `h2` only and was abandoning the handshake. Restricting to `["h2"]` removed `tls handshake eof` entirely and tripled the success rate.
+2. **Connections never released.** One tunnel per connection, never closed, so the peer’s default pool of two filled with connections it could not reuse. Releasing on tunnel completion took `stream-one` and `stream-up` to 100 %.
+3. **Service died under load.** After roughly four minutes of sustained traffic everything stopped: a download whose upload never arrives never completes its tunnel, pinning a pool slot for ever. Retiring a connection after 10 s idle (timer in the `select!`, never a sleep) keeps it serving for a full run with bounded RSS, flat descriptors and constant thread count.
+
+### What remains open, and why it is not a server defect
+
+`packet-up` does not reach 5/5 under rapid sequential requests. The evidence that this is the client:
+
+- **12/12** when requests are spaced two seconds apart;
+- raising xray’s `xmux.maxConnections` takes a burst from **0/10 to 10/10**;
+- no trace anywhere shows a request lost on the server side — every failing request shows a download opened and no upload ever sent;
+- our own client interoperates with a real xray server (integration test), so the implementation works in both roles.
+
+### Performance
+
+`bench_rps`: flux-core 12 290 rps vs sing-box 10 309 and xray 1 301. `bench_matrix` asserts every row at or above both competitors. All five static gates, the full workspace suite and both benchmarks are green on the final commit.
