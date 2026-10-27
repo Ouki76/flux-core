@@ -10755,3 +10755,38 @@ but whose bodies are not being read, in the runs that fail.
 independent runs per configuration, reporting how many of N returned HELLO, rather than one burst that
 happens to come out 5/5 or 0/5. Without that, every change — including correct ones — will be judged
 by noise.
+
+### C7.41 — a trustworthy measurement: it is ~50/50 per request, not "first works, rest fail"
+
+The harness that made this measurable (`/tmp/measure.sh`) runs N independent trials, restarting the
+whole stack for each, and reports how many of the requests in that trial succeeded. Five trials,
+three requests each, `packet-up`, unchanged code:
+
+```
+trial 1: 1/3
+trial 2: 2/3
+trial 3: 1/3
+trial 4: 2/3
+trial 5: 1/3
+         7/15  ≈ 47%
+```
+
+**This invalidates the premise of the objective.** The symptom was recorded as "the first request
+works and the rest fail" — a per-connection pattern. It is not: the failures are **per request and
+roughly random, about one in two**, independent of position in the burst. The earlier 5/5 followed by
+0/15 was noise, and so were the 1/5 and 0/5 readings.
+
+Consequences:
+
+1. every theory built on connection reuse — including the multiplexing work of C7.37 and C7.39 — was
+   chasing a pattern that does not exist. C7.39's revert stands, but its reason is withdrawn;
+2. the thing to explain is why **roughly half** of tunnels establish, carry no VLESS request, and time
+   out after 15 s (`VLESS handshake timed out from 127.0.0.1`), while the other half work normally on
+   the same code with no configuration change;
+3. a 50 % failure rate on identical input is the signature of a race — two paths that should be
+   equivalent, one of which loses the data.
+
+The most likely race, and the only one that fits "the stream exists but carries nothing half the
+time": the XHTTP request is picked up by one of two places — `accept`'s own handling and the
+connection driver that replaces it — and only one of them is attached to the stream the caller
+receives. That is where the next cycle looks, with `/tmp/measure.sh` as the judge.
