@@ -11682,3 +11682,20 @@ packet-up:  0/6, 0/6, 1/6, 1/6      2/24 —  8 %
 What does hold, cleanly: **stream-up serves 24 of 24.** The inbound is sound and the transport is fast; the defect is specific to `packet-up` and is severe.
 
 That the two differ so completely rules out anything shared — TLS, ALPN, h2, the listener, the VLESS handshake, the download response. It leaves the one structural difference: `packet-up` splits the upload across **numbered POSTs**, `stream-up` sends one streaming POST. So the next investigation is that numbered path and nothing else.
+
+### C7.75 — in mode `packet-up`, xray sends no numbered POSTs at all
+
+A clean single-stack burst of ten requests, every one served in 0.2 s total:
+
+```
+requests served:        10/10
+first requests logged:  10 GET
+numbered POSTs logged:  0
+```
+
+Not one request in the log is a POST — every connection's **first** request is the download GET, and the numbered upload handler never fires. Yet all ten requests were carried. So in this xray version the `packet-up` mode drives the **unnumbered** upload path: one GET plus an unnumbered POST on the same connection, which is structurally what `stream-up` does. That is why `stream-up` measures 24/24 and why the modes behave alike when they behave at all.
+
+Two consequences worth recording:
+
+1. our numbered-POST handling (`/<base>/<session>/<seq>`) is **barely exercised** by the client this work has been testing against — it is implemented and unit-tested, but the interop evidence for it is thin, which matters for objective item 3;
+2. the ~8 % failures are therefore **not** in the numbered path. They sit in the same GET-plus-POST flow that `stream-up` drives at 100 %, so the difference between a good and a bad stack is a property of the run, not of the mode.
