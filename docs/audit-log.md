@@ -11760,3 +11760,21 @@ That closes the question that has consumed this campaign. The inbound is not los
 This is also the first test in the campaign that separates the two variables deliberately: every prior burst conflated "many requests" with "requests in quick succession", which is why the numbers wandered between 8 % and 100 % with no code change in between.
 
 **Practical consequence:** the acceptance criterion in the objective ("5/5 on five stacks") measures the client's pool timing as much as the server. Reported honestly, the server side reads: `stream-one` 24/24, `stream-up` 24/24, `packet-up` 12/12 when not racing — all on the overlap-proof harness.
+
+### C7.80 — audit: both shadowsocks panics are unreachable; the length is enforced upstream
+
+Closed the open question from C7.72 by following the data rather than reasoning about it:
+
+```
+derive_master_key_for_kind(pw, kind) -> derive_master_key_len(pw, kind.key_len())
+   base64 branch is taken only if bytes.len() == key_len
+   otherwise EVP_BytesToKey fills exactly key_len
+derive_subkey(master, salt) -> vec![0u8; master_key.len()]   // HKDF-SHA1, same length
+ShadowsocksCipher::new(subkey) -> UnboundKey::new(alg, subkey)
+```
+
+Every path produces a key of exactly `kind.key_len()`, so `UnboundKey::new` cannot fail and the `panic!` cannot fire. **Unreachable**, and no user input reaches it.
+
+Deliberately **not** rewritten into a `Result`. It guards an invariant, the invariant holds at every call site, and the objective says to leave the API and behaviour alone unless a change is proven better — turning an unreachable panic into a propagated error would add error paths to callers for a case that cannot occur. Recorded so the next reader does not have to re-derive it.
+
+Audit status so far: production `unsafe` (60) all in syscall/buffer code with no safe alternative; the two `panic!` sites cleared; the biggest `unwrap` cluster (`wireguard`) cleared in C7.71. Remaining: the three `panic!`-adjacent files, duplicated code across crates, and the benches for anything slow.
