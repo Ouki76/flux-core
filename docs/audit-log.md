@@ -11088,3 +11088,46 @@ its end-to-end tests all along.
 **Not claiming the inbound is perfect** — only that this harness cannot demonstrate otherwise, and that
 eleven measured hypotheses have cleared the server side. The honest next step is to reproduce with a
 configuration in which Xray's transport does open a tunnel per request, and only then judge the server.
+
+### C7.52 — the inbound is healthy; the client declines to connect. Objective premise falsified
+
+The probe that settles it: after each request, check whether our listener is still listening **and**
+whether a fresh TCP connection to it succeeds.
+
+```
+req 1: O  listen=1  direct_tcp=ok
+req 2: X  listen=1  direct_tcp=ok
+req 3: X  listen=1  direct_tcp=ok
+```
+
+Our listener is alive and accepting throughout. Requests 2 and 3 fail because **the client never opens
+a tunnel**, not because the server stopped taking them.
+
+Twelve measurements now agree:
+
+| # | hypothesis | result |
+|---|---|---|
+| 1 | port held | cleared (C7.29) |
+| 2 | POST numbering | cleared (C7.30) |
+| 3 | per-connection registry | cleared (C7.32) |
+| 4 | GOAWAY | worse (C7.35) |
+| 5 | connection reuse / multiplexing | not the pattern (C7.41, C7.44) |
+| 6 | early POST dropped | cleared (C7.42) |
+| 7 | upload lost server-side | client never sends it (C7.43–44) |
+| 8 | priming frame | cleared (C7.48) |
+| 9 | descriptor leak | none — flat at 13 (C7.50) |
+| 10 | connection lifetime | no effect (C7.50) |
+| 11 | XMUX concurrency | no effect (C7.51) |
+| 12 | listener death | **alive and accepting (C7.52)** |
+
+Xray dials the target for every request and establishes one tunnel for eight. The inbound serves every
+tunnel it is given, identically, in the same second that another is refused.
+
+**The objective cannot be completed as written.** Its acceptance criterion — five of five `HELLO` from
+an xray client — is unreachable by changing our server, because the requests never leave the client's
+transport layer. Completing it needs a client that opens a tunnel per request: a different xray build or
+version, or a configuration of this one where its XMUX/transport does not serialise them.
+
+What the sessions established, honestly: the XHTTP inbound works — `stream-one`, `stream-up`,
+`packet-up` and `auto` have each carried real traffic through it against both our client and, on the
+runs where it dials, xray's.
