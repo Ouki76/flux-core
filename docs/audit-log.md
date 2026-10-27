@@ -10625,3 +10625,33 @@ it serves is finished**, not when a second request arrives. Option (a) is the co
 one Xray itself uses.
 
 313 transport tests pass, clippy clean, tree clean.
+
+### C7.36 — clean baseline: five requests work, then nothing; and earlier numbers were contaminated
+
+Two things had to be fixed in the harness before any measurement meant anything:
+
+1. **a stale process was serving the tests.** `pkill -x flux-core` inside the stack script did not kill
+   the previous instance, the new one could not bind 19951, and curl was answered by an *old binary
+   with an old config*. That is why the same commit appeared to give 1/5 on one run and 0/5 on
+   another — the "first request is unreliable" observation in the goal was **an artefact of a stale
+   process**, not a property of the code. The script now `kill -9`s by pid and waits for 18091, 19951
+   and 19020 to be free, failing loudly if any does not come up.
+2. **the log file was stale too**, so "no warnings in flux's log" was also meaningless.
+
+With a verified-fresh stack, `packet-up` from xray's client:
+
+```
+req 1..5 ->  HELLO, HELLO, HELLO, HELLO, HELLO       5/5
+burst of 15 ->  0/15
+```
+
+And the counting settles the cause: **20 requests produced only 5 accepted connections.** Our server
+serves one request per connection; xray opens a fresh connection for the first few and then starts
+reusing the fifth, whose further requests we refuse with `REFUSED_STREAM`. From then on every request
+dies silently.
+
+So C7.34's diagnosis was right, and it is now measured rather than inferred. What is missing is the
+fix: **serve several streams per connection**, which needs `serve_connection` in the VLESS inbound
+split into "transport + framing" and "protocol + dispatch", so that a framed stream produced by a
+second request can be dispatched exactly like the first. That is a real refactor, not a flag, and it is
+the next piece of work. The GOAWAY shortcut is ruled out (C7.35).
