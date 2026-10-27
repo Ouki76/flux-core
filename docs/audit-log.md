@@ -10706,3 +10706,26 @@ and breaks everything at runtime.
 **Next cycle, in this order:** split `unwrap` into security and framing halves (no behaviour change,
 all tests green) → add `unwrap_framing_multiplexed` returning `(stream, Option<Receiver>)` → wire the
 VLESS inbound to spawn `serve_stream` per extra tunnel → measure 5/5 then a 15-burst.
+
+### C7.39 — the multiplexing change regressed and was reverted; only the refactor stands
+
+Implemented the full three-part change: `unwrap` split into `unwrap_security` + `unwrap_framing`,
+`unwrap_framing` returning extra tunnels for a single XHTTP framing, `xhttp::accept` handing back the
+first tunnel plus a channel, and the VLESS inbound spawning a `serve_tunnel` per extra.
+
+It compiles, `clippy -D warnings` is clean, and **127 inbound + 313 transport tests pass**. Against
+xray it is a plain regression:
+
+```
+req 1..5 ->  НЕТ, НЕТ, НЕТ, НЕТ, НЕТ      (baseline was 5/5 then 0/15)
+```
+
+So the tests that exist do not cover this path, and the end-to-end measurement caught what they could
+not. **Reverted in full**; only the behaviour-neutral `serve_stream` extraction (`0bb936b`) remains.
+
+What this cycle did establish, usefully: the three-part change is *not* the hard part — the code
+compiles and passes the suite. The hard part is that replacing the connection driver with an accept
+loop breaks the stream that the driver was already serving, and the tests cannot see it. The next
+attempt should keep `spawn_connection_driver` for the connection that carries the first tunnel and only
+start a multiplexer for connections that have **no** tunnel yet — or, better, prove with a unit test
+that a second request on one connection yields a second usable stream before touching the inbound.
