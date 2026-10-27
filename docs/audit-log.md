@@ -11878,3 +11878,17 @@ and `expect_payload` (line 1355) contains three `assert`/`panic!` sites. **The t
 **So this scan certifies nothing and I am not reporting it as a finding.** It is the fourth instrument-induced false alarm of the session (C7.58 repeated log lines, C7.72 overlapping runs, C7.84 grep excluding the conversion site, and this). A textual scan cannot decide whether a test asserts; only reading the helper can, and the tooling for that is a reader, not a regex.
 
 What would actually work: instrument the test binary to count assertions executed per test (`--nocapture` plus a global counter, or a custom test harness), or simply read the 18. Neither is a regex.
+
+### C7.87 — executable test-quality check: the suite does not cover the fix that mattered
+
+Replaced the regex scan of C7.86 with an experiment that runs: delete the zero-length DATA frame — the change that took `packet-up` from 8 % to 46 % — and run the transport suite.
+
+```
+mutant (primer removed):   313 passed, 0 failed
+```
+
+**The suite does not notice.** No test covers the behaviour that measurably changed interoperability, which is the most defensible answer available to the objective's question about tests asserting less than they claim — and it is an answer obtained by execution, not by reading.
+
+That is the real gap, stated precisely: 313 tests and not one of them would have caught the regression I have been chasing for twenty cycles, nor the fix that resolved half of it.
+
+Restored, suite green again. The next concrete piece of work is a test that drives a download request through `accept` and asserts that **a DATA frame arrives before any payload does** — the property the client actually depends on. It is a small test with a real subject, and it is exactly what twelve rounds of interop measurement were trying to tell me the suite was missing.
