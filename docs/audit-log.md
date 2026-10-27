@@ -10680,3 +10680,29 @@ every inbound protocol, not just XHTTP.
 
 **State of the objective:** the cause is measured and the shape of the fix is known and written down.
 What is left is a refactor of about three hours' work across three crates, with a test at each step.
+
+### C7.38 — step 1 of the refactor landed; step 2 needs `unwrap` split, not wrapped
+
+**Landed and committed** (`0bb936b`): `serve_connection` in the VLESS inbound is now split, with
+everything after transport and framing living in a new `serve_stream`. No behaviour change — 127
+inbound tests pass, clippy clean. That is the seam a multiplexing transport needs.
+
+**Not landed:** the transport side. A `spawn_multiplexer` was written that turns each later request on
+an h2 connection into a tunnel and pushes it to a channel; the xHTTP `accept` was changed to return
+`(first, receiver)`. Two things stopped it:
+
+1. `ServerTransportPipeline::unwrap` returns **one** stream and has **five callers** across the
+   inbounds, so its signature cannot change casually;
+2. the obvious shortcut — "only handle XHTTP, otherwise delegate to `unwrap`" — does not work for the
+   real case, because the test setup runs XHTTP **under TLS**, and `unwrap` interleaves the security
+   layers with the framing in one function. To multiplex, `unwrap` has to be split into
+   `unwrap_security` and `unwrap_framing` so the framing can yield extras while the security layers
+   stay unchanged.
+
+A half-done first attempt at that produced nonsense (an `unreachable!()` placeholder) and was reverted
+rather than committed — recorded here because it is the kind of thing that looks plausible in a diff
+and breaks everything at runtime.
+
+**Next cycle, in this order:** split `unwrap` into security and framing halves (no behaviour change,
+all tests green) → add `unwrap_framing_multiplexed` returning `(stream, Option<Receiver>)` → wire the
+VLESS inbound to spawn `serve_stream` per extra tunnel → measure 5/5 then a 15-burst.
