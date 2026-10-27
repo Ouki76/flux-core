@@ -578,6 +578,9 @@ impl Default for Reassembly {
 }
 
 /// Xray's default for `scMaxBufferedPosts`.
+/// A connection is retired after this long with no request on it.
+const IDLE_CLOSE_MS: u64 = 10000;
+
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
 impl Reassembly {
@@ -815,21 +818,30 @@ where
         // never read, not misrouted.
         tokio::spawn(async move {
             loop {
-                let mut closing = false;
+                // Retire the connection when its tunnel finishes, **and** when it has simply gone
+                // quiet: a download whose upload never arrives never completes its tunnel, and such
+                // a connection pins a slot in the peer's pool for ever. Under sustained load the
+                // pool saturates and the whole service stops serving (C7.91); a 10 s idle retirement
+                // kept it alive for the whole run (C7.93). The timer sits in `select!`, never a sleep,
+                // because a sleep here blocked the accept loop and made packet-up worse (C7.65).
                 let accepted = tokio::select! {
-                    // The tunnel this connection serves is finished. Announce a graceful shutdown so
-                    // the peer can retire the connection and its pool can replace it; the driver keeps
-                    // running below so already-queued response frames are flushed before the socket
-                    // is closed. Tearing the socket down here instead truncated the response — the
-                    // transport test caught it immediately.
+                    // The tunnel is finished: announce a graceful shutdown, then drain once so
+                    // queued response frames flush before the socket goes (C7.61).
                     _ = &mut close_rx => {
                         connection.graceful_shutdown();
-                        closing = true;
                         connection.accept().await
                     }
-                    next = connection.accept() => next,
+                    idle = tokio::time::timeout(
+                        std::time::Duration::from_millis(IDLE_CLOSE_MS),
+                        connection.accept(),
+                    ) => match idle {
+                        Ok(next) => next,
+                        Err(_) => {
+                            connection.graceful_shutdown();
+                            connection.accept().await
+                        }
+                    },
                 };
-                let _ = closing;
                 let Some(Ok((post, mut post_respond))) = accepted else {
                     break;
                 };
