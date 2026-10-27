@@ -10790,3 +10790,30 @@ The most likely race, and the only one that fits "the stream exists but carries 
 time": the XHTTP request is picked up by one of two places — `accept`'s own handling and the
 connection driver that replaces it — and only one of them is attached to the stream the caller
 receives. That is where the next cycle looks, with `/tmp/measure.sh` as the judge.
+
+### C7.42 — the early-POST hypothesis is refuted, and the failures cluster per run
+
+Hypothesis from C7.41: a numbered POST that arrives before its session exists is dropped, and that is
+the ~50 % failure. Implemented an orphan buffer — chunks for an unknown session are held (bounded at
+256) and handed over when the download opens. Measured with the same harness:
+
+| code | result |
+|---|---|
+| before (C7.41) | 7/15 ≈ 47 % |
+| with orphan buffer | **5/15 ≈ 33 %** |
+
+No improvement — within noise, if anything worse. **Reverted.**
+
+The trials themselves are the more informative finding:
+
+```
+trial 1: 2/3   trial 2: 0/3   trial 3: 0/3   trial 4: 0/3   trial 5: 3/3
+```
+
+The failures **cluster inside a run**, not across requests: one stack serves three of three, another
+serves none of three. A per-request race would mix within a trial; this does not. So the variable is
+something about the stack instance — its startup, or state xray establishes once per process — not
+about an individual tunnel.
+
+That redirects the search again, and this time with evidence: compare a stack that serves 0/3 with one
+that serves 3/3 on the *same* binary, and look at what differs at startup rather than at request time.
