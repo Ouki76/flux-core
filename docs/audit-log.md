@@ -10877,3 +10877,32 @@ The candidates worth checking, in order, by reading the response rather than gue
 - whether the h2 SETTINGS window advertised by our server is what makes it wait.
 
 The delivery log and the per-connection first-request log both stay at `debug` for the next attempt.
+
+### C7.45 — Xray runs its own multiplexer (XMUX) over XHTTP
+
+Turned xray's own log to `debug`. What it says about the transport:
+
+```
+[XMUX] creating xmuxClient because xmuxClients is empty
+[XHTTP] dialing to tcp:127.0.0.1:19951, mode packet-up, HTTP version 2, host localhost
+[XMUX] creating xmuxClient because maxConcurrency was hit, xmuxClients = 1
+[XHTTP] dialing to tcp:127.0.0.1:19951, mode packet-up, HTTP version 2, host localhost
+```
+
+**Xray multiplexes at its own layer (`XMUX`) and opens a new client when `maxConcurrency` is hit.**
+So one connection is *reused* up to a concurrency limit and then another is opened — which means
+multiplexing **is** in play after all, for bursts deeper than the limit. C7.44's "one connection per
+request" was true for a two-request burst and should not be generalised further; the honest statement
+is that xray opens connections as its own concurrency policy dictates.
+
+That also reopens the multiplexing work of C7.37–C7.39 as potentially relevant, and explains why the
+symptom looked like connection reuse in some runs and not others.
+
+**Still unexplained, and now the narrowest question yet:** with XMUX in play, a session can be opened
+on one connection and its POSTs sent on another. Our registry is process-wide (`3c30927`), so that part
+is covered — but the *download response* for a reused connection may be what xray waits on before
+posting.
+
+Next cycle: run with three or more requests per trial so XMUX actually reuses a connection, and log
+which connection each GET and each POST arrives on (a per-connection id at accept), rather than only
+the method and path. That distinguishes "session on another connection" from "upload never sent".
