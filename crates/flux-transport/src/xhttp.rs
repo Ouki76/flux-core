@@ -281,10 +281,13 @@ impl AsyncWrite for PacketUpStream {
         let len = chunk.len();
         match this.tx.send(chunk) {
             Ok(()) => Poll::Ready(Ok(len)),
-            Err(_) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "the packet-up poster has stopped",
-            ))),
+            Err(_) => {
+                tracing::warn!("packet-up: channel closed, {len} bytes lost");
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the packet-up poster has stopped",
+                )))
+            }
         }
     }
 
@@ -343,7 +346,9 @@ where
     let headers = headers.clone();
     tokio::spawn(async move {
         let mut seq: u64 = 0;
-        while let Some(_chunk) = rx.recv().await {
+        tracing::debug!("packet-up: poster started");
+        while let Some(chunk) = rx.recv().await {
+            tracing::trace!("packet-up: posting seq {seq}");
             let url = format!("{base}{session}/{seq}?x_padding={padding}");
             seq += 1;
             let mut builder = Request::builder()
@@ -358,19 +363,28 @@ where
                 tracing::warn!("packet-up: could not build the POST request");
                 break;
             };
-            let (posted, _) = match client.send_request(request, false) {
+            // The chunk **is** the request body, and this request ends with it: `end_of_stream =
+            // false` above only opens the stream so a body can follow. Without the `send_data` the
+            // POST stays open forever and the peer never answers — which is exactly what the
+            // counters showed: the poster queued seq 0 and then waited for a response that could
+            // not come.
+            let (posted, mut body) = match client.send_request(request, false) {
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::warn!("packet-up: send_request failed for seq {seq}: {e}");
                     break;
                 }
             };
+            if let Err(e) = body.send_data(chunk, true) {
+                tracing::warn!("packet-up: sending the body for seq {seq} failed: {e}");
+                break;
+            }
             // The request body completes this POST, and the response is **drained**: a response body
             // dropped unread sends `RST_STREAM CANCEL`, which is the fault C7.8 took three cycles to
             // find on the stream-up upload path.
             match posted.await {
                 Ok(response) if response.status().is_success() => {
-                    tracing::debug!("packet-up: seq posted, status {}", response.status());
+                    tracing::trace!("packet-up: seq posted, status {}", response.status());
                     let mut body = response.into_body();
                     while let Some(chunk) = body.data().await {
                         if chunk.is_err() {

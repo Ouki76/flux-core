@@ -473,7 +473,7 @@ async fn an_unsupported_xhttp_mode_is_refused_at_startup() {
         "outbounds": [{
             "tag": "node",
             "carrier": {"type": "tcp", "address": "127.0.0.1:1"},
-            "framing": {"type": "xhttp", "path": "/x", "mode": "packet-up"},
+            "framing": {"type": "xhttp", "path": "/x", "mode": "bogus-mode"},
             "protocol": {"type": "vless", "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}
         }],
         "route": {"final": "node"}
@@ -484,7 +484,7 @@ async fn an_unsupported_xhttp_mode_is_refused_at_startup() {
         Err(e) => e.to_string(),
     };
     assert!(
-        err.contains("packet-up"),
+        err.contains("bogus-mode"),
         "the error must name the mode the user wrote: {err}"
     );
     assert!(
