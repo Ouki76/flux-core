@@ -11800,3 +11800,15 @@ xray         1301 rps    median 2403 µs
 flux-core is **19 % above sing-box and 9.5x xray** on this run. The transport change cost nothing measurable — as expected for one empty frame per download.
 
 Also corrected a long-standing harness mistake: the benches are **examples**, not binaries, so `./target/release/bench_matrix` never existed and any earlier claim of running it from that path was wrong. The correct invocation is `cargo build --release --example bench_matrix` / `./target/release/examples/bench_matrix`.
+
+### C7.82 — gates re-run after the transport change: all five green
+
+```
+cargo fmt --check        clean (fmt applied, tree unchanged since)
+clippy -D warnings       0 errors, 0 warnings
+cargo doc --no-deps      0 errors, 0 warnings  (271 crates)
+cargo deny check         advisories ok, bans ok, licenses ok, sources ok
+cargo audit              no vulnerabilities in Cargo.lock
+```
+
+Together with C7.81 (workspace tests green, both benches asserting), the five static gates and both benchmarks are confirmed on the same tree that carries the XHTTP fixes. Nothing in the objective is blocked by a gate.
