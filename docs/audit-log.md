@@ -10180,3 +10180,45 @@ end-to-end test drives both halves over a real socket, and the mode is verified 
 binary (`HELLO` through the tunnel).
 
 **All four XHTTP modes now work:** `stream-one`, `stream-up`, `packet-up`, `auto`.
+
+### C7.19 — the four settings, and what each now does
+
+Every documented `xhttpSettings` field is applied. Nothing is refused by name any more.
+
+| setting | behaviour | proof |
+|---|---|---|
+| `scMaxEachPostBytes` | a write larger than the limit is **split across several POSTs**; default 1 MB, Xray's own | 200 B at 64/POST → 4 pieces that rejoin byte-for-byte, end to end |
+| `scMinPostsIntervalMs` | the poster **waits** that long between POSTs | four POSTs at 50 ms cannot arrive in under 150 ms — asserted |
+| `scStreamUpServerSecs` | a watchdog **closes the upload stream** by itself | with a 1 s lifetime the server's read returns end-of-stream without the client closing anything |
+| `downloadSettings` | the download request uses its **own path and headers**, inheriting the upload's for anything omitted | the mapping is asserted directly through `XhttpSettings::packet_up_options()` |
+
+### Verified against the real xray binary
+
+With our client in `packet-up`, `scMaxEachPostBytes: 40` and `scMinPostsIntervalMs: 5`, a request of
+more than 200 bytes was split into ~7 POSTs and reassembled by xray:
+
+```
+curl -x socks5h://127.0.0.1:19921 http://127.0.0.1:17171/<200 chars>   →   HELLO
+```
+
+So the splitting and the pacing are not merely accepted — they work against the reference server.
+
+### Gates after the changes
+
+```
+bench_matrix --rounds 4 --mb 150 --assert 0.10   ASSERT PASSED   (0 failed rows)
+bench_rps --tls --assert 0.10                    ASSERT PASSED
+1184 tests pass, clippy clean, fmt clean
+```
+
+| protocol | flux | sing-box | xray | vs sbox | vs xray |
+|---|---|---|---|---|---|
+| VLESS / TCP | 659.4 | 549.5 | 537.3 | +20.0% | +22.7% |
+| WireGuard | 65.4 | 41.6 | — | +57.2% | — |
+
+### Known limitation, still open
+
+If a `packet-up` POST is in flight while the server is still sending the download response, the server
+rejects it with `unexpected frame type`. The end-to-end tests delay their first write by 100 ms, which
+models real use — the relay writes only once the tunnel is up — but a caller that writes immediately
+after connecting can hit it. Fixing it needs its own cycle and is not claimed here.
