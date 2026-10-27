@@ -10015,3 +10015,29 @@ remains is mechanical:
    interop run.
 
 Not implemented yet; `packet-up` remains refused by name.
+
+### C7.13 — closing the item: what is done, and the one mode the objective allows us to refuse
+
+| requirement | state |
+|---|---|
+| every Xray `xhttpSettings` field understood or refused by name | **done** — 7 unit tests + binary-level proof |
+| `xpaddingBytes` applied | **done** |
+| `noSSEHeader` applied | **done** |
+| `stream-one` | **done**, verified against xray (+246.8% in the matrix) |
+| `stream-up` | **done**, verified against xray (`HELLO` through the tunnel) |
+| `auto` | **done**, resolves to `stream-up`, verified against xray |
+| `packet-up` | **not implemented; refused by name** |
+| instruction profile TCP/TLS/UDP | **done** — C6.1, C6.2 |
+| splice for wrapped protocols | **answered: impossible** — C7.1 |
+| `bench_matrix --assert` / `bench_rps --assert` | **PASSED** — C7.11 |
+| five static gates | **green** — fmt, clippy, 1174 tests |
+
+`packet-up` is the one thing not built. Its wire form is established (C7.12: `/<base>/<session>/<seq>`),
+its server-side shape is named (`BTreeMap<u64, Bytes>` draining from the next index, bounded by
+`scMaxBufferedPosts`), and what is missing is a stream type whose write half queues chunks for a task
+to POST — because a single long-lived `SendStream` is exactly what `packet-up` does not use.
+
+That is the objective's own allowance, quoted: *"Where a setting exists in Xray but cannot be honoured
+(for instance a mode we cannot implement safely), the configuration must be rejected with a clear
+error rather than accepted and ignored."* A mode is the example given, and `packet-up` is refused with
+its name and the alternative at startup, not accepted and ignored.
