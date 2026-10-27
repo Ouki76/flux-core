@@ -10967,3 +10967,27 @@ discard a client mid-request.
 
 The instrumentation (`conn#N` on both first-request and POST lines) stays in the tree at `debug`; it is
 what made this observable and the next attempt will need it.
+
+### C7.48 — the "xray waits for a first frame" hypothesis is refuted too
+
+C7.47's leading candidate: Xray holds its upload until the download produces a frame, so a silent
+response body deadlocks it. Tested by sending a zero-length DATA frame immediately after the download
+headers — legal, carries nothing, and would start the stream.
+
+```
+before: 8/16 requests served in the last comparable runs (~50 %)
+with priming frame: trial 1: 1/4, trial 2: 3/4, trial 3: 4/4, trial 4: 0/4   →  8/16 (50 %)
+```
+
+**No change.** Reverted — the frame bought nothing and an oddity in the wire format is not worth
+carrying without a measurement.
+
+But look at the trials: `1/4, 3/4, 4/4, 0/4`. One run serves everything, another serves nothing, on the
+same binary minutes apart. That is the per-run clustering of C7.42 appearing again, and it is now the
+strongest single clue: **a run is globally good or globally bad.** No per-request or per-connection
+property can produce that; something established once per process — on either side — is what changes.
+
+Both sides restart for every trial, so either could be the one: flux's listener state, or xray's XMUX
+client pool and its TLS session. The next cycle should separate them by restarting **only xray** between
+requests within one flux process: if the badness follows xray's restart, it is on its side; if it
+persists through xray restarts, it is on ours.
