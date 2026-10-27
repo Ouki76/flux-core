@@ -11507,3 +11507,25 @@ Reverted. `stream-up` (15/15) and `stream-one` (15/15) are untouched and remain 
 `packet-up` is back to ~63 %, still the only failing mode. A correct fix has to keep accepting while it
 waits — a deadline in the `select!` rather than a sleep in the branch — and that is a larger change than
 what remained in this cycle.
+
+### C7.66 — releasing the packet-up connection early is wrong, in both places tried
+
+Two more attempts at `packet-up`, both measured, both reverted:
+
+| change | result (was ~63 %) |
+|---|---|
+| 250 ms linger on the upload-POST connection (`packet-up` acks one POST per connection) | **3/18 ≈ 17 %** |
+| release on the split-mode download stream, i.e. the `H2Stream` branch used by packet-up | **4/18 ≈ 22 %** |
+
+Both hurt. The reason is now clear and consistent with everything measured: `packet-up` streams
+**numbered POSTs on a connection that stays useful for the whole session**. Retiring the connection when
+the download tunnel finishes — or after a fixed 250 ms — cuts uploads that are still coming. `stream-one`
+and `stream-up` do not have this shape, which is exactly why releasing their connections took them to
+15/15 while packet-up got worse.
+
+So the release rule needs one more condition: **retire a connection only after it has been idle**, not
+after the tunnel ends. That is a timer inside the `select!` that resets on every accepted request — the
+same "deadline in the select, not a blocking sleep" shape C7.65 established, with the deadline meaning
+"no traffic for N seconds" rather than "N seconds after the tunnel closed".
+
+State restored to `c3cb224`: 313 tests pass, `stream-one` 15/15, `stream-up` 15/15, `packet-up` ~63 %.
