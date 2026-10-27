@@ -43,6 +43,7 @@ impl H2Stream {
         self
     }
 
+    /// Wraps a request/response pair as a bidirectional stream, without a release signal.
     pub fn new(send: SendStream<Bytes>, recv: RecvStream) -> Self {
         Self {
             send,
