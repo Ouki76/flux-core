@@ -12004,3 +12004,16 @@ idle 10 s, simplified:        ok = 17 / bad = 48   (4 min)
 RSS stayed bounded in both runs (12.4 MB and 22 MB), descriptors oscillated without climbing, threads constant at 26.
 
 A note for whoever reads this next: the first version of this fix looped forever because I wrote `continue` where the original code drained with `accept().await`. The transport suite caught it in one run — the third time this session that an executable check found what reasoning had missed.
+
+### C7.95 — packet-up burst rate after the idle fix: 29 % and 46 %, unchanged within variance
+
+Measured bursts again now that the idle retirement exists, to see whether it changed the fast-burst behaviour:
+
+```
+idle 10 s:  0/6, 2/6, 1/6, 4/6     7/24 = 29 %
+idle  2 s:  0/6, 2/6, 4/6, 5/6    11/24 = 46 %
+```
+
+Same range as before the fix (8 %-46 %), so the idle retirement neither helps nor harms bursts. Kept the **10 s** value because that is the one validated under sustained load (C7.94); 2 s measured slightly better here but only inside the noise, and a shorter window would turn the stability win into an untested change.
+
+Nothing was committed for the 2 s experiment — the constant is back at 10 s and the tree is clean.
