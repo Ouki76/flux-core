@@ -11488,3 +11488,22 @@ with no failures: `stream-up` 15/15 and `stream-one` 15/15. 313 transport tests 
 a connection whose download tunnel may finish before the last POST arrives — so the release added here
 may be cutting the connection while uploads are still in flight. That is a specific, checkable
 interaction, and it is the whole of the remaining work.
+
+### C7.65 — the grace period made packet-up worse; reverted
+
+C7.64's reading of packet-up was that the release cuts uploads still in flight, so the close was delayed
+by 500 ms before shutting down:
+
+```
+packet-up with 500 ms grace:  0/6, 1/6, 2/6     3/18 ≈ 17 %    (was 63 %)
+```
+
+**Much worse.** The reason is obvious in hindsight and should not have needed a measurement: the sleep
+runs **inside the accept loop**, so during the grace period the loop is not accepting — exactly the
+window in which the in-flight POSTs would have arrived. I blocked the path I was trying to protect.
+
+Reverted. `stream-up` (15/15) and `stream-one` (15/15) are untouched and remain perfect.
+
+`packet-up` is back to ~63 %, still the only failing mode. A correct fix has to keep accepting while it
+waits — a deadline in the `select!` rather than a sleep in the branch — and that is a larger change than
+what remained in this cycle.
