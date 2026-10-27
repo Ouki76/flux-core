@@ -10655,3 +10655,28 @@ fix: **serve several streams per connection**, which needs `serve_connection` in
 split into "transport + framing" and "protocol + dispatch", so that a framed stream produced by a
 second request can be dispatched exactly like the first. That is a real refactor, not a flag, and it is
 the next piece of work. The GOAWAY shortcut is ruled out (C7.35).
+
+### C7.37 — what multiplexing actually requires, and why this cycle stopped
+
+Attempted: `accept` returning the first tunnel plus a channel of further tunnels, with a
+`spawn_multiplexer` loop that turns each later request on the connection into a tunnel of its own
+(either a session download for the split modes, or a `stream-one` POST).
+
+The transport half compiles in isolation, but it cannot stand alone: `ServerTransportPipeline::unwrap`
+returns **one** stream, and the VLESS inbound's `serve_connection` does transport, framing, the VLESS
+handshake and dispatch in a single function. To dispatch a second tunnel, that function has to be split
+so the "framed stream → protocol → dispatcher" part can be called per tunnel — and `unwrap` has to
+return the extra tunnels.
+
+So the fix is a three-crate change:
+
+1. `flux-transport`: `accept` yields the first stream plus a receiver of the rest (written, compiles);
+2. `flux-transport`: `ServerTransportPipeline` gains a variant that returns those extras;
+3. `flux-inbound`: `serve_connection` splits into transport+framing and serve-framed, and the accept
+   loop spawns one serve-framed per extra tunnel.
+
+Reverted rather than left half-applied — an incomplete change to the pipeline signature would break
+every inbound protocol, not just XHTTP.
+
+**State of the objective:** the cause is measured and the shape of the fix is known and written down.
+What is left is a refactor of about three hours' work across three crates, with a test at each step.
