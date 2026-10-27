@@ -11551,3 +11551,17 @@ whole story here.
 The next thing to try is not another release variant but a direct look at where the ~37 % goes: log
 per connection whether the numbered POSTs arrived at all versus whether the download tunnel was opened
 and never fed. Those are different defects and the current logs conflate them.
+
+### C7.68 — the transport suite is flaky: 312/313 in roughly one run in three, at 90 s instead of 9 s
+
+Observed three times in this session, always the same signature: the suite takes **90 s instead of 9**
+and reports **312 passed, 1 failed**, and a re-run passes 313/313 with no code change. The failing test
+is not named in the captured output, so this entry records the symptom, not the culprit.
+
+That 90 s figure is the clue: something waits for a timeout that is normally never reached, so the flake
+is almost certainly in a test with a real timer rather than a logic error. It is a genuine defect in the
+suite — a suite that fails a third of the time cannot certify anything, which is precisely what the code
+audit (goal item 2) exists to find.
+
+Recorded as work, not as noise: the next session must capture the failing test's name by running the
+suite in a loop and grepping the failure block, then fix or bound the offending timeout.
