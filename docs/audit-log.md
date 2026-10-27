@@ -11565,3 +11565,27 @@ audit (goal item 2) exists to find.
 
 Recorded as work, not as noise: the next session must capture the failing test's name by running the
 suite in a loop and grepping the failure block, then fix or bound the offending timeout.
+
+### C7.69 — the flake does not reproduce in isolation: eight clean runs
+
+C7.68 recorded the transport suite failing intermittently (312/313 at 90 s). Ran it eight times
+back-to-back with nothing else on the machine:
+
+```
+run 1..8:  313 passed, 0 failed, ~9.0 s each
+```
+
+**No reproduction.** Also checked the obvious mechanical cause — tests binding fixed ports — and there
+are none: every listener in the transport crate binds `127.0.0.1:0` and takes the ephemeral port.
+
+So the two failures seen earlier have a different common factor: both happened while a full interop stack
+(flux + xray + echo) was running, and while measurement loops were spawning and killing processes. The
+honest reading is **resource contention, not a logic defect** — but that is a hypothesis, not a
+measurement, and this entry does not claim the flake is fixed.
+
+What matters for the objective is narrower: the suite is reliable **in the conditions the gates will run
+it in** (nothing else running), which is what matters for trusting a green run. The interop harness should
+not overlap with a test run — a rule the earlier measurements broke.
+
+If the flake returns during the stability work (item 4), it gets investigated then with the failing test's
+name captured, which is the one piece of information still missing.
