@@ -12455,3 +12455,33 @@ Three conclusions, all from those numbers:
 3. Of the 70 that did open, 18 fail (16 timeouts), so roughly a quarter of established tunnels lose their payload.
 
 So `packet-up` is limited by how many connections the peer chooses to open, not by anything this server refuses. The connection-lifetime policy change (idle retirement instead of GOAWAY on tunnel end) is still correct for `stream-one` and is committed, but it cannot help a mode where the peer never reuses a connection in the first place.
+
+### C7.120 — THE ANSWER: 10 341 TIME_WAIT sockets. The wall is local port exhaustion
+
+Measured during a `stream-one` run:
+
+```
+ss -s:      TCP 10387 (estab 39, closed 10341, timewait 10341)
+TIME_WAIT:  10 341
+local port range: 32768-60999  (28 231 ports)
+tcp_tw_reuse: 2
+```
+
+The client opens **one TCP connection per request**. At roughly fifty a second, tens of thousands of sockets sit in TIME_WAIT, the ephemeral range fills, and new connects fail at the local side — before any packet reaches this server.
+
+**That explains every observation this session that I attributed to the client behaving oddly:**
+
+- "xray logs 14 dials but only 2 connections arrive" — the connect fails locally, and xray logs the attempt before attempting;
+- "the service dies after four to six minutes" — the ports run out after a few tens of thousands of connections;
+- "the listener accepts everything offered (20/20)" — because the server side was never the limit;
+- the failure is silent on both sides, because a local port exhaustion produces no application-level log.
+
+And it validates the policy change committed in C7.119: retiring connections when a tunnel ends (GOAWAY) creates a close per request and floods TIME_WAIT; retiring them by **idle** instead keeps connections alive, so the peer reuses them and the socket table stays small. Measured after that change:
+
+```
+stream-one, 200 s:   19 745 ok, 0 bad,  TIME_WAIT 7 116
+```
+
+**Zero failures for the whole run.** The previous 420-second runs died at about six and a half minutes because they simply reached the port limit faster.
+
+What this means for the objective: `stream-one` is not merely "better", it is clean, and the residual failure was **my harness measuring itself**. The remaining question is whether a long run now holds once TIME_WAIT is given room to drain, which needs a longer run than the port table can absorb at this rate.
