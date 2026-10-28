@@ -12929,3 +12929,18 @@ The cause, found by following `dialer.go`: a numbered `packet-up` POST body was 
 Moved the body read into a spawned task, as the unnumbered `stream-up` path already did. That asymmetry was the whole bug: the unnumbered case had been fixed long ago for precisely this reason, and the numbered case had been left inline.
 
 Committed. 313 transport tests, clippy clean, release built.
+
+### C7.145 — the full matrix after the fix: every mode 18/18
+
+Three freshly started stacks per mode, six requests each, xray client:
+
+```
+stream-one:  6/6, 6/6, 6/6      18/18   100 %
+stream-up:   6/6, 6/6, 6/6      18/18   100 %
+packet-up:   6/6, 6/6, 6/6      18/18   100 %
+auto:        6/6, 6/6, 6/6      18/18   100 %
+```
+
+**72 of 72 requests, no failures in any mode.** `packet-up` was at 8 % at the start of this work and 0-7 of 8 in the controlled comparison an hour ago.
+
+The single change that got there — reading numbered upload bodies off the accept loop — also explains the whole campaign: every theory built on connection policy, pools, GOAWAY, multiplexing or client misbehaviour was working around a stalled accept loop.
