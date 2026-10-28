@@ -13141,3 +13141,18 @@ xray server:  ok=9315  bad=0    (120 s)   77.6 req/s
 Six times apart, so the gap is real and not an artefact of mismatched clients. It is also not the leak: descriptors sit at 15 and memory at 14 MB throughout, against 217 descriptors and 148 MB when this goal started.
 
 What is not yet known is where the time goes. A single request against our inbound measures 2 ms once its connection is warm, yet the loop averages 79 ms per request against 13 ms for xray. Either the loop is not reusing connections the way the controlled test does, or something per request costs ~60 ms that a single curl does not pay. That measurement is the next step, and it must use this same matched setup.
+
+### C7.157 — our server is five times faster per request, so the loop is measuring something else
+
+Same matched setup as C7.156 (identical client file, differing only in port; both at `loglevel: warning`), ten sequential requests each:
+
+```
+flux server:  0.047  0.007  0.002  0.002  0.002  0.002  0.002  0.002  0.002  0.002   (s)
+xray server:  0.037  0.011  0.012  0.011  0.010  0.011  0.009  0.012  0.011  0.012   (s)
+```
+
+**Ours answers in about 2 ms once warm; xray takes about 11 ms.** That is the opposite of what the sustained loop reported (12.7 req/s for us against 77.6 for xray), so the loop number does not describe server latency — it describes the loop.
+
+The two cannot both be right, and the honest reading is that the sustained harness measures something dominated by process spawn, the `timeout` wrapper and the pipe to `tail`, with a handful of fast failures mixed in. Quoting it as a throughput comparison was wrong twice: first with mismatched clients (C7.154), now with a metric that does not track what it appears to measure. Until the harness is replaced with something that can hold many requests in flight — `bench_rps`, or a client that keeps connections busy — no throughput claim about `xhttp` should be made from it.
+
+What stands regardless: the descriptor leak is gone (217 -> 15), CLOSE-WAIT is empty (2 600 before), memory is 14 MB under load instead of 148 MB, and per-request latency is 2 ms against the reference's 11 ms.
