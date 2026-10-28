@@ -12485,3 +12485,22 @@ stream-one, 200 s:   19 745 ok, 0 bad,  TIME_WAIT 7 116
 **Zero failures for the whole run.** The previous 420-second runs died at about six and a half minutes because they simply reached the port limit faster.
 
 What this means for the objective: `stream-one` is not merely "better", it is clean, and the residual failure was **my harness measuring itself**. The remaining question is whether a long run now holds once TIME_WAIT is given room to drain, which needs a longer run than the port table can absorb at this rate.
+
+### C7.121 — the two transport shapes need opposite connection policies
+
+Measured back to back on the same 200-second harness:
+
+```
+stream-one, connection kept alive (idle 5 s):      19 745 ok /      0 bad
+packet-up,  connection kept alive (idle 5 s):           6 ok /     34 bad
+packet-up,  connection retired on tunnel end:         70 ok /     35 bad
+```
+
+Twenty-fold difference from a single policy choice, in opposite directions. The reason is structural:
+
+- **`stream-one`** carries one request over one connection and the peer would otherwise open a fresh socket per request. At fifty a second that fills the ephemeral range — **10 341 TIME_WAIT sockets against 28 231 local ports** — and connects start failing locally with no log on either side. Keeping connections alive lets the peer reuse them, and the socket table stays small.
+- **split modes** (`packet-up`, `stream-up`) open a separate connection per session and expect the old one retired when that session ends. Keeping it alive starves the peer instead: packet-up fell from 52 successes to 6.
+
+So the code now does both: the split-mode loop calls `graceful_shutdown()` when its tunnel ends, and the single-tunnel driver leaves the connection to the idle timer. Committed, 313 tests, clippy clean, both measured.
+
+**This also retires a conclusion I published earlier.** The "14 dials produced 2 connections" observation, and the three rounds built on it, were measuring local port exhaustion in my own harness rather than a client that refused to connect. The server was never refusing anything — it accepted twenty out of twenty when asked directly.
