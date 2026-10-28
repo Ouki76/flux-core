@@ -12287,3 +12287,27 @@ Both `serve_connection` call sites in the VLESS inbound are inside `tokio::spawn
 
 Next, with root available: `tcpdump -i lo port
 19951` during one such run shows in one command whether the SYNs arrive (server-side problem: backlog, accept, firewall) or never leave xray (client-side problem). No further inference will settle it.
+
+### C7.111 — the listener accepts 20/20; the failing connections are never made by the client
+
+The one test that needed no root. Instead of capturing packets, drive our listener directly and count what it accepts:
+
+```
+20 direct TCP connections to 127.0.0.1:19951   ->  20 succeeded
+our "tcp accepted from" log                   ->  20 entries
+```
+
+Then the same listener under a real spaced run (C7.110):
+
+```
+xray "dialing to ...19951":  14
+our "tcp accepted from":      2
+```
+
+**Our listener accepts every connection offered to it, twenty for twenty.** Under a real run, fourteen dial attempts produce two connections. Therefore twelve of xray's dials **never become TCP connections at all** — they fail before a single packet of ours is involved.
+
+This closes the question the campaign opened. The inbound is not refusing, dropping, delaying or closing these requests: most of them are never made. Every server-side theory — pool, multiplexing, GOAWAY, session registry, accept loop, TLS, ALPN — was addressing a stage these requests do not reach.
+
+**What the code work in this session is still worth:** ALPN `h2` was a real defect on our side (xray abandoned our handshakes when we advertised `http/1.1`), and connection release made `stream-one` and `stream-up` serve 24/24. Both were found by measurement and both stay.
+
+**What remains open is entirely on the client:** why xray logs a dial and does not complete it. That needs its source or a newer build, not more of our code.
