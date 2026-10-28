@@ -837,13 +837,21 @@ where
                 let accepted = tokio::select! {
                     // The tunnel is finished: announce a graceful shutdown, then drain once so
                     // queued response frames flush before the socket goes (C7.61).
-                    // The tunnel finished, but the peer multiplexes more streams onto this connection.
-                    // Retiring it here made a connection that could carry many streams carry one
-                    // (C7.118); it is now retired by the idle timer instead. The guard matters: a
-                    // oneshot panics if polled after completion.
+                    // Split modes are the opposite of `stream-one`: the peer opens a fresh connection
+                    // per session and wants this one retired when the session ends. Leaving it to the
+                    // idle timer dropped packet-up from 52 successes to 6 (C7.121).
                     _ = &mut close_rx, if !tunnel_done => {
                         tunnel_done = true;
-                        continue;
+                        connection.graceful_shutdown();
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(IDLE_CLOSE_MS),
+                            connection.accept(),
+                        )
+                        .await
+                        {
+                            Ok(next) => next,
+                            Err(_) => None,
+                        }
                     }
                     idle = tokio::time::timeout(
                         std::time::Duration::from_millis(IDLE_CLOSE_MS),
