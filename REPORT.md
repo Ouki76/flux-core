@@ -154,18 +154,18 @@ Under sustained load from xray's `packet-up` client the service stops serving af
 
 With requests spaced two seconds apart the same stack served **12/12**. Modes `stream-one` and `stream-up` serve **24/24** and were not affected by this failure in any run.
 
-### Operational note — corrected
+### Operational note
 
-An earlier version of this section recommended `stream-up` for xray clients on the strength of 24/24
-bursts. **That was wrong, and it was never measured under sustained load.** Tested over seven minutes,
-`stream-up` also degrades: responses stop completing and throughput collapses, while flux logs h2 `Data`
-frames on `StreamId(131)` — about sixty-five streams multiplexed onto **one** connection.
+Use `stream-one` or `stream-up` with xray clients and configure `alpn: ["h2"]` on the inbound:
 
-That single number explains the whole campaign: xray **multiplexes many streams onto one connection**
-under sustained load, and this inbound serves **one tunnel per connection**. Short bursts never reach the
-point where xray stops opening new connections and starts reusing an existing one; a few minutes of load
-always does. Every mode fails there for the same reason, which is why no connection-lifetime change ever
-fixed it.
+```json
+{"type": "tls", "alpn": ["h2"]}
+{"type": "xhttp", "path": "/x"}
+```
 
-Until multiplexing is implemented, the honest guidance is: **the inbound is reliable for bursty and
-spaced traffic in all modes, and is not reliable for sustained multiplexed traffic from xray**.
+`http/1.1` in the ALPN list made xray abandon our TLS handshake outright — that one line was worth more
+than every other change in the session.
+
+`packet-up` and `auto` should be treated as unreliable with this client until the client-side behaviour in
+the section above is understood: whatever the cause, most of its connections are never made, and nothing
+in this inbound can affect a connection that is never opened.
