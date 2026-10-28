@@ -12745,3 +12745,23 @@ Identical within noise. Combined with C7.133 (waiting for the upload 59 %, keepi
 That is the fifth policy variant measured against the same protocol, and the flat result is itself the finding — the loss is not on this axis at all.
 
 Reverted to the committed behaviour. 313 tests, tree clean.
+
+### C7.136 — compared against xray's own server handler; no structural difference found
+
+Read `hub.go` (`requestHandler.ServeHTTP`) to compare with our inbound:
+
+- xray creates or fetches the session for **any** request carrying a session id (`upsertSession`), then decides uplink by method and sequence (`GET` with a seq is an uplink, everything else is);
+- uploads are pushed into that session's upload queue and answered 200; the download streams on its own request;
+- padding is applied to the response headers, not to the body.
+
+Ours does the same things in the same order: session on the download, queue delivery for uploads, 200 on both, padding in headers. **No structural difference that would explain the remaining 30 %.**
+
+Where the objective stands after this work, stated plainly:
+
+| mode | before this work | now |
+|---|---|---|
+| `stream-one` | died after ~4 min under load | **18 990 requests, zero failures** |
+| `stream-up` | degraded under load | **18/18 across three stacks** |
+| `packet-up` | 8 % | **70 %, flat across five server-side policies** |
+
+The multiplexing work is done and committed; the two modes that were broken by it now pass cleanly. `packet-up` remains at about seventy percent with the loss named by the client as a lost upload connection, and five connection policies have been measured against a single protocol without moving it.
