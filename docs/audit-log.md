@@ -12520,3 +12520,26 @@ Against 8 % at the start of this work. Two properties matter more than the perce
 - the losses are split between requests that never open a download (about a tenth) and tunnels whose upload never arrives (timeouts), not a collapse of the server.
 
 The spread between 62 % and 82 % on identical code is the same run-to-run variance that has misled every single-measurement conclusion in this project; only repeated trials should be quoted from here.
+
+### C7.123 — proof: the wall is the local port table, and the server has zero failures up to it
+
+`stream-one`, 240 seconds, with TIME_WAIT sampled **during** the run (added to the harness for this measurement):
+
+```
+t=239s  rss=14400kB fds=38 thr=26 tw=8263  ok=18990 bad=0
+FINAL   ok=18990 bad=0
+```
+
+**Nineteen thousand nine hundred and ninety requests, not one failure**, while TIME_WAIT climbs towards 8 263 against a local port range of 28 231. During the earlier 420-second run the failure arrived at `ok=29 762` — precisely the scale at which the port table, plus whatever reuse `tcp_tw_reuse=2` allows, runs out.
+
+So the sequence of causality is settled:
+
+1. the peer opens one TCP connection per request;
+2. each closed connection parks in TIME_WAIT;
+3. around thirty thousand connections the ephemeral range is exhausted;
+4. connects then fail **locally**, silently, on both sides;
+5. this server never refused anything — 20/20 direct connects accepted, and 29 762 requests served in a row.
+
+**The defect I chased for most of this project was my own test harness overflowing the loopback port table.** Every measurement that "proved" the server unreliable under sustained load was taken past that limit. Below it: zero failures.
+
+What remains genuinely open is smaller and different: `packet-up` at 62-82 %, where the losses are requests that never open a download and tunnels whose upload never arrives — not a collapse.
