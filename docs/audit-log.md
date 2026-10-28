@@ -12974,3 +12974,26 @@ bench_matrix --assert    ASSERT PASSED
 ```
 
 One note worth keeping: `test_xray_matrix_configs` panics unless the `xray` binary is on `PATH` (or `XRAY_BIN` is set). My first gate run omitted `~/.local/bin` and reported a failure that had nothing to do with the code; with the correct PATH the suite is green. That test failing loudly is the intended behaviour, and it is the reason the project insists `~/.local/bin` is on `PATH`.
+
+### C7.148 — crutch removal: what went, and what each removal was measured against
+
+```
+empty opening DATA frame        removed   packet-up 8/8 on three stacks without it
+close_tx/close_rx/tunnel_done   removed   scaffolding for a timer that no longer existed
+Drop impl on ChannelDuplex      removed   it only fired that channel
+delivered / session fields      removed   instrumentation whose only reader was the Drop log
+IDLE_CLOSE_MS (2 s)             replaced  standard IDLE_TIMEOUT of 10 s on plain keep-alive
+```
+
+The keep-alive change deserves its numbers, because the trade-off is real:
+
+```
+no idle timeout at all:   24/24 correct, but 756 MB RSS and 4 096 descriptors -- the process limit
+idle timeout 10 s:        24/24 correct, 148 MB RSS and 217 descriptors
+```
+
+An idle timeout is what every production HTTP server has; the version without one was not "simpler", it was unbounded. Xray's own server also keeps connections, but it runs with whatever descriptor limit its host provides, and this machine has 4 096.
+
+**One latent limitation left, deliberately:** the `stream-up` download branch still hands its connection to `spawn_connection_driver`, which refuses a second request with `REFUSED_STREAM`. It is dormant — `stream-up` measured 18/18 because the peer opens a fresh connection per session — and making it deliver uploads to sessions is the same change I got wrong once already (C7.126, packet-up fell to 22 %). Left as is, and recorded here rather than quietly ignored.
+
+Gates on the final tree: fmt OK, clippy 0 warnings, rustdoc 0 warnings, deny all-ok, audit exit 0, 0 failing suites, bench_rps ASSERT PASSED, bench_matrix ASSERT PASSED.
