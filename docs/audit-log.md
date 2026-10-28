@@ -13009,3 +13009,31 @@ flux server (19951):   ok=4200  bad=4955   rss=148 336 kB  fds=217   tw≈8 100
 **Time-wait climbs to about eight thousand on both, so the loopback port table is not the cause.** Xray's server takes ten thousand requests through it without a single failure; ours loses more than half under identical conditions.
 
 The earlier conclusion that the failures were a property of the harness was wrong, and the only reason it stood is that it had never been tested against a reference implementation. That is the same mistake as the upload loss: comparing against a guess instead of against something that works.
+
+### C7.150 — the descriptor exhaustion is 2 600 sockets in CLOSE-WAIT: we never notice the peer closing
+
+Thirty seconds of sustained load, then the descriptor table of the server process:
+
+```
+ok=2601  bad=0   fds=2707
+
+2700 socket:[N]           <- essentially all of them
+2600 CLOSE-WAIT            <- the peer closed; we did not
+  96 ESTABLISHED
+   1 LISTEN
+```
+
+`CLOSE-WAIT` is unambiguous: the client sent FIN and we are holding the socket open. The exit-reason counters from the instrumented loop agree — across a ninety-second run:
+
+```
+connections accepted:  116
+exit: peer closed:       0      <- accept() never reports the peer gone
+exit: idle timeout:    104
+fds at the end:       4086
+```
+
+The arithmetic closes it: `packet-up` gives each request **two** connections (the peer uses separate clients for download and upload), load runs at about 87 requests per second, and the idle timeout is 15 s. 2 × 87 × 15 ≈ 2 600 — exactly the number of sockets held. Xray's own server, with the same client, holds **173** because it releases a connection the moment its peer closes it.
+
+So the failures under sustained load were never about the port table and never about the upload path: the process runs out of descriptors because it waits out an idle timer instead of noticing EOF. Xray's 9 990/0 with the same harness is the proof that a correct implementation has no trouble here.
+
+Next: make the connection notice the peer going away. A likely cause is that the download response stream stays open until its session ends, and an h2 connection cannot report itself closed while a stream is open — so the FIN is held behind a stream that outlives the request.

@@ -567,7 +567,7 @@ impl Default for Reassembly {
 
 /// Xray's default for `scMaxBufferedPosts`.
 /// How long a connection may sit idle before it is closed, as any HTTP server does.
-const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
@@ -819,7 +819,18 @@ where
                 let (post, mut post_respond) =
                     match tokio::time::timeout(IDLE_TIMEOUT, connection.accept()).await {
                         Ok(Some(Ok(pair))) => pair,
-                        _ => break,
+                        Ok(Some(Err(e))) => {
+                            tracing::debug!("split loop: accept error, closing ({e})");
+                            break;
+                        }
+                        Ok(None) => {
+                            tracing::debug!("split loop: peer closed, releasing the connection");
+                            break;
+                        }
+                        Err(_) => {
+                            tracing::debug!("split loop: idle timeout, closing");
+                            break;
+                        }
                     };
                 let post_path = post.uri().path().to_string();
                 // A later **download** on this connection is a tunnel of its own, not an upload.
