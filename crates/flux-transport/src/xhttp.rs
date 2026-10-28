@@ -676,7 +676,10 @@ pub async fn accept<S>(
     no_sse_header: bool,
     max_buffered_posts: Option<u64>,
     stream_up_server_secs: Option<u64>,
-) -> FluxResult<Box<dyn AsyncStream>>
+) -> FluxResult<(
+    Box<dyn AsyncStream>,
+    tokio::sync::mpsc::UnboundedReceiver<Box<dyn AsyncStream>>,
+)>
 where
     S: AsyncStream + 'static,
 {
@@ -685,6 +688,10 @@ where
     static CONN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let conn_id = CONN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut connection = shared::server_handshake(stream, "xhttp").await?;
+    // Xray's http2.Transport reuses one connection for many streams: its "XHTTP is dialing" line is
+    // per *stream*, not per socket (splithttp/dialer.go). Serving one tunnel per connection left the
+    // rest unanswered, which is the sustained-load failure. Later requests become tunnels here.
+    let (extra_tx, extra_rx) = tokio::sync::mpsc::unbounded_channel();
     let buffered_bound = max_buffered_posts
         .map(|n| n as usize)
         .unwrap_or(DEFAULT_MAX_BUFFERED_POSTS);
@@ -920,13 +927,16 @@ where
                 );
             }
         });
-        return Ok(Box::new(ChannelDuplex {
-            rx: upload_rx,
-            tx: down_tx,
-            read_buf: Bytes::new(),
-            read_pos: 0,
-            close: Some(close_tx),
-        }));
+        return Ok((
+            Box::new(ChannelDuplex {
+                rx: upload_rx,
+                tx: down_tx,
+                read_buf: Bytes::new(),
+                read_pos: 0,
+                close: Some(close_tx),
+            }),
+            extra_rx,
+        ));
     }
 
     // `packet-up` uploads: `/<base>/<session>/<seq>`, each POST carrying one chunk. They are
@@ -1026,7 +1036,7 @@ where
                     message: format!("failed to send the XHTTP download response: {e}"),
                 })?;
         shared::spawn_connection_driver(connection, None);
-        return Ok(Box::new(H2Stream::new(send, recv)));
+        return Ok((Box::new(H2Stream::new(send, recv)), extra_rx));
     }
 
     // Xray only ever uses POST for a streaming upload; anything else is not this
@@ -1071,6 +1081,14 @@ where
     // Same release as the split path: one tunnel per connection, so when it ends the connection must
     // go back to the peer's pool instead of lingering (C7.63).
     let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+    // Later streams on this connection are tunnels of their own, not noise to be discarded: xray's
+    // http2 transport reuses one socket for many streams (C7.110), and every one of them needs a
+    // VLESS session. Hand them out through `extra_tx`.
+    let body_type = if no_sse_header {
+        "application/octet-stream"
+    } else {
+        "text/event-stream"
+    };
     tokio::spawn(async move {
         let mut connection = connection;
         loop {
@@ -1081,12 +1099,40 @@ where
                 }
                 next = connection.accept() => next,
             };
-            if !matches!(next, Some(Ok(_))) {
+            let Some(Ok((later, mut later_respond))) = next else {
+                break;
+            };
+            if later.method() != Method::POST {
+                let _ = later_respond.send_response(
+                    Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(())
+                        .expect("static refusal"),
+                    true,
+                );
+                continue;
+            }
+            let Ok(resp) = Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", body_type)
+                .body(())
+            else {
+                continue;
+            };
+            let Ok(send2) = later_respond.send_response(resp, false) else {
+                continue;
+            };
+            let recv2: RecvStream = later.into_body();
+            let tunnel: Box<dyn AsyncStream> = Box::new(H2Stream::new(send2, recv2));
+            if extra_tx.send(tunnel).is_err() {
                 break;
             }
         }
     });
-    Ok(Box::new(H2Stream::new(send, recv).with_close(close_tx)))
+    Ok((
+        Box::new(H2Stream::new(send, recv).with_close(close_tx)),
+        extra_rx,
+    ))
 }
 
 /// Normalises a configured path the way Xray does: leading and trailing slashes.
@@ -1207,7 +1253,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
-                .expect("server accept");
+                .expect("server accept")
+                .0;
             let mut buf = vec![0u8; 5];
             s.read_exact(&mut buf).await.expect("server read");
             assert_eq!(&buf, b"hello");
@@ -1310,7 +1357,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
-                .expect("accept");
+                .expect("accept")
+                .0;
             let mut buf = [0u8; 3];
             s.read_exact(&mut buf).await.expect("read");
             s.write_all(&buf).await.expect("write");
@@ -1521,7 +1569,8 @@ mod stream_up_end_to_end {
         let server = tokio::spawn(async move {
             let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
-                .expect("server must pair the session");
+                .expect("server must pair the session")
+                .0;
             let mut buf = vec![0u8; 64];
             let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf))
                 .await
@@ -1584,7 +1633,8 @@ mod packet_up_tests {
         let server = tokio::spawn(async move {
             let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
-                .expect("server must open the packet-up session");
+                .expect("server must open the packet-up session")
+                .0;
             let mut buf = vec![0u8; 64];
             let n = tokio::time::timeout(std::time::Duration::from_secs(10), s.read(&mut buf))
                 .await
@@ -1692,7 +1742,8 @@ mod split_write_tests {
         let server = tokio::spawn(async move {
             let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
-                .expect("server must open the session");
+                .expect("server must open the session")
+                .0;
             let started = std::time::Instant::now();
             let mut got = vec![0u8; 200];
             let mut filled = 0;
@@ -1757,7 +1808,8 @@ mod split_write_tests {
         let server = tokio::spawn(async move {
             let mut s = accept(server_io, "/tunnel", false, None, Some(1))
                 .await
-                .expect("server must open the session");
+                .expect("server must open the session")
+                .0;
             let mut buf = vec![0u8; 64];
             let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut buf))
                 .await
@@ -1818,7 +1870,8 @@ mod split_write_tests {
         let server = tokio::spawn(async move {
             let mut s = accept(server_io, "/tunnel", false, None, None)
                 .await
-                .expect("server must open the session");
+                .expect("server must open the session")
+                .0;
             let mut got = vec![0u8; 200];
             let mut filled = 0;
             while filled < 200 {

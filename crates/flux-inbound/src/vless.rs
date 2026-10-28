@@ -312,8 +312,39 @@ async fn serve_connection<St>(
 ) where
     St: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
+    // Xray reuses one connection for many streams, so a single socket can carry several tunnels.
+    // The first is served below; the rest are handed to `serve_stream`, which is exactly the code
+    // path the first one takes (C7.103 step 3).
+    let (first_stream, extras) = match pipe.unwrap_multiplexed(raw).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(
+                "[{}] transport unwrap failed from {}: {}",
+                inbound_tag, client_addr, e
+            );
+            return;
+        }
+    };
+    if let Some(mut extra_rx) = extras {
+        let disp = disp.clone();
+        let tag = inbound_tag.clone();
+        let uuids = uuids.clone();
+        let mux = mux.clone();
+        tokio::spawn(async move {
+            while let Some(tunnel) = extra_rx.recv().await {
+                let disp = disp.clone();
+                let tag = tag.clone();
+                let uuids = uuids.clone();
+                let mux = mux.clone();
+                tokio::spawn(async move {
+                    serve_tunnel(tunnel, client_addr, disp, tag, uuids, mux).await;
+                });
+            }
+        });
+    }
+
     let handshake_fut = async {
-        let mut stream = pipe.unwrap(raw).await?;
+        let mut stream = first_stream;
         let req = VlessProtocol::read_request_header(&mut stream, &uuids).await?;
         // Refuse anything we cannot serve before answering: the
         // response header is this inbound's only "authenticated,
@@ -510,6 +541,36 @@ async fn serve_stream(
             "[{}] VLESS unsupported command: {}",
             inbound_tag, req.command
         );
+    }
+}
+
+/// Runs the VLESS handshake on an already-framed tunnel, then serves it.
+///
+/// Used for every tunnel a multiplexing transport produces beyond the first on a connection.
+async fn serve_tunnel(
+    mut stream: BoxedStream,
+    client_addr: SocketAddr,
+    disp: Arc<dyn Dispatcher>,
+    inbound_tag: Arc<str>,
+    uuids: Arc<Vec<Uuid>>,
+    mux: Option<MuxConfig>,
+) {
+    let handshake = async {
+        let req = VlessProtocol::read_request_header(&mut stream, &uuids).await?;
+        check_request(&req)?;
+        VlessProtocol::write_response_header(&mut stream).await?;
+        Ok::<_, FluxError>(req)
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(15), handshake).await {
+        Ok(Ok(req)) => serve_stream(stream, req, client_addr, disp, inbound_tag, mux).await,
+        Ok(Err(e)) => warn!(
+            "[{}] VLESS handshake failed on a multiplexed tunnel from {}: {}",
+            inbound_tag, client_addr, e
+        ),
+        Err(_) => debug!(
+            "[{}] VLESS handshake timed out on a multiplexed tunnel from {}",
+            inbound_tag, client_addr
+        ),
     }
 }
 

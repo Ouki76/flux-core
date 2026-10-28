@@ -457,7 +457,7 @@ impl ServerTransportPipeline {
         let boxed: BoxedStream = Box::new(carrier_stream);
         let fut = async {
             let stream = self.unwrap_security(boxed).await?;
-            let stream = self.unwrap_framing(stream).await?;
+            let stream = self.unwrap_framing_single(stream).await?;
             Ok(stream)
         };
 
@@ -497,8 +497,56 @@ impl ServerTransportPipeline {
         Ok(stream)
     }
 
-    /// Unwraps the framing layers only.
-    async fn unwrap_framing(&self, mut stream: BoxedStream) -> FluxResult<BoxedStream> {
+    /// Unwraps the transport and returns **every** tunnel the connection will carry.
+    ///
+    /// Xray's http2 transport reuses one connection for many streams — its "XHTTP is dialing" line is
+    /// per stream, not per socket (`splitttp/dialer.go`) — so a connection may legitimately produce
+    /// several tunnels. The first is returned here; the rest arrive on the receiver. Other framings
+    /// yield a single stream and an empty receiver.
+    pub async fn unwrap_multiplexed<S>(
+        &self,
+        carrier_stream: S,
+    ) -> FluxResult<(
+        BoxedStream,
+        Option<tokio::sync::mpsc::UnboundedReceiver<BoxedStream>>,
+    )>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + Unpin + 'static,
+    {
+        let boxed: BoxedStream = Box::new(carrier_stream);
+        let fut = async {
+            let stream = self.unwrap_security(boxed).await?;
+            if self.framings.len() == 1
+                && let ServerFramingLayer::Xhttp {
+                    path,
+                    no_sse_header,
+                    max_buffered_posts,
+                    stream_up_server_secs,
+                } = &self.framings[0]
+            {
+                let (first, extras) = crate::xhttp::accept(
+                    stream,
+                    path.as_deref().unwrap_or(crate::xhttp::DEFAULT_XHTTP_PATH),
+                    *no_sse_header,
+                    *max_buffered_posts,
+                    *stream_up_server_secs,
+                )
+                .await?;
+                return Ok((first, Some(extras)));
+            }
+            let single = self.unwrap_framing_single(stream).await?;
+            Ok::<_, FluxError>((single, None))
+        };
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(res) => res,
+            Err(_) => Err(FluxError::Timeout(
+                "server transport pipeline handshake timed out".into(),
+            )),
+        }
+    }
+
+    /// Unwraps the framing layers only, single-stream form.
+    async fn unwrap_framing_single(&self, mut stream: BoxedStream) -> FluxResult<BoxedStream> {
         for framing in &self.framings {
             stream = match framing {
                 ServerFramingLayer::Raw => stream,
@@ -508,7 +556,7 @@ impl ServerTransportPipeline {
                     max_buffered_posts,
                     stream_up_server_secs,
                 } => {
-                    let st = crate::xhttp::accept(
+                    let (st, _extras) = crate::xhttp::accept(
                         stream,
                         path.as_deref().unwrap_or(crate::xhttp::DEFAULT_XHTTP_PATH),
                         *no_sse_header,
@@ -516,7 +564,7 @@ impl ServerTransportPipeline {
                         *stream_up_server_secs,
                     )
                     .await?;
-                    Box::new(st)
+                    st
                 }
                 ServerFramingLayer::WebSocket { path } => {
                     let ws = crate::websocket::server_handshake(stream, path.as_deref()).await?;
