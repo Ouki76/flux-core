@@ -1024,7 +1024,7 @@ where
 
     // `packet-up` uploads: `/<base>/<session>/<seq>`, each POST carrying one chunk. They are
     // reassembled here and delivered to the session's download stream, which is a separate request.
-    if request.method() == Method::POST && under_base && uri_path.matches('/').count() >= 3 {
+    if is_uplink_method(request.method()) && under_base && uri_path.matches('/').count() >= 3 {
         let (session, seq) = match uri_path.rsplit_once('/') {
             Some((rest, seq)) => (rest.rsplit('/').next().unwrap_or("").to_string(), seq),
             None => (String::new(), ""),
@@ -1063,7 +1063,7 @@ where
                     break;
                 };
                 let path = post.uri().path().to_string();
-                if post.method() != Method::POST {
+                if !is_uplink_method(post.method()) {
                     let _ = post_respond.send_response(
                         Response::builder()
                             .status(StatusCode::NOT_FOUND)
@@ -1113,7 +1113,7 @@ where
     }
 
     if let Some(session) = path_session
-        && request.method() == Method::POST
+        && is_uplink_method(request.method())
         && under_base
     {
         let (download, mut download_respond) = match connection.accept().await {
@@ -1177,7 +1177,7 @@ where
 
     // Xray only ever uses POST for a streaming upload; anything else is not this
     // transport and gets a plain 404 rather than a stream that would never work.
-    if request.method() != Method::POST || !under_base {
+    if !is_uplink_method(request.method()) || !under_base {
         let refusal = Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(())
@@ -1239,7 +1239,7 @@ where
             let Some(Ok((later, mut later_respond))) = next else {
                 break;
             };
-            if later.method() != Method::POST {
+            if !is_uplink_method(later.method()) {
                 let _ = later_respond.send_response(
                     Response::builder()
                         .status(StatusCode::NOT_FOUND)
@@ -1270,6 +1270,14 @@ where
         Box::new(H2Stream::new(send, recv).with_close(close_tx)),
         extra_rx,
     ))
+}
+
+/// Is this request an uplink (the client pushing bytes)?
+///
+/// Xray defaults to `POST` but lets the client choose (`uplinkHTTPMethod`), and sing-box sends
+/// `PUT`. Accepting only POST made every sing-box request a 404 followed by `REFUSED_STREAM`.
+fn is_uplink_method(method: &Method) -> bool {
+    *method == Method::POST || *method == Method::PUT
 }
 
 /// Normalises a configured path the way Xray does: leading and trailing slashes.
