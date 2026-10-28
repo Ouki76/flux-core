@@ -12543,3 +12543,18 @@ So the sequence of causality is settled:
 **The defect I chased for most of this project was my own test harness overflowing the loopback port table.** Every measurement that "proved" the server unreliable under sustained load was taken past that limit. Below it: zero failures.
 
 What remains genuinely open is smaller and different: `packet-up` at 62-82 %, where the losses are requests that never open a download and tunnels whose upload never arrives — not a collapse.
+
+### C7.124 — full matrix on the restart-per-trial harness
+
+Three freshly started stacks per mode, six requests each:
+
+```
+stream-one:  6/6, 6/6, 6/6    18/18  100 %
+stream-up:   6/6, 6/6, 6/6    18/18  100 %
+packet-up:   1/6, 6/6, 5/6    12/18   67 %
+auto:        1/6, 6/6, 5/6    12/18   67 %   (resolves to packet-up)
+```
+
+Two modes are clean across every trial. `packet-up` jumps between a perfect run and a poor one — and adding a three-second warm-up moved the bad trial from first to second (5/6, 1/6, 5/6), so it is **per-request, not per-startup**.
+
+What the counters say about those losses: downloads and uploads match almost one-to-one (`delivered=None` is zero — nothing is thrown away), yet a third of the tunnels time out in the VLESS handshake. So the bytes reach the session channel and the tunnel still never gets a request. That is the specific thing left to find, and it is now the only one.
