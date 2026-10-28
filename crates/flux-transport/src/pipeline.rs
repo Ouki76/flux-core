@@ -456,71 +456,8 @@ impl ServerTransportPipeline {
     ) -> FluxResult<BoxedStream> {
         let boxed: BoxedStream = Box::new(carrier_stream);
         let fut = async {
-            let mut stream = boxed;
-
-            // 1. Unwrap security layers in sequence
-            for sec in &self.securities {
-                stream = match sec {
-                    ServerSecurityLayer::None => stream,
-                    ServerSecurityLayer::Tls(acceptor) => {
-                        let mut s = acceptor.accept(stream).await.map_err(FluxError::Io)?;
-                        // A writer above this layer may hand rustls a whole 64 KiB frame
-                        // plus its header in one vectored write, and rustls' default
-                        // 64 KiB buffer limit makes that a short write every time. Raising
-                        // it lets the frame pass through in one call instead of being
-                        // copied into a frame buffer first.
-                        s.get_mut().1.set_buffer_limit(Some(TLS_WRITE_BUFFER));
-                        Box::new(s)
-                    }
-                    ServerSecurityLayer::Reality(cfg) => {
-                        let s = RealityHandshake::server_handshake(stream, cfg).await?;
-                        Box::new(s)
-                    }
-                    ServerSecurityLayer::ShadowTls(cfg) => {
-                        ShadowTlsHandshake::server_handshake(stream, cfg).await?
-                    }
-                };
-            }
-
-            // 2. Unwrap framing layers in sequence
-            for framing in &self.framings {
-                stream = match framing {
-                    ServerFramingLayer::Raw => stream,
-                    ServerFramingLayer::Xhttp {
-                        path,
-                        no_sse_header,
-                        max_buffered_posts,
-                        stream_up_server_secs,
-                    } => {
-                        let st = crate::xhttp::accept(
-                            stream,
-                            path.as_deref().unwrap_or(crate::xhttp::DEFAULT_XHTTP_PATH),
-                            *no_sse_header,
-                            *max_buffered_posts,
-                            *stream_up_server_secs,
-                        )
-                        .await?;
-                        Box::new(st)
-                    }
-                    ServerFramingLayer::WebSocket { path } => {
-                        let ws =
-                            crate::websocket::server_handshake(stream, path.as_deref()).await?;
-                        Box::new(ws)
-                    }
-                    ServerFramingLayer::HttpUpgrade { path } => {
-                        crate::httpupgrade::server_handshake(stream, path.as_deref()).await?
-                    }
-                    ServerFramingLayer::Http2 => {
-                        let h2 = crate::h2::H2Transport::server_handshake(stream).await?;
-                        Box::new(h2)
-                    }
-                    ServerFramingLayer::Grpc => {
-                        let grpc = crate::grpc::GrpcTransport::server_handshake(stream).await?;
-                        Box::new(grpc)
-                    }
-                };
-            }
-
+            let stream = self.unwrap_security(boxed).await?;
+            let stream = self.unwrap_framing(stream).await?;
             Ok(stream)
         };
 
@@ -530,6 +467,76 @@ impl ServerTransportPipeline {
                 "server transport pipeline handshake timed out".into(),
             )),
         }
+    }
+
+    /// Unwraps the security layers only.
+    async fn unwrap_security(&self, mut stream: BoxedStream) -> FluxResult<BoxedStream> {
+        for sec in &self.securities {
+            stream = match sec {
+                ServerSecurityLayer::None => stream,
+                ServerSecurityLayer::Tls(acceptor) => {
+                    let mut s = acceptor.accept(stream).await.map_err(FluxError::Io)?;
+                    // A writer above this layer may hand rustls a whole 64 KiB frame
+                    // plus its header in one vectored write, and rustls' default
+                    // 64 KiB buffer limit makes that a short write every time. Raising
+                    // it lets the frame pass through in one call instead of being
+                    // copied into a frame buffer first.
+                    s.get_mut().1.set_buffer_limit(Some(TLS_WRITE_BUFFER));
+                    Box::new(s)
+                }
+                ServerSecurityLayer::Reality(cfg) => {
+                    let s = RealityHandshake::server_handshake(stream, cfg).await?;
+                    Box::new(s)
+                }
+                ServerSecurityLayer::ShadowTls(cfg) => {
+                    ShadowTlsHandshake::server_handshake(stream, cfg).await?
+                }
+            };
+        }
+
+        Ok(stream)
+    }
+
+    /// Unwraps the framing layers only.
+    async fn unwrap_framing(&self, mut stream: BoxedStream) -> FluxResult<BoxedStream> {
+        for framing in &self.framings {
+            stream = match framing {
+                ServerFramingLayer::Raw => stream,
+                ServerFramingLayer::Xhttp {
+                    path,
+                    no_sse_header,
+                    max_buffered_posts,
+                    stream_up_server_secs,
+                } => {
+                    let st = crate::xhttp::accept(
+                        stream,
+                        path.as_deref().unwrap_or(crate::xhttp::DEFAULT_XHTTP_PATH),
+                        *no_sse_header,
+                        *max_buffered_posts,
+                        *stream_up_server_secs,
+                    )
+                    .await?;
+                    Box::new(st)
+                }
+                ServerFramingLayer::WebSocket { path } => {
+                    let ws = crate::websocket::server_handshake(stream, path.as_deref()).await?;
+                    Box::new(ws)
+                }
+                ServerFramingLayer::HttpUpgrade { path } => {
+                    crate::httpupgrade::server_handshake(stream, path.as_deref()).await?
+                }
+                ServerFramingLayer::Http2 => {
+                    let h2 = crate::h2::H2Transport::server_handshake(stream).await?;
+                    Box::new(h2)
+                }
+                ServerFramingLayer::Grpc => {
+                    let grpc = crate::grpc::GrpcTransport::server_handshake(stream).await?;
+                    Box::new(grpc)
+                }
+            };
+        }
+
+        Ok(stream)
     }
 }
 
