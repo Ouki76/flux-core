@@ -12074,3 +12074,20 @@ t=73s  rss=11376kB fds=17 thr=26 ok=2 bad=13
 ```
 
 What this run has to show to be worth reporting: success continuing past the four-minute mark, bounded RSS, flat descriptors, constant threads. The four-minute failure (C7.91) is the specific thing it exists to falsify.
+
+### C7.99 — CORRECTION: the idle fix postpones the death, it does not cure it
+
+Twenty-minute run, past the point every earlier run stopped:
+
+```
+t=310s  rss=18408kB fds=54 thr=26 ok=61 bad=74
+t=412s  rss=18496kB fds=33 thr=26 ok=61 bad=104
+t=570s  rss=18468kB fds=35 thr=26 ok=61 bad=134
+t=709s  rss=18528kB fds=39 thr=26 ok=61 bad=164
+```
+
+**`ok` freezes at 61 and does not move for six minutes.** The service still dies permanently — it now takes about five minutes instead of four.
+
+C7.94's conclusion was **wrong**, for a specific and instructive reason: every run I judged it on lasted four to five minutes, ending seconds before the failure. The fix moved the wall just past the end of my measurement, and I read the absence of a failure inside the window as its absence.
+
+What the numbers do say: our process is **healthy while it stops working** — RSS flat at 18.4 MB, descriptors low and falling, threads constant. Nothing on our side leaks. The saturation is downstream, as C7.60 showed.
