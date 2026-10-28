@@ -12311,3 +12311,15 @@ This closes the question the campaign opened. The inbound is not refusing, dropp
 **What the code work in this session is still worth:** ALPN `h2` was a real defect on our side (xray abandoned our handshakes when we advertised `http/1.1`), and connection release made `stream-one` and `stream-up` serve 24/24. Both were found by measurement and both stay.
 
 **What remains open is entirely on the client:** why xray logs a dial and does not complete it. That needs its source or a newer build, not more of our code.
+
+### C7.112 — xray logs no error while twelve of fourteen dials fail
+
+The log from the run in C7.110 (14 dial attempts, 2 connections accepted, 1 request served) contains **87 lines and not one error, warning or retry**:
+
+```
+grep -i "error|fail|warn|retry|closed|refus"  ->  the only hit is "Xray 26.3.27 started"
+```
+
+So the client attempts the connection, does not complete it, and **does not record that anything went wrong**. That is why the symptom looked like silence from our side for so long: both ends were quiet about it, and only counting the two logs against each other (14 dials vs 2 accepts) exposed the gap.
+
+**Final state of the investigation:** the inbound accepts every connection offered to it (20/20, C7.111); the client fails to make most of them and reports nothing. Nothing further can be established here without either xray's source or a packet capture, and both are outside this environment.
