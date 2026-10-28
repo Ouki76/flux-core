@@ -137,6 +137,12 @@ jobs:
           fi
         env:
           SINGBOX_BIN: /usr/local/bin/sing-box
+          # The TUN / TPROXY / REDIRECT tests need a real kernel datapath, and
+          # this job is not privileged — the "Privileged Tests" job runs them for
+          # real. Without this they panic here (tests/test_transparent_inbounds.rs
+          # refuses to pass vacuously), taking the whole suite and every later
+          # step with them. The variable downgrades them to a visible skip.
+          FLUX_ALLOW_TRANSPARENT_SKIP: "1"
 
       # A release-profile compile is a different code path (`lto = "fat"`,
       # `codegen-units = 1`, `strip`); catching a break here beats catching it in
