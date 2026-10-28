@@ -1103,15 +1103,13 @@ async fn handle_http_connection<S: AsyncReadExt + AsyncWriteExt + Unpin>(
         if subpath_clean.is_empty() {
             met.close_all_connections();
             ("204 No Content", String::new())
+        } else if met.close_connection(subpath_clean) {
+            ("204 No Content", String::new())
         } else {
-            if met.close_connection(subpath_clean) {
-                ("204 No Content", String::new())
-            } else {
-                (
-                    "404 Not Found",
-                    json!({"error": "connection not found"}).to_string(),
-                )
-            }
+            (
+                "404 Not Found",
+                json!({"error": "connection not found"}).to_string(),
+            )
         }
     } else if path_clean == "/api/v1/connections" && method == "GET" {
         let mut conn_list = Vec::new();

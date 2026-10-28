@@ -711,7 +711,11 @@ mod adversarial {
             if i > 0 {
                 host.push('.');
             }
-            host.push_str(rng.pick(&LABELS));
+            // Indexing directly avoids a `pick` call whose element type inference differs
+            // between Rust 1.91 (what CI pins) and 1.97: with `push_str` in the argument
+            // position, 1.91 resolves `pick::<str>` and then rejects `&[&str; 15]`.
+            let label = LABELS[rng.below(LABELS.len() as u64) as usize];
+            host.push_str(label);
         }
         match rng.below(8) {
             0 => host.push('.'),
