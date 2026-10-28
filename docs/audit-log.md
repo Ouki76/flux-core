@@ -12121,3 +12121,22 @@ All processes alive when sampled. Failures are **instant**, not timeouts, and fl
 `stream-up` does not fail like `packet-up` (timeouts after five minutes), but it fails: responses stop completing and throughput collapses.
 
 **I withdraw the C7.83 recommendation.** It was an inference from bursts presented as operational guidance — the exact failure mode this log keeps recording: a number from one experiment used to justify a claim about another. The report still carries that recommendation and is wrong; it must be corrected before anyone acts on it.
+
+### C7.102 — the root cause of every sustained-load failure: xray multiplexes streams, we serve one tunnel per connection
+
+Evidence chain, all measured:
+
+1. Under sustained `stream-up` load, flux logs h2 `Data` frames on **`StreamId(131)`** — about sixty-five streams multiplexed onto a single connection (C7.101).
+2. Our `xhttp::accept` returns **one** tunnel per connection and hands the connection to a driver that refuses further requests (C7.34, never fixed).
+3. Short bursts never reach this state: xray opens a new connection per request while its pool has room. A few minutes of load always does — which is why **every** mode fails under sustained traffic and **no** connection-lifetime change fixed it (five variants, C7.70).
+4. Spacing requests two seconds apart serves 12/12 (C7.79): the connection completes and is replaced before reuse piles up.
+5. Raising xray's `xmux.maxConnections` gave 0/10 -> 10/10 (C7.60): more connections means less multiplexing, which is the same conclusion from the other side.
+
+**This makes the multiplexing work of C7.37 the actual fix**, and it was abandoned for a bad reason: I reverted it in C7.39 because it measured 0/5, on a harness that C7.40 later proved was producing contaminated numbers. The implementation was almost certainly right and the measurement was wrong.
+
+What C7.37 established and what remains:
+
+- written and compiling: `accept` returning the first tunnel plus a channel of further tunnels, with a `spawn_multiplexer` loop over `connection.accept()`;
+- missing: `ServerTransportPipeline::unwrap` must be split into security and framing halves so the framing can yield extras, and the VLESS inbound must dispatch each extra tunnel through `serve_stream` — which already exists and is committed (`0bb936b`).
+
+That is the whole of the remaining work, and it is now supported by a diagnosis rather than a guess.
