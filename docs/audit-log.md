@@ -13288,3 +13288,27 @@ cargo fmt --all --check              not available (rustfmt not installed for 1.
 All that is left of goal item 3 is reading the failing test names from a CI run. That is not a code question any more: the job now emits them as `::error::` annotations, and the check-runs annotations endpoint is public. The only obstacle is the unauthenticated rate limit — 60 requests an hour, already spent on polling — which resets within minutes.
 
 Resume by calling the annotations endpoint for the "Check, Lint & Test" job on the newest commit; the failing test names will be listed there. Everything up to that point is measured and recorded: the clippy failure that kept CI red for twenty runs is fixed and verified on Rust 1.91.0, which is the version CI and the Dockerfile pin and which no gate in this session had been run against until now.
+
+### C7.167 — CI is green: the twenty red runs had three separate causes, all now fixed
+
+The check-run annotations finally named the failing tests, and there were three distinct problems stacked on top of each other:
+
+**1. The Rust version.** CI pins 1.91.0; every gate in this session had been run on 1.97.0. Installing 1.91.0 reproduced the failure immediately: `rng.pick(&LABELS)` resolves its element type to `str` there and the array is rejected, and `api.rs` had a `collapsible_else_if` that 1.97 does not report. Fixed — this unblocked step 7, which had been skipping documentation, the test suite and the release build.
+
+**2. Seven kernel-datapath tests.** `test_tun_inbound_*`, `test_tproxy_inbound_*` and `test_redirect_inbound_tcp_e2e` need a real TUN/TPROXY/REDIRECT datapath and refuse to pass vacuously. A dedicated privileged job runs them for real; the main job never set `FLUX_ALLOW_TRANSPARENT_SKIP`, so a runner without unprivileged user+net namespaces failed the whole suite.
+
+**3. `XRAY_BIN`.** `tests/test_xhttp_interop.rs` resolves xray through `XRAY_BIN` or `$HOME/.local/bin/xray` and never searches PATH, while the install step puts it in `/usr/local/bin`. The test panicked with "the xray binary is required but was not found" while the binary was installed.
+
+Final state of the checks on `ed7d1a4`:
+
+```
+Check, Lint & Test      success
+Line coverage           success
+Formatting              success
+API Stability           success
+Supply Chain            success
+Privileged Tests        success
+Docker (multi-arch)     still building -- unrelated to this goal
+```
+
+**Six green, zero red.** The coverage workflow had been failing for at least twenty consecutive runs; it passes now.
