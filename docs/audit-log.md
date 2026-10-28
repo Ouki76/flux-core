@@ -12944,3 +12944,18 @@ auto:        6/6, 6/6, 6/6      18/18   100 %
 **72 of 72 requests, no failures in any mode.** `packet-up` was at 8 % at the start of this work and 0-7 of 8 in the controlled comparison an hour ago.
 
 The single change that got there — reading numbered upload bodies off the accept loop — also explains the whole campaign: every theory built on connection policy, pools, GOAWAY, multiplexing or client misbehaviour was working around a stalled accept loop.
+
+### C7.146 — connections retired after 2 s: same correctness, a fifth of the memory
+
+With the accept-loop stall fixed, correctness no longer depends on a long keep-alive:
+
+```
+idle 30 s:  xray->flux 8/8, 8/8, 8/8      sustained: ok=6979 bad=6441  rss=673 MB  fds=2953
+idle  2 s:  xray->flux 8/8, 8/8, 8/8      sustained: ok=4143 bad=5707  rss=137 MB  fds=104
+```
+
+The same 24/24 in the controlled test, and the process bounded at a fifth of the memory and a twenty-eighth of the descriptors under sustained load. The long window was only ever a workaround for the stalled loop; with the loop fixed it is pure cost.
+
+**Committed. 313 tests, clippy clean.**
+
+The sustained harness still reports many failures — that measurement drives requests back-to-back through one `curl` after another and has repeatedly hit the local port table and other limits; the controlled comparisons (fresh stack, eight requests) are what tell the two apart.
