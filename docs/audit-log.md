@@ -12558,3 +12558,22 @@ auto:        1/6, 6/6, 5/6    12/18   67 %   (resolves to packet-up)
 Two modes are clean across every trial. `packet-up` jumps between a perfect run and a poor one — and adding a three-second warm-up moved the bad trial from first to second (5/6, 1/6, 5/6), so it is **per-request, not per-startup**.
 
 What the counters say about those losses: downloads and uploads match almost one-to-one (`delivered=None` is zero — nothing is thrown away), yet a third of the tunnels time out in the VLESS handshake. So the bytes reach the session channel and the tunnel still never gets a request. That is the specific thing left to find, and it is now the only one.
+
+### C7.125 — the failing tunnels receive no upload at all, and it is not a session mismatch
+
+Instrumented every tunnel to report how many bytes it delivered before ending:
+
+```
+tunnels ending after 0 bytes:   5      (= exactly the 5 VLESS handshake timeouts)
+tunnels ending after >0 bytes:  3
+session ids with a POST:        5f17…, 6f65…, a4fa…, bbac…, c341…, d46d…, dc69…, e4d6…, e97f…
+session ids of empty tunnels:   2d26…, 5b0d…, 5d4a…, 7a03…, ce32…
+```
+
+The two sets are **disjoint**. My first reading of that was a session mismatch — one session's upload landing in another's tunnel — and it is wrong: the disjoint sets are simply different requests. The correct reading is the simpler and more damning one: **for the five tunnels that timed out, no POST ever arrived.** Every successful request has a matching POST; every failed one has none.
+
+So `packet-up`'s remaining losses are not a delivery bug on our side — `delivered=None` is zero, meaning nothing received is thrown away. The upload is **never sent by the client** for roughly a third of sessions, even though the download tunnel opens and is answered.
+
+That is the same shape as the very first symptom in this project, now localised to a mode rather than the whole transport, and it sits on the client side of the wire: `dialer.go` starts the upload goroutine only after `OpenStream` for the download returns without error, and if that call errors it logs "failed to send upload" and interrupts the pipe. Our server would see exactly this — a download that opened, was answered, and never fed.
+
+Next: check whether xray's own log contains "failed to send upload" during a failing run. That single grep decides whether the client is reporting an error we have not been reading.

@@ -471,10 +471,19 @@ pub struct ChannelDuplex {
     /// and a peer pools connections: leaving ours open fills the pool with connections nobody can
     /// reuse, which is the wall measured in C7.59/C7.60.
     close: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Bytes this tunnel handed to its reader, so a timeout can be attributed: "the upload never
+    /// arrived" and "the upload arrived and was not delivered" are different defects (C7.124).
+    delivered: usize,
+    session: String,
 }
 
 impl Drop for ChannelDuplex {
     fn drop(&mut self) {
+        tracing::debug!(
+            "xhttp: tunnel session={} ended after {} bytes",
+            &self.session[..self.session.len().min(8)],
+            self.delivered
+        );
         if let Some(close) = self.close.take() {
             let _ = close.send(());
         }
@@ -500,6 +509,7 @@ impl AsyncRead for ChannelDuplex {
                 let to_copy = avail.min(buf.remaining());
                 buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + to_copy]);
                 this.read_pos += to_copy;
+                this.delivered += to_copy;
                 if this.read_pos == this.read_buf.len() {
                     this.read_buf = Bytes::new();
                     this.read_pos = 0;
@@ -914,6 +924,8 @@ where
                                 read_buf: Bytes::new(),
                                 read_pos: 0,
                                 close: None,
+                                delivered: 0,
+                                session: new_session.clone(),
                             });
                             if extra_for_loop.send(tunnel).is_err() {
                                 break;
@@ -1003,6 +1015,8 @@ where
                 read_buf: Bytes::new(),
                 read_pos: 0,
                 close: Some(close_tx),
+                delivered: 0,
+                session: session.clone(),
             }),
             extra_rx,
         ));
