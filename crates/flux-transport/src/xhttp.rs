@@ -467,27 +467,6 @@ pub struct ChannelDuplex {
     tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     read_buf: Bytes,
     read_pos: usize,
-    /// Fired when this tunnel is dropped. The connection it was served on carries exactly one tunnel,
-    /// and a peer pools connections: leaving ours open fills the pool with connections nobody can
-    /// reuse, which is the wall measured in C7.59/C7.60.
-    close: Option<tokio::sync::oneshot::Sender<()>>,
-    /// Bytes this tunnel handed to its reader, so a timeout can be attributed: "the upload never
-    /// arrived" and "the upload arrived and was not delivered" are different defects (C7.124).
-    delivered: usize,
-    session: String,
-}
-
-impl Drop for ChannelDuplex {
-    fn drop(&mut self) {
-        tracing::debug!(
-            "xhttp: tunnel session={} ended after {} bytes",
-            &self.session[..self.session.len().min(8)],
-            self.delivered
-        );
-        if let Some(close) = self.close.take() {
-            let _ = close.send(());
-        }
-    }
 }
 
 impl std::fmt::Debug for ChannelDuplex {
@@ -509,7 +488,6 @@ impl AsyncRead for ChannelDuplex {
                 let to_copy = avail.min(buf.remaining());
                 buf.put_slice(&this.read_buf[this.read_pos..this.read_pos + to_copy]);
                 this.read_pos += to_copy;
-                this.delivered += to_copy;
                 if this.read_pos == this.read_buf.len() {
                     this.read_buf = Bytes::new();
                     this.read_pos = 0;
@@ -588,8 +566,8 @@ impl Default for Reassembly {
 }
 
 /// Xray's default for `scMaxBufferedPosts`.
-/// A connection is retired after this long with no request on it.
-const IDLE_CLOSE_MS: u64 = 2000;
+/// How long a connection may sit idle before it is closed, as any HTTP server does.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
@@ -755,7 +733,6 @@ where
     {
         let (upload_tx, upload_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         let (down_tx, mut down_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
         with_sessions(|map| {
             map.insert(
                 session.clone(),
@@ -829,44 +806,21 @@ where
         // further POSTs on the same connection, and a bare connection driver would pump frames
         // without ever handing them to anyone. That is why nothing moved before — the POSTs were
         // never read, not misrouted.
-        let mut tunnel_done = false;
         let extra_for_loop = extra_tx.clone();
         let base_for_loop = base.clone();
         tokio::spawn(async move {
+            // Plain HTTP keep-alive: the connection serves requests until the peer closes it, as
+            // xray's own server does. Forcing it shut on a timer was a workaround for an accept loop
+            // that stalled on inline upload reads (C7.144); with that fixed the timer is unnecessary.
             loop {
-                // Retire the connection when its tunnel finishes, **and** when it has simply gone
-                // quiet: a download whose upload never arrives never completes its tunnel, and such
-                // a connection pins a slot in the peer's pool for ever. Under sustained load the
-                // pool saturates and the whole service stops serving (C7.91); a 10 s idle retirement
-                // kept it alive for the whole run (C7.93). The timer sits in `select!`, never a sleep,
-                // because a sleep here blocked the accept loop and made packet-up worse (C7.65).
-                let accepted = tokio::select! {
-                    // The tunnel is finished: announce a graceful shutdown, then drain once so
-                    // queued response frames flush before the socket goes (C7.61).
-                    // Split modes: retire the connection when its session ends. Keeping it alive
-                    // measured worse (15/35 against 44/21) even though the client reports
-                    // "http2: client connection lost" on uploads either way (C7.126).
-                    // Plain HTTP keep-alive, like xray's own server: a finished session does not
-                    // close the connection, because later requests share it. Retirement happens in
-                    // the idle branch below, timed from the last request.
-                    _ = &mut close_rx, if !tunnel_done => {
-                        tunnel_done = true;
-                        continue;
-                    }
-                    idle = tokio::time::timeout(
-                        std::time::Duration::from_millis(IDLE_CLOSE_MS),
-                        connection.accept(),
-                    ) => match idle {
-                        Ok(next) => next,
-                        Err(_) => {
-                            connection.graceful_shutdown();
-                            connection.accept().await
-                        }
-                    },
-                };
-                let Some(Ok((post, mut post_respond))) = accepted else {
-                    break;
-                };
+                // Standard HTTP keep-alive with an idle timeout, as any production server has: without
+                // one, connections the peer never closes accumulate until the descriptor limit is hit
+                // (measured: 4 096 descriptors and 756 MB under sustained load).
+                let (post, mut post_respond) =
+                    match tokio::time::timeout(IDLE_TIMEOUT, connection.accept()).await {
+                        Ok(Some(Ok(pair))) => pair,
+                        _ => break,
+                    };
                 let post_path = post.uri().path().to_string();
                 // A later **download** on this connection is a tunnel of its own, not an upload.
                 // Xray reuses one socket for many streams, so `packet-up` and `stream-up` clients
@@ -916,9 +870,6 @@ where
                                 tx: dn_tx,
                                 read_buf: Bytes::new(),
                                 read_pos: 0,
-                                close: None,
-                                delivered: 0,
-                                session: new_session.clone(),
                             });
                             if extra_for_loop.send(tunnel).is_err() {
                                 break;
@@ -1014,9 +965,6 @@ where
                 tx: down_tx,
                 read_buf: Bytes::new(),
                 read_pos: 0,
-                close: Some(close_tx),
-                delivered: 0,
-                session: session.clone(),
             }),
             extra_rx,
         ));
