@@ -12699,3 +12699,19 @@ keep alive (continue):   13/32 = 41 %
 The current behaviour stands: split modes retire the connection when the session ends; `stream-one` keeps it and lets the idle timer retire it. 313 tests pass, tree clean.
 
 **What this leaves for `packet-up`:** 70 % is the honest figure with the best policy, the losses are stack-level, the server discards nothing received, and the client reports `http2: client connection lost` on uploads regardless of policy.
+
+### C7.133 — three policies, one protocol: prompt close wins
+
+Four stacks, eight requests each, identical except for when a split-mode connection is retired:
+
+```
+retire immediately when the session ends      23/32 = 72 %   22/32 = 69 %   -> 70 %
+retire after the upload arrives (750 ms)      19/32 = 59 %
+never retire (idle timer only)                13/32 = 41 %
+```
+
+The client reports "http2: client connection lost" in all three, and it performs **best when the connection is retired at once**. Waiting for the upload — the intuitive fix, since that is the operation that fails — makes things worse, and keeping the connection entirely makes them worse still.
+
+That is the opposite of what the error message suggests, and it is why a controlled comparison mattered: I would have shipped the "wait for the upload" version on the strength of its rationale alone.
+
+Current behaviour kept: retire on session end. 313 tests, tree clean.
