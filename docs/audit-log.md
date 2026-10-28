@@ -12159,3 +12159,11 @@ procs:  none left running
 **Why this is the fix:** xray multiplexes ~65 streams onto one connection under sustained load (C7.101); this inbound serves one tunnel per connection and refuses the rest (C7.34).
 
 **Mistake not to repeat:** C7.39 reverted this implementation on a 0/5 reading, and C7.40 showed that harness was blending runs. The implementation was probably right and the measurement wrong.
+
+### C7.104 — step 1 of the multiplexing fix landed: unwrap split, nothing changed
+
+`ServerTransportPipeline::unwrap` now delegates to `unwrap_security` and `unwrap_framing`. The signature, the timeout wrapper and every call site are untouched — this exists so the framing half can later return extra tunnels without disturbing the security layers.
+
+Verified: `clippy -D warnings` clean, **the entire workspace suite passes with 0 failed suites**, fmt applied.
+
+Remaining, per C7.103: the framing half returns extra tunnels for a single XHTTP framing, and the VLESS inbound dispatches each through the already-committed `serve_stream`. Then judge with `/tmp/stress.sh 420`.
