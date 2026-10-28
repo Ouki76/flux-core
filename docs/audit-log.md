@@ -13075,3 +13075,25 @@ Measured after the change: **711 sockets to :18091 still in CLOSE-WAIT**, agains
 Both changes are kept: removing the session on drop and honouring `poll_shutdown` are correct on their own terms, whatever else is still holding the socket.
 
 **Where this stands.** The defect is fully localised — outbound sockets to the target, one per successful request, held in CLOSE-WAIT — and the reference implementation (`xray` server, 173 descriptors, 9 990/0) shows what correct looks like. What is left is finding which task holds the remaining reference.
+
+### C7.153 — the deadlock is broken: CLOSE-WAIT empty, descriptors 217 -> 16, memory 148 MB -> 13 MB
+
+The copier's own words, from its backstop log under load, were the whole diagnosis:
+
+```
+727 relay copier (poke #9): b at EOF, a quiet; moved up=79 down=43 — re-polling
+```
+
+`b` (the target) had finished; `a` (the client side) never would, because `packet-up` keeps its upload POST open until the session ends — and the session could only end when the relay finished. `ChannelDuplex::poll_shutdown` now ends **both** directions, which is what xray's own server does when the target closes.
+
+Measurements after the fix:
+
+```
+descriptors in CLOSE-WAIT:  711 -> 0
+fds held after 699 requests: 725 -> 15
+sustained 180 s:  ok=1567 bad=33   rss 13 MB   fds 16
+before:           ok=4200 bad=4955 rss 148 MB  fds 217
+packet-up, 3 stacks: 8/8, 8/8, 8/8 — with TWO connections for eight requests instead of eight
+```
+
+The connection count is the quiet proof that this was the right fix: the peer now reuses its connections because they are actually released, whereas before every request needed a new one and nothing was ever freed.
