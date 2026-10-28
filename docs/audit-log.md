@@ -13065,3 +13065,13 @@ A session guard was added (the registry previously kept every session for ever �
 **The missing link is a policy decision, not a leak:** the copier waits for a half-close that this transport can never deliver, because `packet-up` keeps its upload open until the session ends. Xray's server ends the session when the target closes, which is what makes its own fd count stay at 173.
 
 Fix to make next: when the target direction reaches EOF, end the session (drop the tunnel, which closes the download stream and lets the client finish) instead of waiting for the client side to close first.
+
+### C7.152 — `poll_shutdown` on the tunnel was a no-op, and fixing it is not enough
+
+`ChannelDuplex::poll_shutdown` returned `Ready(Ok(()))` without doing anything, so a half-close of the download direction never reached the writer task, never produced END_STREAM, and never let the peer finish. It now drops the download sender, which is the only signal the writer understands.
+
+Measured after the change: **711 sockets to :18091 still in CLOSE-WAIT**, against 1 680 before. Lower, but not fixed — so either the half-close never reaches this type in the relay path used here, or the copier's rule of waiting for both EOFs is what holds the session open regardless.
+
+Both changes are kept: removing the session on drop and honouring `poll_shutdown` are correct on their own terms, whatever else is still holding the socket.
+
+**Where this stands.** The defect is fully localised — outbound sockets to the target, one per successful request, held in CLOSE-WAIT — and the reference implementation (`xray` server, 173 descriptors, 9 990/0) shows what correct looks like. What is left is finding which task holds the remaining reference.

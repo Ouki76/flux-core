@@ -480,7 +480,7 @@ pub struct ChannelDuplex {
     /// Removes the session entry on drop; see `SessionGuard`.
     _session: SessionGuard,
     rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
-    tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    tx: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
     read_buf: Bytes,
     read_pos: usize,
 }
@@ -536,7 +536,13 @@ impl AsyncWrite for ChannelDuplex {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        match self.tx.send(Bytes::copy_from_slice(buf)) {
+        let Some(tx) = self.tx.as_ref() else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "the download direction was already shut down",
+            )));
+        };
+        match tx.send(Bytes::copy_from_slice(buf)) {
             Ok(()) => Poll::Ready(Ok(buf.len())),
             Err(_) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -549,7 +555,12 @@ impl AsyncWrite for ChannelDuplex {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Dropping the sender is what ends the download stream: the writer task sees its channel
+        // close and sends END_STREAM, the peer finishes its request, closes its upload, and the
+        // relay's other direction reaches EOF. Leaving this a no-op kept every session alive for
+        // ever — 1 700 sockets to the target stuck in CLOSE-WAIT (C7.151).
+        self.tx.take();
         Poll::Ready(Ok(()))
     }
 }
@@ -894,7 +905,7 @@ where
                             });
                             let tunnel: Box<dyn AsyncStream> = Box::new(ChannelDuplex {
                                 rx: up_rx,
-                                tx: dn_tx,
+                                tx: Some(dn_tx),
                                 _session: SessionGuard(new_session.clone()),
                                 read_buf: Bytes::new(),
                                 read_pos: 0,
@@ -991,7 +1002,7 @@ where
             Box::new(ChannelDuplex {
                 _session: SessionGuard(session.clone()),
                 rx: upload_rx,
-                tx: down_tx,
+                tx: Some(down_tx),
                 read_buf: Bytes::new(),
                 read_pos: 0,
             }),
