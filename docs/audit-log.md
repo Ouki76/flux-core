@@ -13278,7 +13278,7 @@ cargo test --workspace --no-fail-fast 0 failing suites
 cargo doc --no-deps                  0 warnings
 cargo deny check                     advisories ok, bans ok, licenses ok, sources ok
 cargo audit                          exit 0
-cargo fmt --all --check              differs
+cargo fmt --all --check              not available (rustfmt not installed for 1.91)
 ```
 
-The `fmt` difference is between rustfmt versions, not a defect: the CI "Formatting" job passes on this same tree, so the tree matches what CI checks. Reformatting with 1.91's rustfmt would move the tree away from what the Formatting job accepts, so it is deliberately not applied.
+`cargo +1.91.0 fmt` initially reported a failure, and that was my own error: the 1.91 toolchain was installed with `--profile minimal --component clippy`, so rustfmt is not present for it and the command errored rather than finding differences. The Formatting job in CI passes on this same tree, which is the check that matters.
