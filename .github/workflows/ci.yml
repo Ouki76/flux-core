@@ -118,7 +118,23 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
       - name: Run unit & integration tests
-        run: cargo test --locked --workspace
+        # The suite is the only place a failing test is named, and the run log
+        # needs a GitHub session to read. Failing tests are re-emitted as
+        # `::error::` annotations, which the public check-runs API exposes —
+        # so the next failure can be diagnosed instead of guessed at.
+        run: |
+          set +e
+          cargo test --locked --workspace --no-fail-fast 2>&1 | tee /tmp/tests.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            awk '/^failures:$/ {f=1; next} f && /^$/ {f=0} f && NF {print}' /tmp/tests.log \
+              | sort -u | head -20 | while read -r name; do
+                echo "::error::failing test: $name"
+              done
+            grep -E 'panicked at' /tmp/tests.log | head -5 \
+              | while read -r line; do echo "::error::$line"; done
+            exit "$rc"
+          fi
         env:
           SINGBOX_BIN: /usr/local/bin/sing-box
 
