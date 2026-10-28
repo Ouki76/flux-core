@@ -12636,3 +12636,13 @@ So there are two distinct defects and only one is understood:
 - **a stack that is born dead**: serves nothing for its entire life. That is a startup condition, not a per-request one, and it is the larger of the two when it happens.
 
 The one-second grace is committed (68/22 in one run, 7/8 and 6/8 here). 313 tests, clippy clean.
+
+### C7.129 — the 1 s grace was never active; those two measurements were the old code
+
+`clippy` caught it: `GRACE_CLOSE_MS` was added to the file but the loop that was supposed to use it never changed, so the constant was dead and the behaviour was identical to before.
+
+That means the runs I attributed to a grace period — 68/22 in one, then 7/8 and 6/8 in another — were the **unchanged** code, and the 7/30 run right after them was the same code too. The spread from 23 % to 76 % on literally identical binaries is therefore measured variance, not an effect.
+
+Removed the dead constant. This is the seventh time in this project that a change was believed to have been applied when it was not, and it was caught by a compiler warning rather than by me — persisting in treating `clippy -D warnings` as a gate rather than a chore is the only reason it surfaced.
+
+**Revised conclusion for `packet-up`:** connection policy does not move it. The mode's losses are stack-level (a stack either serves six or seven of eight, or serves nothing), and the run-to-run spread on identical code is wide enough that only multi-trial measurements mean anything.
