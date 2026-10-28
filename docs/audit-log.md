@@ -13097,3 +13097,20 @@ packet-up, 3 stacks: 8/8, 8/8, 8/8 — with TWO connections for eight requests i
 ```
 
 The connection count is the quiet proof that this was the right fix: the peer now reuses its connections because they are actually released, whereas before every request needed a new one and nothing was ever freed.
+
+### C7.154 — the leak is gone; what is left is that 1.7 % of requests hang until timeout
+
+Per-request latency against our server, six requests back to back through the same client:
+
+```
+0.037  0.006  0.002  0.002  0.002  0.002   (seconds)
+```
+
+So the server answers in about two milliseconds once a connection is warm — the same order as xray. Yet the sustained loop manages only 1 627 requests in 150 s while xray's server manages 11 575, and the arithmetic says why: the loop runs one `curl` at a time with a six-second cap, so **28 requests that hang cost about 140 of the 150 seconds**. Throughput is not limited by speed, it is limited by the few requests that never complete.
+
+```
+flux:  ok=1627  bad=28   (1.7 % hang, each burning the full timeout)
+xray:  ok=11575 bad=0
+```
+
+That is the remaining defect, and it is a much smaller target than where this started: the descriptor leak, the CLOSE-WAIT sockets and the deadlocked session are gone.
