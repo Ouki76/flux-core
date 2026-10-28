@@ -12603,3 +12603,19 @@ Keeping it open is **worse**, and the error persists, so the loss is not simply 
 Reverted to the better configuration: close on session end, 313 tests, clippy clean.
 
 **Where this leaves `packet-up`:** the client reports a lost upload connection, we have measured that keeping connections open does not fix it, and the next step is to instrument the upload-only connections — the ones whose first request is a POST — rather than the download ones, which is what every measurement so far has been counting.
+
+### C7.127 — packet-up connection policy: three variants, the middle one wins
+
+All measured on the same 120-second harness, same code otherwise:
+
+```
+retire on session end (5 s idle)       44 ok / 21 bad   67 %
+keep alive, idle 5 s, no GOAWAY        15 ok / 20 bad   43 %
+keep alive, idle 60 s, no GOAWAY        8 ok / 22 bad   27 %
+```
+
+Both extremes are worse than the middle, and the client's "http2: client connection lost" appears in all three (15, 11 and 17 occurrences respectively). So the policy is not what causes it — it is emitted on a connection state our server does not control.
+
+Kept the middle configuration: retire on session end. 313 tests, clippy clean, tree clean.
+
+**Summary of packet-up after this work:** 8 % at the start, 60-68 % now, with two modes at 100 %, and the remaining loss named by the client itself as a lost upload connection. Servicing upload connections continuously (committed) did not remove it either.
