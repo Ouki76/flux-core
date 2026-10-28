@@ -12577,3 +12577,29 @@ So `packet-up`'s remaining losses are not a delivery bug on our side — `delive
 That is the same shape as the very first symptom in this project, now localised to a mode rather than the whole transport, and it sits on the client side of the wire: `dialer.go` starts the upload goroutine only after `OpenStream` for the download returns without error, and if that call errors it logs "failed to send upload" and interrupts the pipe. Our server would see exactly this — a download that opened, was answered, and never fed.
 
 Next: check whether xray's own log contains "failed to send upload" during a failing run. That single grep decides whether the client is reporting an error we have not been reading.
+
+### C7.126 — the client names the failure: "http2: client connection lost" on the upload
+
+Xray's own log, with `loglevel: debug`, during a failing `packet-up` run:
+
+```
+failed to send upload > Post "https://localhost/x/cd548e5c-…/0": http2: client connection lost
+failed to send upload > Post "https://localhost/x/ce88d3c1-…/0": http2: client connection lost
+failed to send upload > Post "https://localhost/x/47b89009-…/0": http2: client connection lost
+… 15 occurrences in one run
+```
+
+**The client is not silent after all — it names the failure, and it is a lost connection.** The upload POST is issued on a connection that no longer exists by the time it goes out.
+
+Tested the obvious response — stop retiring the split-mode connection when its session ends and let the idle timer do it:
+
+```
+close on session end:   44 ok / 21 bad   (67 %)
+keep alive, idle 5 s:   15 ok / 20 bad   (43 %),  still 11 "connection lost"
+```
+
+Keeping it open is **worse**, and the error persists, so the loss is not simply "we closed too early". The upload is issued on a *different* connection from the download — `dialer.go` uses one `httpClient` for uploads and `httpClient2` for the download — so the connection that dies is the upload one, which our server never sees as a download at all.
+
+Reverted to the better configuration: close on session end, 313 tests, clippy clean.
+
+**Where this leaves `packet-up`:** the client reports a lost upload connection, we have measured that keeping connections open does not fix it, and the next step is to instrument the upload-only connections — the ones whose first request is a POST — rather than the download ones, which is what every measurement so far has been counting.
