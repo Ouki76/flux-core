@@ -138,3 +138,20 @@ The port is open, connections are accepted, xray dials, the tunnel opens, and no
 Under sustained load from xray's `packet-up` client the service stops serving after roughly five minutes, and the evidence says the client stops sending payloads while our process remains healthy. **flux-core is not confirmed stable for long-running third-party client load**; it is confirmed to consume no growing resources while that load fails.
 
 With requests spaced two seconds apart the same stack served **12/12**. Modes `stream-one` and `stream-up` serve **24/24** and were not affected by this failure in any run.
+
+### Operational recommendation
+
+Until the client-side behaviour above is understood, use **`stream-up`** or **`stream-one`** when the peer is xray's client:
+
+- both serve 24/24 in every run, including under the sustained load that kills `packet-up`;
+- `packet-up` additionally degrades over minutes even when it starts well;
+- our own client interoperates with a real xray server in all modes, so this is a peer-selection matter, not a capability gap.
+
+The inbound configuration for a reliable xray pairing:
+
+```json
+{"type": "tls", "alpn": ["h2"]}
+{"type": "xhttp", "path": "/x"}
+```
+
+with `alpn` restricted to `h2` — advertising `http/1.1` as well made xray abandon the TLS handshake outright (C7.53), and that one line was worth more than every other change combined.
