@@ -12997,3 +12997,15 @@ An idle timeout is what every production HTTP server has; the version without on
 **One latent limitation left, deliberately:** the `stream-up` download branch still hands its connection to `spawn_connection_driver`, which refuses a second request with `REFUSED_STREAM`. It is dormant — `stream-up` measured 18/18 because the peer opens a fresh connection per session — and making it deliver uploads to sessions is the same change I got wrong once already (C7.126, packet-up fell to 22 %). Left as is, and recorded here rather than quietly ignored.
 
 Gates on the final tree: fmt OK, clippy 0 warnings, rustdoc 0 warnings, deny all-ok, audit exit 0, 0 failing suites, bench_rps ASSERT PASSED, bench_matrix ASSERT PASSED.
+
+### C7.149 — the control kills the "harness limit" excuse: xray serves 9 990 with zero failures
+
+Same harness (/tmp/stress.sh shape), same duration, same client, same host — only the server differs:
+
+```
+xray server (19952):   ok=9990  bad=0      rss=69 288 kB   fds=173   tw≈8 187
+flux server (19951):   ok=4200  bad=4955   rss=148 336 kB  fds=217   tw≈8 100
+
+**Time-wait climbs to about eight thousand on both, so the loopback port table is not the cause.** Xray's server takes ten thousand requests through it without a single failure; ours loses more than half under identical conditions.
+
+The earlier conclusion that the failures were a property of the harness was wrong, and the only reason it stood is that it had never been tested against a reference implementation. That is the same mistake as the upload loss: comparing against a guess instead of against something that works.
