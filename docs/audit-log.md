@@ -12855,3 +12855,24 @@ xray -> flux   1/8     4 connections, 8 first requests, 4 downloads,
 **The failure is ours and it is in the multiplexed-tunnel path**: a later download on a reused connection becomes a tunnel (the counts prove it), and that tunnel never receives its upload. Requests served as the FIRST request on a fresh connection work; the ones handed over from the reused-connection path do not.
 
 That is a much narrower target than anything earlier in this project, and it was reached by comparing against a working implementation rather than by guessing.
+
+### C7.141 — the failing tunnel simply never gets its POST, and the client says nothing
+
+Session ids compared within one run:
+
+```
+tunnels created:        6e8762b0, 5e74829b, f23b139a
+POSTs delivered:        session=a15ab21d, session=6e8762b0, session=5e74829b
+reused-connection tunnels: none in this sample
+```
+
+**The ids match exactly for the tunnels that worked** — so session routing is correct, and `delivered=None` is zero. The failing tunnel (`f23b139a`) received no POST at all, and the client logged no error for it at debug level.
+
+That is as far as measurement takes this in the time available. The isolated facts:
+
+- xray client against xray's own server: **8/8**, no errors;
+- the same client against ours: some tunnels are fed and some are not;
+- server-side delivery is lossless whenever a POST arrives;
+- the difference must therefore be in what the client decides to send, which is influenced by how we retire connections between requests on a shared socket.
+
+The next thing to try, with fresh context: keep the split-mode connection alive **only while it has an unfinished session** and close it a fixed delay after the *last* request rather than after a tunnel ends — the two policies tried so far were "close at tunnel end" and "never close", and neither matches what xray's own server does, which is ordinary HTTP keep-alive with no forced close at all.
