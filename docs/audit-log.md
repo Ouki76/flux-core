@@ -12323,3 +12323,25 @@ grep -i "error|fail|warn|retry|closed|refus"  ->  the only hit is "Xray 26.3.27 
 So the client attempts the connection, does not complete it, and **does not record that anything went wrong**. That is why the symptom looked like silence from our side for so long: both ends were quiet about it, and only counting the two logs against each other (14 dials vs 2 accepts) exposed the gap.
 
 **Final state of the investigation:** the inbound accepts every connection offered to it (20/20, C7.111); the client fails to make most of them and reports nothing. Nothing further can be established here without either xray's source or a packet capture, and both are outside this environment.
+
+### C7.113 — how to resume: the environment is ready
+
+Verified before stopping:
+
+```
+target/release/flux-core   11.9 MB, built from 65e1fcd
+harness scripts present    measure.sh, stress.sh, timed.sh, rec.sh, fl_tls_in.json, xr.json, echo.py
+client config mode         packet-up
+```
+
+**To restart the investigation in one command:**
+
+```sh
+cd /home/ouki/Projects/flux-core
+./target/release/flux-core run -c /tmp/fl_tls_in.json &
+xray run -c /tmp/xr.json &
+python3 /tmp/echo.py &
+curl -s -x socks5h://127.0.0.1:19020 http://127.0.0.1:18091/
+```
+
+**The one measurement to run first next session** is the pair that localised the fault: count `grep -c "tcp accepted from" /tmp/f.log` against `grep -c "dialing to tcp:127.0.0.1:19951" /tmp/x.log` after a burst. If the ratio is again about 2 to 14, the client is still the failing side and nothing in this repository should be changed to chase it.
