@@ -591,6 +591,9 @@ impl Default for Reassembly {
 /// A connection is retired after this long with no request on it.
 const IDLE_CLOSE_MS: u64 = 5000;
 
+/// How long a split-mode connection outlives its session, waiting for the upload that follows.
+const GRACE_CLOSE_MS: u64 = 1000;
+
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
 impl Reassembly {
