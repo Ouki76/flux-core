@@ -12345,3 +12345,15 @@ curl -s -x socks5h://127.0.0.1:19020 http://127.0.0.1:18091/
 ```
 
 **The one measurement to run first next session** is the pair that localised the fault: count `grep -c "tcp accepted from" /tmp/f.log` against `grep -c "dialing to tcp:127.0.0.1:19951" /tmp/x.log` after a burst. If the ratio is again about 2 to 14, the client is still the failing side and nothing in this repository should be changed to chase it.
+
+### C7.114 — the headline number re-verified on the final tree: stream-up 24/24
+
+The 24/24 for `stream-up` was measured **before** the idle retirement and the `unwrap` split. Re-measured now, four freshly started stacks, six requests each:
+
+```
+trial 1: 6/6   trial 2: 6/6   trial 3: 6/6   trial 4: 6/6      24/24
+```
+
+It holds. This is the one figure in the entire log that has now been reproduced **three separate times** on three different trees, and it is the one the operational guidance rests on.
+
+Everything else in this log that was measured once and believed was later retracted (C7.40, C7.99, C7.109). This entry exists so that the surviving claim is held to the same standard as the retracted ones.
