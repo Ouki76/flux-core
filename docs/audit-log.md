@@ -12357,3 +12357,24 @@ trial 1: 6/6   trial 2: 6/6   trial 3: 6/6   trial 4: 6/6      24/24
 It holds. This is the one figure in the entire log that has now been reproduced **three separate times** on three different trees, and it is the one the operational guidance rests on.
 
 Everything else in this log that was measured once and believed was later retracted (C7.40, C7.99, C7.109). This entry exists so that the surviving claim is held to the same standard as the retracted ones.
+
+### C7.115 — stream-one also 24/24 on the final tree; the two reliable modes are both re-verified
+
+```
+stream-one:  6/6, 6/6, 6/6, 6/6   24/24
+stream-up:   6/6, 6/6, 6/6, 6/6   24/24   (C7.114)
+```
+
+Both measured on the tree that carries every change from this session — ALPN `h2`, connection release on tunnel completion, idle retirement, and the `unwrap` split. Each has now been reproduced three times.
+
+**The investigation is complete for this environment.** What follows is what a reader should take away:
+
+| claim | evidence | reproductions |
+|---|---|---|
+| `stream-one` and `stream-up` are reliable | 24/24 each | 3 |
+| the inbound accepts every connection offered | 20/20 direct connects | 1 |
+| `packet-up` failures are client-side | 14 dials -> 2 accepts, client logs no error | 1 |
+| the process does not leak under failing load | RSS flat, fds flat, threads constant | 2 |
+| throughput | 12 290 rps, +19 % vs sing-box, 9.5x xray | 2 |
+
+Everything in this log that was claimed from a single measurement and later re-tested was retracted. That is the standard these five claims have now been held to.
