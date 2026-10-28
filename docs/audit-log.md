@@ -13114,3 +13114,17 @@ xray:  ok=11575 bad=0
 ```
 
 That is the remaining defect, and it is a much smaller target than where this started: the descriptor leak, the CLOSE-WAIT sockets and the deadlocked session are gone.
+
+### C7.155 — the residual failures are silent, and they are not hangs
+
+Forty seconds of sustained load with the server at debug level:
+
+```
+ok=644  bad=7  (1.1 %)
+server log: no handshake timeouts, no protocol errors attributable to these
+client log: nothing at all
+```
+
+Two facts follow. The failures are not slow — if each had burned the six-second cap the run could not have completed seven of them in forty seconds, so they fail fast. And neither side records a reason, which points at the SOCKS handshake between the harness and the client rather than at the tunnel.
+
+Wall-clock per request in this loop is about 61 ms while the measured request latency against the server is 2 ms, so the loop is dominated by process spawn and client work, not by the server. The 11 575 that xray's server reached in 150 s (13 ms per request) is therefore not explained yet either — that comparison needs to be re-run with the same client pointed at both servers before any throughput conclusion is drawn from it. The earlier number compared two different client configurations, which is exactly the kind of mistake this project keeps paying for.
