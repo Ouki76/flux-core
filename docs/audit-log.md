@@ -12413,3 +12413,25 @@ Two things improved beyond doubt:
 Still not the criterion: 59 %. But the shape of the failure changed from "the service dies" to "some tunnels lose their payload", which is a defect this repository can actually chase.
 
 Both multiplexing changes are committed (c550d10 for `stream-one`, 80bee82 for the split modes). 313 transport tests, clippy clean.
+
+### C7.118 — why packet-up still loses a third: we close the connection after one tunnel
+
+Measured counts from a 180 s `packet-up` run, with a log line added at the point a later download on a reused connection is handed over:
+
+```
+idle retirement ON  (10 s):  55 requests, 27 first-GET connections,  8 reused  -> 35 tunnels
+idle retirement OFF (600 s): 65 requests, 12 first-GET connections, 32 reused  -> 44 tunnels
+```
+
+Turning the idle retirement off makes the peer multiplex hard (12 connections carrying 44 tunnels) instead of constantly dialling, which is exactly the behaviour the source describes. But requests still vanish: **21 of 65 produced no tunnel at all.**
+
+The mechanism is ours: when the first tunnel on a connection finishes, `close_rx` fires and we call `graceful_shutdown()` — a GOAWAY. Xray treats a GOAWAY connection as unusable (`IsClosed()` in `mux.go` removes it) and opens another, so a connection that could have carried ten more streams carries one. Tried keeping the connection open instead:
+
+```
+no shutdown on tunnel end, idle 600 s:  43 ok / 42 bad
+no shutdown on tunnel end, idle 1.5 s:  3 transport tests fail
+```
+
+Neither is acceptable — the second breaks the suite, the first did not help. Reverted to the committed behaviour: 313 tests green, tree clean.
+
+So there are **two separate faults**, and only one of them is still open: the connection is retired after a single tunnel (by design in every mode except the multiplexing I added), and the peer then does not reliably open a replacement. Closing that gap needs the retirement policy decided together with the tests rather than against them — the tests encode "a finished tunnel ends its connection", which is precisely the behaviour multiplexing wants to abolish.
