@@ -579,7 +579,7 @@ impl Default for Reassembly {
 
 /// Xray's default for `scMaxBufferedPosts`.
 /// A connection is retired after this long with no request on it.
-const IDLE_CLOSE_MS: u64 = 10000;
+const IDLE_CLOSE_MS: u64 = 5000;
 
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
@@ -823,6 +823,7 @@ where
         // further POSTs on the same connection, and a bare connection driver would pump frames
         // without ever handing them to anyone. That is why nothing moved before — the POSTs were
         // never read, not misrouted.
+        let mut tunnel_done = false;
         let extra_for_loop = extra_tx.clone();
         let base_for_loop = base.clone();
         tokio::spawn(async move {
@@ -836,9 +837,13 @@ where
                 let accepted = tokio::select! {
                     // The tunnel is finished: announce a graceful shutdown, then drain once so
                     // queued response frames flush before the socket goes (C7.61).
-                    _ = &mut close_rx => {
-                        connection.graceful_shutdown();
-                        connection.accept().await
+                    // The tunnel finished, but the peer multiplexes more streams onto this connection.
+                    // Retiring it here made a connection that could carry many streams carry one
+                    // (C7.118); it is now retired by the idle timer instead. The guard matters: a
+                    // oneshot panics if polled after completion.
+                    _ = &mut close_rx, if !tunnel_done => {
+                        tunnel_done = true;
+                        continue;
                     }
                     idle = tokio::time::timeout(
                         std::time::Duration::from_millis(IDLE_CLOSE_MS),
@@ -1150,11 +1155,12 @@ where
     };
     tokio::spawn(async move {
         let mut connection = connection;
+        let mut tunnel_done = false;
         loop {
             let next = tokio::select! {
-                _ = &mut close_rx => {
-                    connection.graceful_shutdown();
-                    connection.accept().await
+                _ = &mut close_rx, if !tunnel_done => {
+                    tunnel_done = true;
+                    continue;
                 }
                 next = connection.accept() => next,
             };
