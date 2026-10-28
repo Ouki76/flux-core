@@ -843,15 +843,12 @@ where
                     _ = &mut close_rx, if !tunnel_done => {
                         tunnel_done = true;
                         connection.graceful_shutdown();
-                        match tokio::time::timeout(
+                        tokio::time::timeout(
                             std::time::Duration::from_millis(IDLE_CLOSE_MS),
                             connection.accept(),
                         )
                         .await
-                        {
-                            Ok(next) => next,
-                            Err(_) => None,
-                        }
+                        .unwrap_or_default()
                     }
                     idle = tokio::time::timeout(
                         std::time::Duration::from_millis(IDLE_CLOSE_MS),
