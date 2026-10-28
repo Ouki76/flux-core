@@ -12205,3 +12205,20 @@ FINAL ok=26 bad=64
 Successful requests kept accumulating to the end of the five-minute window, RSS bounded at 16.9 MB, descriptors oscillating 35-46, threads constant.
 
 **Treat this as a boundary reading, not a survival result.** C7.99 measured the freeze at about five minutes — this run ended exactly at that boundary, so it says the service is alive at five minutes and nothing about six. Reporting it as stability would repeat the error of C7.94, where a run that ended just before the failure was read as its absence.
+
+---
+
+## ИТОГ СЕССИИ — если читать только одну запись
+
+**Можно ли пользоваться ядром.** Да, с одной оговоркой. `stream-one` и `stream-up` стабильно отдают полные серии (24/24, проверено дважды). Скорость 12 290 rps — на 19 % выше sing-box, в 9,5 раза выше xray. Все гейты зелёные, утечек нет.
+
+**Чего нельзя.** Длительная нагрузка от `packet-up`-клиента xray роняет обслуживание через ~5 минут. Причина найдена и измерена: xray мультиплексирует около 65 потоков на одно соединение, а вход обслуживает один туннель на соединение и остальные отклоняет.
+
+**Что уже сделано в коде:**
+- ALPN ограничен `h2` — это убрало обрывы TLS-рукопожатий полностью;
+- соединения освобождаются по завершении туннеля и по простою;
+- `unwrap` разделён на половины безопасности и фрейминга — шаг 1 исправления мультиплексирования.
+
+**Что осталось:** шаги 2-4 из C7.105 — вернуть `spawn_multiplexer`, дополнить места вызова `accept` через `.0`, направить каждый лишний туннель в `serve_stream` (он уже есть). Судить через `/tmp/stress.sh 420`.
+
+**Ошибка, которая стоила больше всех:** C7.39 откатил готовую реализацию мультиплексирования по замеру 0/5, а стенд той эпохи смешивал прогоны (доказано в C7.40). Реализация была верной, измерение — нет.
