@@ -823,6 +823,8 @@ where
         // further POSTs on the same connection, and a bare connection driver would pump frames
         // without ever handing them to anyone. That is why nothing moved before — the POSTs were
         // never read, not misrouted.
+        let extra_for_loop = extra_tx.clone();
+        let base_for_loop = base.clone();
         tokio::spawn(async move {
             loop {
                 // Retire the connection when its tunnel finishes, **and** when it has simply gone
@@ -853,6 +855,63 @@ where
                     break;
                 };
                 let post_path = post.uri().path().to_string();
+                // A later **download** on this connection is a tunnel of its own, not an upload.
+                // Xray reuses one socket for many streams, so `packet-up` and `stream-up` clients
+                // open subsequent sessions here (C7.116).
+                if post.method() == Method::GET {
+                    let suffix = post_path
+                        .strip_prefix(base_for_loop.as_str())
+                        .map(|x| x.trim_matches('/').to_string())
+                        .filter(|x| looks_like_a_session(x));
+                    if let Some(new_session) = suffix {
+                        let (up_tx, up_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+                        let (dn_tx, mut dn_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+                        with_sessions(|map| {
+                            map.insert(
+                                new_session.clone(),
+                                Session {
+                                    tx: up_tx,
+                                    state: Reassembly {
+                                        max_buffered: buffered_bound,
+                                        ..Reassembly::default()
+                                    },
+                                    opened: std::time::Instant::now(),
+                                },
+                            );
+                        });
+                        let bt = if no_sse_header {
+                            "application/octet-stream"
+                        } else {
+                            "text/event-stream"
+                        };
+                        if let Ok(resp) = Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", bt)
+                            .body(())
+                            && let Ok(mut send2) = post_respond.send_response(resp, false)
+                        {
+                            tokio::spawn(async move {
+                                while let Some(chunk) = dn_rx.recv().await {
+                                    if send2.send_data(chunk, false).is_err() {
+                                        break;
+                                    }
+                                }
+                                let _ = send2.send_data(Bytes::new(), true);
+                            });
+                            let tunnel: Box<dyn AsyncStream> = Box::new(ChannelDuplex {
+                                rx: up_rx,
+                                tx: dn_tx,
+                                read_buf: Bytes::new(),
+                                read_pos: 0,
+                                close: None,
+                            });
+                            if extra_for_loop.send(tunnel).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // `/<base>/<session>/<seq>` for packet-up, `/<base>/<session>` for stream-up. Taking
                 // the last segment as a sequence unconditionally made the session "x" for the
                 // unnumbered form, which is why xray's stream-up never delivered anything.
