@@ -13200,3 +13200,18 @@ xray server:  400/400 successful in 0.470 s  =  851 req/s
 **Eighteen hundredths of a second faster than the reference on the same work, with no failures on either side.** The earlier 6x deficit was an artefact of the harness, twice over: first from mismatched clients (C7.154), then from a metric that does not measure throughput (C7.156).
 
 Item 1 of this goal is therefore closed on measurement: the failures were a descriptor leak and a deadlocked session (both fixed, C7.150-C7.153), and once fixed the server sustains concurrent load faster than the implementation it was compared against.
+
+### C7.161 — the coverage failure is not reproduced locally, even with the CI's exact sing-box
+
+Tested the two differences that could plausibly matter:
+
+```
+project script, local sing-box 1.11.4:   ./scripts/coverage.sh --lcov /tmp/lcov.info -> EXIT 0
+CI sing-box 1.11.15, interop suites:    41 passed + 2 passed
+```
+
+So neither the script nor the interop tests explain it. What the timing still says: the job fails about three minutes after starting, while the same instrumented run takes eight to nine minutes on this twenty-four-core machine — so it dies early, not on the hour-long timeout, and not because instrumented compilation ran long.
+
+One contributing fact is now clear and is mine to own: the workflow cancels superseded runs (`concurrency`), and this session pushed often enough that several coverage runs ended as `cancelled`, which reads like a failure in a list of runs. That does not explain the twenty consecutive failures that predate this session, but it does mean the history has to be read carefully.
+
+The job now prints the failing tests and any panics into its step summary, so the next failure names its cause instead of reporting only a non-zero exit. Reading that summary needs a GitHub session, which this machine does not have.
