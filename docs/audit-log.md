@@ -12876,3 +12876,21 @@ That is as far as measurement takes this in the time available. The isolated fac
 - the difference must therefore be in what the client decides to send, which is influenced by how we retire connections between requests on a shared socket.
 
 The next thing to try, with fresh context: keep the split-mode connection alive **only while it has an unfinished session** and close it a fixed delay after the *last* request rather than after a tunnel ends — the two policies tried so far were "close at tunnel end" and "never close", and neither matches what xray's own server does, which is ordinary HTTP keep-alive with no forced close at all.
+
+### C7.142 — success tracks the number of connections the client opens, exactly
+
+Keep-alive with 30 s idle retirement, three freshly started stacks, eight requests each:
+
+```
+stack 1:  0/8    connections 2   uploads 0
+stack 2:  3/8    connections 4   uploads 3
+stack 3:  7/8    connections 7   uploads 7
+```
+
+The relationship is monotone and tight: **every request that got its own connection also got its upload, and every request the client squeezed onto a shared connection lost it.** Eight requests over seven connections is 7/8; eight over two is 0/8.
+
+So the question is no longer "why is the upload lost" but **"why does the client sometimes open two connections instead of seven"** — and since the same client opens one per request against xray's server, the answer is in what our server does to its pool accounting.
+
+Xray's pool (`mux.go`) creates a new `xmuxClient` when `Running >= maxConcurrency`. `Running` rises on each Dial and falls when the connection closes. A connection we keep alive for 30 s counts as running for 30 s, which should force **more** dials, not fewer — so the low-connection stacks suggest the client believes the existing connections can serve it, and then loses the uploads on them.
+
+That points at the download response: if our response does not look "finished" to the client, it may keep reusing the same connection while each session starves.

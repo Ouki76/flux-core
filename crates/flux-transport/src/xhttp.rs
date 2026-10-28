@@ -589,7 +589,7 @@ impl Default for Reassembly {
 
 /// Xray's default for `scMaxBufferedPosts`.
 /// A connection is retired after this long with no request on it.
-const IDLE_CLOSE_MS: u64 = 5000;
+const IDLE_CLOSE_MS: u64 = 30000;
 
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
@@ -850,15 +850,12 @@ where
                     // Split modes: retire the connection when its session ends. Keeping it alive
                     // measured worse (15/35 against 44/21) even though the client reports
                     // "http2: client connection lost" on uploads either way (C7.126).
+                    // Plain HTTP keep-alive, like xray's own server: a finished session does not
+                    // close the connection, because later requests share it. Retirement happens in
+                    // the idle branch below, timed from the last request.
                     _ = &mut close_rx, if !tunnel_done => {
                         tunnel_done = true;
-                        connection.graceful_shutdown();
-                        tokio::time::timeout(
-                            std::time::Duration::from_millis(IDLE_CLOSE_MS),
-                            connection.accept(),
-                        )
-                        .await
-                        .unwrap_or_default()
+                        continue;
                     }
                     idle = tokio::time::timeout(
                         std::time::Duration::from_millis(IDLE_CLOSE_MS),
