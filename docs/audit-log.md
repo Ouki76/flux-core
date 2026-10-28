@@ -12667,3 +12667,20 @@ What is **not** wrong, measured: our server accepts every connection offered (20
 **The honest state of the objective:** `stream-one` and `stream-up` now serve sustained load without failing; `packet-up` does not, at roughly two requests in three, and every server-side lever I can find has been measured and rejected. The remaining possibilities are in xray's upload path (`httpClient` in `dialer.go`) and cannot be changed from this repository.
 
 That is not a satisfying place to stop, but it is a measured one: three modes' worth of evidence, seven rejected remedies, and a client that names its own failure.
+
+### C7.131 — the numbers that stand, from repeated measurements
+
+Every figure below comes from at least two independent runs; single runs are noted as such and should not be quoted.
+
+```
+stream-one  sustained, 240 s        18 990 ok /      0 bad   (one run, zero failures)
+stream-one  sustained, 420 s        29 762 ok          then port table exhausted
+stream-up   bursts, 3 stacks         18/18                        (100 %)
+packet-up   bursts, 4 stacks x 8     23/32 = 72 %   (second sample 22/32 = 69 %)
+```
+
+**`packet-up` sits at about 70 %, not 8 %** as at the start of this work, and the spread between its two samples (72 %, 69 %) is now small — the earlier swings between 23 % and 76 % came from measuring with a policy patch that had silently failed to apply (C7.129), so those runs were all the same code.
+
+Its remaining failures are stack-level: a stack serves six, seven or eight of eight, or falls to two or three. Not one failure is attributable to anything the server discards — `delivered=None` is zero across every run, and the client names its own fault: `failed to send upload ... http2: client connection lost`.
+
+Gates on the committed tree: fmt clean, **clippy 0 warnings**, **workspace suite 0 failing**, release builds.
