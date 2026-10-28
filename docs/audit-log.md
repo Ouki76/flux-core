@@ -12504,3 +12504,19 @@ Twenty-fold difference from a single policy choice, in opposite directions. The 
 So the code now does both: the split-mode loop calls `graceful_shutdown()` when its tunnel ends, and the single-tunnel driver leaves the connection to the idle timer. Committed, 313 tests, clippy clean, both measured.
 
 **This also retires a conclusion I published earlier.** The "14 dials produced 2 connections" observation, and the three rounds built on it, were measuring local port exhaustion in my own harness rather than a client that refused to connect. The server was never refusing anything — it accepted twenty out of twenty when asked directly.
+
+### C7.122 — packet-up after the policy split: 62-82 %, and nothing is dropped server-side
+
+Two runs, same code, 140 requests each:
+
+```
+150 s:  ok=115 bad=25   (82 %)   GET 129, POST 115, VLESS timeouts 12, delivered=None 0
+300 s:  ok= 87 bad=53   (62 %)   GET 106, POST  90, VLESS timeouts 16
+```
+
+Against 8 % at the start of this work. Two properties matter more than the percentage:
+
+- **`delivered=None` is zero** — every upload that arrives is handed to its session; the earlier failure mode "the POST is received and thrown away" no longer happens;
+- the losses are split between requests that never open a download (about a tenth) and tunnels whose upload never arrives (timeouts), not a collapse of the server.
+
+The spread between 62 % and 82 % on identical code is the same run-to-run variance that has misled every single-measurement conclusion in this project; only repeated trials should be quoted from here.
