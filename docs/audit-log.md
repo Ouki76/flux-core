@@ -13215,3 +13215,28 @@ So neither the script nor the interop tests explain it. What the timing still sa
 One contributing fact is now clear and is mine to own: the workflow cancels superseded runs (`concurrency`), and this session pushed often enough that several coverage runs ended as `cancelled`, which reads like a failure in a list of runs. That does not explain the twenty consecutive failures that predate this session, but it does mean the history has to be read carefully.
 
 The job now prints the failing tests and any panics into its step summary, so the next failure names its cause instead of reporting only a non-zero exit. Reading that summary needs a GitHub session, which this machine does not have.
+
+### C7.162 — CI has been red at clippy, not at the tests
+
+The step list of the "Check, Lint & Test" job settles where the failure is:
+
+```
+7  Run Clippy linter            -> failure
+8  Build documentation          -> skipped
+9  Run unit & integration tests -> skipped
+10 Build release binary         -> skipped
+```
+
+So the suite never ran: the job died at clippy, with the documented exit 101, and every later step was skipped. The coverage job inherits the same red because it runs the same gates before measuring.
+
+The CI invocation differs from what I had been running locally in two ways, and one of them is the likely cause:
+
+```
+CI:      cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+local:   cargo clippy --workspace --all-targets -- -D warnings        (-D only, no --all-features)
+toolchain: CI pins 1.91.0, this machine has 1.97.0
+```
+
+Running the CI's exact command locally with the local toolchain passes, so `--all-features` alone is not it — the difference that remains is the pinned 1.91.0, whose clippy has a different lint set from 1.97.0.
+
+Also worth stating plainly: the xray install added before this was a real gap and is kept, but it was not the cause of the red CI — the tests it protects never ran.
