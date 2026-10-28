@@ -12894,3 +12894,20 @@ So the question is no longer "why is the upload lost" but **"why does the client
 Xray's pool (`mux.go`) creates a new `xmuxClient` when `Running >= maxConcurrency`. `Running` rises on each Dial and falls when the connection closes. A connection we keep alive for 30 s counts as running for 30 s, which should force **more** dials, not fewer — so the low-connection stacks suggest the client believes the existing connections can serve it, and then loses the uploads on them.
 
 That points at the download response: if our response does not look "finished" to the client, it may keep reusing the same connection while each session starves.
+
+### C7.143 — the upload goroutine only starts after the download returns headers
+
+From `dialer.go` (lines 433-445): the `packet-up` path opens the download with
+
+```go
+conn.reader, ... , err = httpClient2.OpenStream(ctx, requestURL2.String(), sessionId, nil, false)
+if err != nil { return nil, err }        // <- no upload goroutine is ever started
+...
+go func() { /* the upload loop */ }()
+```
+
+The upload loop is started **after** `OpenStream` returns, and `OpenStream` returns when the response headers arrive. So a download whose response head we delay — or never deliver — produces exactly what the counters show: a tunnel with zero bytes, a VLESS handshake timeout, and **no error in the client log at all**.
+
+That fits every measurement in C7.142: when the client opens a fresh connection the response head is delivered immediately and the request succeeds (7/8 with seven connections); when it multiplexes onto a connection already in use, the head is delayed or lost and the upload never starts (0/8 with two connections).
+
+**Next step, precisely:** instrument the moment we send the response head versus the moment the client's upload arrives, per request, on a multiplexed connection. If the head is late, the fix is to send it *before* doing anything else for that stream — including before creating the session — so no other work can delay it.
