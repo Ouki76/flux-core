@@ -12222,3 +12222,23 @@ Successful requests kept accumulating to the end of the five-minute window, RSS 
 **Что осталось:** шаги 2-4 из C7.105 — вернуть `spawn_multiplexer`, дополнить места вызова `accept` через `.0`, направить каждый лишний туннель в `serve_stream` (он уже есть). Судить через `/tmp/stress.sh 420`.
 
 **Ошибка, которая стоила больше всех:** C7.39 откатил готовую реализацию мультиплексирования по замеру 0/5, а стенд той эпохи смешивал прогоны (доказано в C7.40). Реализация была верной, измерение — нет.
+
+### C7.108 — the spaced-request result no longer reproduces: 2/12, not 12/12
+
+Smoke test of the release binary from the current commit — twelve requests, two seconds apart, mode `packet-up`, same harness that produced C7.79:
+
+```
+C7.79 (earlier):        12/12 — 100 %
+now:                     2/12 —  17 %
+```
+
+**This weakens the central conclusion of the campaign.** "The server serves every tunnel it is given; the losses are the client racing its pool" rested on that 12/12. It does not hold on the current tree.
+
+Two candidates, neither measured:
+
+1. a change since then broke it — the idle retirement (C7.94) and the `unwrap` split (C7.104) both touched this path;
+2. C7.79's 12/12 was itself a lucky run, like the 5/5 of C7.36 that C7.40 later retracted.
+
+**I am not choosing between them without a measurement**, and the measurement is cheap and specific: `git stash`-free bisect over the two commits after C7.79, running `/tmp/rec.sh` at each. That is the first task for a session with context to spare.
+
+Until then the honest statement in the report is weaker than the one written there: the inbound serves **bursts** perfectly in `stream-one` and `stream-up`, and its behaviour under spaced `packet-up` traffic is **not currently reproducible as good**.
