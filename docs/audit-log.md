@@ -13253,3 +13253,17 @@ Both fixed. `cargo +1.91.0 clippy --locked --workspace --all-targets --all-featu
 Confirmed on the next CI run: **"Run Clippy linter" passes**, documentation passes, and the failure has moved to step 9, "Run unit & integration tests". The coverage job, which failed at the same gate before, has yet to be re-read.
 
 So the twenty consecutive red runs were a toolchain mismatch that no local run could show, because this machine had only 1.97. Worth recording plainly: the project pins 1.91.0 in CI and in the Dockerfile, and every gate I ran in this session used 1.97 unless I said otherwise.
+
+### C7.164 — the CI test failure is environment-specific, and now observable
+
+Ran the whole suite on the pinned toolchain locally:
+
+```
+cargo +1.91.0 test --workspace --no-fail-fast   -> 0 failing suites
+```
+
+So the step-9 failure is not the Rust version (that was step 7, now fixed) and not reproducible on this machine. What differs in CI is the environment: a fresh runner, no `~/.local/bin`, xray installed to `/usr/local/bin`, and whatever network and capability limits the runner imposes.
+
+The step log needs a GitHub session, so the failure could only ever be reported as exit 101 — which is precisely why it stayed unexplained through twenty runs. The test step now re-emits every failing test and panic as `::error::` annotations, and **check-run annotations are readable through the public API without credentials**. The next failing run therefore names its tests to anyone, including this machine.
+
+That is the state to resume from: read `check-runs/{id}/annotations` for the "Check, Lint & Test" job on the newest commit and the failing test names will be there.
