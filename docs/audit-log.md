@@ -13037,3 +13037,31 @@ The arithmetic closes it: `packet-up` gives each request **two** connections (th
 So the failures under sustained load were never about the port table and never about the upload path: the process runs out of descriptors because it waits out an idle timer instead of noticing EOF. Xray's 9 990/0 with the same harness is the proof that a correct implementation has no trouble here.
 
 Next: make the connection notice the peer going away. A likely cause is that the download response stream stays open until its session ends, and an h2 connection cannot report itself closed while a stream is open — so the FIN is held behind a stream that outlives the request.
+
+### C7.151 — the leak is a deadlock, not a missing free
+
+Where the 1 730 sockets actually are — grouped by the *remote* port of every socket the server process holds in CLOSE-WAIT:
+
+```
+1729  ->  :18091      (the echo target)
+   1  ..  other
+```
+
+**All of them are outbound connections to the target, none are inbound.** The XHTTP side is innocent: the socket that never closes is the one the relay opened to the destination after the destination said goodbye.
+
+The cycle, traced through the code:
+
+```
+1. the copier finishes only when BOTH directions reach EOF   (copy.rs:458, `eof_ab && eof_ba`)
+2. the client direction reaches EOF only when the tunnel reports EOF
+3. the tunnel reports EOF only when its upload sender is dropped
+4. the upload sender is dropped only when the session entry is removed
+5. the session entry is removed only when the tunnel is dropped   (added: SessionGuard)
+6. the tunnel is dropped only when the relay finishes
+   -> back to 1.
+
+A session guard was added (the registry previously kept every session for ever — 1 730 sessions logged, 1 730 CLOSE-WAIT sockets, an exact match) and it is necessary, but it does not break the cycle on its own: measured after adding it, still 1 680 sockets to :18091.
+
+**The missing link is a policy decision, not a leak:** the copier waits for a half-close that this transport can never deliver, because `packet-up` keeps its upload open until the session ends. Xray's server ends the session when the target closes, which is what makes its own fd count stay at 173.
+
+Fix to make next: when the target direction reaches EOF, end the session (drop the tunnel, which closes the download stream and lets the client finish) instead of waiting for the client side to close first.

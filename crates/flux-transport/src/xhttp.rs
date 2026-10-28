@@ -461,8 +461,24 @@ where
 /// The server half of `packet-up` needs exactly this shape. Its upload is not a stream at all — it is
 /// a series of separate POSTs reassembled by sequence — so the read side is fed by the POST handlers
 /// through a channel; and its download is an h2 response body, so the write side is drained into that
+/// Removes a session from the registry when its tunnel is dropped.
+///
+/// Without this the entry lives for ever: it keeps the upload sender alive, so the tunnel never
+/// reports EOF, so the relay waits for a half-close that cannot come and the outbound socket to the
+/// target is held in CLOSE-WAIT. Measured before the fix: 1 730 sessions and 1 730 sockets in
+/// CLOSE-WAIT, one per successful request, until the descriptor limit ended the run.
+struct SessionGuard(String);
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        with_sessions(|map| map.remove(&self.0));
+    }
+}
+
 /// `SendStream` by a task.
 pub struct ChannelDuplex {
+    /// Removes the session entry on drop; see `SessionGuard`.
+    _session: SessionGuard,
     rx: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
     read_buf: Bytes,
@@ -879,6 +895,7 @@ where
                             let tunnel: Box<dyn AsyncStream> = Box::new(ChannelDuplex {
                                 rx: up_rx,
                                 tx: dn_tx,
+                                _session: SessionGuard(new_session.clone()),
                                 read_buf: Bytes::new(),
                                 read_pos: 0,
                             });
@@ -972,6 +989,7 @@ where
         });
         return Ok((
             Box::new(ChannelDuplex {
+                _session: SessionGuard(session.clone()),
                 rx: upload_rx,
                 tx: down_tx,
                 read_buf: Bytes::new(),
