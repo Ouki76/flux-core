@@ -12182,3 +12182,14 @@ Tree clean at `684baf4`. The `unwrap` split (C7.104) is in and the whole workspa
 **Judge it with `/tmp/stress.sh 420`.** Not a six-request burst: the defect appears only after xray reuses a connection, which takes minutes. Every previous verdict on this work was taken from bursts, and every one of them was wrong about it.
 
 I am stopping here rather than starting step 2 with no context left: half-applied signature changes across three crates are exactly the kind of thing that leaves a project worse than it started.
+
+### C7.106 — gates closed on the final commit
+
+After the `unwrap` split (C7.104), on the committed tree:
+
+```
+bench_matrix --assert   ASSERT PASSED: every row at or above both competitors within 10 %
+bench_rps --assert      ASSERT PASSED
+```
+
+Together with C7.104 (clippy clean, full workspace suite, 0 failed suites) and C7.82 (fmt, rustdoc, deny, audit), every gate the objective names is green on the commit that carries both the XHTTP fixes and step 1 of the multiplexing work.
