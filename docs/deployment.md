@@ -51,7 +51,7 @@ one manifest list, so `docker pull` selects the right architecture:
 | Ref | Built from |
 |---|---|
 | `ghcr.io/<owner>/flux-core:latest`, `:<version>`, `:<major>.<minor>` | a `v*` tag |
-| `ghcr.io/<owner>/flux-core:edge`, `:sha-<short>` | every push to `main` |
+| `ghcr.io/<owner>/flux-core:main`, `:sha-<short>` | every push to `main` |
 
 ```bash
 docker pull ghcr.io/<owner>/flux-core:latest

@@ -3,7 +3,7 @@ name: Docker
 # Multi-arch images (linux/amd64 + linux/arm64) published to GHCR.
 #
 # Triggers, and what each one is for:
-#   - push to main      -> builds and publishes `edge` and `sha-<short>`
+#   - push to main      -> builds and publishes `main` and `sha-<short>`
 #   - push of a v* tag  -> publishes the version, `<major>.<minor>` and `latest`
 #   - pull request      -> builds amd64 only, publishes nothing (validates the
 #                          Dockerfile and the context before it lands)
