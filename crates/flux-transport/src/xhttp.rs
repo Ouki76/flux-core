@@ -589,7 +589,7 @@ impl Default for Reassembly {
 
 /// Xray's default for `scMaxBufferedPosts`.
 /// A connection is retired after this long with no request on it.
-const IDLE_CLOSE_MS: u64 = 30000;
+const IDLE_CLOSE_MS: u64 = 2000;
 
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
