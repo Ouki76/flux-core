@@ -12193,3 +12193,15 @@ bench_rps --assert      ASSERT PASSED
 ```
 
 Together with C7.104 (clippy clean, full workspace suite, 0 failed suites) and C7.82 (fmt, rustdoc, deny, audit), every gate the objective names is green on the commit that carries both the XHTTP fixes and step 1 of the multiplexing work.
+
+### C7.107 — sustained-load number on the current commit (after the unwrap split)
+
+```
+t=235s  rss=13896kB fds=35 thr=26 ok=15 bad=45
+t=302s  rss=16872kB fds=46 thr=26 ok=26 bad=64
+FINAL ok=26 bad=64
+```
+
+Successful requests kept accumulating to the end of the five-minute window, RSS bounded at 16.9 MB, descriptors oscillating 35-46, threads constant.
+
+**Treat this as a boundary reading, not a survival result.** C7.99 measured the freeze at about five minutes — this run ended exactly at that boundary, so it says the service is alive at five minutes and nothing about six. Reporting it as stability would repeat the error of C7.94, where a run that ended just before the failure was read as its absence.
