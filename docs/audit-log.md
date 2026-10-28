@@ -12715,3 +12715,18 @@ The client reports "http2: client connection lost" in all three, and it performs
 That is the opposite of what the error message suggests, and it is why a controlled comparison mattered: I would have shipped the "wait for the upload" version on the strength of its rationale alone.
 
 Current behaviour kept: retire on session end. 313 tests, tree clean.
+
+### C7.134 — every gate green on the final tree
+
+```
+cargo fmt --check        clean
+clippy -D warnings       0 warnings
+cargo doc --no-deps      0 warnings
+cargo deny check         advisories ok, bans ok, licenses ok, sources ok
+cargo audit              no findings (exit 0)
+cargo test --workspace   0 failing suites
+bench_rps --assert       ASSERT PASSED
+bench_matrix --assert    ASSERT PASSED
+```
+
+All on the commit that carries the multiplexing work and the three measured connection policies.
