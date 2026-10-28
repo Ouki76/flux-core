@@ -12167,3 +12167,18 @@ procs:  none left running
 Verified: `clippy -D warnings` clean, **the entire workspace suite passes with 0 failed suites**, fmt applied.
 
 Remaining, per C7.103: the framing half returns extra tunnels for a single XHTTP framing, and the VLESS inbound dispatches each through the already-committed `serve_stream`. Then judge with `/tmp/stress.sh 420`.
+
+### C7.105 — stopping point: step 1 committed, step 2 needs a full-context session
+
+Tree clean at `684baf4`. The `unwrap` split (C7.104) is in and the whole workspace suite passes.
+
+**Step 2, exactly, for whoever picks this up.** It is one signature change plus three adaptations, and it must be done in one pass or the tree stops compiling:
+
+1. `crates/flux-transport/src/xhttp.rs`: `accept` returns `(Box<dyn AsyncStream>, UnboundedReceiver<Box<dyn AsyncStream>>)`; for the stream-one return, spawn `spawn_multiplexer(connection, base, no_sse_header, max_buffered, stream_up_secs, extra_tx)` instead of `spawn_connection_driver(connection, None)`. A `spawn_multiplexer` was written in C7.37 and compiled; it must be restored, with its `select!` carrying the idle deadline from C7.94 rather than replacing the driver wholesale — **that wholesale replacement is what made C7.39 fail**, together with a harness that C7.40 later showed was blending runs.
+2. Adapt every `accept` call site with `.0` — the tests included; this was mechanical in C7.37 and is the cheap part.
+3. `unwrap_framing` returns `(BoxedStream, Option<UnboundedReceiver<BoxedStream>>)`; `unwrap` drops the receiver.
+4. The VLESS inbound takes the receiver and spawns `serve_stream` per tunnel — `serve_stream` exists and is committed (`0bb936b`).
+
+**Judge it with `/tmp/stress.sh 420`.** Not a six-request burst: the defect appears only after xray reuses a connection, which takes minutes. Every previous verdict on this work was taken from bursts, and every one of them was wrong about it.
+
+I am stopping here rather than starting step 2 with no context left: half-applied signature changes across three crates are exactly the kind of thing that leaves a project worse than it started.
