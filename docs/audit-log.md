@@ -12619,3 +12619,20 @@ Both extremes are worse than the middle, and the client's "http2: client connect
 Kept the middle configuration: retire on session end. 313 tests, clippy clean, tree clean.
 
 **Summary of packet-up after this work:** 8 % at the start, 60-68 % now, with two modes at 100 %, and the remaining loss named by the client itself as a lost upload connection. Servicing upload connections continuously (committed) did not remove it either.
+
+### C7.128 — packet-up is stack-level, not request-level: 7/8, 6/8, 0/8
+
+Three freshly started stacks, eight requests each, with a one-second grace before a split-mode connection is retired:
+
+```
+trial 1: 7/8      trial 2: 6/8      trial 3: 0/8      13/24 = 54 %
+```
+
+Within a working stack the loss is now one or two requests in eight. The third stack served **nothing at all** — the same all-or-nothing shape recorded in C7.62 at the very beginning of this work, and the reason single runs of `packet-up` have swung between 23 % and 76 % on identical code.
+
+So there are two distinct defects and only one is understood:
+
+- **per-request losses inside a working stack**: one or two in eight, the client reports "http2: client connection lost" on the upload;
+- **a stack that is born dead**: serves nothing for its entire life. That is a startup condition, not a per-request one, and it is the larger of the two when it happens.
+
+The one-second grace is committed (68/22 in one run, 7/8 and 6/8 here). 313 tests, clippy clean.
