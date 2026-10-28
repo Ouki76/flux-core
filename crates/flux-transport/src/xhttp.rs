@@ -1171,7 +1171,66 @@ where
                     protocol: "xhttp",
                     message: format!("failed to send the XHTTP download response: {e}"),
                 })?;
-        shared::spawn_connection_driver(connection, None);
+        // Later requests on this connection belong to *sessions*, not to new tunnels: a `stream-up`
+        // download is one stream per session, and that session's upload may follow on the same
+        // connection. Handing the connection to a refusing driver reset those with REFUSED_STREAM,
+        // which is exactly what made sing-box report `stream error ... REFUSED_STREAM` (C7.137).
+        // Uploads are delivered to their session here — turning them into tunnels instead is the
+        // mistake that cost packet-up 78 points in C7.126.
+        let base_for_later = base.clone();
+        tokio::spawn(async move {
+            let mut connection = connection;
+            while let Some(accepted) = connection.accept().await {
+                let Ok((later, mut later_respond)) = accepted else {
+                    break;
+                };
+                let later_path = later.uri().path().to_string();
+                let later_session = later_path
+                    .strip_prefix(base_for_later.as_str())
+                    .map(|suffix| suffix.trim_matches('/').to_string());
+                if !is_uplink_method(later.method()) || later_session.is_none() {
+                    let _ = later_respond.send_response(
+                        Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(())
+                            .expect("static refusal"),
+                        true,
+                    );
+                    continue;
+                }
+                let session_of_post = later_session.unwrap_or_default();
+                let later_type = if no_sse_header {
+                    "application/octet-stream"
+                } else {
+                    "text/event-stream"
+                };
+                let Ok(resp) = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", later_type)
+                    .body(())
+                else {
+                    continue;
+                };
+                let _ = later_respond.send_response(resp, true);
+                let mut body = later.into_body();
+                let sender = with_sessions(|map| map.get(&session_of_post).map(|e| e.tx.clone()));
+                tokio::spawn(async move {
+                    while let Some(frame) = body.data().await {
+                        match frame {
+                            Ok(data) => {
+                                if let Some(sender) = &sender
+                                    && !data.is_empty()
+                                    && sender.send(data).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        });
         return Ok((Box::new(H2Stream::new(send, recv)), extra_rx));
     }
 
