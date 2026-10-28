@@ -12107,3 +12107,17 @@ flux "VLESS handshake timed out": 9
 In the state where nothing works: our port is open and accepts, xray **does** dial for each new request, the tunnel opens, and no upload arrives.
 
 This rules out every server-side mechanism that could explain it — listener, accept, TLS, h2 handshake, connection limits. The connection is made and the payload never comes. Together with C7.99 (RSS flat, descriptors falling, threads constant while dead) the conclusion is that **our process is healthy throughout and the peer stops uploading**. The 177 accumulated dials are the number to pursue next.
+
+### C7.101 — CORRECTION: stream-up also degrades under sustained load; my recommendation was unmeasured
+
+C7.83 recommended `stream-up` for xray clients on the strength of 24/24 bursts — a claim **never tested under sustained load**. Tested now, seven minutes:
+
+```
+t=249s  rss=44076kB fds=141 thr=26 ok=191 bad=25174  (bad climbing 15 per sample)
+```
+
+All processes alive when sampled. Failures are **instant**, not timeouts, and flux logs h2 `Data` frames on **`StreamId(131)`** — about sixty-five streams multiplexed onto one connection, while our server serves one tunnel per connection.
+
+`stream-up` does not fail like `packet-up` (timeouts after five minutes), but it fails: responses stop completing and throughput collapses.
+
+**I withdraw the C7.83 recommendation.** It was an inference from bursts presented as operational guidance — the exact failure mode this log keeps recording: a number from one experiment used to justify a claim about another. The report still carries that recommendation and is wrong; it must be corrected before anyone acts on it.
