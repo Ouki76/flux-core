@@ -1052,7 +1052,60 @@ where
                 }
             }
         });
-        shared::spawn_connection_driver(connection, None);
+        // An upload connection carries POSTs only, and the peer sends more than one on it. Handing it
+        // to a bare driver ignored everything after the first chunk — which the client reports as
+        // "http2: client connection lost" (C7.126). Keep servicing it.
+        let base_for_uploads = base.clone();
+        tokio::spawn(async move {
+            let mut connection = connection;
+            while let Some(accepted) = connection.accept().await {
+                let Ok((post, mut post_respond)) = accepted else {
+                    break;
+                };
+                let path = post.uri().path().to_string();
+                if post.method() != Method::POST {
+                    let _ = post_respond.send_response(
+                        Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .body(())
+                            .expect("static refusal"),
+                        true,
+                    );
+                    continue;
+                }
+                let last = path.rsplit('/').next().unwrap_or("").to_string();
+                let (sess, seq_str) = match path.rsplit_once('/') {
+                    Some((rest, seq)) if last.parse::<u64>().is_ok() => (
+                        rest.rsplit('/').next().unwrap_or("").to_string(),
+                        seq.to_string(),
+                    ),
+                    _ => (last.clone(), String::new()),
+                };
+                let _ = base_for_uploads.as_str();
+                let seq: u64 = seq_str.parse().unwrap_or_default();
+                let mut body = post.into_body();
+                let mut chunk = Vec::new();
+                while let Some(Ok(data)) = body.data().await {
+                    chunk.extend_from_slice(&data);
+                }
+                let _ = post_respond.send_response(
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(())
+                        .expect("static ack"),
+                    true,
+                );
+                let chunk = Bytes::from(chunk);
+                with_sessions(|map| {
+                    if let Some(entry) = map.get_mut(&sess) {
+                        let ready = entry.state.accept(seq, chunk);
+                        for piece in ready {
+                            let _ = entry.tx.send(piece);
+                        }
+                    }
+                });
+            }
+        });
         return Err(FluxError::Protocol {
             protocol: "xhttp",
             message: format!("packet-up chunk {seq} for session {session} accepted"),
