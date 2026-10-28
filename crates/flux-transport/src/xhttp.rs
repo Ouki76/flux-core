@@ -561,6 +561,18 @@ impl AsyncWrite for ChannelDuplex {
         // relay's other direction reaches EOF. Leaving this a no-op kept every session alive for
         // ever — 1 700 sockets to the target stuck in CLOSE-WAIT (C7.151).
         self.tx.take();
+        // A half-close here means the upstream finished, so the session is over in this direction.
+        // For `packet-up` the peer keeps its upload POST open until the session ends, so waiting for
+        // it would deadlock: the copier sat at "b at EOF, a quiet" for every request, holding the
+        // socket to the target in CLOSE-WAIT. Ending the upload as well is what xray's own server
+        // does when the target closes.
+        let id = self._session.0.clone();
+        with_sessions(|map| {
+            if let Some(entry) = map.get(&id) {
+                let _ = entry.tx.send(Bytes::new());
+            }
+            map.remove(&id);
+        });
         Poll::Ready(Ok(()))
     }
 }
