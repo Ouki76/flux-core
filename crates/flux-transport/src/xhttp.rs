@@ -978,31 +978,38 @@ where
                     });
                     continue;
                 }
-                let mut chunk = Vec::new();
-                while let Some(frame) = body.data().await {
-                    match frame {
-                        Ok(data) => chunk.extend_from_slice(&data),
-                        Err(_) => break,
-                    }
-                }
-                let chunk = Bytes::from(chunk);
+                // A numbered upload also has to be read off the loop: its DATA frames arrive after
+                // the headers, and reading them here stalled the accept loop — which delayed the
+                // response head of the *next* request on this connection. Xray starts its upload
+                // goroutine only once that head arrives (dialer.go), so a stalled loop cost the
+                // following session its upload entirely (C7.143).
                 let seq = seq.expect("numbered");
-                let delivered = with_sessions(|map| {
-                    if let Some(entry) = map.get_mut(&session_of_post) {
-                        let ready = entry.state.accept(seq, chunk);
-                        let n: usize = ready.iter().map(|p| p.len()).sum();
-                        for piece in ready {
-                            let _ = entry.tx.send(piece);
+                tokio::spawn(async move {
+                    let mut chunk = Vec::new();
+                    while let Some(frame) = body.data().await {
+                        match frame {
+                            Ok(data) => chunk.extend_from_slice(&data),
+                            Err(_) => break,
                         }
-                        Some(n)
-                    } else {
-                        None
                     }
+                    let chunk = Bytes::from(chunk);
+                    let delivered = with_sessions(|map| {
+                        if let Some(entry) = map.get_mut(&session_of_post) {
+                            let ready = entry.state.accept(seq, chunk);
+                            let n: usize = ready.iter().map(|p| p.len()).sum();
+                            for piece in ready {
+                                let _ = entry.tx.send(piece);
+                            }
+                            Some(n)
+                        } else {
+                            None
+                        }
+                    });
+                    tracing::debug!(
+                        "packet-up: conn#{conn_id} POST seq={seq:?} session={} delivered={delivered:?}",
+                        &session_of_post[..session_of_post.len().min(8)]
+                    );
                 });
-                tracing::debug!(
-                    "packet-up: conn#{conn_id} POST seq={seq:?} session={} delivered={delivered:?}",
-                    &session_of_post[..session_of_post.len().min(8)]
-                );
             }
         });
         return Ok((
