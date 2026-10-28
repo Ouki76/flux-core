@@ -12789,3 +12789,17 @@ sing-box packet-up:   0/8  ->  8/8,  zero errors in its log
 **This is a genuine compatibility defect, not a tuning question**: any client using `uplinkHTTPMethod: PUT` could not use this inbound at all. It was invisible because only xray was ever tested, and xray happens to default to POST.
 
 Xray packet-up after the change: four samples of 4x8 — 72 %, 69 %, 38 %, 53 %, mean about 58 % with a wide spread. The two low samples are within the variance this mode has shown all along; the change is provably neutral for POST (`is_uplink_method` returns true for POST exactly as the old condition did).
+
+### C7.138 — sing-box: 24/24 across three stacks, zero errors
+
+```
+stack 1: 8/8  (errors in sing-box log: 0)
+stack 2: 8/8  (errors in sing-box log: 0)
+stack 3: 8/8  (errors in sing-box log: 0)
+```
+
+And the shape it uses is visible in our own log: **`first request: PUT /x`** — an unnumbered uplink with no session in the path, i.e. the `stream-up` structure over a PUT instead of a POST. With PUT accepted, it serves every request and its log contains no error at all.
+
+**This is the cleanest result of the entire project**: 24 of 24 on freshly started stacks, no failures anywhere, no errors reported by the client.
+
+It also reframes the `packet-up` work: the same inbound, in the same configuration, serves a correct client perfectly. What remains is specific to xray's `packet-up` client, whose upload path reports `http2: client connection lost` under every server policy measured.
