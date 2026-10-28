@@ -12435,3 +12435,23 @@ no shutdown on tunnel end, idle 1.5 s:  3 transport tests fail
 Neither is acceptable — the second breaks the suite, the first did not help. Reverted to the committed behaviour: 313 tests green, tree clean.
 
 So there are **two separate faults**, and only one of them is still open: the connection is retired after a single tunnel (by design in every mode except the multiplexing I added), and the peer then does not reliably open a replacement. Closing that gap needs the retirement policy decided together with the tests rather than against them — the tests encode "a finished tunnel ends its connection", which is precisely the behaviour multiplexing wants to abolish.
+
+### C7.119 — packet-up: the peer does not multiplex at all, and only opens 70 connections for 105 requests
+
+Exact counts from a 300 s `packet-up` run (52 ok, 53 bad = 105 requests):
+
+```
+connections accepted:            70   (every one with a GET as its first request)
+connections with POST first:      0
+downloads handed out on a reused connection:  0
+numbered POSTs received:         53
+VLESS handshake timeouts:        16
+```
+
+Three conclusions, all from those numbers:
+
+1. **Xray does not multiplex `packet-up` at all.** Not one second download arrived on an existing connection, so the split-mode multiplexer I added never fires for this client. The `http2.Transport` reuse that the source describes applies to streams within one connection, and xray opens a fresh connection per `packet-up` session instead.
+2. **A third of the requests never get a connection** — 105 requested, 70 opened. That is the same client-side gap measured earlier (14 dials, 2 accepts), now quantified under load.
+3. Of the 70 that did open, 18 fail (16 timeouts), so roughly a quarter of established tunnels lose their payload.
+
+So `packet-up` is limited by how many connections the peer chooses to open, not by anything this server refuses. The connection-lifetime policy change (idle retirement instead of GOAWAY on tunnel end) is still correct for `stream-one` and is committed, but it cannot help a mode where the peer never reuses a connection in the first place.
