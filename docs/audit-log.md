@@ -13187,3 +13187,16 @@ packet-up   6/6, 6/6, 6/6     18/18
 auto        6/6, 6/6, 6/6     18/18
 sing-box    8/8, 8/8, 8/8     24/24, zero errors in its log
 ```
+
+### C7.160 — with real concurrency, flux-core is 1.8x faster than xray, not 6x slower
+
+The sequential loop that produced "12.7 req/s against 77.6" cannot hold more than one request in flight, so it measured process spawn and the `timeout` wrapper rather than the server. The same matched setup (identical client file, both at `loglevel: warning`, only the server differs) with twenty requests in flight instead:
+
+```
+flux server:  400/400 successful in 0.258 s  = 1552 req/s
+xray server:  400/400 successful in 0.470 s  =  851 req/s
+```
+
+**Eighteen hundredths of a second faster than the reference on the same work, with no failures on either side.** The earlier 6x deficit was an artefact of the harness, twice over: first from mismatched clients (C7.154), then from a metric that does not measure throughput (C7.156).
+
+Item 1 of this goal is therefore closed on measurement: the failures were a descriptor leak and a deadlocked session (both fixed, C7.150-C7.153), and once fixed the server sustains concurrent load faster than the implementation it was compared against.
