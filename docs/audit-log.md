@@ -12378,3 +12378,20 @@ Both measured on the tree that carries every change from this session — ALPN `
 | throughput | 12 290 rps, +19 % vs sing-box, 9.5x xray | 2 |
 
 Everything in this log that was claimed from a single measurement and later re-tested was retracted. That is the standard these five claims have now been held to.
+
+### C7.116 — multiplexing landed: 26 -> 19 534 successful requests under the same load
+
+The fix the source pointed to, implemented and measured:
+
+```
+before (one tunnel per connection):   26 successful requests in 5 minutes, then dead
+after  (every stream served):     19 534 successful, 0 failures for ~6.5 minutes
+```
+
+RSS flat at 12.5-12.9 MB, descriptors 11-13, threads constant at 26 — **no growth at all across nineteen thousand requests.**
+
+**What changed:** `accept` returns the first tunnel plus a receiver of the rest; the stream-one driver turns every later POST on the connection into a tunnel instead of discarding it; the VLESS inbound serves each through `serve_stream`. The pipeline gained `unwrap_multiplexed`, and the inbound now uses it. 313 transport tests pass, clippy clean, release built.
+
+**Still not finished:** after roughly six and a half minutes the failures return (7 496 of them in the remainder of the run). So multiplexing removed the immediate wall but something else still degrades later. The honest number to carry forward is: **750x more work served before the failure, not no failure.**
+
+Modes other than `stream-one` still need the same treatment: the split-mode accept loop does not yet hand out later downloads as tunnels, so `packet-up` and `stream-up` remain on the old behaviour.
