@@ -12959,3 +12959,18 @@ The same 24/24 in the controlled test, and the process bounded at a fifth of the
 **Committed. 313 tests, clippy clean.**
 
 The sustained harness still reports many failures — that measurement drives requests back-to-back through one `curl` after another and has repeatedly hit the local port table and other limits; the controlled comparisons (fresh stack, eight requests) are what tell the two apart.
+
+### C7.147 — final verification: every gate green on the fixed tree
+
+```
+fmt --check              OK
+clippy -D warnings       OK
+rustdoc                  0 warnings
+deny check               advisories ok, bans ok, licenses ok, sources ok
+audit                    exit 0
+cargo test --workspace   0 failing suites  (requires ~/.local/bin on PATH for the xray matrix test)
+bench_rps --assert       ASSERT PASSED
+bench_matrix --assert    ASSERT PASSED
+```
+
+One note worth keeping: `test_xray_matrix_configs` panics unless the `xray` binary is on `PATH` (or `XRAY_BIN` is set). My first gate run omitted `~/.local/bin` and reported a failure that had nothing to do with the code; with the correct PATH the suite is green. That test failing loudly is the intended behaviour, and it is the reason the project insists `~/.local/bin` is on `PATH`.
