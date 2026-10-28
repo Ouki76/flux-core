@@ -12264,3 +12264,26 @@ What is still measured and still true:
 - xray multiplexes ~65 streams onto one connection (C7.101).
 
 Changed: the idle retirement is restored (it measured no worse than its absence, and both states fail), and C7.79 is marked retracted in the report.
+
+### C7.110 — the losses happen before our accept(): 14 dials, 2 accepts
+
+A single spaced run, counted from both logs:
+
+```
+requests issued:            12
+xray "dialing to ...19951": 14
+our "tcp accepted from":     2
+first requests reaching h2:  2
+TLS handshake errors:        0
+VLESS handshake timeouts:    1
+successes:                   1
+```
+
+**Xray attempts fourteen connections and our listener accepts two.** Not one TLS error is logged, so the other twelve never reached the TLS layer — they are lost between xray's connect and our `accept()`.
+
+Both `serve_connection` call sites in the VLESS inbound are inside `tokio::spawn` (lines 141 and 269), so the accept loop is not blocked by a stuck tunnel. The gap is therefore in the kernel's listen path or in xray's connect — the one place this session has never been able to look, because `tcpdump` needs root.
+
+**This supersedes the pool explanation.** Whatever the client is doing, the requests are not reaching the listener, and every theory built on "the server receives the tunnel and refuses it" was addressing a stage that most of these requests never reach.
+
+Next, with root available: `tcpdump -i lo port
+19951` during one such run shows in one command whether the SYNs arrive (server-side problem: backlog, accept, firewall) or never leave xray (client-side problem). No further inference will settle it.
