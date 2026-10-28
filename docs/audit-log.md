@@ -13282,3 +13282,9 @@ cargo fmt --all --check              not available (rustfmt not installed for 1.
 ```
 
 `cargo +1.91.0 fmt` initially reported a failure, and that was my own error: the 1.91 toolchain was installed with `--profile minimal --component clippy`, so rustfmt is not present for it and the command errored rather than finding differences. The Formatting job in CI passes on this same tree, which is the check that matters.
+
+### C7.166 — where the last item stands
+
+All that is left of goal item 3 is reading the failing test names from a CI run. That is not a code question any more: the job now emits them as `::error::` annotations, and the check-runs annotations endpoint is public. The only obstacle is the unauthenticated rate limit — 60 requests an hour, already spent on polling — which resets within minutes.
+
+Resume by calling the annotations endpoint for the "Check, Lint & Test" job on the newest commit; the failing test names will be listed there. Everything up to that point is measured and recorded: the clippy failure that kept CI red for twenty runs is fixed and verified on Rust 1.91.0, which is the version CI and the Dockerfile pin and which no gate in this session had been run against until now.
