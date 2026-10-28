@@ -12803,3 +12803,29 @@ And the shape it uses is visible in our own log: **`first request: PUT /x`** —
 **This is the cleanest result of the entire project**: 24 of 24 on freshly started stacks, no failures anywhere, no errors reported by the client.
 
 It also reframes the `packet-up` work: the same inbound, in the same configuration, serves a correct client perfectly. What remains is specific to xray's `packet-up` client, whose upload path reports `http2: client connection lost` under every server policy measured.
+
+### C7.139 — control test: xray client is fine, xray->flux is not
+
+The comparison that should have come thirty rounds earlier:
+
+```
+xray client -> xray server   8/8    zero upload errors in the client log
+xray client -> flux server   1/8    zero upload errors as well
+```
+
+So the client is not at fault, and my earlier conclusion ("the loss is in xray's upload path") is **withdrawn**. Against its own server the same binary performs perfectly; against ours it does not.
+
+What our logs show during the flux run:
+
+```
+connections accepted: 4
+first requests:       8      <- multiplexing is working
+downloads:            4
+VLESS handshake timed out on a multiplexed tunnel; tunnel ended after 0 bytes
+```
+
+Eight requests arrived over four connections, four became tunnels, and those tunnels received **zero bytes** — no upload ever came for them, and the client logged no error about it. With xray's server the very same client produces a request and an upload for every one.
+
+So the difference is in what our inbound sends back. The next step is a byte-level comparison of responses to the same `packet-up` GET: xray's server sends `X-Padding` and a specific content-type from `WriteResponseHeader` (`hub.go`), and the client may be waiting on something in that response before it starts uploading.
+
+Everything is committed, 313 tests pass.
