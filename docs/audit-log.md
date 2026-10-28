@@ -13156,3 +13156,18 @@ xray server:  0.037  0.011  0.012  0.011  0.010  0.011  0.009  0.012  0.011  0.0
 The two cannot both be right, and the honest reading is that the sustained harness measures something dominated by process spawn, the `timeout` wrapper and the pipe to `tail`, with a handful of fast failures mixed in. Quoting it as a throughput comparison was wrong twice: first with mismatched clients (C7.154), now with a metric that does not track what it appears to measure. Until the harness is replaced with something that can hold many requests in flight — `bench_rps`, or a client that keeps connections busy — no throughput claim about `xhttp` should be made from it.
 
 What stands regardless: the descriptor leak is gone (217 -> 15), CLOSE-WAIT is empty (2 600 before), memory is 14 MB under load instead of 148 MB, and per-request latency is 2 ms against the reference's 11 ms.
+
+### C7.158 — coverage passes locally; the CI failure is not reproduced here
+
+Installed the toolchain the job uses (`cargo-llvm-cov` 0.9.1 plus `llvm-tools-preview`) and ran the project's own script:
+
+```
+./scripts/coverage.sh --lcov /tmp/lcov.info    -> EXIT=0, 0 failing suites, report written
+cargo test --test test_wireguard_interop       -> 2 passed (with a real sing-box)
+```
+
+The one failure I did reproduce was self-inflicted: I passed `SINGBOX_BIN=/usr/local/bin/sing-box`, which does not exist on this machine, and the WireGuard interop tests failed for that reason. With the correct path they pass. **So there is no evidence yet that the CI failure is these tests** — only that they are the part of the suite that depends on the environment.
+
+What the job's timing does establish: it fails **2.2 minutes** after starting, not at the 60-minute timeout, so it is a hard error rather than an instrumented build running long. The failing step is "Measure coverage (lcov)", and the step before it — the tier probe — succeeds, so the toolchain is found.
+
+Without the step log (no `gh`, and the logs endpoint needs auth) the next honest step is to make the job print its own diagnosis: run the suite with `--no-fail-fast` and echo which test failed, so the next run names the culprit instead of only reporting a non-zero exit.
