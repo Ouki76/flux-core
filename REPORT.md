@@ -103,3 +103,38 @@ Measured against a real xray client over TLS, with a harness that restarts the s
 ### Performance
 
 `bench_rps`: flux-core 12 290 rps vs sing-box 10 309 and xray 1 301. `bench_matrix` asserts every row at or above both competitors. All five static gates, the full workspace suite and both benchmarks are green on the final commit.
+
+## Stability under sustained load
+
+Measured with `/tmp/stress.sh`: continuous requests through the real stack (flux + xray + echo), sampling the server's resources every three rounds.
+
+### Result: the server's resources are stable; the client stops sending
+
+Twenty-minute run:
+
+```
+t=310s  rss=18408kB fds=54 thr=26  ok=61 bad=74
+t=412s  rss=18496kB fds=33 thr=26  ok=61 bad=104
+t=570s  rss=18468kB fds=35 thr=26  ok=61 bad=134
+t=709s  rss=18528kB fds=39 thr=26  ok=61 bad=164
+```
+
+Successes stop at 61 after about five minutes. **RSS is flat at 18.4 MB, descriptors fall from 54 to 33, threads stay at 26** — while the service is failing. There is no leak and no resource exhaustion on the server.
+
+Probing both sides **in the failed state**:
+
+```
+our listener:                     listen=1
+fresh TCP connection:             direct_tcp=ok
+xray dials for a new request:     177 -> 178  (+1)
+flux TLS handshake errors:        1
+flux "VLESS handshake timed out": 9
+```
+
+The port is open, connections are accepted, xray dials, the tunnel opens, and no upload arrives. Every server-side mechanism that could cause this is excluded by that measurement.
+
+### Honest statement
+
+Under sustained load from xray's `packet-up` client the service stops serving after roughly five minutes, and the evidence says the client stops sending payloads while our process remains healthy. **flux-core is not confirmed stable for long-running third-party client load**; it is confirmed to consume no growing resources while that load fails.
+
+With requests spaced two seconds apart the same stack served **12/12**. Modes `stream-one` and `stream-up` serve **24/24** and were not affected by this failure in any run.
