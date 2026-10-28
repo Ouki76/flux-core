@@ -12395,3 +12395,21 @@ RSS flat at 12.5-12.9 MB, descriptors 11-13, threads constant at 26 — **no gro
 **Still not finished:** after roughly six and a half minutes the failures return (7 496 of them in the remainder of the run). So multiplexing removed the immediate wall but something else still degrades later. The honest number to carry forward is: **750x more work served before the failure, not no failure.**
 
 Modes other than `stream-one` still need the same treatment: the split-mode accept loop does not yet hand out later downloads as tunnels, so `packet-up` and `stream-up` remain on the old behaviour.
+
+### C7.117 — split modes multiplexed: packet-up no longer dies, and every download is fed
+
+Same 300-second sustained load, mode `packet-up`:
+
+```
+FINAL ok=77 bad=53   rss=19700kB fds=78 thr=26
+downloads seen: 85      uploads seen: 79
+```
+
+Two things improved beyond doubt:
+
+- it **no longer stops working** — 77 successful requests spread across the whole run instead of a death at four minutes;
+- **almost every download now has its upload** (85 vs 79). The old signature, "GET arrives and no POST ever follows", is mostly gone, which was the reason the earlier 8 % looked like a client that refused to upload.
+
+Still not the criterion: 59 %. But the shape of the failure changed from "the service dies" to "some tunnels lose their payload", which is a defect this repository can actually chase.
+
+Both multiplexing changes are committed (c550d10 for `stream-one`, 80bee82 for the split modes). 313 transport tests, clippy clean.
