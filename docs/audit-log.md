@@ -12140,3 +12140,22 @@ What C7.37 established and what remains:
 - missing: `ServerTransportPipeline::unwrap` must be split into security and framing halves so the framing can yield extras, and the VLESS inbound must dispatch each extra tunnel through `serve_stream` — which already exists and is committed (`0bb936b`).
 
 That is the whole of the remaining work, and it is now supported by a diagnosis rather than a guess.
+
+### C7.103 — session handoff: root cause known, work scoped, tree clean
+
+```
+git:    clean at aadeae1
+tests:  313 passed, 0 failed
+procs:  none left running
+```
+
+**Next session, in order:**
+
+1. Split `ServerTransportPipeline::unwrap` into `unwrap_security` and `unwrap_framing` (no behaviour change; tests must stay green).
+2. Have the framing half return extra tunnels for a single XHTTP framing — the `accept` side is already written and compiles (C7.37).
+3. In the VLESS inbound, dispatch each extra tunnel through `serve_stream` (already committed, `0bb936b`).
+4. Judge with `/tmp/stress.sh 420`, **not** a six-request burst: the defect only appears once xray reuses a connection (~5 min of load). Every earlier verdict on this work came from bursts.
+
+**Why this is the fix:** xray multiplexes ~65 streams onto one connection under sustained load (C7.101); this inbound serves one tunnel per connection and refuses the rest (C7.34).
+
+**Mistake not to repeat:** C7.39 reverted this implementation on a 0/5 reading, and C7.40 showed that harness was blending runs. The implementation was probably right and the measurement wrong.
