@@ -12091,3 +12091,19 @@ t=709s  rss=18528kB fds=39 thr=26 ok=61 bad=164
 C7.94's conclusion was **wrong**, for a specific and instructive reason: every run I judged it on lasted four to five minutes, ending seconds before the failure. The fix moved the wall just past the end of my measurement, and I read the absence of a failure inside the window as its absence.
 
 What the numbers do say: our process is **healthy while it stops working** — RSS flat at 18.4 MB, descriptors low and falling, threads constant. Nothing on our side leaks. The saturation is downstream, as C7.60 showed.
+
+### C7.100 — in the dead state the listener is fine, xray still dials, uploads stop
+
+Seven minutes of sustained load, then a probe of both sides **in the failed state itself**:
+
+```
+our listener:                    listen=1
+fresh TCP connection:            direct_tcp=ok
+xray dials for a new request:    177 -> 178  (+1, it does try)
+flux TLS handshake errors:       1
+flux "VLESS handshake timed out": 9
+```
+
+In the state where nothing works: our port is open and accepts, xray **does** dial for each new request, the tunnel opens, and no upload arrives.
+
+This rules out every server-side mechanism that could explain it — listener, accept, TLS, h2 handshake, connection limits. The connection is made and the payload never comes. Together with C7.99 (RSS flat, descriptors falling, threads constant while dead) the conclusion is that **our process is healthy throughout and the peer stops uploading**. The 177 accumulated dials are the number to pursue next.
