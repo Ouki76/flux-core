@@ -847,9 +847,9 @@ where
                 let accepted = tokio::select! {
                     // The tunnel is finished: announce a graceful shutdown, then drain once so
                     // queued response frames flush before the socket goes (C7.61).
-                    // Split modes are the opposite of `stream-one`: the peer opens a fresh connection
-                    // per session and wants this one retired when the session ends. Leaving it to the
-                    // idle timer dropped packet-up from 52 successes to 6 (C7.121).
+                    // Split modes: retire the connection when its session ends. Keeping it alive
+                    // measured worse (15/35 against 44/21) even though the client reports
+                    // "http2: client connection lost" on uploads either way (C7.126).
                     _ = &mut close_rx, if !tunnel_done => {
                         tunnel_done = true;
                         connection.graceful_shutdown();
