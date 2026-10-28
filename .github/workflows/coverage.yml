@@ -82,6 +82,20 @@ jobs:
           sudo install -m 0755 "/tmp/sing-box-${VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
           sing-box version
 
+      # The xray matrix test panics — deliberately, with instructions — when the
+      # `xray` binary is missing, and it is missing on a fresh runner. That panic
+      # exits `cargo test` with 101, which is why both this job and the coverage
+      # job have been red: the failure is a missing tool, not a broken test.
+      - name: Install xray (required by the matrix config test)
+        run: |
+          set -euo pipefail
+          VERSION="26.3.27"
+          curl -fsSL -o /tmp/xray.zip \
+            "https://github.com/XTLS/Xray-core/releases/download/v${VERSION}/Xray-linux-64.zip"
+          unzip -q /tmp/xray.zip -d /tmp/xray-dist
+          sudo install -m 0755 /tmp/xray-dist/xray /usr/local/bin/xray
+          xray version
+
       - name: Expose cargo tools on PATH
         # Kept in $GITHUB_ENV rather than repeated as an env: override, because
         # `${{ env.PATH }}` is not a reliable way to read the inherited PATH.
