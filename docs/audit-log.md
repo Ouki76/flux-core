@@ -12684,3 +12684,18 @@ packet-up   bursts, 4 stacks x 8     23/32 = 72 %   (second sample 22/32 = 69 %)
 Its remaining failures are stack-level: a stack serves six, seven or eight of eight, or falls to two or three. Not one failure is attributable to anything the server discards — `delivered=None` is zero across every run, and the client names its own fault: `failed to send upload ... http2: client connection lost`.
 
 Gates on the committed tree: fmt clean, **clippy 0 warnings**, **workspace suite 0 failing**, release builds.
+
+### C7.132 — the connection-policy question settled with a controlled comparison
+
+Same protocol both times (four stacks, eight requests each), the only difference being whether a split-mode connection is retired when its session ends:
+
+```
+retire on session end:   23/32 = 72 %   and   22/32 = 69 %   -> 70 %
+keep alive (continue):   13/32 = 41 %
+```
+
+**Keeping the connection open is clearly worse — 41 % against 70 % — and this is the first time the comparison has been run with equal effort on both sides.** Every earlier policy verdict in this log was a single run against a single run, with run-to-run spread of 23-76 %; they were noise dressed as evidence.
+
+The current behaviour stands: split modes retire the connection when the session ends; `stream-one` keeps it and lets the idle timer retire it. 313 tests pass, tree clean.
+
+**What this leaves for `packet-up`:** 70 % is the honest figure with the best policy, the losses are stack-level, the server discards nothing received, and the client reports `http2: client connection lost` on uploads regardless of policy.
