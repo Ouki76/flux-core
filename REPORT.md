@@ -91,14 +91,29 @@ Measured against a real xray client over TLS, with a harness that restarts the s
 2. **Connections never released.** One tunnel per connection, never closed, so the peer’s default pool of two filled with connections it could not reuse. Releasing on tunnel completion took `stream-one` and `stream-up` to 100 %.
 3. **Service died under load.** After roughly four minutes of sustained traffic everything stopped: a download whose upload never arrives never completes its tunnel, pinning a pool slot for ever. Retiring a connection after 10 s idle (timer in the `select!`, never a sleep) keeps it serving for a full run with bounded RSS, flat descriptors and constant thread count.
 
-### What remains open, and why it is not a server defect
+### What remains open — measured, not assumed
 
-`packet-up` does not reach 5/5 under rapid sequential requests. The evidence that this is the client:
+`packet-up` and `auto` (which resolves to `packet-up`) do not reach 5/5, and the reason is now located
+precisely rather than inferred:
 
-- **12/12** when requests are spaced two seconds apart;
-- raising xray’s `xmux.maxConnections` takes a burst from **0/10 to 10/10**;
-- no trace anywhere shows a request lost on the server side — every failing request shows a download opened and no upload ever sent;
-- our own client interoperates with a real xray server (integration test), so the implementation works in both roles.
+```
+20 direct TCP connections to our listener   ->  20 accepted and logged
+a real run: xray "dialing to ...19951"      ->  14 attempts
+            our "tcp accepted from"         ->   2 connections
+```
+
+**Our listener accepts twenty out of twenty connections offered to it.** Under a real run, fourteen dial
+attempts by xray produce two connections — so twelve of them never become TCP connections at all, before
+any of our code is involved.
+
+Earlier explanations in this report — connection-pool timing, multiplexing of streams onto one
+connection — described stages these requests never reach, and are withdrawn. What the inbound does with
+a connection it is given is sound: `stream-one` and `stream-up` serve 24/24, twice, and the process
+shows no resource growth while failing (RSS flat, descriptors flat, threads constant).
+
+Two real defects on our side were found and fixed along the way, and both stand: advertising
+`http/1.1` in ALPN made xray abandon the TLS handshake (restricted to `h2`), and connections were never
+released, which pinned the peer's pool.
 
 ### Performance
 
