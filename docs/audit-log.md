@@ -13240,3 +13240,16 @@ toolchain: CI pins 1.91.0, this machine has 1.97.0
 Running the CI's exact command locally with the local toolchain passes, so `--all-features` alone is not it — the difference that remains is the pinned 1.91.0, whose clippy has a different lint set from 1.97.0.
 
 Also worth stating plainly: the xray install added before this was a real gap and is kept, but it was not the cause of the red CI — the tests it protects never ran.
+
+### C7.163 — the pinned toolchain was the cause; clippy now passes, the failure moved to the tests
+
+Installing Rust 1.91.0 — the version CI pins — reproduced the failure immediately, and both defects are real:
+
+```
+router.rs:714  rng.pick(&LABELS)   inference resolved `T = str` on 1.91 because push_str wants &str,   so the array was rejected as &[&str; 15]; 1.97 resolves it the other way api.rs:1106   else { if .. }     collapsible_else_if, which current clippy reports and 1.97 does not   ```
+
+Both fixed. `cargo +1.91.0 clippy --locked --workspace --all-targets --all-features -- -D warnings` now reports **0 errors**, and the same command on 1.97 also reports 0, with the workspace suite green.
+
+Confirmed on the next CI run: **"Run Clippy linter" passes**, documentation passes, and the failure has moved to step 9, "Run unit & integration tests". The coverage job, which failed at the same gate before, has yet to be re-read.
+
+So the twenty consecutive red runs were a toolchain mismatch that no local run could show, because this machine had only 1.97. Worth recording plainly: the project pins 1.91.0 in CI and in the Dockerfile, and every gate I ran in this session used 1.97 unless I said otherwise.
