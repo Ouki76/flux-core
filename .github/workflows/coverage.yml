@@ -97,7 +97,28 @@ jobs:
       - name: Measure coverage (lcov)
         env:
           SINGBOX_BIN: /usr/local/bin/sing-box
-        run: ./scripts/coverage.sh --lcov target/coverage/lcov.info
+        # The instrumented run executes the whole suite, so a single failing
+        # test fails this step — and without the log the job only reports a
+        # non-zero exit, which is why its twenty consecutive failures said
+        # nothing. Capture the output and print the failing tests before
+        # propagating the exit code.
+        run: |
+          set +e
+          ./scripts/coverage.sh --lcov target/coverage/lcov.info 2>&1 | tee /tmp/coverage.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "::error::coverage failed with exit $rc"
+              echo "--- failing tests ---"
+              grep -E '^failures:$' -A 20 /tmp/coverage.log | head -40 || true
+              echo "--- errors and panics ---"
+              grep -E 'panicked at|^error(\[|:)' /tmp/coverage.log | head -20 || true
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::group::coverage log (tail)"
+            tail -80 /tmp/coverage.log
+            echo "::endgroup::"
+            exit "$rc"
+          fi
 
       - name: Summarise total coverage
         run: |
