@@ -12765,3 +12765,27 @@ Where the objective stands after this work, stated plainly:
 | `packet-up` | 8 % | **70 %, flat across five server-side policies** |
 
 The multiplexing work is done and committed; the two modes that were broken by it now pass cleanly. `packet-up` remains at about seventy percent with the loss named by the client as a lost upload connection, and five connection policies have been measured against a single protocol without moving it.
+
+### C7.137 — the real interoperability bug: we accepted only POST, sing-box sends PUT
+
+Testing with a second client found in minutes what xray had hidden for days.
+
+With sing-box 1.11.4 as the client, xray's log showed:
+
+```
+connection download closed: v2ray-http: unexpected status: 404 Not Found
+connection download closed: stream error: stream ID 3; REFUSED_STREAM; received from peer
+…
+```
+
+Our own log named the cause: `first request: PUT /x`. Xray defaults to POST (`GetNormalizedUplinkHTTPMethod` in `config.go`) but lets the client choose, and **sing-box sends PUT**. Our inbound required POST, so every sing-box request was a 404 — and the 404 path hands the connection to a driver that refuses later streams, which is where the REFUSED_STREAM came from.
+
+Accepting both methods:
+
+```
+sing-box packet-up:   0/8  ->  8/8,  zero errors in its log
+```
+
+**This is a genuine compatibility defect, not a tuning question**: any client using `uplinkHTTPMethod: PUT` could not use this inbound at all. It was invisible because only xray was ever tested, and xray happens to default to POST.
+
+Xray packet-up after the change: four samples of 4x8 — 72 %, 69 %, 38 %, 53 %, mean about 58 % with a wide spread. The two low samples are within the variance this mode has shown all along; the change is provably neutral for POST (`is_uplink_method` returns true for POST exactly as the old condition did).
