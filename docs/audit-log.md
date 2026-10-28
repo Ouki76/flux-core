@@ -12646,3 +12646,24 @@ That means the runs I attributed to a grace period — 68/22 in one, then 7/8 an
 Removed the dead constant. This is the seventh time in this project that a change was believed to have been applied when it was not, and it was caught by a compiler warning rather than by me — persisting in treating `clippy -D warnings` as a gate rather than a chore is the only reason it surfaced.
 
 **Revised conclusion for `packet-up`:** connection policy does not move it. The mode's losses are stack-level (a stack either serves six or seven of eight, or serves nothing), and the run-to-run spread on identical code is wide enough that only multi-trial measurements mean anything.
+
+### C7.130 — packet-up: seven remedies measured, none moves it past ~67 %
+
+Everything tried, each measured:
+
+```
+retire connection on session end            60-67 %
+keep connection alive, idle 5 s             43 %
+keep connection alive, idle 60 s            27 %
+service upload connections continuously     ~60 %   (kept: correct in itself)
+warm-up request before measuring            67 %
+first-request-only loss, then fine          observed, but not the whole picture
+```
+
+And the client says why, every run: `failed to send upload > Post "...": http2: client connection lost` — between 11 and 17 times per run, on every policy.
+
+What is **not** wrong, measured: our server accepts every connection offered (20/20 direct), never discards a received upload (`delivered=None` is zero), and serves 18 990 `stream-one` requests with zero failures. So the loss is in the client's upload channel, on a connection it considers lost.
+
+**The honest state of the objective:** `stream-one` and `stream-up` now serve sustained load without failing; `packet-up` does not, at roughly two requests in three, and every server-side lever I can find has been measured and rejected. The remaining possibilities are in xray's upload path (`httpClient` in `dialer.go`) and cannot be changed from this repository.
+
+That is not a satisfying place to stop, but it is a measured one: three modes' worth of evidence, seven rejected remedies, and a client that names its own failure.
