@@ -137,6 +137,11 @@ jobs:
           fi
         env:
           SINGBOX_BIN: /usr/local/bin/sing-box
+          # tests/test_xhttp_interop.rs does not search PATH: it honours XRAY_BIN,
+          # then falls back to $HOME/.local/bin/xray. The install above puts the
+          # binary in /usr/local/bin, so without this the test panics with
+          # "the `xray` binary is required by this test but was not found".
+          XRAY_BIN: /usr/local/bin/xray
           # The TUN / TPROXY / REDIRECT tests need a real kernel datapath, and
           # this job is not privileged — the "Privileged Tests" job runs them for
           # real. Without this they panic here (tests/test_transparent_inbounds.rs

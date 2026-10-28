@@ -125,6 +125,8 @@ jobs:
       - name: Measure coverage (lcov)
         env:
           SINGBOX_BIN: /usr/local/bin/sing-box
+          XRAY_BIN: /usr/local/bin/xray
+          FLUX_ALLOW_TRANSPARENT_SKIP: "1"
         # The instrumented run executes the whole suite, so a single failing
         # test fails this step — and without the log the job only reports a
         # non-zero exit, which is why its twenty consecutive failures said
