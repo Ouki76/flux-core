@@ -13171,3 +13171,19 @@ The one failure I did reproduce was self-inflicted: I passed `SINGBOX_BIN=/usr/l
 What the job's timing does establish: it fails **2.2 minutes** after starting, not at the 60-minute timeout, so it is a hard error rather than an instrumented build running long. The failing step is "Measure coverage (lcov)", and the step before it — the tier probe — succeeds, so the toolchain is found.
 
 Without the step log (no `gh`, and the logs endpoint needs auth) the next honest step is to make the job print its own diagnosis: run the suite with `--no-fail-fast` and echo which test failed, so the next run names the culprit instead of only reporting a non-zero exit.
+
+### C7.159 — stream-up no longer refuses a second stream
+
+The download branch that returns `H2Stream` handed its connection to `spawn_connection_driver`, which answers any later request with `REFUSED_STREAM`. It now keeps servicing the connection: an uplink is acknowledged and its body forwarded to the session it names, and anything else gets a 404.
+
+The distinction that matters, and the reason this was attempted once before and abandoned: later requests are delivered to **sessions**, not turned into VLESS tunnels. Turning them into tunnels is exactly what dropped packet-up from 100 % to 22 % in C7.126.
+
+Measured after the change:
+
+```
+stream-one  6/6, 6/6, 6/6     18/18
+stream-up   6/6, 6/6, 6/6     18/18
+packet-up   6/6, 6/6, 6/6     18/18
+auto        6/6, 6/6, 6/6     18/18
+sing-box    8/8, 8/8, 8/8     24/24, zero errors in its log
+```
