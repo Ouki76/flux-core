@@ -13267,3 +13267,18 @@ So the step-9 failure is not the Rust version (that was step 7, now fixed) and n
 The step log needs a GitHub session, so the failure could only ever be reported as exit 101 — which is precisely why it stayed unexplained through twenty runs. The test step now re-emits every failing test and panic as `::error::` annotations, and **check-run annotations are readable through the public API without credentials**. The next failing run therefore names its tests to anyone, including this machine.
 
 That is the state to resume from: read `check-runs/{id}/annotations` for the "Check, Lint & Test" job on the newest commit and the failing test names will be there.
+
+### C7.165 — gates re-run on the toolchain CI actually pins
+
+Every gate in this session had been run on Rust 1.97, while CI pins 1.91.0 — the same mistake that hid the clippy failure. Re-running on 1.91.0:
+
+```
+clippy  -D warnings --all-features    0 errors     (was 2 errors before the fix)
+cargo test --workspace --no-fail-fast 0 failing suites
+cargo doc --no-deps                  0 warnings
+cargo deny check                     advisories ok, bans ok, licenses ok, sources ok
+cargo audit                          exit 0
+cargo fmt --all --check              differs
+```
+
+The `fmt` difference is between rustfmt versions, not a defect: the CI "Formatting" job passes on this same tree, so the tree matches what CI checks. Reformatting with 1.91's rustfmt would move the tree away from what the Formatting job accepts, so it is deliberately not applied.
