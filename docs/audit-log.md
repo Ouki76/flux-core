@@ -12829,3 +12829,29 @@ Eight requests arrived over four connections, four became tunnels, and those tun
 So the difference is in what our inbound sends back. The next step is a byte-level comparison of responses to the same `packet-up` GET: xray's server sends `X-Padding` and a specific content-type from `WriteResponseHeader` (`hub.go`), and the client may be waiting on something in that response before it starts uploading.
 
 Everything is committed, 313 tests pass.
+
+### C7.140 — what the control narrowed it to, and where the search stands
+
+Compared our download response against xray's own (`hub.go:355-375`):
+
+```
+xray server:  X-Accel-Buffering: no, Cache-Control: no-store
+              Content-Type: text/event-stream  (unless NoSSEHeader)
+              WriteHeader(200) then Flush() immediately
+our server:   Content-Type: text/event-stream, 200, then an empty DATA frame as the flush
+```
+
+The flush is present (one `send_data(Bytes::new(), false)` in the split download branch), the status and content type match, and the padding headers xray adds are for middleboxes rather than for its own client. So the responses are not obviously different in the ways that matter to a Go http2 client.
+
+Measured during the paired run:
+
+```
+xray -> xray   8/8     zero client errors
+xray -> flux   1/8     4 connections, 8 first requests, 4 downloads,
+                      "VLESS handshake timed out on a multiplexed tunnel",
+                      tunnel ended after 0 bytes, and no client-side error
+```
+
+**The failure is ours and it is in the multiplexed-tunnel path**: a later download on a reused connection becomes a tunnel (the counts prove it), and that tunnel never receives its upload. Requests served as the FIRST request on a fresh connection work; the ones handed over from the reused-connection path do not.
+
+That is a much narrower target than anything earlier in this project, and it was reached by comparing against a working implementation rather than by guessing.
