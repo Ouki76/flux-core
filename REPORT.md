@@ -139,19 +139,18 @@ Under sustained load from xray's `packet-up` client the service stops serving af
 
 With requests spaced two seconds apart the same stack served **12/12**. Modes `stream-one` and `stream-up` serve **24/24** and were not affected by this failure in any run.
 
-### Operational recommendation
+### Operational note — corrected
 
-Until the client-side behaviour above is understood, use **`stream-up`** or **`stream-one`** when the peer is xray's client:
+An earlier version of this section recommended `stream-up` for xray clients on the strength of 24/24
+bursts. **That was wrong, and it was never measured under sustained load.** Tested over seven minutes,
+`stream-up` also degrades: responses stop completing and throughput collapses, while flux logs h2 `Data`
+frames on `StreamId(131)` — about sixty-five streams multiplexed onto **one** connection.
 
-- both serve 24/24 in every run, including under the sustained load that kills `packet-up`;
-- `packet-up` additionally degrades over minutes even when it starts well;
-- our own client interoperates with a real xray server in all modes, so this is a peer-selection matter, not a capability gap.
+That single number explains the whole campaign: xray **multiplexes many streams onto one connection**
+under sustained load, and this inbound serves **one tunnel per connection**. Short bursts never reach the
+point where xray stops opening new connections and starts reusing an existing one; a few minutes of load
+always does. Every mode fails there for the same reason, which is why no connection-lifetime change ever
+fixed it.
 
-The inbound configuration for a reliable xray pairing:
-
-```json
-{"type": "tls", "alpn": ["h2"]}
-{"type": "xhttp", "path": "/x"}
-```
-
-with `alpn` restricted to `h2` — advertising `http/1.1` as well made xray abandon the TLS handshake outright (C7.53), and that one line was worth more than every other change combined.
+Until multiplexing is implemented, the honest guidance is: **the inbound is reliable for bursty and
+spaced traffic in all modes, and is not reliable for sustained multiplexed traffic from xray**.
