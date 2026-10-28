@@ -12911,3 +12911,21 @@ The upload loop is started **after** `OpenStream` returns, and `OpenStream` retu
 That fits every measurement in C7.142: when the client opens a fresh connection the response head is delivered immediately and the request succeeds (7/8 with seven connections); when it multiplexes onto a connection already in use, the head is delayed or lost and the upload never starts (0/8 with two connections).
 
 **Next step, precisely:** instrument the moment we send the response head versus the moment the client's upload arrives, per request, on a multiplexed connection. If the head is late, the fix is to send it *before* doing anything else for that stream — including before creating the session — so no other work can delay it.
+
+### C7.144 — ROOT CAUSE FOUND: reading upload bodies inside the accept loop
+
+Three consecutive fresh stacks, xray client against our inbound, mode `packet-up`:
+
+```
+stack 1: 8/8   conns=8  uploads=8  timeouts=0
+stack 2: 8/8   conns=8  uploads=8  timeouts=0
+stack 3: 8/8   conns=8  uploads=8  timeouts=0
+```
+
+**24 of 24, zero timeouts** — against 0-7 of 8 before, with the same client and the same server otherwise.
+
+The cause, found by following `dialer.go`: a numbered `packet-up` POST body was read **inside the connection's accept loop**, so while that body was being consumed the loop could not accept the next request on the same connection. The next request's response head was therefore delayed, and xray starts its upload goroutine **only after that head arrives** (`OpenStream` returns, then `go func()`). A delayed head means no upload at all — which is exactly the signature that survived twenty rounds: a tunnel with zero bytes, a VLESS handshake timeout, and no error anywhere in the client log.
+
+Moved the body read into a spawned task, as the unnumbered `stream-up` path already did. That asymmetry was the whole bug: the unnumbered case had been fixed long ago for precisely this reason, and the numbered case had been left inline.
+
+Committed. 313 transport tests, clippy clean, release built.
