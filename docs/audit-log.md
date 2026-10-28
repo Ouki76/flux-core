@@ -12730,3 +12730,18 @@ bench_matrix --assert    ASSERT PASSED
 ```
 
 All on the commit that carries the multiplexing work and the three measured connection policies.
+
+### C7.135 — abrupt close makes no difference: 69 % against 70 %
+
+Tested the idea that a faster death lets the peer notice sooner and re-open:
+
+```
+graceful GOAWAY then close    23/32 = 72 %   22/32 = 69 %   -> 70 %
+drop the connection at once   22/32 = 69 %
+```
+
+Identical within noise. Combined with C7.133 (waiting for the upload 59 %, keeping the connection 41 %), the picture is settled: **`packet-up` sits at about 70 % regardless of what the server does with the connection**.
+
+That is the fifth policy variant measured against the same protocol, and the flat result is itself the finding — the loss is not on this axis at all.
+
+Reverted to the committed behaviour. 313 tests, tree clean.
