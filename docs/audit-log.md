@@ -13128,3 +13128,16 @@ client log: nothing at all
 Two facts follow. The failures are not slow — if each had burned the six-second cap the run could not have completed seven of them in forty seconds, so they fail fast. And neither side records a reason, which points at the SOCKS handshake between the harness and the client rather than at the tunnel.
 
 Wall-clock per request in this loop is about 61 ms while the measured request latency against the server is 2 ms, so the loop is dominated by process spawn and client work, not by the server. The 11 575 that xray's server reached in 150 s (13 ms per request) is therefore not explained yet either — that comparison needs to be re-run with the same client pointed at both servers before any throughput conclusion is drawn from it. The earlier number compared two different client configurations, which is exactly the kind of mistake this project keeps paying for.
+
+### C7.156 — matched comparison: 12.7 requests/s against 77.6, with the same client
+
+This replaces the invalid comparison from C7.154, where the two runs used different client configurations (one at `loglevel: debug`, one at `warning`). Here the client file is identical except for the port, both at `warning`, the harness is the same, and only the server differs:
+
+```
+flux server:  ok=1523  bad=27   (120 s)   12.7 req/s   fds=15  rss=14 MB
+xray server:  ok=9315  bad=0    (120 s)   77.6 req/s
+```
+
+Six times apart, so the gap is real and not an artefact of mismatched clients. It is also not the leak: descriptors sit at 15 and memory at 14 MB throughout, against 217 descriptors and 148 MB when this goal started.
+
+What is not yet known is where the time goes. A single request against our inbound measures 2 ms once its connection is warm, yet the loop averages 79 ms per request against 13 ms for xray. Either the loop is not reusing connections the way the controlled test does, or something per request costs ~60 ms that a single curl does not pay. That measurement is the next step, and it must use this same matched setup.
