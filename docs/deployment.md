@@ -43,6 +43,27 @@ docker run -d --cap-add NET_ADMIN --cap-add NET_BIND_SERVICE \
 > otherwise the container cannot read the config (`Permission denied`):
 > `-v $PWD/config.yaml:/etc/flux-core/config.yaml:Z`
 
+### Prebuilt multi-arch images
+
+`.github/workflows/docker.yml` publishes `linux/amd64` **and** `linux/arm64` as
+one manifest list, so `docker pull` selects the right architecture:
+
+| Ref | Built from |
+|---|---|
+| `ghcr.io/<owner>/flux-core:latest`, `:<version>`, `:<major>.<minor>` | a `v*` tag |
+| `ghcr.io/<owner>/flux-core:edge`, `:sha-<short>` | every push to `main` |
+
+```bash
+docker pull ghcr.io/<owner>/flux-core:latest
+docker run -d -v $PWD/config.yaml:/etc/flux-core/config.yaml \
+  ghcr.io/<owner>/flux-core:latest run -c /etc/flux-core/config.yaml
+```
+
+The image is `linux/amd64` + `linux/arm64`; a tag is the only thing that moves
+`latest`, matching the release rule in `release.yml`. Pull requests build the
+Dockerfile for `amd64` only and publish nothing, so a broken context is caught
+before it lands.
+
 The image's default `CMD` and `HEALTHCHECK` point at `/etc/flux-core/config.json`;
 either mount the file under that name (the format is auto-detected by content, so
 YAML works there too) or override the command as above.

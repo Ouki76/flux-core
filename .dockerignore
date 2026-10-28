@@ -1,0 +1,27 @@
+# Build output. `target/` alone reaches ~148 GB after a full test and coverage
+# run, and every byte here is sent to the daemon before the first layer is
+# built, so leaving it out is what makes the image build possible at all.
+target/
+target-cov/
+cov-prof/
+callgrind.out.*
+*.profraw
+*.profdata
+*.gcda
+*.gcno
+
+# Version control and CI metadata: not needed inside the image, and `.git`
+# alone would add tens of megabytes to every build.
+.git/
+.github/
+
+# Local scratch output
+*.log
+/tmp/
+/scratch/
+
+# Fuzzing workspaces: the corpus and crash artefacts are rebuilt by the runner
+# and can be large.
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/

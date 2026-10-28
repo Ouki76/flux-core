@@ -1,0 +1,158 @@
+name: Docker
+
+# Multi-arch images (linux/amd64 + linux/arm64) published to GHCR.
+#
+# Triggers, and what each one is for:
+#   - push to main      -> builds and publishes `edge` and `sha-<short>`
+#   - push of a v* tag  -> publishes the version, `<major>.<minor>` and `latest`
+#   - pull request      -> builds amd64 only, publishes nothing (validates the
+#                          Dockerfile and the context before it lands)
+#   - manual dispatch   -> same as main, with an explicit "push" switch
+#
+# A tag is the project's single "this is a release" signal (see release.yml), so
+# a tag is also the only thing that moves `latest`.
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/docker.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "src/**"
+      - "benches/**"
+      - "examples/**"
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Publish the built images to GHCR"
+        type: boolean
+        default: false
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+
+jobs:
+  image:
+    name: Build linux/amd64 + linux/arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+      # provenance and SBOM attestations are signed with the workflow identity
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Decide once whether this run publishes, so the build steps below cannot
+      # disagree about it.
+      - name: Decide whether to publish
+        id: gate
+        run: |
+          set -euo pipefail
+          publish=false
+          case "${{ github.event_name }}" in
+            push)
+              # main and v* tags publish; nothing else does
+              case "${GITHUB_REF}" in
+                refs/heads/main|refs/tags/v*) publish=true ;;
+              esac
+              ;;
+            workflow_dispatch)
+              [ "${{ inputs.push }}" = "true" ] && publish=true || true
+              ;;
+          esac
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "publishing: ${publish}"
+
+      # arm64 is emulated: QEMU is only set up when both platforms are built.
+      - name: Set up QEMU
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=flux-core
+            org.opencontainers.image.description=Modular proxy core
+
+      # Publishing run: both architectures, one manifest list.
+      - name: Build and push (amd64 + arm64)
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=multiarch
+          cache-to: type=gha,mode=max,scope=multiarch
+          provenance: true
+          sbom: true
+
+      # Validation run (pull requests): native architecture only, nothing is
+      # published. Multi-platform without a push has no usable output, so the
+      # build is cached only.
+      - name: Build (validate, amd64)
+        if: steps.gate.outputs.publish != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          outputs: type=cacheonly
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=multiarch
+          cache-to: type=gha,mode=max,scope=multiarch
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          {
+            echo "### Docker image"
+            echo
+            if [ "${{ steps.gate.outputs.publish }}" = "true" ]; then
+              echo "Published \`linux/amd64\` and \`linux/arm64\` as one manifest list:"
+              echo
+              echo '```'
+              echo "${{ steps.meta.outputs.tags }}"
+              echo '```'
+            else
+              echo "Validated only (amd64, nothing published)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
