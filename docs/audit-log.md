@@ -12242,3 +12242,25 @@ Two candidates, neither measured:
 **I am not choosing between them without a measurement**, and the measurement is cheap and specific: `git stash`-free bisect over the two commits after C7.79, running `/tmp/rec.sh` at each. That is the first task for a session with context to spare.
 
 Until then the honest statement in the report is weaker than the one written there: the inbound serves **bursts** perfectly in `stream-one` and `stream-up`, and its behaviour under spaced `packet-up` traffic is **not currently reproducible as good**.
+
+### C7.109 — C7.79's 12/12 was a fluke; spaced requests fail too
+
+Reproduced the regression (1/12, then 2/12), then bisected one suspect by reverting the idle retirement:
+
+```
+current tree (idle retirement in):   1/12 and 2/12 spaced
+with idle retirement reverted:       0/12 spaced
+```
+
+Reverting made it no better, and the transport suite passed in both states (313/313), so the idle change is **not** the cause. That leaves the uncomfortable explanation: **C7.79's 12/12 was a lucky run**, exactly like the 5/5 of C7.36 that C7.40 retracted.
+
+**Consequence, stated plainly:** the claim repeated throughout this campaign — "the server serves every tunnel it is given, the losses are the client racing its pool" — **is not supported**. `packet-up` fails whether requests are spaced or not.
+
+What is still measured and still true:
+
+- `stream-one` and `stream-up` serve **24/24** bursts, twice each;
+- our process shows **no resource growth** under failing load (C7.99);
+- xray **does** connect when the service fails (C7.100);
+- xray multiplexes ~65 streams onto one connection (C7.101).
+
+Changed: the idle retirement is restored (it measured no worse than its absence, and both states fail), and C7.79 is marked retracted in the report.
