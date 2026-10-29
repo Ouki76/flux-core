@@ -8,7 +8,6 @@ use flux_types::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 
@@ -18,10 +17,6 @@ pub struct SocksOutbound {
     server_address: TargetAddress,
     auth: Option<(String, String)>,
     resolver: Arc<DnsResolver>,
-    /// Retained for API compatibility; connection timeouts are enforced by
-    /// `dialer` (the carrier) rather than here.
-    #[allow(dead_code)]
-    connect_timeout: Duration,
     dialer: Arc<dyn StreamDialer>,
 }
 
@@ -38,7 +33,6 @@ impl SocksOutbound {
             server_address,
             auth: None,
             resolver,
-            connect_timeout: Duration::from_secs(10),
             dialer,
         }
     }

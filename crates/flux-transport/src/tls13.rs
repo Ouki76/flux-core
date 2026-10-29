@@ -28,27 +28,16 @@ pub(crate) fn crypto_err(msg: impl Into<String>) -> flux_types::FluxError {
 }
 
 /// TLS record and handshake message types, shared by every handshake driver.
-#[allow(dead_code)]
 pub(crate) const TLS_HANDSHAKE: u8 = 0x16;
-#[allow(dead_code)]
 pub(crate) const TLS_ALERT: u8 = 0x15;
-#[allow(dead_code)]
 pub(crate) const TLS_APPDATA: u8 = 0x17;
-#[allow(dead_code)]
 pub(crate) const TLS_CCS: u8 = 0x14;
-#[allow(dead_code)]
 pub(crate) const HS_CLIENT_HELLO: u8 = 1;
-#[allow(dead_code)]
 pub(crate) const HS_SERVER_HELLO: u8 = 2;
-#[allow(dead_code)]
 pub(crate) const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
-#[allow(dead_code)]
 pub(crate) const HS_CERTIFICATE: u8 = 11;
-#[allow(dead_code)]
 pub(crate) const HS_CERTIFICATE_VERIFY: u8 = 15;
-#[allow(dead_code)]
 pub(crate) const HS_FINISHED: u8 = 20;
-#[allow(dead_code)]
 pub(crate) const HS_KEY_UPDATE: u8 = 24;
 /// `NewSessionTicket` (RFC 8446 §4.6.1), sent after the handshake.
 pub(crate) const HS_NEW_SESSION_TICKET: u8 = 4;
@@ -68,7 +57,6 @@ pub(crate) fn psk_offer_enabled() -> bool {
         Err(_) => true,
     })
 }
-#[allow(dead_code)]
 pub(crate) const MAX_TLS_RECORD: usize = 16384;
 
 /// Marker in the error text when a server cannot speak TLS 1.3.
@@ -454,7 +442,8 @@ impl TrafficState {
 /// full record protection, post-handshake messages, key update, close_notify.
 pub struct Tls13Stream<S> {
     pub(crate) inner: S,
-    #[allow(dead_code)] // kept for diagnostics/debugging
+    /// The negotiated suite. Read when a `NewSessionTicket` arrives (`self.suite` below), because
+    /// the PSK it produces is meaningless under a different suite.
     pub(crate) suite: Tls13Suite,
     pub(crate) read_state: TrafficState,
     pub(crate) write_state: TrafficState,
@@ -490,18 +479,18 @@ pub struct Tls13Stream<S> {
     pub(crate) server_name: String,
     /// Whether this connection was a resumption rather than a full handshake. Read by the
     /// resumption tests and, once the offer is enabled, by the metrics that justify it.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) resumed: bool,
     /// Intermediates kept for the resumption diagnostics: the master secret and the transcript
     /// hash with and without the client Finished. A PSK that does not match the server's is a
     /// difference in one of these three, and nothing else can tell them apart.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) debug_master_secret: Option<Vec<u8>>,
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) debug_hash_before_cf: Option<Vec<u8>>,
     /// The client application traffic secret, so a test can compare it with the value the
     /// reference implementation logs for the same connection.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) debug_c_ap: Option<Vec<u8>>,
     pub(crate) closed: bool,
 }
@@ -891,7 +880,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
 /// verification algorithm.
 // Wired into a handshake in the next step; until then only the tests exercise it, and the
 // dead-code lint would otherwise hide the moment it goes stale.
-#[allow(dead_code)]
 pub(crate) mod verify {
     use super::{FluxResult, crypto_err};
     use rustls_pki_types::{CertificateDer, ServerName, TrustAnchor, UnixTime};
@@ -942,10 +930,6 @@ pub(crate) mod verify {
                 added += 1;
             }
             Ok(added)
-        }
-
-        pub(crate) fn is_empty(&self) -> bool {
-            self.system.is_empty() && self.owned.is_empty()
         }
 
         /// Every anchor, borrowed for the duration of one verification.
@@ -1531,7 +1515,6 @@ pub(crate) fn build_client_hello_parts(
 }
 
 /// Everything a general TLS 1.3 connection needs to know about who it is talking to.
-#[allow(dead_code)] // wired into `tls.rs` in the next step
 pub(crate) struct ClientHelloConfig<'a> {
     /// The name to put in SNI and to check the certificate against.
     pub(crate) server_name: &'a str,
@@ -1548,7 +1531,6 @@ pub(crate) struct ClientHelloConfig<'a> {
 /// The shape of this handshake — cipher list, extension list, GREASE — is ours, which is the
 /// whole point: rustls will not let a caller control it. What is *not* ours is certificate
 /// validation, which is delegated to `verify` and therefore to `rustls-webpki`.
-#[allow(dead_code)] // wired into `tls.rs` in the next step
 pub(crate) async fn connect<S>(
     mut stream: S,
     cfg: &ClientHelloConfig<'_>,
@@ -1873,6 +1855,7 @@ where
     let c_ap = suite.derive_secret(&master_secret, "c ap traffic", &ap_hash)?;
     let s_ap = suite.derive_secret(&master_secret, "s ap traffic", &ap_hash)?;
 
+    #[cfg(test)]
     let debug_c_ap_value = c_ap.clone();
     let fin_key = suite.hkdf_expand_label(&c_hs_secret, "finished", &[], suite.hash_len())?;
     let fin_hash = suite.hash(&transcript);
@@ -1890,6 +1873,7 @@ where
     // RFC 8446 §7.1: the resumption master secret covers the transcript through the **client's**
     // Finished. Leaving it out produces a PSK that differs from the server's by one hash, which a
     // server answers with `decrypt_error` — a binder problem that is really a transcript problem.
+    #[cfg(test)]
     let hash_before_cf = suite.hash(&transcript);
     transcript.extend_from_slice(&fin_msg);
 
@@ -1922,9 +1906,13 @@ where
             suite.hash_len(),
         )?),
         server_name: cfg.server_name.to_string(),
+        #[cfg(test)]
         resumed: server_selected_psk,
+        #[cfg(test)]
         debug_master_secret: Some(master_secret.clone()),
+        #[cfg(test)]
         debug_hash_before_cf: Some(hash_before_cf),
+        #[cfg(test)]
         debug_c_ap: Some(debug_c_ap_value),
         closed: false,
     })
@@ -1995,51 +1983,6 @@ async fn read_record_body<S: AsyncRead + Unpin>(
         .await
         .map_err(flux_types::FluxError::Io)?;
     Ok(body)
-}
-
-/// Reads one record of an expected type.
-///
-/// Unused since the greeting moved to `read_one_handshake_record`, which also skips the
-/// compatibility CCS and names alerts; kept because the encrypted flight still uses the same
-/// shape and deleting it would mean re-deriving it.
-#[allow(dead_code)]
-async fn read_record_typed<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    expect: u8,
-) -> FluxResult<Vec<u8>> {
-    loop {
-        let hdr = read_record_header(stream).await?;
-        if hdr[0] == expect {
-            return read_record_body(stream, &hdr).await;
-        }
-        if hdr[0] == TLS_CCS {
-            let _ = read_record_body(stream, &hdr).await?;
-            continue;
-        }
-        if hdr[0] == TLS_ALERT {
-            let body = read_record_body(stream, &hdr).await?;
-            let level = body.first().copied().unwrap_or(0);
-            let desc = body.get(1).copied().unwrap_or(0);
-            // Alert 70 is `protocol_version`: a server that cannot do TLS 1.3 refuses the
-            // greeting outright rather than choosing a lower suite. Say so, because the dial
-            // path falls back to another TLS stack on exactly this.
-            let name = match desc {
-                70 => "protocol_version; not-tls13",
-                40 => "handshake_failure",
-                47 => "illegal_parameter",
-                112 => "unrecognized_name",
-                _ => "unrecognised",
-            };
-            return Err(crypto_err(format!(
-                "the server refused the handshake before {expect} (level {level}, {name}, \
-                 description {desc})"
-            )));
-        }
-        return Err(crypto_err(format!(
-            "expected record type {expect}, got {}",
-            hdr[0]
-        )));
-    }
 }
 
 #[cfg(test)]
@@ -2561,7 +2504,6 @@ mod ticket_store_tests {
 /// The offsets are found by **walking the finished hello**, not by arithmetic on its parts: the
 /// first version of this computed them from field sizes and was wrong by two bytes — which is
 /// exactly the mistake this extension punishes, since a mis-truncated binder is silently ignored.
-#[allow(dead_code)] // `connect` starts offering tickets in the next step
 pub(crate) fn build_client_hello_with_psk(
     server_name: &str,
     alpn: &[&[u8]],

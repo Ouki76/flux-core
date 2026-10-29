@@ -338,7 +338,6 @@ pub(crate) mod shared {
 
     /// `SETTINGS_INITIAL_WINDOW_SIZE` advertised to the peer, in bytes.
     pub(crate) const STREAM_WINDOW: u32 = flux_common::copy::RELAY_BUFFER_BYTES as u32;
-    #[allow(dead_code)]
     const INITIAL_STREAM_WINDOW: u32 = STREAM_WINDOW;
     /// Largest DATA frame either side will send, negotiated in SETTINGS.
     ///
@@ -348,7 +347,6 @@ pub(crate) mod shared {
     const MAX_FRAME_SIZE: u32 = 64 * 1024;
     /// Connection-level window advertised to the peer, in bytes.
     pub(crate) const CONNECTION_WINDOW: u32 = 2 * flux_common::copy::RELAY_BUFFER_BYTES as u32;
-    #[allow(dead_code)]
     const INITIAL_CONNECTION_WINDOW: u32 = CONNECTION_WINDOW;
     /// Consecutive non-I/O `accept()` failures tolerated before the driver gives
     /// up on a connection that is otherwise still open.

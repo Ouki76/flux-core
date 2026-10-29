@@ -10,10 +10,6 @@
 //! of 1.2 with the history of trouble; a client that offers only this shape refuses to negotiate
 //! them at all.
 
-// The handshake driver lands next; until it does, the PRF, the key schedule and the record layer
-// are exercised by the tests at the bottom of this file and nothing else.
-#![allow(dead_code)]
-
 use flux_types::FluxResult;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
 use sha2::{Digest, Sha256, Sha384};
@@ -55,15 +51,6 @@ impl Tls12Suite {
             0xC02C => Some(Self::EcdheEcdsaAes256GcmSha384),
             0xC030 => Some(Self::EcdheRsaAes256GcmSha384),
             _ => None,
-        }
-    }
-
-    pub(crate) fn id(self) -> u16 {
-        match self {
-            Self::EcdheEcdsaAes128GcmSha256 => 0xC02B,
-            Self::EcdheRsaAes128GcmSha256 => 0xC02F,
-            Self::EcdheEcdsaAes256GcmSha384 => 0xC02C,
-            Self::EcdheRsaAes256GcmSha384 => 0xC030,
         }
     }
 
@@ -281,11 +268,6 @@ use crate::tls13::verify::{self, TrustStore};
 use flux_types::FluxError;
 use rustls_pki_types::CertificateDer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-/// Handshake message types that TLS 1.2 uses and TLS 1.3 does not.
-const HS_SERVER_KEY_EXCHANGE: u8 = 12;
-const HS_CLIENT_KEY_EXCHANGE: u8 = 16;
-const HS_SERVER_HELLO_DONE: u8 = 14;
 
 /// What a TLS 1.2 connection needs to know.
 pub(crate) struct ClientHello12Config<'a> {
@@ -675,21 +657,6 @@ mod prf_tests {
 // ---------------------------------------------------------------------------
 // The handshake
 // ---------------------------------------------------------------------------
-
-/// Builds a TLS 1.2 ClientHello offering only the ECDHE + AEAD suites in `OFFERED_SUITES`.
-fn build_client_hello(server_name: &str, alpn: &[&[u8]], random: &[u8; 32]) -> Vec<u8> {
-    build_client_hello_with_ticket(server_name, alpn, random, &[])
-}
-
-/// The same greeting, offering a session ticket back to the server when one is stored.
-fn build_client_hello_with_ticket(
-    server_name: &str,
-    alpn: &[&[u8]],
-    random: &[u8; 32],
-    ticket: &[u8],
-) -> Vec<u8> {
-    build_client_hello_with_session(server_name, alpn, random, &[], ticket)
-}
 
 /// The same, offering a session id back — the form rustls and most servers resume with.
 fn build_client_hello_with_session(
@@ -1221,7 +1188,6 @@ where
                 ticket: session_ticket.unwrap_or_default(),
                 master_secret: master.clone(),
                 suite,
-                received: std::time::Instant::now(),
             },
         );
     }
@@ -1448,14 +1414,6 @@ pub(crate) struct Session12 {
     pub(crate) ticket: Vec<u8>,
     pub(crate) master_secret: Vec<u8>,
     pub(crate) suite: Tls12Suite,
-    pub(crate) received: std::time::Instant,
-}
-
-impl Session12 {
-    /// A ticket lives as long as the server says; without a lifetime it is not reused.
-    pub(crate) fn is_fresh(&self, lifetime_secs: u32) -> bool {
-        self.received.elapsed() < std::time::Duration::from_secs(lifetime_secs as u64)
-    }
 }
 
 fn sessions() -> &'static std::sync::RwLock<std::collections::HashMap<String, Session12>> {

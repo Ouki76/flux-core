@@ -8,7 +8,6 @@
 //! The store is filled by a completed handshake; the reader is the `pre_shared_key` extension on
 //! the next one, which lands in the following cycle. Until then the types are exercised by the
 //! tests at the bottom of this file and by the ticket-store test in `tls13`.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
@@ -28,7 +27,9 @@ pub(crate) struct StoredTicket {
     pub(crate) suite: Tls13Suite,
     /// `ticket_lifetime` from the server, in seconds.
     pub(crate) lifetime: u32,
-    /// The nonce the ticket was issued with; the PSK is derived from it.
+    /// The nonce the ticket was issued with; checked by the parse tests, since the PSK derived
+    /// from it is what authenticates the next handshake.
+    #[cfg(test)]
     pub(crate) nonce: Vec<u8>,
     /// `ticket_age_add`, added to the client's age so the value the server sees is obfuscated.
     pub(crate) age_add: u32,
@@ -72,12 +73,6 @@ pub(crate) fn get(server_name: &str) -> Option<StoredTicket> {
 }
 
 /// Drops every stored ticket. Used by tests so one connection cannot make another pass.
-pub(crate) fn clear() {
-    if let Ok(mut map) = store().write() {
-        map.clear();
-    }
-}
-
 /// Parses a `NewSessionTicket` and derives the PSK it implies (RFC 8446 §4.6.1, §7.1).
 ///
 /// `rms` is the resumption master secret from the handshake that issued the ticket.
@@ -126,6 +121,7 @@ pub(crate) fn parse_ticket(msg: &[u8], rms: &[u8], suite: Tls13Suite) -> FluxRes
         ticket,
         suite,
         lifetime,
+        #[cfg(test)]
         nonce: nonce.to_vec(),
         age_add,
         received: Instant::now(),
@@ -274,19 +270,6 @@ pub(crate) fn pre_shared_key_extension(
     Ok(ext)
 }
 
-/// `psk_key_exchange_modes` offering only `psk_dhe_ke` (RFC 8446 §4.2.9).
-///
-/// Pure PSK without DHE is not offered: it loses forward secrecy, and there is no reason to
-/// accept that when every TLS 1.3 server supports the DHE form.
-pub(crate) fn psk_modes_extension() -> Vec<u8> {
-    vec![1, modes::PSK_DHE_KE]
-}
-
-pub(crate) mod modes {
-    /// `psk_dhe_ke`: PSK with (EC)DHE key establishment.
-    pub(crate) const PSK_DHE_KE: u8 = 1;
-}
-
 #[cfg(test)]
 mod binder_tests {
     use super::*;
@@ -365,6 +348,16 @@ mod binder_tests {
     }
 }
 
+/// Empties the store so one test cannot see the tickets another one left behind.
+#[cfg(test)]
+pub(crate) fn clear() {
+    if let Ok(mut map) = store().write() {
+        map.clear();
+    }
+}
+
+/// Hex for test failure messages; `hex` was live only in the test module below.
+#[cfg(test)]
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }

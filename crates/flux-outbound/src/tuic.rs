@@ -4,8 +4,7 @@ use flux_protocol::tuic::TuicV5Config;
 use flux_protocol::tuic::TuicV5Protocol;
 use flux_transport::quic::QuicTransport;
 use flux_types::{
-    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, TargetAddress,
-    UdpPacket,
+    BoxedStream, FluxError, FluxResult, Outbound, PacketEndpoint, SessionMeta, UdpPacket,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -210,7 +209,7 @@ impl Outbound for TuicOutbound {
         Ok(stream)
     }
 
-    async fn dial_packet(&self, meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
+    async fn dial_packet(&self, _meta: &SessionMeta) -> FluxResult<Box<dyn PacketEndpoint>> {
         let conn = self.get_connection().await?;
         let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
         let demux = self
@@ -228,7 +227,6 @@ impl Outbound for TuicOutbound {
             session_id,
             next_packet_id: AtomicU16::new(0),
             rx: Mutex::new(rx),
-            destination: meta.destination.clone(),
             demux,
         }))
     }
@@ -240,8 +238,6 @@ pub struct TuicDatagramEndpoint {
     session_id: u16,
     next_packet_id: AtomicU16,
     rx: Mutex<mpsc::Receiver<UdpPacket>>,
-    #[allow(dead_code)]
-    destination: TargetAddress,
     demux: Arc<DatagramDemux>,
 }
 

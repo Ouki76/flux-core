@@ -928,9 +928,13 @@ impl Tls13Client {
             pending_unacked: 0,
             resumption_master_secret: None,
             server_name: String::new(),
+            #[cfg(test)]
             resumed: false,
+            #[cfg(test)]
             debug_master_secret: None,
+            #[cfg(test)]
             debug_hash_before_cf: None,
+            #[cfg(test)]
             debug_c_ap: None,
             closed: false,
         };
@@ -1512,9 +1516,13 @@ impl Tls13Server {
             pending_unacked: 0,
             resumption_master_secret: None,
             server_name: String::new(),
+            #[cfg(test)]
             resumed: false,
+            #[cfg(test)]
             debug_master_secret: None,
+            #[cfg(test)]
             debug_hash_before_cf: None,
+            #[cfg(test)]
             debug_c_ap: None,
             closed: false,
         })
