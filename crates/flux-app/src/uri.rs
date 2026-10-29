@@ -48,6 +48,10 @@ pub struct ProxySpec {
     pub reality_public_key: Option<String>,
     /// REALITY short id.
     pub reality_short_id: Option<String>,
+    /// REALITY ML-DSA-65 verify public key.
+    pub reality_mldsa65_verify: Option<String>,
+    /// VLESS encryption.
+    pub encryption: Option<String>,
     /// Transport named in the URI, e.g. `ws`.
     pub transport_type: Option<String>,
     /// Request path for the HTTP-shaped transports.
@@ -95,6 +99,12 @@ pub struct UriParams {
     #[serde(alias = "sid", alias = "short_id", alias = "shortId")]
     /// REALITY short id.
     pub short_id: Option<String>,
+    #[serde(alias = "mldsa65_verify", alias = "mldsa65Verify", alias = "pqv")]
+    /// REALITY ML-DSA-65 verify public key.
+    pub mldsa65_verify: Option<String>,
+    #[serde(default)]
+    /// VLESS encryption configuration.
+    pub encryption: Option<String>,
     #[serde(alias = "fp", alias = "fingerprint", alias = "utls")]
     /// Browser profile to imitate.
     pub utls: Option<String>,
@@ -353,6 +363,8 @@ impl ProxySpec {
                 Some(pk) if !pk.trim().is_empty() => {
                     self.reality_public_key = Some(pk.clone());
                     self.reality_short_id = p.short_id.clone();
+                    self.reality_mldsa65_verify = p.mldsa65_verify.clone();
+                    self.encryption = p.encryption.clone();
                 }
                 _ => {
                     self.reality_missing_pbk = true;
@@ -390,6 +402,8 @@ impl ProxySpec {
                 ProtocolConfig::Vless {
                     uuid,
                     flow: self.flow,
+                    encryption: self.encryption,
+                    decryption: None,
                 }
             }
             "trojan" => {
@@ -470,6 +484,7 @@ impl ProxySpec {
                 sni: self.sni,
                 public_key: pub_k,
                 short_id: self.reality_short_id,
+                mldsa65_verify: self.reality_mldsa65_verify,
             }))
         } else if self.security_hint_tls || self.insecure || !self.alpn.is_empty() {
             Some(FlexibleList::Single(SecurityConfig::Tls {
@@ -870,13 +885,54 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_vless_with_mlkem768x25519plus_and_pqv() {
+        use base64::Engine;
+        let enc_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x42u8; 1184]);
+        let pqv_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x43u8; 1952]);
+
+        let uri = format!(
+            "vless://00000000-0000-0000-0000-000000000001@example.com:443?encryption=mlkem768x25519plus.native.0rtt.{enc_key}&security=reality&pbk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&pqv={pqv_key}&sni=example.com#SyntheticPQ"
+        );
+        let out = parse_proxy_uri(&uri).expect("must parse PQ URI");
+        let node = node_of(out);
+        assert_eq!(node.tag, "SyntheticPQ");
+        match node.protocol {
+            ProtocolConfig::Vless {
+                uuid, encryption, ..
+            } => {
+                assert_eq!(uuid, "00000000-0000-0000-0000-000000000001");
+                assert_eq!(
+                    encryption.as_deref(),
+                    Some(format!("mlkem768x25519plus.native.0rtt.{enc_key}").as_str())
+                );
+            }
+            _ => panic!("expected vless protocol"),
+        }
+        match node.security.unwrap().into_vec().pop().unwrap() {
+            SecurityConfig::Reality {
+                sni,
+                public_key,
+                mldsa65_verify,
+                ..
+            } => {
+                assert_eq!(sni.as_deref(), Some("example.com"));
+                assert_eq!(
+                    public_key,
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                );
+                assert_eq!(mldsa65_verify.as_deref(), Some(pqv_key.as_str()));
+            }
+            _ => panic!("expected reality security"),
+        }
+    }
+    #[test]
     fn test_parse_vless_reality_uri() {
         let uri = "vless://a1b2c3d4-e5f6-7890-1234-56789abcdef0@1.2.3.4:443?security=reality&sni=www.microsoft.com&pbk=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&sid=0123456789abcdef&flow=xtls-rprx-vision#My-Reality-Node";
         let out = parse_proxy_uri(uri).unwrap();
         let node = node_of(out);
         assert_eq!(node.tag, "My-Reality-Node");
         match node.protocol {
-            ProtocolConfig::Vless { uuid, flow } => {
+            ProtocolConfig::Vless { uuid, flow, .. } => {
                 assert_eq!(uuid, "a1b2c3d4-e5f6-7890-1234-56789abcdef0");
                 assert_eq!(flow.as_deref(), Some("xtls-rprx-vision"));
             }
@@ -887,6 +943,7 @@ mod tests {
                 sni,
                 public_key,
                 short_id,
+                ..
             } => {
                 assert_eq!(sni.as_deref(), Some("www.microsoft.com"));
                 assert_eq!(

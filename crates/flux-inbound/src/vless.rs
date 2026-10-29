@@ -22,6 +22,8 @@ pub struct VlessInbound {
     /// Serve mKCP instead of TCP when set. mKCP is Xray's reliable stream over UDP;
     /// everything above the carrier is the same code.
     kcp: Option<flux_transport::KcpConfig>,
+    /// Post-quantum VLESS Decryption (`mlkem768x25519plus`).
+    decryption: Option<Arc<flux_protocol::vless_encryption::VlessDecryptionServerConfig>>,
     running: Arc<AtomicBool>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     /// Handles of the listener-owning tasks; `stop()` joins them so that
@@ -46,6 +48,7 @@ impl VlessInbound {
             rate_limiter: None,
             mux: None,
             kcp: None,
+            decryption: None,
             running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
             tasks: crate::InboundTasks::new(),
@@ -87,6 +90,7 @@ impl VlessInbound {
         let pipeline = Arc::new(self.pipeline.clone());
         let rate_limiter = self.rate_limiter.clone();
         let mux = self.mux.clone();
+        let decryption = self.decryption.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!(
@@ -137,6 +141,7 @@ impl VlessInbound {
                 let uuids = uuids.clone();
                 let pipe = pipeline.clone();
                 let mux = mux.clone();
+                let dec = decryption.clone();
                 tokio::spawn(async move {
                     serve_connection(
                         stream,
@@ -147,6 +152,7 @@ impl VlessInbound {
                         uuids,
                         pipe,
                         mux,
+                        dec,
                     )
                     .await;
                 });
@@ -154,6 +160,15 @@ impl VlessInbound {
         });
 
         Ok(())
+    }
+
+    /// Enables post-quantum VLESS Decryption (`mlkem768x25519plus`).
+    pub fn with_decryption(
+        mut self,
+        config: flux_protocol::vless_encryption::VlessDecryptionServerConfig,
+    ) -> Self {
+        self.decryption = Some(Arc::new(config));
+        self
     }
 
     /// Accept multiplexed (smux) sessions on this inbound.
@@ -218,6 +233,7 @@ impl Inbound for VlessInbound {
         let pipeline = self.pipeline.clone();
         let rate_limiter = self.rate_limiter.clone();
         let mux = self.mux.clone();
+        let decryption = self.decryption.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         info!("[{}] VLESS inbound listening on {}", tag, self.listen_addr);
@@ -265,6 +281,7 @@ impl Inbound for VlessInbound {
                 let uuids = Arc::new(uuids.clone());
                 let pipe = Arc::new(pipeline.clone());
                 let mux = mux.clone();
+                let dec = decryption.clone();
                 tokio::spawn(async move {
                     serve_connection(
                         socket,
@@ -275,6 +292,7 @@ impl Inbound for VlessInbound {
                         uuids,
                         pipe,
                         mux,
+                        dec,
                     )
                     .await;
                 });
@@ -309,6 +327,7 @@ async fn serve_connection<St>(
     uuids: Arc<Vec<Uuid>>,
     pipe: Arc<flux_transport::pipeline::ServerTransportPipeline>,
     mux: Option<MuxConfig>,
+    decryption: Option<Arc<flux_protocol::vless_encryption::VlessDecryptionServerConfig>>,
 ) where
     St: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + Sync + 'static,
 {
@@ -330,14 +349,16 @@ async fn serve_connection<St>(
         let tag = inbound_tag.clone();
         let uuids = uuids.clone();
         let mux = mux.clone();
+        let dec = decryption.clone();
         tokio::spawn(async move {
             while let Some(tunnel) = extra_rx.recv().await {
                 let disp = disp.clone();
                 let tag = tag.clone();
                 let uuids = uuids.clone();
                 let mux = mux.clone();
+                let dec = dec.clone();
                 tokio::spawn(async move {
-                    serve_tunnel(tunnel, client_addr, disp, tag, uuids, mux).await;
+                    serve_tunnel(tunnel, client_addr, disp, tag, uuids, mux, dec).await;
                 });
             }
         });
@@ -345,6 +366,9 @@ async fn serve_connection<St>(
 
     let handshake_fut = async {
         let mut stream = first_stream;
+        if let Some(dec) = &decryption {
+            stream = flux_protocol::vless_encryption::server_handshake(stream, dec).await?;
+        }
         let req = VlessProtocol::read_request_header(&mut stream, &uuids).await?;
         // Refuse anything we cannot serve before answering: the
         // response header is this inbound's only "authenticated,
@@ -548,21 +572,28 @@ async fn serve_stream(
 ///
 /// Used for every tunnel a multiplexing transport produces beyond the first on a connection.
 async fn serve_tunnel(
-    mut stream: BoxedStream,
+    stream: BoxedStream,
     client_addr: SocketAddr,
     disp: Arc<dyn Dispatcher>,
     inbound_tag: Arc<str>,
     uuids: Arc<Vec<Uuid>>,
     mux: Option<MuxConfig>,
+    decryption: Option<Arc<flux_protocol::vless_encryption::VlessDecryptionServerConfig>>,
 ) {
     let handshake = async {
+        let mut stream = stream;
+        if let Some(dec) = &decryption {
+            stream = flux_protocol::vless_encryption::server_handshake(stream, dec).await?;
+        }
         let req = VlessProtocol::read_request_header(&mut stream, &uuids).await?;
         check_request(&req)?;
         VlessProtocol::write_response_header(&mut stream).await?;
-        Ok::<_, FluxError>(req)
+        Ok::<_, FluxError>((stream, req))
     };
     match tokio::time::timeout(std::time::Duration::from_secs(15), handshake).await {
-        Ok(Ok(req)) => serve_stream(stream, req, client_addr, disp, inbound_tag, mux).await,
+        Ok(Ok((stream, req))) => {
+            serve_stream(stream, req, client_addr, disp, inbound_tag, mux).await
+        }
         Ok(Err(e)) => warn!(
             "[{}] VLESS handshake failed on a multiplexed tunnel from {}: {}",
             inbound_tag, client_addr, e

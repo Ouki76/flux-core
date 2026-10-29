@@ -1050,17 +1050,34 @@ fn compile_client_securities(
                 sni,
                 public_key,
                 short_id,
+                mldsa65_verify,
             } => {
                 let sni_str = sni.unwrap_or_else(|| default_sni.to_string());
                 let pk_bytes = crate::config::decode_key_32bytes(&public_key)?;
                 let sid = short_id
                     .and_then(|s| flux_types::decode_hex(&s))
                     .unwrap_or_default();
+                let verify_bytes = match mldsa65_verify {
+                    Some(s) if !s.trim().is_empty() => {
+                        let bytes = crate::config::decode_base64_arbitrary(&s)?;
+                        if bytes.len() != 1952 {
+                            return Err(FluxError::Config(format!(
+                                "invalid mldsa65_verify length {}: expected 1952 bytes",
+                                bytes.len()
+                            )));
+                        }
+                        let mut arr = [0u8; 1952];
+                        arr.copy_from_slice(&bytes);
+                        Some(Box::new(arr))
+                    }
+                    _ => None,
+                };
                 list.push(flux_transport::pipeline::SecurityLayer::Reality(
                     RealityClientConfig {
                         server_name: sni_str,
                         public_key: pk_bytes,
                         short_id: sid,
+                        mldsa65_verify: verify_bytes,
                     },
                 ));
             }
@@ -1338,10 +1355,23 @@ fn build_layered_outbound(
     }
 
     match node.protocol {
-        ProtocolConfig::Vless { uuid, flow } => {
+        ProtocolConfig::Vless {
+            uuid,
+            flow,
+            encryption,
+            ..
+        } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid vless uuid {}: {}", uuid, e)))?;
             let mut out = VlessOutbound::new(tag.clone(), parsed_uuid, flow, dialer);
+            if let Some(enc_str) = encryption.as_deref()
+                && !enc_str.is_empty()
+                && enc_str != "none"
+            {
+                let enc =
+                    flux_protocol::vless_encryption::VlessEncryptionClientConfig::parse(enc_str)?;
+                out = out.with_encryption(enc);
+            }
             if let Some(mux) = mux.clone() {
                 out = out.with_mux(mux)?;
             }
@@ -1606,18 +1636,24 @@ fn compile_server_securities(
                 private_key,
                 short_ids,
                 fallback,
+                mldsa65_seed,
             } => {
                 let pk_bytes = crate::config::decode_key_32bytes(&private_key)?;
                 let sids = short_ids
                     .into_iter()
                     .filter_map(|s| flux_types::decode_hex(&s))
                     .collect();
+                let seed_bytes = match mldsa65_seed {
+                    Some(s) if !s.trim().is_empty() => Some(crate::config::decode_key_32bytes(&s)?),
+                    _ => None,
+                };
                 list.push(flux_transport::pipeline::ServerSecurityLayer::Reality(
-                    flux_transport::reality::RealityServerConfig::new(
+                    flux_transport::reality::RealityServerConfig::with_mldsa65(
                         server_names,
                         pk_bytes,
                         sids,
                         fallback,
+                        seed_bytes,
                     ),
                 ));
             }
@@ -1811,7 +1847,12 @@ fn build_layered_inbound(
     let pipeline = flux_transport::pipeline::ServerTransportPipeline::new(securities, framings);
 
     match node.protocol {
-        ProtocolConfig::Vless { uuid, .. } => {
+        ProtocolConfig::Vless {
+            uuid,
+            decryption,
+            encryption,
+            ..
+        } => {
             let parsed_uuid = Uuid::parse_str(&uuid)
                 .map_err(|e| FluxError::Config(format!("invalid vless uuid {}: {}", uuid, e)))?;
             let mut ib = flux_inbound::VlessInbound::new(tag, addr, vec![parsed_uuid], pipeline);
@@ -1826,6 +1867,14 @@ fn build_layered_inbound(
             }
             if let Some(mux) = mux.clone() {
                 ib = ib.with_mux(mux);
+            }
+            let dec_str = decryption.as_deref().or(encryption.as_deref());
+            if let Some(s) = dec_str
+                && !s.is_empty()
+                && s != "none"
+            {
+                let dec = flux_protocol::vless_encryption::VlessDecryptionServerConfig::parse(s)?;
+                ib = ib.with_decryption(dec);
             }
             inbounds.push(Arc::new(ib));
         }

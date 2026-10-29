@@ -604,6 +604,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3e0f1c7c3a72c66fd80abe965175f7523475c0489a87d3ff9d6e8c87d87a9d2d"
 
 [[package]]
+name = "fips203"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "602e37d80ffd53e1b6037a91bbc471d94bd18a6d1f86493b721b7ef4609a013c"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha3",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "fips204"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a823e139c2d539b1b735d31cdce8b0b356671585eac3d54dec79d1d15052093b"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha3",
+ "zeroize",
+]
+
+[[package]]
 name = "flux-app"
 version = "1.3.4"
 dependencies = [
@@ -660,6 +683,8 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
+ "fips203",
+ "fips204",
  "flux-app",
  "flux-common",
  "flux-dns",
@@ -772,12 +797,15 @@ name = "flux-protocol"
 version = "1.3.4"
 dependencies = [
  "aes",
+ "aes-gcm",
  "async-trait",
  "base64",
  "blake2",
  "blake3",
  "bytes",
  "chacha20poly1305",
+ "ctr",
+ "fips203",
  "flux-common",
  "flux-types",
  "futures",
@@ -821,6 +849,8 @@ dependencies = [
  "base64",
  "blake3",
  "bytes",
+ "fips203",
+ "fips204",
  "flux-common",
  "flux-types",
  "h2",
@@ -1988,6 +2018,7 @@ checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
 dependencies = [
  "digest",
  "keccak",
+ "zeroize",
 ]
 
 [[package]]

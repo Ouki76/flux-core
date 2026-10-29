@@ -33,6 +33,8 @@ pub mod udp;
 pub mod vision;
 /// VLESS, including the REALITY and Vision flows.
 pub mod vless;
+/// Post-quantum VLESS Encryption (`mlkem768x25519plus`).
+pub mod vless_encryption;
 /// VMess, with AEAD headers.
 pub mod vmess;
 /// WireGuard and AmneziaWG.

@@ -13344,3 +13344,28 @@ hand-written 404 responses             5   -> one helper, not_found_response()
 A helper taking an optional content type was written first and had **no callers** — the 200s differ by header rather than by shape. It was deleted rather than kept for symmetry, which is the same rule applied to `id()`, `build_client_hello` and the rest earlier.
 
 Across the whole workspace clippy reports 23 functions past `too_many_lines`. They are protocol parsers and test bodies (shadowsocks, vmess, wireguard, reality, the TLS record layers). Splitting them by line count would scatter state that is deliberately local — a handshake parser whose steps are numbered in comments is easier to check in one place than across six helpers. No change made, and none justified by a measurement.
+
+### C7.170 — Post-quantum cryptography: mlkem768x25519plus and ML-DSA-65 in VLESS and REALITY
+
+Implemented complete post-quantum cryptographic upgrades matching Xray-core v26:
+
+1. **VLESS Post-Quantum Encryption (`mlkem768x25519plus`)** (`crates/flux-protocol/src/vless_encryption.rs`):
+   - Supports hybrid post-quantum key exchange combining ML-KEM-768 (FIPS 203) with X25519.
+   - Authentication modes supported: classic X25519 (32 bytes) and post-quantum ML-KEM-768 (1184 bytes encapsulation key / 64 bytes seed).
+   - Obfuscation modes: `native` (0), `xorpub` (1), `random` (2, full-stream AES-256-CTR key stream).
+   - Framing: TLS 1.3-shaped records `[23, 3, 3, len]` with AES-256-GCM / ChaCha20-Poly1305 and BLAKE3-derived subkeys.
+   - Wired seamlessly into `VlessOutbound` (`with_encryption`), `VlessInbound` (`with_decryption`), and configuration parsing (`ProtocolConfig::Vless` + `vless://` URI handler).
+
+2. **REALITY Post-Quantum Authentication with ML-DSA-65** (`crates/flux-transport/src/reality.rs`):
+   - Server: `mldsa65_seed` generates an ML-DSA-65 (FIPS 204) keypair from 32 bytes seed, signs `HMAC-SHA512(auth_key, ed25519_pub, ClientHello, ServerHello)`, and embeds the 3309-byte signature into certificate custom extension `{0, 0}`.
+   - Client: `mldsa65_verify` (and URI query param `pqv`) extracts the custom certificate extension and verifies the 3309-byte signature against the 1952-byte public key.
+   - Caught and resolved upstream target probe constraint: target server certificate chain must be >= 3500 bytes for ML-DSA-65 REALITY servers due to X.509 cert size extension.
+
+3. **Verification**:
+   - 8/8 end-to-end integration tests against real `xray` binary (`tests/test_xray_interop.rs`):
+     - `vlessenc_mlkem768_flux_client_to_xray` -> PASSED
+     - `vlessenc_mlkem768_xray_client_to_flux` -> PASSED
+     - `reality_mldsa65_flux_client_to_xray` -> PASSED
+     - `reality_mldsa65_xray_client_to_flux` -> PASSED
+   - Verified live in production against external reference VLESS+REALITY PQ servers, successfully establishing post-quantum tunnels and proxying real HTTP traffic.
+   - All gates clean on pinned Rust 1.91.0: `cargo fmt`, `clippy -D warnings`, `rustdoc`, `cargo audit`, `cargo deny check`, 0 failing test suites, `bench_rps --assert` and `bench_matrix --assert` PASSED.

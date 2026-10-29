@@ -635,6 +635,9 @@ pub enum SecurityConfig {
         /// REALITY short id, which authenticates the client.
         #[serde(default)]
         short_id: Option<String>,
+        /// Optional ML-DSA-65 public key (1952 bytes base64) for post-quantum cert verification.
+        #[serde(default, rename = "mldsa65_verify", alias = "mldsa65Verify")]
+        mldsa65_verify: Option<String>,
     },
     /// ShadowTLS: a real TLS handshake, then hijacked.
     #[serde(rename = "shadowtls")]
@@ -716,6 +719,9 @@ pub enum InboundSecurityConfig {
         /// Member to use when the preferred one fails.
         #[serde(default)]
         fallback: Option<String>,
+        /// Optional ML-DSA-65 seed (32 bytes base64) for post-quantum cert signatures.
+        #[serde(default, rename = "mldsa65_seed", alias = "mldsa65Seed")]
+        mldsa65_seed: Option<String>,
     },
     /// ShadowTLS: a real TLS handshake, then hijacked.
     #[serde(rename = "shadowtls")]
@@ -954,6 +960,12 @@ pub enum ProtocolConfig {
         /// The flow to request, e.g. `xtls-rprx-vision`.
         #[serde(default)]
         flow: Option<String>,
+        /// Post-quantum VLESS Encryption (`mlkem768x25519plus...`).
+        #[serde(default)]
+        encryption: Option<String>,
+        /// Inbound VLESS Decryption (`mlkem768x25519plus...`).
+        #[serde(default)]
+        decryption: Option<String>,
     },
     /// Shadowsocks.
     #[serde(rename = "shadowsocks", alias = "ss")]
@@ -2443,6 +2455,28 @@ impl Config {
 }
 
 /// Decodes 32-byte key from either 64-character hex or standard/URL-safe base64.
+/// Decodes a base64 string with arbitrary length, accepting standard, URL-safe, padded or unpadded forms.
+pub fn decode_base64_arbitrary(s: &str) -> FluxResult<Vec<u8>> {
+    let clean = s.trim();
+    use base64::Engine;
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(clean) {
+        return Ok(bytes);
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE.decode(clean) {
+        return Ok(bytes);
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(clean) {
+        return Ok(bytes);
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(clean) {
+        return Ok(bytes);
+    }
+    Err(FluxError::Config(format!(
+        "invalid base64 encoding: '{clean}'"
+    )))
+}
+
+/// Decodes a 32-byte key from either 64-character hex or standard/URL-safe base64.
 pub fn decode_key_32bytes(s: &str) -> FluxResult<[u8; 32]> {
     let clean = s.trim();
 

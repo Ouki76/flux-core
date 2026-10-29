@@ -524,8 +524,73 @@ pub fn get_rss_mb() -> f64 {
     get_rss_kb() as f64 / 1024.0
 }
 
-/// Starts a real TLS 1.3 echo server (usable as a REALITY handshake target/decoy).
-#[allow(dead_code)] // used by interop tests only
+/// Starts a real TLS 1.3 echo server with a large cert chain (for REALITY ML-DSA-65).
+#[allow(dead_code)]
+pub async fn start_large_tls_echo_server() -> SocketAddr {
+    let dir = TempDir::new().expect("tempdir");
+    // Generate a 3-cert chain so total DER length exceeds 3500 bytes for Xray ML-DSA-65 REALITY
+    let mut root_params = rcgen::CertificateParams::new(vec!["Root CA".to_string()]).unwrap();
+    root_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    root_params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[1, 2, 3, 4],
+            vec![0x33u8; 1500],
+        ));
+    let root_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let root_cert = root_params.self_signed(&root_key).unwrap();
+
+    let mut leaf_params =
+        rcgen::CertificateParams::new(vec!["www.microsoft.com".to_string()]).unwrap();
+    leaf_params
+        .custom_extensions
+        .push(rcgen::CustomExtension::from_oid_content(
+            &[1, 2, 3, 4],
+            vec![0x44u8; 1500],
+        ));
+    let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &root_cert, &root_key)
+        .unwrap();
+
+    let cert_path = dir.path().join("cert.pem");
+    let key_path = dir.path().join("key.pem");
+    let full_chain = format!(
+        "{}
+{}",
+        leaf_cert.pem(),
+        root_cert.pem()
+    );
+    std::fs::write(&cert_path, full_chain).expect("write cert");
+    std::fs::write(&key_path, leaf_key.serialize_pem()).expect("write key");
+
+    let (certs, key) = flux_transport::tls::TlsTransport::load_certs_and_key(
+        cert_path.to_str().unwrap(),
+        key_path.to_str().unwrap(),
+    )
+    .unwrap();
+    let acceptor =
+        flux_transport::tls::TlsTransport::create_server_acceptor(certs, key, vec![]).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::mem::forget(dir);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    #[allow(unused_mut)]
+                    let mut tls = tls;
+                    let (mut r, mut w) = tokio::io::split(tls);
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                }
+            });
+        }
+    });
+    addr
+}
+
 pub async fn start_tls_echo_server() -> SocketAddr {
     let dir = TempDir::new().expect("tempdir");
     let cert = rcgen::generate_simple_self_signed(vec![
@@ -552,7 +617,9 @@ pub async fn start_tls_echo_server() -> SocketAddr {
         while let Ok((stream, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                if let Ok(mut tls) = acceptor.accept(stream).await {
+                if let Ok(tls) = acceptor.accept(stream).await {
+                    #[allow(unused_mut)]
+                    let mut tls = tls;
                     let mut buf = vec![0u8; 65536];
                     while let Ok(n) = tls.read(&mut buf).await {
                         if n == 0 {

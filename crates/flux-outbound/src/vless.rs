@@ -19,6 +19,8 @@ pub struct VlessOutbound {
     dialer: Arc<dyn StreamDialer>,
     /// Stream multiplexer, when `multiplex.enabled` is set on the node.
     mux: Option<Arc<MuxClient>>,
+    /// Post-quantum VLESS Encryption (`mlkem768x25519plus`).
+    encryption: Option<Arc<flux_protocol::vless_encryption::VlessEncryptionClientConfig>>,
 }
 
 impl VlessOutbound {
@@ -35,7 +37,17 @@ impl VlessOutbound {
             flow,
             dialer,
             mux: None,
+            encryption: None,
         }
+    }
+
+    /// Enables post-quantum VLESS Encryption (`mlkem768x25519plus`).
+    pub fn with_encryption(
+        mut self,
+        config: flux_protocol::vless_encryption::VlessEncryptionClientConfig,
+    ) -> Self {
+        self.encryption = Some(Arc::new(config));
+        self
     }
 
     /// Enables multiplexing: every dialled stream is tunnelled over a shared
@@ -49,6 +61,7 @@ impl VlessOutbound {
         let mux_dialer = Arc::new(VlessMuxDialer {
             inner: self.dialer.clone(),
             uuid: self.uuid,
+            encryption: self.encryption.clone(),
         });
         self.mux = Some(MuxClient::new(mux_dialer, config));
         Ok(self)
@@ -60,12 +73,16 @@ impl VlessOutbound {
 struct VlessMuxDialer {
     inner: Arc<dyn StreamDialer>,
     uuid: Uuid,
+    encryption: Option<Arc<flux_protocol::vless_encryption::VlessEncryptionClientConfig>>,
 }
 
 #[async_trait]
 impl StreamDialer for VlessMuxDialer {
     async fn dial(&self) -> FluxResult<BoxedStream> {
         let mut stream = self.inner.dial().await?;
+        if let Some(enc) = &self.encryption {
+            stream = flux_protocol::vless_encryption::client_handshake(stream, enc).await?;
+        }
         VlessProtocol::write_request_header(
             &mut stream,
             &self.uuid,
@@ -97,6 +114,10 @@ impl Outbound for VlessOutbound {
             return mux.dial_stream(&meta.destination).await;
         }
         let mut stream = self.dialer.dial().await?;
+        tracing::debug!("VLESS outbound: carrier dialed successfully");
+        if let Some(enc) = &self.encryption {
+            stream = flux_protocol::vless_encryption::client_handshake(stream, enc).await?;
+        }
 
         VlessProtocol::write_request_header(
             &mut stream,
@@ -126,6 +147,10 @@ impl Outbound for VlessOutbound {
             return mux.dial_packet(&meta.destination).await;
         }
         let mut stream = self.dialer.dial().await?;
+        tracing::debug!("VLESS outbound: carrier dialed successfully");
+        if let Some(enc) = &self.encryption {
+            stream = flux_protocol::vless_encryption::client_handshake(stream, enc).await?;
+        }
 
         VlessProtocol::write_request_header(
             &mut stream,

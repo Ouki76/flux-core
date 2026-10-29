@@ -35,6 +35,7 @@ const MAX_HANDSHAKE_RECORD: usize = 16384 + 2048;
 
 const GROUP_X25519_MLKEM768: u16 = 0x11ec;
 const MLKEM768_ENC_KEY_SIZE: usize = 1184;
+const MLKEM768_CIPHERTEXT_SIZE: usize = 1088;
 
 const SIG_ED25519: u16 = 0x0807;
 
@@ -254,6 +255,26 @@ pub struct RealityClientConfig {
     pub public_key: [u8; 32],
     /// Short id, which authenticates the client inside the handshake.
     pub short_id: Vec<u8>,
+    /// Optional ML-DSA-65 public key (1952 bytes) for post-quantum cert verification.
+    pub mldsa65_verify: Option<Box<[u8; 1952]>>,
+}
+
+impl RealityClientConfig {
+    /// Builds a client config for the given server name, public key, and short id.
+    pub fn new(server_name: impl Into<String>, public_key: [u8; 32], short_id: Vec<u8>) -> Self {
+        Self {
+            server_name: server_name.into(),
+            public_key,
+            short_id,
+            mldsa65_verify: None,
+        }
+    }
+
+    /// Attaches an ML-DSA-65 public key for post-quantum certificate verification.
+    pub fn with_mldsa65_verify(mut self, verify: [u8; 1952]) -> Self {
+        self.mldsa65_verify = Some(Box::new(verify));
+        self
+    }
 }
 
 /// Server-side REALITY configuration.
@@ -269,7 +290,9 @@ pub struct RealityServerConfig {
     pub fallback: Option<String>,
     /// Max accepted client timestamp skew. None = no time check (sing-box default).
     pub max_time_diff: Option<std::time::Duration>,
-    /// Process-wide Ed25519 material for the temporary handshake certificate.
+    /// Optional ML-DSA-65 seed (32 bytes) for post-quantum cert signatures.
+    pub mldsa65_seed: Option<[u8; 32]>,
+    /// Material for the temporary handshake certificate.
     cert: Arc<RealityCertMaterial>,
 }
 
@@ -281,6 +304,7 @@ impl Clone for RealityServerConfig {
             short_ids: self.short_ids.clone(),
             fallback: self.fallback.clone(),
             max_time_diff: self.max_time_diff,
+            mldsa65_seed: self.mldsa65_seed,
             cert: self.cert.clone(),
         }
     }
@@ -292,6 +316,7 @@ impl std::fmt::Debug for RealityServerConfig {
             .field("server_names", &self.server_names)
             .field("short_ids", &self.short_ids)
             .field("fallback", &self.fallback)
+            .field("mldsa65_seed", &self.mldsa65_seed.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -303,20 +328,33 @@ impl Default for RealityServerConfig {
 }
 
 impl RealityServerConfig {
-    /// Builds a client config for one server.
+    /// Builds a server config without ML-DSA-65.
     pub fn new(
         server_names: Vec<String>,
         private_key: [u8; 32],
         short_ids: Vec<Vec<u8>>,
         fallback: Option<String>,
     ) -> Self {
+        Self::with_mldsa65(server_names, private_key, short_ids, fallback, None)
+    }
+
+    /// Builds a server config with optional ML-DSA-65 post-quantum signing.
+    pub fn with_mldsa65(
+        server_names: Vec<String>,
+        private_key: [u8; 32],
+        short_ids: Vec<Vec<u8>>,
+        fallback: Option<String>,
+        mldsa65_seed: Option<[u8; 32]>,
+    ) -> Self {
+        let cert = RealityCertMaterial::create(mldsa65_seed);
         Self {
             server_names,
             private_key,
             short_ids,
             fallback,
             max_time_diff: None,
-            cert: RealityCertMaterial::get_or_init(),
+            mldsa65_seed,
+            cert: Arc::new(cert),
         }
     }
 }
@@ -332,35 +370,64 @@ struct RealityCertMaterial {
     ed25519_pub: [u8; 32],
     /// Raw Ed25519 keypair for signing the TLS 1.3 CertificateVerify.
     ed25519_key: ring::signature::Ed25519KeyPair,
+    /// DER certificate template with ML-DSA-65 extension if enabled.
+    mldsa_cert_der: Option<Vec<u8>>,
+    mldsa_ext_offset: usize,
+    mldsa_priv: Option<fips204::ml_dsa_65::PrivateKey>,
 }
 
 impl RealityCertMaterial {
-    fn get_or_init() -> Arc<Self> {
-        static INSTANCE: std::sync::OnceLock<Arc<RealityCertMaterial>> = std::sync::OnceLock::new();
-        INSTANCE
-            .get_or_init(|| {
-                let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
-                    .expect("failed to generate ed25519 keypair for REALITY");
-                let params = rcgen::CertificateParams::new(Vec::<String>::new())
-                    .expect("failed to build REALITY cert params");
-                let cert = params
-                    .self_signed(&key_pair)
-                    .expect("failed to self-sign REALITY cert");
-                let cert_der = cert.der().to_vec();
-                let pub_bytes: [u8; 32] = key_pair
-                    .public_key_raw()
-                    .try_into()
-                    .expect("ed25519 public key must be 32 bytes");
-                let pkcs8 = key_pair.serialize_der();
-                let ed25519_key = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
-                    .expect("failed to build ring ed25519 keypair");
-                Arc::new(Self {
-                    cert_der,
-                    ed25519_pub: pub_bytes,
-                    ed25519_key,
-                })
-            })
-            .clone()
+    fn create(mldsa_seed: Option<[u8; 32]>) -> Self {
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
+            .expect("failed to generate ed25519 keypair for REALITY");
+        let params = rcgen::CertificateParams::new(Vec::<String>::new())
+            .expect("failed to build REALITY cert params");
+        let cert = params
+            .self_signed(&key_pair)
+            .expect("failed to self-sign REALITY cert");
+        let cert_der = cert.der().to_vec();
+        let pub_bytes: [u8; 32] = key_pair
+            .public_key_raw()
+            .try_into()
+            .expect("ed25519 public key must be 32 bytes");
+        let pkcs8 = key_pair.serialize_der();
+        let ed25519_key = ring::signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .expect("failed to build ring ed25519 keypair");
+
+        let (mldsa_cert_der, mldsa_ext_offset, mldsa_priv) = if let Some(seed) = mldsa_seed {
+            use fips204::ml_dsa_65;
+            use fips204::traits::KeyGen;
+            let (_mldsa_pub, mldsa_priv) = ml_dsa_65::KG::keygen_from_seed(&seed);
+            let mut params_mldsa = rcgen::CertificateParams::new(Vec::<String>::new())
+                .expect("failed to build REALITY cert params");
+            params_mldsa
+                .custom_extensions
+                .push(rcgen::CustomExtension::from_oid_content(
+                    &[0, 0],
+                    vec![0u8; 3309],
+                ));
+            let cert_mldsa = params_mldsa
+                .self_signed(&key_pair)
+                .expect("failed to self-sign REALITY cert with ML-DSA-65");
+            let der_mldsa = cert_mldsa.der().to_vec();
+            let pattern = [0u8; 3309];
+            let offset = der_mldsa
+                .windows(3309)
+                .position(|w| w == pattern.as_slice())
+                .expect("failed to locate ML-DSA-65 extension value in certificate template");
+            (Some(der_mldsa), offset, Some(mldsa_priv))
+        } else {
+            (None, 0, None)
+        };
+
+        Self {
+            cert_der,
+            ed25519_pub: pub_bytes,
+            ed25519_key,
+            mldsa_cert_der,
+            mldsa_ext_offset,
+            mldsa_priv,
+        }
     }
 
     /// Signs the TLS 1.3 CertificateVerify content with the Ed25519 key.
@@ -369,21 +436,41 @@ impl RealityCertMaterial {
     }
 
     /// Returns the certificate DER with the signature field replaced by
-    /// HMAC-SHA512(auth_key, ed25519_pub) — the REALITY proof of possession.
-    fn cert_for(&self, auth_key: &[u8; 32]) -> Vec<u8> {
+    /// HMAC-SHA512(auth_key, ed25519_pub), and if ML-DSA-65 is configured,
+    /// signs (auth_key, ed25519_pub, ClientHello, ServerHello) and embeds the 3309-byte signature.
+    fn cert_for(&self, auth_key: &[u8; 32], handshake_ctx: Option<(&[u8], &[u8])>) -> Vec<u8> {
         use hmac::{Hmac, Mac};
-        let mut mac = <Hmac<sha2::Sha512> as Mac>::new_from_slice(auth_key)
+        use sha2::Sha512;
+        let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(auth_key)
             .expect("HMAC-SHA512 accepts any key length");
         mac.update(&self.ed25519_pub);
-        let tag = mac.finalize().into_bytes();
-        let mut der = self.cert_der.clone();
-        // The certificate is generated in-process by `rcgen` and always carries
-        // a 64-byte Ed25519 signature, but keep the slice total anyway so a
-        // future shorter certificate cannot panic the handshake path.
-        if let Some(sig) = der.len().checked_sub(64).and_then(|n| der.get_mut(n..)) {
-            sig.copy_from_slice(&tag);
+        let tag = mac.clone().finalize().into_bytes();
+
+        if let (Some(mldsa_der), Some(mldsa_priv), Some((ch, sh))) =
+            (&self.mldsa_cert_der, &self.mldsa_priv, handshake_ctx)
+        {
+            let mut der = mldsa_der.clone();
+            mac.update(ch);
+            mac.update(sh);
+            let msg = mac.finalize().into_bytes();
+            use fips204::traits::Signer;
+            if let Ok(sig) = mldsa_priv.try_sign(&msg, &[]) {
+                let off = self.mldsa_ext_offset;
+                if off + 3309 <= der.len() {
+                    der[off..off + 3309].copy_from_slice(&sig);
+                }
+            }
+            if let Some(sig) = der.len().checked_sub(64).and_then(|n| der.get_mut(n..)) {
+                sig.copy_from_slice(&tag);
+            }
+            der
+        } else {
+            let mut der = self.cert_der.clone();
+            if let Some(sig) = der.len().checked_sub(64).and_then(|n| der.get_mut(n..)) {
+                sig.copy_from_slice(&tag);
+            }
+            der
         }
-        der
     }
 }
 
@@ -861,7 +948,7 @@ impl Tls13Client {
             }
         }
 
-        // ---- 7. REALITY server authentication: HMAC-tagged ed25519 cert.
+        // ---- 7. REALITY server authentication: HMAC-tagged ed25519 cert, optionally ML-DSA-65 verified.
         let cert = cert_der.ok_or_else(|| crypto_err("server sent no certificate"))?;
         let verified = 'check: {
             let Some(cert_pub) = extract_ed25519_pubkey(&cert) else {
@@ -870,22 +957,50 @@ impl Tls13Client {
             let Some(cert_sig) = extract_cert_signature(&cert) else {
                 break 'check false;
             };
-            {
-                use hmac::{Hmac, Mac};
-                let mut mac = <Hmac<sha2::Sha512> as Mac>::new_from_slice(&auth_key)
-                    .expect("HMAC-SHA512 accepts any key length");
-                mac.update(cert_pub);
-                let expect = mac.finalize().into_bytes();
-                let verified = cert_sig == expect.as_slice();
-                if !verified {
-                    tracing::debug!(
-                        "REALITY: received real certificate (potential MITM or redirection), entering spider mode"
-                    );
-                }
-                verified
+            use hmac::{Hmac, Mac};
+            use sha2::Sha512;
+            let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(&auth_key)
+                .expect("HMAC-SHA512 accepts any key length");
+            mac.update(cert_pub);
+            let expect = mac.clone().finalize().into_bytes();
+            if cert_sig != expect.as_slice() {
+                tracing::debug!(
+                    "REALITY: received real certificate (potential MITM or redirection), entering spider mode"
+                );
+                break 'check false;
             }
+            if let Some(ref verify_pub_bytes) = cfg.mldsa65_verify {
+                let Some(ext_val) = extract_first_extension_value(&cert) else {
+                    tracing::debug!("REALITY: certificate missing extension for ML-DSA-65");
+                    break 'check false;
+                };
+                if ext_val.len() != 3309 {
+                    tracing::debug!(
+                        "REALITY: ML-DSA-65 extension length {} != 3309",
+                        ext_val.len()
+                    );
+                    break 'check false;
+                }
+                mac.update(&hello);
+                mac.update(sh);
+                let mldsa_msg = mac.finalize().into_bytes();
+                use fips204::ml_dsa_65;
+                use fips204::traits::{SerDes, Verifier};
+                let Ok(verifier) = ml_dsa_65::PublicKey::try_from_bytes(**verify_pub_bytes) else {
+                    tracing::debug!("REALITY: invalid ML-DSA-65 public key");
+                    break 'check false;
+                };
+                let mut sig_arr = [0u8; 3309];
+                sig_arr.copy_from_slice(ext_val);
+                if !verifier.verify(&mldsa_msg, &sig_arr, &[]) {
+                    tracing::debug!("REALITY: ML-DSA-65 signature verification failed");
+                    break 'check false;
+                }
+            }
+            true
         };
 
+        tracing::debug!("REALITY client: server auth verified={verified}");
         // ---- 8. Application traffic secrets (transcript through server Finished).
         let derived2 = suite.derive_secret(&handshake_secret, "derived", &empty_hash)?;
         let master_secret = suite.hkdf_extract(&derived2, &vec![0u8; suite.hash_len()]);
@@ -990,7 +1105,78 @@ impl Tls13Client {
 }
 
 /// Extracts the Ed25519 public key from a DER X.509 certificate by locating the
-/// Ed25519 OID (1.3.101.112) followed by the BIT STRING with the 32-byte key.
+/// Reads an ASN.1 DER tag, length and value from a slice.
+pub(crate) fn read_der_tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    if input.is_empty() {
+        return None;
+    }
+    let tag = input[0];
+    let mut idx = 1;
+    if idx >= input.len() {
+        return None;
+    }
+    let first_len = input[idx];
+    idx += 1;
+    let len = if first_len < 0x80 {
+        first_len as usize
+    } else {
+        let num_bytes = (first_len & 0x7f) as usize;
+        if num_bytes == 0 || num_bytes > 4 || idx + num_bytes > input.len() {
+            return None;
+        }
+        let mut l = 0usize;
+        for &b in &input[idx..idx + num_bytes] {
+            l = (l << 8) | (b as usize);
+        }
+        idx += num_bytes;
+        l
+    };
+    if idx + len > input.len() {
+        return None;
+    }
+    Some((tag, &input[idx..idx + len], &input[idx + len..]))
+}
+
+/// Extracts the first extension's value from a DER-encoded X.509 certificate.
+pub(crate) fn extract_first_extension_value(cert_der: &[u8]) -> Option<&[u8]> {
+    let (tag, cert_seq, _) = read_der_tlv(cert_der)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (tag, mut tbs_content, _) = read_der_tlv(cert_seq)?;
+    if tag != 0x30 {
+        return None;
+    }
+    while !tbs_content.is_empty() {
+        let (tag, content, rem) = read_der_tlv(tbs_content)?;
+        tbs_content = rem;
+        if tag == 0xa3 {
+            let (tag_exts, extensions_seq, _) = read_der_tlv(content)?;
+            if tag_exts != 0x30 {
+                return None;
+            }
+            let (tag_first, first_ext, _) = read_der_tlv(extensions_seq)?;
+            if tag_first != 0x30 {
+                return None;
+            }
+            let (tag_oid, _oid, ext_rem) = read_der_tlv(first_ext)?;
+            if tag_oid != 0x06 {
+                return None;
+            }
+            let (tag2, val2, ext_rem2) = read_der_tlv(ext_rem)?;
+            if tag2 == 0x01 {
+                let (tag_val, octet_val, _) = read_der_tlv(ext_rem2)?;
+                if tag_val == 0x04 {
+                    return Some(octet_val);
+                }
+            } else if tag2 == 0x04 {
+                return Some(val2);
+            }
+        }
+    }
+    None
+}
+
 fn extract_ed25519_pubkey(cert: &[u8]) -> Option<&[u8; 32]> {
     const OID_ED25519_WITH_BITSTRING: [u8; 8] = [0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00];
     // `windows(8)` only guarantees that the *match start* is in bounds, so the
@@ -1202,7 +1388,8 @@ async fn probe_target_handshake_uncached(
                                             u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]) as usize;
                                         if (group == GROUP_X25519 && klen == 32)
                                             || (group == GROUP_X25519_MLKEM768
-                                                && klen == MLKEM768_ENC_KEY_SIZE + 32)
+                                                && (klen == MLKEM768_CIPHERTEXT_SIZE + 32
+                                                    || klen == MLKEM768_ENC_KEY_SIZE + 32))
                                         {
                                             okks = true;
                                         }
@@ -1371,7 +1558,7 @@ impl Tls13Server {
         flight.extend_from_slice(&ee_rec);
 
         // Certificate: HMAC-tagged ed25519 cert
-        let cert_der = cfg.cert.cert_for(auth_key);
+        let cert_der = cfg.cert.cert_for(auth_key, Some((&hello.raw, &sh)));
         let mut cert_msg = Vec::with_capacity(cert_der.len() + 16);
         cert_msg.push(HS_CERTIFICATE);
         let cert_body_len = (1 + 3 + 3 + cert_der.len() + 2) as u32;
@@ -1660,6 +1847,7 @@ mod tests {
             server_name: "www.microsoft.com".into(),
             public_key: server_public.to_bytes(),
             short_id: vec![0x01, 0x02, 0x03, 0x04],
+            mldsa65_verify: None,
         };
 
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
@@ -1808,6 +1996,7 @@ mod tests {
             server_name: "www.microsoft.com".into(),
             public_key: [0x42u8; 32], // wrong key: server is a plain TLS server
             short_id: vec![0x01, 0x02, 0x03, 0x04],
+            mldsa65_verify: None,
         };
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let res = RealityHandshake::client_handshake(stream, &ccfg).await;
@@ -1829,6 +2018,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_reality_mldsa65_handshake_and_data_roundtrip() {
+        use fips204::ml_dsa_65;
+        use fips204::traits::{KeyGen, SerDes};
+
+        let seed = [0x77u8; 32];
+        let (mldsa_pub, _) = ml_dsa_65::KG::keygen_from_seed(&seed);
+        let mldsa_verify_bytes = mldsa_pub.into_bytes();
+
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = X25519PublicKey::from(&server_secret);
+        let short_id = vec![0x11, 0x22, 0x33, 0x44];
+
+        let scfg = RealityServerConfig::with_mldsa65(
+            vec!["www.microsoft.com".into()],
+            server_secret.to_bytes(),
+            vec![short_id.clone()],
+            None,
+            Some(seed),
+        );
+
+        let ccfg =
+            RealityClientConfig::new("www.microsoft.com", server_public.to_bytes(), short_id)
+                .with_mldsa65_verify(mldsa_verify_bytes);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let srv_handle =
+            tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
+
+        let cli_handle =
+            tokio::spawn(async move { RealityHandshake::client_handshake(client_io, &ccfg).await });
+
+        let (srv_res, cli_res) = tokio::join!(srv_handle, cli_handle);
+        let mut srv_stream = srv_res.expect("join srv").expect("server handshake");
+        let mut cli_stream = cli_res.expect("join cli").expect("client handshake");
+
+        // Verify data exchange over the post-quantum secured tunnel
+        cli_stream
+            .write_all(b"ping-mldsa65")
+            .await
+            .expect("cli write");
+        cli_stream.flush().await.expect("cli flush");
+
+        let mut buf = [0u8; 12];
+        srv_stream.read_exact(&mut buf).await.expect("srv read");
+        assert_eq!(&buf, b"ping-mldsa65");
+
+        srv_stream
+            .write_all(b"pong-mldsa65")
+            .await
+            .expect("srv write");
+        srv_stream.flush().await.expect("srv flush");
+
+        let mut buf2 = [0u8; 12];
+        cli_stream.read_exact(&mut buf2).await.expect("cli read");
+        assert_eq!(&buf2, b"pong-mldsa65");
+    }
+
+    #[tokio::test]
+    async fn test_reality_mldsa65_tampered_key_rejected() {
+        use fips204::ml_dsa_65;
+        use fips204::traits::{KeyGen, SerDes};
+
+        let seed = [0x77u8; 32];
+        let (mldsa_pub, _) = ml_dsa_65::KG::keygen_from_seed(&seed);
+        let mut mldsa_verify_bytes = mldsa_pub.into_bytes();
+        // Tamper with the public key
+        mldsa_verify_bytes[10] ^= 0xff;
+
+        let server_secret = StaticSecret::random_from_rng(OsRng);
+        let server_public = X25519PublicKey::from(&server_secret);
+        let short_id = vec![0x11, 0x22, 0x33, 0x44];
+
+        let scfg = RealityServerConfig::with_mldsa65(
+            vec!["www.microsoft.com".into()],
+            server_secret.to_bytes(),
+            vec![short_id.clone()],
+            None,
+            Some(seed),
+        );
+
+        let ccfg =
+            RealityClientConfig::new("www.microsoft.com", server_public.to_bytes(), short_id)
+                .with_mldsa65_verify(mldsa_verify_bytes);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        let srv_handle =
+            tokio::spawn(async move { RealityHandshake::server_handshake(server_io, &scfg).await });
+
+        let cli_handle =
+            tokio::spawn(async move { RealityHandshake::client_handshake(client_io, &ccfg).await });
+
+        let (_srv_res, cli_res) = tokio::join!(srv_handle, cli_handle);
+        // Client must reject the handshake because ML-DSA-65 signature does not verify
+        assert!(
+            cli_res.expect("join cli").is_err(),
+            "client should reject tampered mldsa65 key"
+        );
+    }
+
+    #[tokio::test]
     async fn test_reality_xtls_handshake_and_data_roundtrip() {
         let server_secret = StaticSecret::random_from_rng(OsRng);
         let server_public = X25519PublicKey::from(&server_secret);
@@ -1838,6 +2129,7 @@ mod tests {
             server_name: "www.microsoft.com".into(),
             public_key: server_public.to_bytes(),
             short_id: vec![0x01, 0x02, 0x03, 0x04],
+            mldsa65_verify: None,
         };
 
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
@@ -1873,6 +2165,7 @@ mod tests {
             server_name: "www.microsoft.com".into(),
             public_key: server_public.to_bytes(),
             short_id: vec![0xde, 0xad, 0xbe, 0xef], // not allowed
+            mldsa65_verify: None,
         };
 
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
@@ -1936,6 +2229,7 @@ mod tests {
             server_name: "www.microsoft.com".into(),
             public_key: server_public.to_bytes(),
             short_id: vec![0x01, 0x02, 0x03, 0x04],
+            mldsa65_verify: None,
         };
 
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
@@ -2167,6 +2461,7 @@ mod hostile_transport_tests {
             server_name: "www.microsoft.com".into(),
             public_key: server_public.to_bytes(),
             short_id: vec![0x01, 0x02, 0x03, 0x04],
+            mldsa65_verify: None,
         };
 
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
@@ -2254,6 +2549,7 @@ mod bulk_integrity_tests {
             server_name: "www.microsoft.com".into(),
             public_key: server_public.to_bytes(),
             short_id: vec![0x01, 0x02, 0x03, 0x04],
+            mldsa65_verify: None,
         };
 
         let (client_io, server_io) = tokio::io::duplex(256 * 1024);
@@ -2441,6 +2737,7 @@ mod client_hello_shape_tests {
             server_name: "www.example.com".into(),
             public_key: pk,
             short_id: vec![1, 2, 3, 4],
+            mldsa65_verify: None,
         };
         let written = Arc::new(Mutex::new(Vec::new()));
         let stream = CapturingStream {

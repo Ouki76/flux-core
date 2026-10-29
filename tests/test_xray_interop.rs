@@ -36,7 +36,10 @@
 
 mod common;
 
-use common::{get_free_tcp_port, retry_on_flake, start_tcp_echo_server, start_tls_echo_server};
+use common::{
+    get_free_tcp_port, retry_on_flake, start_large_tls_echo_server, start_tcp_echo_server,
+    start_tls_echo_server,
+};
 use flux_app::{Config, Instance};
 use flux_types::{NetworkType, SessionMeta, TargetAddress};
 use serde_json::{Value, json};
@@ -83,7 +86,37 @@ fn get_xray_bin() -> Option<PathBuf> {
     which("xray")
 }
 
-/// Fresh x25519 keypair as REALITY expects it: base64url, unpadded.
+/// Generates ML-DSA-65 seed (32 bytes) and verify key (1952 bytes) as base64url unpadded.
+fn mldsa65_keypair() -> (String, String) {
+    use base64::Engine;
+    use fips204::traits::{KeyGen, SerDes};
+    let mut seed = [0u8; 32];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let (pubkey, _) = fips204::ml_dsa_65::KG::keygen_from_seed(&seed);
+    (
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pubkey.into_bytes()),
+    )
+}
+
+/// Generates ML-KEM-768 seed (64 bytes) and client encapsulation key (1184 bytes) as base64url unpadded.
+fn mlkem768_keypair() -> (String, String) {
+    use base64::Engine;
+    use fips203::traits::{KeyGen, SerDes};
+    let mut seed = [0u8; 64];
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let (ek, _) = fips203::ml_kem_768::KG::keygen_from_seed(
+        seed[..32].try_into().unwrap(),
+        seed[32..].try_into().unwrap(),
+    );
+    (
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(seed),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ek.into_bytes()),
+    )
+}
+
 fn reality_keypair() -> (String, String) {
     use base64::Engine;
     let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
@@ -539,4 +572,241 @@ async fn reality_vision_xray_client_to_flux() {
         reality_xray_client_to_flux(true)
     })
     .await;
+}
+
+// ===========================================================================
+// Post-quantum tests: ML-DSA-65 (REALITY) and mlkem768x25519plus (VLESS Encryption)
+// ===========================================================================
+
+#[tokio::test]
+async fn reality_mldsa65_flux_client_to_xray() {
+    let echo = start_tcp_echo_server().await;
+    let target = start_large_tls_echo_server().await;
+
+    let xray_vless_port = get_free_tcp_port().await;
+    let flux_socks_port = get_free_tcp_port().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let (priv_b64, pub_b64) = reality_keypair();
+    let (mldsa_seed, mldsa_verify) = mldsa65_keypair();
+
+    let mut srv_cfg = xray_server_config(xray_vless_port, target.port(), &uuid, &priv_b64, false);
+    srv_cfg["inbounds"][0]["streamSettings"]["realitySettings"]["mldsa65Seed"] = json!(mldsa_seed);
+    srv_cfg["inbounds"][0]["streamSettings"]["realitySettings"]["show"] = json!(true);
+
+    let Some(mut xray) = XrayProcess::start(&srv_cfg, "xray REALITY ML-DSA-65 server") else {
+        eprintln!("SKIPPING: xray binary not found");
+        return;
+    };
+    wait_for_listen(&mut xray, xray_vless_port, "xray reality listener").await;
+
+    let mut flux_val: Value =
+        serde_json::from_str(&flux_client_config(xray_vless_port, &uuid, &pub_b64, false)).unwrap();
+    flux_val["outbounds"][0]["security"]["mldsa65_verify"] = json!(mldsa_verify);
+    let inbounds = json!([{
+        "tag": "in",
+        "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": flux_socks_port },
+        "protocol": { "type": "socks" }
+    }]);
+    flux_val["inbounds"] = inbounds;
+    flux_val["route"] = json!({ "final": "xray-reality" });
+
+    let inst = Instance::new(Config::from_json_str(&flux_val.to_string()).unwrap()).unwrap();
+    inst.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    println!(
+        "xray log before connect:
+{}",
+        xray.log()
+    );
+    let mut stream = socks5_connect(
+        flux_socks_port,
+        echo,
+        "flux REALITY+ML-DSA-65 client -> xray",
+    )
+    .await;
+    println!(
+        "xray log after connect:
+{}",
+        xray.log()
+    );
+    assert_two_roundtrips(&mut stream, "flux-mldsa65->xray").await;
+
+    drop(stream);
+    inst.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn reality_mldsa65_xray_client_to_flux() {
+    let echo = start_tcp_echo_server().await;
+    let target = start_tls_echo_server().await;
+
+    let flux_port = get_free_tcp_port().await;
+    let xray_socks_port = get_free_tcp_port().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let (priv_b64, pub_b64) = reality_keypair();
+    let (mldsa_seed, mldsa_verify) = mldsa65_keypair();
+
+    let mut flux_val: Value = serde_json::from_str(&flux_server_config(
+        flux_port,
+        target.port(),
+        &uuid,
+        &priv_b64,
+        false,
+    ))
+    .unwrap();
+    flux_val["log"]["level"] = json!("debug");
+    flux_val["inbounds"][0]["security"]["mldsa65_seed"] = json!(mldsa_seed);
+
+    let inst = Instance::new(Config::from_json_str(&flux_val.to_string()).unwrap()).unwrap();
+    inst.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut cli_cfg = xray_client_config(xray_socks_port, flux_port, &uuid, &pub_b64, false);
+    cli_cfg["outbounds"][0]["streamSettings"]["realitySettings"]["mldsa65Verify"] =
+        json!(mldsa_verify);
+    cli_cfg["log"]["loglevel"] = json!("debug");
+    cli_cfg["outbounds"][0]["streamSettings"]["realitySettings"]["show"] = json!(true);
+
+    let Some(mut xray) = XrayProcess::start(&cli_cfg, "xray REALITY ML-DSA-65 client") else {
+        eprintln!("SKIPPING: xray binary not found");
+        inst.stop().await.unwrap();
+        return;
+    };
+    wait_for_listen(&mut xray, xray_socks_port, "xray socks inbound").await;
+
+    let mut stream = socks5_connect(
+        xray_socks_port,
+        echo,
+        "xray REALITY+ML-DSA-65 client -> flux",
+    )
+    .await;
+    assert_two_roundtrips(&mut stream, "xray-mldsa65->flux").await;
+
+    drop(stream);
+    inst.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn vlessenc_mlkem768_flux_client_to_xray() {
+    let echo = start_tcp_echo_server().await;
+
+    let xray_vless_port = get_free_tcp_port().await;
+    let flux_socks_port = get_free_tcp_port().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let (sec_b64, pub_b64) = mlkem768_keypair();
+    let dec_str = format!("mlkem768x25519plus.native.600s.{sec_b64}");
+    let enc_str = format!("mlkem768x25519plus.native.0rtt.{pub_b64}");
+
+    let xray_cfg = json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [{
+            "port": xray_vless_port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{ "id": uuid }],
+                "decryption": dec_str
+            }
+        }],
+        "outbounds": [{ "protocol": "freedom" }]
+    });
+
+    let Some(mut xray) = XrayProcess::start(&xray_cfg, "xray VLESS Decryption server") else {
+        eprintln!("SKIPPING: xray binary not found");
+        return;
+    };
+    wait_for_listen(&mut xray, xray_vless_port, "xray vless listener").await;
+
+    let flux_cfg = json!({
+        "log": { "level": "warning" },
+        "inbounds": [{
+            "tag": "in",
+            "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": flux_socks_port },
+            "protocol": { "type": "socks" }
+        }],
+        "outbounds": [{
+            "tag": "out",
+            "carrier": { "type": "tcp", "address": format!("127.0.0.1:{xray_vless_port}") },
+            "protocol": {
+                "type": "vless",
+                "uuid": uuid,
+                "encryption": enc_str
+            }
+        }],
+        "route": { "final": "out" }
+    });
+
+    let inst = Instance::new(Config::from_json_str(&flux_cfg.to_string()).unwrap()).unwrap();
+    inst.start().await.unwrap();
+
+    let mut stream = socks5_connect(flux_socks_port, echo, "flux VLESS PQ client -> xray").await;
+    assert_two_roundtrips(&mut stream, "flux-vlessenc-pq->xray").await;
+
+    drop(stream);
+    inst.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn vlessenc_mlkem768_xray_client_to_flux() {
+    let echo = start_tcp_echo_server().await;
+
+    let flux_vless_port = get_free_tcp_port().await;
+    let xray_socks_port = get_free_tcp_port().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let (sec_b64, pub_b64) = mlkem768_keypair();
+    let dec_str = format!("mlkem768x25519plus.native.600s.{sec_b64}");
+    let enc_str = format!("mlkem768x25519plus.native.0rtt.{pub_b64}");
+
+    let flux_cfg = json!({
+        "log": { "level": "warning" },
+        "inbounds": [{
+            "tag": "in",
+            "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": flux_vless_port },
+            "protocol": {
+                "type": "vless",
+                "uuid": uuid,
+                "decryption": dec_str
+            }
+        }],
+        "outbounds": [{ "type": "direct", "tag": "d" }],
+        "route": { "final": "d" }
+    });
+
+    let inst = Instance::new(Config::from_json_str(&flux_cfg.to_string()).unwrap()).unwrap();
+    inst.start().await.unwrap();
+
+    let xray_cfg = json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [{
+            "port": xray_socks_port,
+            "protocol": "socks",
+            "settings": { "auth": "noauth" }
+        }],
+        "outbounds": [{
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": "127.0.0.1",
+                    "port": flux_vless_port,
+                    "users": [{
+                        "id": uuid,
+                        "encryption": enc_str
+                    }]
+                }]
+            }
+        }]
+    });
+
+    let Some(mut xray) = XrayProcess::start(&xray_cfg, "xray VLESS Encryption client") else {
+        eprintln!("SKIPPING: xray binary not found");
+        inst.stop().await.unwrap();
+        return;
+    };
+    wait_for_listen(&mut xray, xray_socks_port, "xray socks listener").await;
+
+    let mut stream = socks5_connect(xray_socks_port, echo, "xray VLESS PQ client -> flux").await;
+    assert_two_roundtrips(&mut stream, "xray-vlessenc-pq->flux").await;
+
+    drop(stream);
+    inst.stop().await.unwrap();
 }

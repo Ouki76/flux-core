@@ -28,6 +28,8 @@ tracing = { workspace = true }
 rcgen = { workspace = true }
 pem = { workspace = true }
 socket2 = { workspace = true }
+fips203 = { workspace = true }
+fips204 = { workspace = true }
 serde = { workspace = true }
 md-5 = { workspace = true }
 hmac = { workspace = true }
