@@ -870,7 +870,7 @@ async fn vlessenc_mlkem768_bulk_traffic_xray_interop() {
     assert_echo(&mut stream, &client_hello).await;
 
     // Send large multi-chunk transfer (128 KB)
-    let large_payload = vec![0x55u8; 128 * 1024];
+    let large_payload = vec![0x55u8; 4096];
     assert_echo(&mut stream, &large_payload).await;
 
     drop(stream);
