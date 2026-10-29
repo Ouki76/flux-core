@@ -13330,3 +13330,17 @@ Below thirty seconds the constant is **immaterial**: descriptors stay in the low
 Ten seconds is chosen as the middle of the flat region: inside the client's own timeout, and long enough that a peer pooling connections across two requests is not cut off. The comment at the constant now carries this table.
 
 Also recorded honestly: the first attempt at this measured nothing useful because a `sed` intended for `IDLE_TIMEOUT` rewrote the driver grace period and the test's pacing values as well, which broke `posts_are_paced_by_the_configured_interval`. Caught by the suite, reverted, and the constant set by hand.
+
+### C7.169 — duplication removed where it was real, left alone where it was not
+
+`accept` in xhttp.rs is 323 lines, so the suspicion was justified. What the survey found:
+
+```
+Response::builder() blocks            17
+hand-written 404 responses             5   -> one helper, not_found_response()
+200 responses with a body type       ~10   -> left explicit: each carries a different content-type
+```
+
+A helper taking an optional content type was written first and had **no callers** — the 200s differ by header rather than by shape. It was deleted rather than kept for symmetry, which is the same rule applied to `id()`, `build_client_hello` and the rest earlier.
+
+Across the whole workspace clippy reports 23 functions past `too_many_lines`. They are protocol parsers and test bodies (shadowsocks, vmess, wireguard, reality, the TLS record layers). Splitting them by line count would scatter state that is deliberately local — a handshake parser whose steps are numbered in comments is easier to check in one place than across six helpers. No change made, and none justified by a measurement.
