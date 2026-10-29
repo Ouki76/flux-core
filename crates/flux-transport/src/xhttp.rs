@@ -1081,13 +1081,7 @@ where
                 };
                 let path = post.uri().path().to_string();
                 if !is_uplink_method(post.method()) {
-                    let _ = post_respond.send_response(
-                        Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(())
-                            .expect("static refusal"),
-                        true,
-                    );
+                    let _ = post_respond.send_response(not_found_response(), true);
                     continue;
                 }
                 let last = path.rsplit('/').next().unwrap_or("").to_string();
@@ -1148,12 +1142,17 @@ where
             .map(|suffix| suffix.trim_matches('/').to_string());
         if download.method() != Method::GET || download_session.as_deref() != Some(session.as_str())
         {
-            let refusal = Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(())
-                .expect("static refusal response");
+            let refusal = not_found_response();
             let _ = download_respond.send_response(refusal, true);
-            shared::spawn_connection_driver(connection, Some(std::time::Duration::from_millis(250)));
+            // Deliberately refusing: the download path did not match its upload, so this
+            // connection carries nothing we can serve. A bare driver answers any later request
+            // with REFUSED_STREAM and the socket closes after the grace period. This is the one
+            // place where that behaviour is correct — everywhere else a later request is either a
+            // tunnel or an upload for an existing session (C7.159).
+            shared::spawn_connection_driver(
+                connection,
+                Some(std::time::Duration::from_millis(250)),
+            );
             return Err(FluxError::Protocol {
                 protocol: "xhttp",
                 message: format!("the download for session {session} did not match its upload"),
@@ -1203,13 +1202,7 @@ where
                     .strip_prefix(base_for_later.as_str())
                     .map(|suffix| suffix.trim_matches('/').to_string());
                 if !is_uplink_method(later.method()) || later_session.is_none() {
-                    let _ = later_respond.send_response(
-                        Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(())
-                            .expect("static refusal"),
-                        true,
-                    );
+                    let _ = later_respond.send_response(not_found_response(), true);
                     continue;
                 }
                 let session_of_post = later_session.unwrap_or_default();
@@ -1251,11 +1244,9 @@ where
     // Xray only ever uses POST for a streaming upload; anything else is not this
     // transport and gets a plain 404 rather than a stream that would never work.
     if !is_uplink_method(request.method()) || !under_base {
-        let refusal = Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(())
-            .expect("static refusal response");
+        let refusal = not_found_response();
         let _ = respond.send_response(refusal, true);
+        // Same deliberate refusal as above: this is not an XHTTP request at all.
         shared::spawn_connection_driver(connection, Some(std::time::Duration::from_millis(250)));
         return Err(FluxError::Protocol {
             protocol: "xhttp",
@@ -1313,13 +1304,7 @@ where
                 break;
             };
             if !is_uplink_method(later.method()) {
-                let _ = later_respond.send_response(
-                    Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(())
-                        .expect("static refusal"),
-                    true,
-                );
+                let _ = later_respond.send_response(not_found_response(), true);
                 continue;
             }
             let Ok(resp) = Response::builder()
@@ -1343,6 +1328,14 @@ where
         Box::new(H2Stream::new(send, recv).with_close(close_tx)),
         extra_rx,
     ))
+}
+
+/// The refusal every non-XHTTP path gives: a bare 404 with no body.
+fn not_found_response() -> Response<()> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(())
+        .expect("static refusal response")
 }
 
 /// Is this request an uplink (the client pushing bytes)?
