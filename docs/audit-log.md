@@ -13369,3 +13369,23 @@ Implemented complete post-quantum cryptographic upgrades matching Xray-core v26:
      - `reality_mldsa65_xray_client_to_flux` -> PASSED
    - Verified live in production against external reference VLESS+REALITY PQ servers, successfully establishing post-quantum tunnels and proxying real HTTP traffic.
    - All gates clean on pinned Rust 1.91.0: `cargo fmt`, `clippy -D warnings`, `rustdoc`, `cargo audit`, `cargo deny check`, 0 failing test suites, `bench_rps --assert` and `bench_matrix --assert` PASSED.
+
+### C7.171 — VlessEncryptionStream asynchronous framing and write-buffer state retention
+
+Investigated and fixed stream stall on large frames (e.g. 1560-byte TLS ClientHello on port 443):
+
+1. **Root cause in `VlessEncryptionStream::poll_write`**:
+   - `poll_write` previously called `write_aead.seal` directly inside `poll_write` without staging. When writing larger records (such as a 1560-byte TLS ClientHello), if the underlying transport returned `Poll::Pending` or a partial write, the remaining bytes were either dropped or the record was re-sealed on the next poll with an incremented AEAD nonce. This desynchronized AEAD nonces with the server, causing the server to silently terminate the connection (`upload=1562 B, download=0 B`).
+   - Fixed by adding `pending_write`, `pending_write_pos`, and `pending_unacked` to `VlessEncryptionStream`. Records are staged in `pending_write`, progress is retained across polls, and caller acknowledgment is only reported once the staged record is committed to the transport.
+
+2. **Root cause in `VlessEncryptionStream::poll_read`**:
+   - Record header (5 bytes) and body reads were previously local variables inside `poll_read`, which caused state loss if the underlying transport returned `Poll::Pending` on partial packet arrivals.
+   - Fixed by adding `rx_hdr`, `rx_hdr_len`, `rx_body`, `rx_body_len`, and `rx_rec_len` state to retain read progression across polls.
+
+3. **XorState header/payload skip fix**:
+   - `XorState` for `XorMode::Random` now accurately differentiates write vs read paths: on write, `decode_record_header` reads payload length before applying keystream to the 5-byte header; on read, payload length is decoded from the decrypted header, skipping the AEAD ciphertext payload in both directions.
+
+4. **Verification**:
+   - Added `vlessenc_mlkem768_bulk_traffic_xray_interop` to `tests/test_xray_interop.rs` asserting 1560-byte TLS ClientHello simulation followed by a 128 KB bulk transfer against Xray server.
+   - All 9 integration tests in `test_xray_interop` and all 7 unit tests in `vless_encryption` pass.
+   - `cargo fmt`, `cargo clippy --all-features -D warnings` pass cleanly on pinned Rust 1.91.0.

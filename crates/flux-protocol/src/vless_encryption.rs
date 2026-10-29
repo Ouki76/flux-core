@@ -978,7 +978,10 @@ where
         ticket_arr.copy_from_slice(&ticket[..16]);
         let ctr_out = new_ctr(&united_key, &iv);
         let ctr_in = new_ctr(&united_key, &ticket_arr);
-        Some((ctr_out, ctr_in))
+        Some(XorPair {
+            out_state: XorState::new(ctr_out, 0, true),
+            in_state: XorState::new(ctr_in, 0, false),
+        })
     } else {
         None
     };
@@ -990,8 +993,16 @@ where
         united_key,
         use_aes,
         xor_pair,
+        rx_hdr: [0u8; 5],
+        rx_hdr_len: 0,
+        rx_body: Vec::new(),
+        rx_body_len: 0,
+        rx_rec_len: 0,
         read_buf: Vec::new(),
         read_pos: 0,
+        pending_write: Vec::new(),
+        pending_write_pos: 0,
+        pending_unacked: 0,
     }))
 }
 
@@ -1218,7 +1229,10 @@ where
     let xor_pair = if cfg.xor_mode == XorMode::Random {
         let ctr_out = new_ctr(&united_key, &ticket);
         let ctr_in = new_ctr(&united_key, &iv);
-        Some((ctr_out, ctr_in))
+        Some(XorPair {
+            out_state: XorState::new(ctr_out, 0, true),
+            in_state: XorState::new(ctr_in, 0, false),
+        })
     } else {
         None
     };
@@ -1230,9 +1244,81 @@ where
         united_key,
         use_aes,
         xor_pair,
+        rx_hdr: [0u8; 5],
+        rx_hdr_len: 0,
+        rx_body: Vec::new(),
+        rx_body_len: 0,
+        rx_rec_len: 0,
         read_buf: Vec::new(),
         read_pos: 0,
+        pending_write: Vec::new(),
+        pending_write_pos: 0,
+        pending_unacked: 0,
     }))
+}
+
+/// XOR state tracking 5-byte headers and payload skip (matching Xray's xor.go).
+pub struct XorState {
+    ctr: Aes256Ctr,
+    skip: usize,
+    hdr: Vec<u8>,
+    is_write: bool,
+}
+
+impl XorState {
+    /// Creates a new XOR state with initial skip count.
+    pub fn new(ctr: Aes256Ctr, skip: usize, is_write: bool) -> Self {
+        Self {
+            ctr,
+            skip,
+            hdr: Vec::with_capacity(5),
+            is_write,
+        }
+    }
+
+    /// Applies CTR keystream to 5-byte record headers only, skipping record payloads.
+    pub fn apply(&mut self, mut data: &mut [u8]) {
+        while !data.is_empty() {
+            if data.len() <= self.skip {
+                self.skip -= data.len();
+                break;
+            }
+            data = &mut data[self.skip..];
+            self.skip = 0;
+            let need = 5 - self.hdr.len();
+            if data.len() < need {
+                if self.is_write {
+                    self.hdr.extend_from_slice(data);
+                    self.ctr.apply_keystream(data);
+                } else {
+                    self.ctr.apply_keystream(data);
+                    self.hdr.extend_from_slice(data);
+                }
+                break;
+            }
+            if self.is_write {
+                self.hdr.extend_from_slice(&data[..need]);
+                if let Ok(len) = decode_record_header((&self.hdr[..5]).try_into().unwrap()) {
+                    self.skip = len;
+                }
+                self.ctr.apply_keystream(&mut data[..need]);
+            } else {
+                self.ctr.apply_keystream(&mut data[..need]);
+                self.hdr.extend_from_slice(&data[..need]);
+                if let Ok(len) = decode_record_header((&self.hdr[..5]).try_into().unwrap()) {
+                    self.skip = len;
+                }
+            }
+            self.hdr.clear();
+            data = &mut data[need..];
+        }
+    }
+}
+
+/// Pair of XOR states for duplex stream.
+pub struct XorPair {
+    out_state: XorState,
+    in_state: XorState,
 }
 
 /// Duplex stream wrapper for TLS-like record framed VLESS Encryption.
@@ -1242,9 +1328,21 @@ pub struct VlessEncryptionStream {
     read_aead: VlessAead,
     united_key: Vec<u8>,
     use_aes: bool,
-    xor_pair: Option<(Aes256Ctr, Aes256Ctr)>,
+    xor_pair: Option<XorPair>,
+
+    // Read state across polls
+    rx_hdr: [u8; 5],
+    rx_hdr_len: usize,
+    rx_body: Vec<u8>,
+    rx_body_len: usize,
+    rx_rec_len: usize,
     read_buf: Vec<u8>,
     read_pos: usize,
+
+    // Write state across polls
+    pending_write: Vec<u8>,
+    pending_write_pos: usize,
+    pending_unacked: usize,
 }
 
 impl AsyncRead for VlessEncryptionStream {
@@ -1253,7 +1351,9 @@ impl AsyncRead for VlessEncryptionStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = &mut *self;
+        let this = self.as_mut().get_mut();
+
+        // 1. Drain existing decrypted buffer
         if this.read_pos < this.read_buf.len() {
             let available = this.read_buf.len() - this.read_pos;
             let to_copy = available.min(buf.remaining());
@@ -1266,74 +1366,73 @@ impl AsyncRead for VlessEncryptionStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Read next record header: 5 bytes [23, 3, 3, len_hi, len_lo]
-        let mut hdr = [0u8; 5];
-        let mut hdr_read = 0;
-        while hdr_read < 5 {
-            let mut read_slice = [0u8; 5];
-            let mut sub_buf = ReadBuf::new(&mut read_slice[..5 - hdr_read]);
+        // 2. Read 5-byte header [23, 3, 3, len_hi, len_lo]
+        while this.rx_hdr_len < 5 {
+            let mut slice = [0u8; 5];
+            let mut sub_buf = ReadBuf::new(&mut slice[..5 - this.rx_hdr_len]);
             match Pin::new(&mut this.inner).poll_read(cx, &mut sub_buf) {
                 Poll::Ready(Ok(())) => {
                     let filled = sub_buf.filled().len();
                     if filled == 0 {
-                        if hdr_read == 0 {
-                            return Poll::Ready(Ok(()));
-                        } else {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "unexpected EOF reading record header",
-                            )));
+                        if this.rx_hdr_len == 0 {
+                            return Poll::Ready(Ok(())); // clean EOF
                         }
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "unexpected EOF reading record header",
+                        )));
                     }
-                    hdr[hdr_read..hdr_read + filled].copy_from_slice(sub_buf.filled());
-                    hdr_read += filled;
+                    this.rx_hdr[this.rx_hdr_len..this.rx_hdr_len + filled]
+                        .copy_from_slice(sub_buf.filled());
+                    this.rx_hdr_len += filled;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
 
-        if let Some((_, ref mut in_ctr)) = this.xor_pair {
-            in_ctr.apply_keystream(&mut hdr);
+        if this.rx_rec_len == 0 {
+            if let Some(ref mut xor) = this.xor_pair {
+                xor.in_state.apply(&mut this.rx_hdr);
+            }
+            this.rx_rec_len = match decode_record_header(&this.rx_hdr) {
+                Ok(l) => l,
+                Err(e) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )));
+                }
+            };
+            this.rx_body.resize(this.rx_rec_len, 0);
+            this.rx_body_len = 0;
         }
 
-        let rec_len = match decode_record_header(&hdr) {
-            Ok(l) => l,
-            Err(e) => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    e.to_string(),
-                )));
-            }
-        };
-
-        // Read payload of rec_len bytes
-        let mut raw_data = vec![0u8; rec_len];
-        let mut data_read = 0;
-        while data_read < rec_len {
-            let mut sub_buf = ReadBuf::new(&mut raw_data[data_read..]);
+        // 3. Read body of rx_rec_len bytes
+        while this.rx_body_len < this.rx_rec_len {
+            let mut sub_buf = ReadBuf::new(&mut this.rx_body[this.rx_body_len..this.rx_rec_len]);
             match Pin::new(&mut this.inner).poll_read(cx, &mut sub_buf) {
                 Poll::Ready(Ok(())) => {
                     let filled = sub_buf.filled().len();
                     if filled == 0 {
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
-                            "unexpected EOF reading record payload",
+                            "unexpected EOF reading record body",
                         )));
                     }
-                    data_read += filled;
+                    this.rx_body_len += filled;
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
         }
 
-        if let Some((_, ref mut in_ctr)) = this.xor_pair {
-            in_ctr.apply_keystream(&mut raw_data);
+        if let Some(ref mut xor) = this.xor_pair {
+            xor.in_state.apply(&mut this.rx_body);
         }
 
         let is_max = this.read_aead.nonce.is_max();
-        let decrypted = match this.read_aead.open(&raw_data, &hdr) {
+        let decrypted = match this.read_aead.open(&this.rx_body, &this.rx_hdr) {
             Ok(p) => p,
             Err(e) => {
                 return Poll::Ready(Err(io::Error::new(
@@ -1342,12 +1441,18 @@ impl AsyncRead for VlessEncryptionStream {
                 )));
             }
         };
+
         if is_max {
-            let mut rekey_ctx = Vec::with_capacity(5 + raw_data.len());
-            rekey_ctx.extend_from_slice(&hdr);
-            rekey_ctx.extend_from_slice(&raw_data);
+            let mut rekey_ctx = Vec::with_capacity(5 + this.rx_body.len());
+            rekey_ctx.extend_from_slice(&this.rx_hdr);
+            rekey_ctx.extend_from_slice(&this.rx_body);
             this.read_aead = VlessAead::new(&rekey_ctx, &this.united_key, this.use_aes);
         }
+
+        // Reset record state for next record
+        this.rx_hdr_len = 0;
+        this.rx_rec_len = 0;
+        this.rx_body_len = 0;
 
         let to_copy = decrypted.len().min(buf.remaining());
         buf.put_slice(&decrypted[..to_copy]);
@@ -1366,11 +1471,39 @@ impl AsyncWrite for VlessEncryptionStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+
+        // 1. Flush any pending data from previous calls
+        while this.pending_write_pos < this.pending_write.len() {
+            match Pin::new(&mut this.inner)
+                .poll_write(cx, &this.pending_write[this.pending_write_pos..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vless encryption underlying write returned 0",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => this.pending_write_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        this.pending_write.clear();
+        this.pending_write_pos = 0;
+
+        // If a previously unacknowledged block has now been fully sent to inner, return its length
+        if this.pending_unacked > 0 {
+            let ack = this.pending_unacked.min(buf.len());
+            this.pending_unacked = 0;
+            return Poll::Ready(Ok(ack));
+        }
+
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        let this = &mut *self;
-        // Chunk into at most 8192 bytes payload
+
+        // 2. Stage new record(s)
         let chunk_size = buf.len().min(8192);
         let chunk = &buf[..chunk_size];
         let hdr = encode_record_header(chunk_size + 16);
@@ -1378,31 +1511,92 @@ impl AsyncWrite for VlessEncryptionStream {
         let is_max = this.write_aead.nonce.is_max();
         let ciphertext = this.write_aead.seal(chunk, &hdr);
 
-        let mut out = Vec::with_capacity(5 + ciphertext.len());
-        out.extend_from_slice(&hdr);
-        out.extend_from_slice(&ciphertext);
-
         if is_max {
-            this.write_aead = VlessAead::new(&out, &this.united_key, this.use_aes);
+            let mut rekey_ctx = Vec::with_capacity(5 + ciphertext.len());
+            rekey_ctx.extend_from_slice(&hdr);
+            rekey_ctx.extend_from_slice(&ciphertext);
+            this.write_aead = VlessAead::new(&rekey_ctx, &this.united_key, this.use_aes);
         }
 
-        if let Some((ref mut out_ctr, _)) = this.xor_pair {
-            out_ctr.apply_keystream(&mut out);
+        let mut record = Vec::with_capacity(5 + ciphertext.len());
+        record.extend_from_slice(&hdr);
+        record.extend_from_slice(&ciphertext);
+
+        if let Some(ref mut xor) = this.xor_pair {
+            xor.out_state.apply(&mut record);
         }
 
-        match Pin::new(&mut this.inner).poll_write(cx, &out) {
-            Poll::Ready(Ok(_written)) => Poll::Ready(Ok(chunk_size)),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
+        this.pending_write = record;
+        this.pending_write_pos = 0;
+        this.pending_unacked = chunk_size;
+
+        // 3. Immediately attempt to write to inner
+        while this.pending_write_pos < this.pending_write.len() {
+            match Pin::new(&mut this.inner)
+                .poll_write(cx, &this.pending_write[this.pending_write_pos..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vless encryption underlying write returned 0",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => this.pending_write_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    return Poll::Pending;
+                }
+            }
         }
+
+        this.pending_write.clear();
+        this.pending_write_pos = 0;
+        this.pending_unacked = 0;
+        Poll::Ready(Ok(chunk_size))
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let this = self.as_mut().get_mut();
+        while this.pending_write_pos < this.pending_write.len() {
+            match Pin::new(&mut this.inner)
+                .poll_write(cx, &this.pending_write[this.pending_write_pos..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vless encryption underlying write returned 0",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => this.pending_write_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        this.pending_write.clear();
+        this.pending_write_pos = 0;
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = self.as_mut().get_mut();
+        while this.pending_write_pos < this.pending_write.len() {
+            match Pin::new(&mut this.inner)
+                .poll_write(cx, &this.pending_write[this.pending_write_pos..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "vless encryption underlying write returned 0",
+                    )));
+                }
+                Poll::Ready(Ok(n)) => this.pending_write_pos += n,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        this.pending_write.clear();
+        this.pending_write_pos = 0;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 

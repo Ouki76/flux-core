@@ -810,3 +810,69 @@ async fn vlessenc_mlkem768_xray_client_to_flux() {
     drop(stream);
     inst.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn vlessenc_mlkem768_bulk_traffic_xray_interop() {
+    let echo = start_tcp_echo_server().await;
+
+    let xray_vless_port = get_free_tcp_port().await;
+    let flux_socks_port = get_free_tcp_port().await;
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let (sec_b64, pub_b64) = mlkem768_keypair();
+    let dec_str = format!("mlkem768x25519plus.native.600s.{sec_b64}");
+    let enc_str = format!("mlkem768x25519plus.native.0rtt.{pub_b64}");
+
+    let xray_cfg = json!({
+        "log": { "loglevel": "warning" },
+        "inbounds": [{
+            "port": xray_vless_port,
+            "protocol": "vless",
+            "settings": {
+                "clients": [{ "id": uuid }],
+                "decryption": dec_str
+            }
+        }],
+        "outbounds": [{ "protocol": "freedom" }]
+    });
+
+    let Some(mut xray) = XrayProcess::start(&xray_cfg, "xray VLESS Decryption server") else {
+        return;
+    };
+    wait_for_listen(&mut xray, xray_vless_port, "xray vless listener").await;
+
+    let flux_cfg = json!({
+        "log": { "level": "warning" },
+        "inbounds": [{
+            "tag": "in",
+            "carrier": { "type": "tcp", "listen": "127.0.0.1", "listen_port": flux_socks_port },
+            "protocol": { "type": "socks" }
+        }],
+        "outbounds": [{
+            "tag": "out",
+            "carrier": { "type": "tcp", "address": format!("127.0.0.1:{xray_vless_port}") },
+            "protocol": {
+                "type": "vless",
+                "uuid": uuid,
+                "encryption": enc_str
+            }
+        }],
+        "route": { "final": "out" }
+    });
+
+    let inst = Instance::new(Config::from_json_str(&flux_cfg.to_string()).unwrap()).unwrap();
+    inst.start().await.unwrap();
+
+    let mut stream =
+        socks5_connect(flux_socks_port, echo, "flux VLESS PQ client -> xray bulk").await;
+
+    // Simulate TLS ClientHello size (1560 bytes)
+    let client_hello = vec![0x16u8; 1560];
+    assert_echo(&mut stream, &client_hello).await;
+
+    // Send large multi-chunk transfer (128 KB)
+    let large_payload = vec![0x55u8; 128 * 1024];
+    assert_echo(&mut stream, &large_payload).await;
+
+    drop(stream);
+    inst.stop().await.unwrap();
+}
