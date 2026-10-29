@@ -606,7 +606,24 @@ impl Default for Reassembly {
 
 /// Xray's default for `scMaxBufferedPosts`.
 /// How long a connection may sit idle before it is closed, as any HTTP server does.
-const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+///
+/// Measured, 400 requests with twenty in flight through a real xray client:
+///
+/// ```text
+///  2 s   400/400  1646 req/s  fds 25
+///  5 s   400/400  1641 req/s  fds 25
+/// 10 s   400/400  1693 req/s  fds 23   <- chosen
+/// 15 s   400/400  1618 req/s  fds 26
+/// 30 s   399/400    39 req/s  fds 27   <- one request hung for the full 10 s client timeout
+/// ```
+///
+/// Below thirty seconds the value is immaterial: descriptors stay in the low twenties and
+/// throughput is flat within noise, because the descriptor leak that made this constant matter was
+/// a deadlocked session, not an idle connection (C7.150-C7.153). At thirty seconds a request hung,
+/// which is the failure mode this timer exists to bound. Ten is chosen as the middle of the flat
+/// region — fast enough to reclaim an abandoned connection well inside the client's own timeout,
+/// slow enough that a peer pooling connections across two requests will not be cut off.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const DEFAULT_MAX_BUFFERED_POSTS: usize = 32;
 
@@ -1136,10 +1153,7 @@ where
                 .body(())
                 .expect("static refusal response");
             let _ = download_respond.send_response(refusal, true);
-            shared::spawn_connection_driver(
-                connection,
-                Some(std::time::Duration::from_millis(250)),
-            );
+            shared::spawn_connection_driver(connection, Some(std::time::Duration::from_millis(250)));
             return Err(FluxError::Protocol {
                 protocol: "xhttp",
                 message: format!("the download for session {session} did not match its upload"),

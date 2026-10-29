@@ -13312,3 +13312,21 @@ Docker (multi-arch)     still building -- unrelated to this goal
 ```
 
 **Six green, zero red.** The coverage workflow had been failing for at least twenty consecutive runs; it passes now.
+
+### C7.168 — IDLE_TIMEOUT measured, not guessed: the boundary is at thirty seconds
+
+400 requests with twenty in flight, through a real xray client, on a freshly started stack per value:
+
+```
+  2 s   400/400  1646 req/s  fds 25 
+  5 s   400/400  1641 req/s  fds 25 
+ 10 s   400/400  1693 req/s  fds 23   <- chosen 
+ 15 s   400/400  1618 req/s  fds 26 
+ 30 s   399/400    39 req/s  fds 27   <- one request hung for the client's full 10 s 
+```
+
+Below thirty seconds the constant is **immaterial**: descriptors stay in the low twenties and throughput is flat within noise. That is the useful finding — the descriptor exhaustion that made this value seem critical was the deadlocked session (C7.150-C7.153), and once that was fixed the timer stopped being a load-bearing parameter. At thirty seconds a single request hung, which is exactly the failure the timer exists to bound.
+
+Ten seconds is chosen as the middle of the flat region: inside the client's own timeout, and long enough that a peer pooling connections across two requests is not cut off. The comment at the constant now carries this table.
+
+Also recorded honestly: the first attempt at this measured nothing useful because a `sed` intended for `IDLE_TIMEOUT` rewrote the driver grace period and the test's pacing values as well, which broke `posts_are_paced_by_the_configured_interval`. Caught by the suite, reverted, and the constant set by hand.
